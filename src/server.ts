@@ -525,6 +525,12 @@ export class DiscordMcplServer {
 
     if (!isEnabled('discord.messaging', this.enabledFeatureSets)) return;
 
+    // Only forward DMs or messages that mention the bot
+    const botId = this.discord.botUserId;
+    const isDM = msg.guildId === null;
+    const isMentioned = botId !== null && msg.mentions.includes(botId);
+    if (!isDM && !isMentioned) return;
+
     const guildId = msg.guildId ?? 'dm';
     const channelMcplId = mcplChannelId(guildId, msg.channelId);
 
