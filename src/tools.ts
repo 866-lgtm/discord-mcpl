@@ -144,4 +144,41 @@ export const toolDefinitions: ToolDefinition[] = [
       required: ['channelId'],
     },
   },
+  {
+    name: 'subscribe_channel',
+    description:
+      'Subscribe to ambient (non-mention) messages from a Discord channel. ' +
+      'Direct mentions and DMs always come through regardless of subscriptions; ' +
+      'this only controls passive awareness of channel chatter. Persisted across restarts.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        channelId: { type: 'string', description: 'Discord channel ID to subscribe to' },
+      },
+      required: ['channelId'],
+    },
+  },
+  {
+    name: 'unsubscribe_channel',
+    description:
+      'Stop receiving ambient messages from a Discord channel. Mentions and DMs ' +
+      'from that channel will still arrive. Persisted across restarts.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        channelId: { type: 'string', description: 'Discord channel ID to unsubscribe from' },
+      },
+      required: ['channelId'],
+    },
+  },
+  {
+    name: 'list_subscriptions',
+    description:
+      'List the Discord channels currently subscribed for ambient message ' +
+      'delivery. Returns the channel IDs as an array.',
+    inputSchema: {
+      type: 'object',
+      properties: {},
+    },
+  },
 ];

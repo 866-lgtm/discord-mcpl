@@ -195,8 +195,12 @@ describe('DiscordMcplServer', () => {
     assert.equal(mcpl.channels, true);
     assert.equal(mcpl.rollback, true);
     assert.ok(mcpl.featureSets);
-    assert.equal(mcpl.featureSets!.length, 3);
+    assert.equal(mcpl.featureSets!.length, 4);
     assert.equal(mcpl.featureSets![0].name, 'discord.messaging');
+    assert.ok(
+      mcpl.featureSets!.some((fs) => fs.name === 'discord.subscriptions'),
+      'discord.subscriptions feature set should be declared',
+    );
 
     // Server should register channels — accept the request
     const regMsg = await client.nextMessage();
@@ -305,11 +309,14 @@ describe('DiscordMcplServer', () => {
     discord.simulateMessage({
       id: 'dm1',
       content: 'Hello agent!',
+      cleanContent: 'Hello agent!',
       authorId: 'u1',
       authorName: 'Alice',
       isBot: false,
       channelId: 'c1',
+      channelName: 'general',
       guildId: 'g1',
+      guildName: 'Test Server',
       mentions: ['bot_123'],
       timestamp: new Date(),
     });
@@ -353,11 +360,14 @@ describe('DiscordMcplServer', () => {
     discord.simulateMessage({
       id: 'dm2',
       content: 'Message on open channel',
+      cleanContent: 'Message on open channel',
       authorId: 'u1',
       authorName: 'Bob',
       isBot: false,
       channelId: 'c1',
+      channelName: 'general',
       guildId: 'g1',
+      guildName: 'Test Server',
       mentions: ['bot_123'],
       timestamp: new Date(),
     });

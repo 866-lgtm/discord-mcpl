@@ -26,6 +26,16 @@ export const featureSets: FeatureSetDeclaration[] = [
     rollback: false,
     hostState: false,
   },
+  {
+    name: 'discord.subscriptions',
+    description:
+      'Manage per-channel ambient-message subscriptions (which channels deliver ' +
+      'non-mention messages for passive awareness). Mentions and DMs are always ' +
+      'delivered and are not affected by subscriptions.',
+    uses: ['tools'],
+    rollback: false,
+    hostState: false,
+  },
 ];
 
 /** Check if a feature set is in a given enabled list. */
@@ -56,6 +66,10 @@ export function featureSetForTool(toolName: string): string | undefined {
       return 'discord.channels';
     case 'fetch_history':
       return 'discord.history';
+    case 'subscribe_channel':
+    case 'unsubscribe_channel':
+    case 'list_subscriptions':
+      return 'discord.subscriptions';
     case 'list_guilds':
     case 'list_channels':
       return undefined; // Always available

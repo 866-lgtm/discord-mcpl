@@ -15,6 +15,8 @@ import {
   type Message,
   type Guild,
   type GuildBasedChannel,
+  type GuildMember,
+  type User,
 } from 'discord.js';
 
 // ── Public Types ──
@@ -26,14 +28,32 @@ export interface DiscordAdapterConfig {
 
 export interface DiscordMessageData {
   id: string;
+  /** Raw content, mentions encoded as `<@USER_ID>` etc. */
   content: string;
+  /** Content with user / role / channel mentions resolved to human-readable
+   *  forms (`@username`, `@role-name`, `#channel-name`). Falls back to raw
+   *  content for channel types where discord.js doesn't populate cleanContent. */
+  cleanContent: string;
   authorId: string;
   authorName: string;
   isBot: boolean;
   channelId: string;
+  /** Channel name (e.g. "general"). `null` for DMs and unnamed channels. */
+  channelName: string | null;
   guildId: string | null;
+  /** Guild name (e.g. "My Server"). `null` for DMs. */
+  guildName: string | null;
   threadId?: string;
+  /** Thread name when the message is in a thread. */
+  threadName?: string;
   replyToId?: string;
+  /** User id of the author of the message this message is in reply to.
+   *  Populated for reply messages regardless of whether the sender left
+   *  the reply-ping toggle on — Discord includes `referenced_message`
+   *  inline in the gateway payload, so this is intent-free and sync.
+   *  Used by the gate to treat reply-to-bot as direct address even when
+   *  the bot isn't explicitly @-mentioned. */
+  replyToUserId?: string | null;
   mentions: string[];
   timestamp: Date;
 }
@@ -56,7 +76,11 @@ export interface HistoryMessage {
   authorId: string;
   authorName: string;
   isBot: boolean;
+  /** Raw content (mentions encoded as `<@id>`). */
   content: string;
+  /** Content with mentions resolved (@username, #channel, @role). Falls back
+   *  to raw content for channel types where discord.js doesn't populate it. */
+  cleanContent: string;
   timestamp: Date;
 }
 
@@ -85,6 +109,17 @@ export class DiscordAdapter {
         GatewayIntentBits.MessageContent,
         GatewayIntentBits.DirectMessages,
         GatewayIntentBits.GuildMessageReactions,
+        // Privileged. Must also be enabled in the Discord Developer Portal
+        // under Bot → Privileged Gateway Intents. Required for:
+        //  - guild.members.fetch() to receive member chunks (otherwise
+        //    the no-arg fetch promise hangs forever, since Discord never
+        //    sends GUILD_MEMBERS_CHUNK to a client that didn't subscribe)
+        //  - GUILD_MEMBER_ADD/UPDATE/REMOVE gateway events to keep the
+        //    cache fresh as people join, change nicknames, or leave.
+        // Without it, `@name` → `<@id>` resolution only works for members
+        // who've recently messaged (cached opportunistically via
+        // messageCreate); inactive members can't be pinged by name.
+        GatewayIntentBits.GuildMembers,
       ],
       partials: [Partials.Channel, Partials.Message],
     });
@@ -147,17 +182,23 @@ export class DiscordAdapter {
     if (!channel || !('send' in channel)) {
       throw new Error(`Channel ${channelId} not found or not a text channel`);
     }
+    const resolved = await this.resolveOutgoingMentions(channel, content);
     const msg = await (channel as TextChannel | DMChannel).send({
-      content,
+      content: resolved,
       reply: options?.replyTo ? { messageReference: options.replyTo } : undefined,
     });
     return { messageId: msg.id };
   }
 
-  async sendDM(userId: string, content: string): Promise<{ messageId: string }> {
+  async sendDM(userId: string, content: string): Promise<{ messageId: string; channelId: string }> {
     const user = await this.client.users.fetch(userId);
-    const msg = await user.send(content);
-    return { messageId: msg.id };
+    // For DMs, the only resolvable user is the recipient. We resolve against
+    // the DM channel we're about to send to. Return the DM channel ID too so
+    // the caller can update sticky-reply state.
+    const dm = await user.createDM();
+    const resolved = await this.resolveOutgoingMentions(dm, content);
+    const msg = await user.send(resolved);
+    return { messageId: msg.id, channelId: dm.id };
   }
 
   async editMessage(channelId: string, messageId: string, content: string): Promise<void> {
@@ -166,7 +207,74 @@ export class DiscordAdapter {
       throw new Error(`Channel ${channelId} not found`);
     }
     const msg = await (channel as TextChannel).messages.fetch(messageId);
-    await msg.edit(content);
+    const resolved = await this.resolveOutgoingMentions(channel, content);
+    await msg.edit(resolved);
+  }
+
+  /** Resolve human-readable @handle mentions in outgoing content to Discord's
+   *  `<@USER_ID>` syntax. Lena learns the @handle form from incoming
+   *  cleanContent and tends to imitate it, but Discord only treats `<@id>`
+   *  as an actual ping. Resolution checks (case-insensitive) the channel's
+   *  guild members against:
+   *    - server nickname
+   *    - user's global display name
+   *    - user's username (handle)
+   *  Skips `@everyone` / `@here` (Discord handles those natively) and the
+   *  bot's own identity (don't self-ping when Lena writes about herself in
+   *  third person). Leaves the original text untouched when there are zero
+   *  matches or multiple ambiguous matches — better to fail to ping than
+   *  to ping the wrong person. */
+  private async resolveOutgoingMentions(
+    channel: unknown,
+    content: string,
+  ): Promise<string> {
+    const selfId = this.client.user?.id;
+    type Candidate = { id: string; aliases: string[] };
+    const candidates: Candidate[] = [];
+
+    const ch = channel as { guild?: Guild; recipient?: User };
+    if (ch.guild) {
+      // The member cache was warmed eagerly at startup (see warmGuildMemberCache).
+      // discord.js keeps it current via GUILD_MEMBER_ADD/UPDATE/REMOVE events,
+      // so reading the cache here is fast and covers all members of the guild.
+      // We deliberately don't call guild.members.fetch() on the hot path —
+      // even with the intent, a fresh bulk fetch can be slow and the cache
+      // is sufficient.
+      for (const member of ch.guild.members.cache.values() as IterableIterator<GuildMember>) {
+        if (member.user.id === selfId) continue;
+        const aliases = [
+          member.nickname,
+          (member.user as User & { globalName?: string | null }).globalName,
+          member.user.displayName,
+          member.user.username,
+        ].filter((s): s is string => typeof s === 'string' && s.length > 0);
+        candidates.push({ id: member.user.id, aliases });
+      }
+    } else if (ch.recipient) {
+      if (ch.recipient.id !== selfId) {
+        const aliases = [
+          (ch.recipient as User & { globalName?: string | null }).globalName,
+          ch.recipient.displayName,
+          ch.recipient.username,
+        ].filter((s): s is string => typeof s === 'string' && s.length > 0);
+        candidates.push({ id: ch.recipient.id, aliases });
+      }
+    }
+
+    if (candidates.length === 0) return content;
+
+    // Discord usernames allow [a-z0-9._]; we match anything in that charset
+    // following `@`. Display names can contain spaces / unicode but allowing
+    // multi-word matches has too high a false-positive rate. Single-token
+    // handles only.
+    return content.replace(/@([A-Za-z0-9_.][A-Za-z0-9_.-]*)/g, (whole, handle) => {
+      const lower = String(handle).toLowerCase();
+      if (lower === 'everyone' || lower === 'here') return whole;
+      const matches = candidates.filter((c) =>
+        c.aliases.some((a) => a.toLowerCase() === lower),
+      );
+      return matches.length === 1 ? `<@${matches[0].id}>` : whole;
+    });
   }
 
   async deleteMessage(channelId: string, messageId: string): Promise<void> {
@@ -189,23 +297,76 @@ export class DiscordAdapter {
 
   async fetchHistory(
     channelId: string,
-    options?: { limit?: number },
+    options?: { limit?: number; before?: string; after?: string },
   ): Promise<HistoryMessage[]> {
     const channel = await this.client.channels.fetch(channelId);
     if (!channel || !('messages' in channel)) {
       throw new Error(`Channel ${channelId} not found`);
     }
-    const messages = await (channel as TextChannel).messages.fetch({
-      limit: options?.limit ?? 50,
-    });
-    return messages.map((m: Message) => ({
-      id: m.id,
-      authorId: m.author.id,
-      authorName: m.author.username,
-      isBot: m.author.bot,
-      content: m.content,
-      timestamp: m.createdAt,
-    }));
+    // Discord's REST endpoint caps a single fetch at 100 messages and
+    // discord.js does not auto-paginate. To support backscroll requests
+    // larger than 100 (we want up to 300), walk backwards page-by-page
+    // using `before: <oldest seen so far>` until we have enough or the
+    // channel runs out of history. `after` (the watermark) is checked
+    // per-message rather than passed to Discord — combining `before`
+    // and `after` in the same request narrows to a slice in time but
+    // doesn't paginate it, which would let us miss messages.
+    const requested = options?.limit ?? 50;
+    const after = options?.after;
+    const collected: HistoryMessage[] = [];
+    let before = options?.before;
+
+    while (collected.length < requested) {
+      const pageLimit = Math.min(100, requested - collected.length);
+      const fetchOpts: { limit: number; before?: string } = { limit: pageLimit };
+      if (before) fetchOpts.before = before;
+      const page = await (channel as TextChannel).messages.fetch(fetchOpts);
+      if (page.size === 0) break;
+
+      // Sort the page newest → oldest so we can break cleanly when we
+      // cross the watermark, and so `before` for the next page is the
+      // oldest snowflake in this page.
+      const pageArr = [...page.values()].sort((a, b) =>
+        b.id.localeCompare(a.id, 'en-US-u-kn-true'),
+      );
+
+      let hitWatermark = false;
+      for (const m of pageArr) {
+        if (after && this.snowflakeLte(m.id, after)) {
+          hitWatermark = true;
+          break;
+        }
+        const rawClean = (m as { cleanContent?: string }).cleanContent;
+        const cleanContent =
+          typeof rawClean === 'string' && rawClean.length > 0 ? rawClean : m.content;
+        collected.push({
+          id: m.id,
+          authorId: m.author.id,
+          authorName: m.author.username,
+          isBot: m.author.bot,
+          content: m.content,
+          cleanContent,
+          timestamp: m.createdAt,
+        });
+        if (collected.length >= requested) break;
+      }
+
+      if (hitWatermark) break;
+      // Page returned fewer than the asked-for window: out of history.
+      if (page.size < pageLimit) break;
+      // Next iteration walks further back from the oldest message we got.
+      const oldest = pageArr[pageArr.length - 1];
+      if (!oldest) break;
+      before = oldest.id;
+    }
+
+    return collected;
+  }
+
+  /** Compare two Discord snowflake IDs numerically without BigInt parsing.
+   *  Snowflakes are 64-bit so we use locale numeric collation. */
+  private snowflakeLte(a: string, b: string): boolean {
+    return a.localeCompare(b, 'en-US-u-kn-true') <= 0;
   }
 
   async sendTyping(channelId: string): Promise<void> {
@@ -217,6 +378,76 @@ export class DiscordAdapter {
 
   getGuildName(guildId: string): string {
     return this.client.guilds.cache.get(guildId)?.name ?? guildId;
+  }
+
+  /** Bulk-fetch all members of a guild into the local cache. Idempotent
+   *  (safe to call multiple times). Wrapped in a timeout so that
+   *  misconfigured intents — portal-disabled but client-requested, for
+   *  instance — fail fast with a clear error instead of hanging the
+   *  whole client. */
+  private async warmGuildMemberCache(guild: Guild): Promise<void> {
+    const TIMEOUT_MS = 30_000;
+    const fetchP = guild.members.fetch();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeoutP = new Promise<never>((_, reject) => {
+      timer = setTimeout(
+        () =>
+          reject(
+            new Error(
+              `guild.members.fetch() timed out after ${TIMEOUT_MS}ms for "${guild.name}". ` +
+                'GuildMembers intent must be enabled in BOTH the Discord Developer ' +
+                "Portal (Bot → Privileged Gateway Intents) AND the discord.js client's " +
+                'intents array. The client side is set; check the portal side.',
+            ),
+          ),
+        TIMEOUT_MS,
+      );
+    });
+    try {
+      await Promise.race([fetchP, timeoutP]);
+      console.error(
+        `[discord-mcpl] member cache warmed for "${guild.name}" (${guild.members.cache.size} members)`,
+      );
+    } catch (err) {
+      console.error(
+        `[discord-mcpl] member cache warm-up failed for "${guild.name}": ${(err as Error).message}`,
+      );
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  /** Produce a human-readable label for a channel id, for use in
+   *  sticky-shift notices to the agent. Tries cache then a single
+   *  REST fetch; falls back to the raw id if either fails. */
+  async describeChannel(
+    channelId: string,
+  ): Promise<{ label: string; channelName?: string; guildName?: string; isDM: boolean }> {
+    try {
+      const channel = await this.client.channels.fetch(channelId);
+      if (!channel) return { label: channelId, isDM: false };
+      const ch = channel as { guild?: Guild; recipient?: User; name?: string };
+      if (ch.guild) {
+        const channelName = typeof ch.name === 'string' ? ch.name : undefined;
+        const guildName = ch.guild.name;
+        return {
+          label: channelName
+            ? `#${channelName} in ${guildName}`
+            : `channel ${channelId} in ${guildName}`,
+          channelName,
+          guildName,
+          isDM: false,
+        };
+      }
+      if (ch.recipient) {
+        const u = ch.recipient as User & { globalName?: string | null };
+        const name = u.globalName ?? u.displayName ?? u.username ?? u.id;
+        return { label: `DM with @${name}`, isDM: true };
+      }
+      return { label: channelId, isDM: false };
+    } catch {
+      return { label: channelId, isDM: false };
+    }
   }
 
   async listGuilds(): Promise<DiscordGuildInfo[]> {
@@ -336,6 +567,20 @@ export class DiscordAdapter {
 
     this.client.on('ready', () => {
       this.readyHandler?.();
+      // Eagerly warm the member cache for every guild we're in so
+      // @name → <@id> resolution in outbound sends works for inactive
+      // members too (not just those who've recently spoken). One bulk
+      // fetch per guild; discord.js keeps it fresh thereafter via
+      // GUILD_MEMBER_ADD/UPDATE/REMOVE events (which need the
+      // GuildMembers intent we declared above).
+      for (const guild of this.client.guilds.cache.values()) {
+        void this.warmGuildMemberCache(guild);
+      }
+    });
+
+    // Newly-joined guilds: warm their member cache too.
+    this.client.on('guildCreate', (guild) => {
+      void this.warmGuildMemberCache(guild);
     });
 
     this.client.on('error', (err: Error) => {
@@ -352,16 +597,43 @@ export class DiscordAdapter {
   }
 
   private convertMessage(message: Message): DiscordMessageData {
+    // discord.js exposes channel/guild names directly on the Message object
+    // (`message.channel.name`, `message.guild?.name`); they're only undefined
+    // for unusual channel kinds (e.g. uncached partials). Fall back to null
+    // so downstream rendering can distinguish "unknown" from "DM".
+    const channel = message.channel as { name?: string } | null;
+    const channelName = channel && typeof channel.name === 'string' && channel.name.length > 0
+      ? channel.name
+      : null;
+    const guildName = message.guild?.name ?? null;
+    // `cleanContent` resolves <@id>, <@&roleId>, <#channelId> to
+    // @username / @role / #channel. For DMs and partial channels it can be
+    // undefined or empty — fall back to raw content so we never lose the
+    // message body.
+    const rawClean = (message as { cleanContent?: string }).cleanContent;
+    const cleanContent = typeof rawClean === 'string' && rawClean.length > 0
+      ? rawClean
+      : message.content;
+    const threadName = (message.thread as { name?: string } | null)?.name;
     return {
       id: message.id,
       content: message.content,
+      cleanContent,
       authorId: message.author.id,
       authorName: message.author.username,
       isBot: message.author.bot,
       channelId: message.channelId,
+      channelName,
       guildId: message.guildId ?? null,
+      guildName,
       threadId: message.thread?.id,
+      threadName,
       replyToId: message.reference?.messageId ?? undefined,
+      // mentions.repliedUser is the User the reply targets — distinct
+      // from mentions.users (which only includes them if the sender
+      // explicitly enabled the reply-ping). We capture it so reply-to-bot
+      // can be treated as direct address regardless of the ping toggle.
+      replyToUserId: message.mentions.repliedUser?.id ?? null,
       mentions: message.mentions.users.map((u) => u.id),
       timestamp: message.createdAt,
     };
