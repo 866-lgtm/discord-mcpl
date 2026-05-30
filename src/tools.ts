@@ -109,6 +109,18 @@ export const toolDefinitions: ToolDefinition[] = [
     },
   },
   {
+    name: 'refresh_channels',
+    description:
+      'Re-scan every Discord channel the bot can currently see and register any ' +
+      'that the host does not yet know about. Use this if you were added to a new ' +
+      'server or channel after startup and it is not showing up in your channel ' +
+      'list. Returns the count of visible channels and any newly-registered ones.',
+    inputSchema: {
+      type: 'object',
+      properties: {},
+    },
+  },
+  {
     name: 'fetch_history',
     description: 'Fetch recent message history from a channel',
     inputSchema: {

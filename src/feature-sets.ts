@@ -72,6 +72,7 @@ export function featureSetForTool(toolName: string): string | undefined {
       return 'discord.subscriptions';
     case 'list_guilds':
     case 'list_channels':
+    case 'refresh_channels':
       return undefined; // Always available
     default:
       return undefined;

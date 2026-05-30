@@ -9,6 +9,7 @@ import {
   Client,
   GatewayIntentBits,
   Partials,
+  PermissionsBitField,
   TextChannel,
   DMChannel,
   ChannelType,
@@ -97,6 +98,12 @@ export class DiscordAdapter {
   private readyHandler?: () => void;
   private channelCreateHandler?: (guildId: string, channel: DiscordChannelInfo) => void;
   private channelDeleteHandler?: (guildId: string, channelId: string) => void;
+  private guildCreateHandler?: (
+    guildId: string,
+    guildName: string,
+    channels: DiscordChannelInfo[],
+  ) => void;
+  private channelAvailableHandler?: (guildId: string, channel: DiscordChannelInfo) => void;
 
   constructor(config: DiscordAdapterConfig) {
     this.token = config.token;
@@ -175,6 +182,23 @@ export class DiscordAdapter {
 
   onChannelDelete(handler: (guildId: string, channelId: string) => void): void {
     this.channelDeleteHandler = handler;
+  }
+
+  /** Fired when the bot joins a new guild after startup. The handler receives
+   *  every text channel currently visible to the bot in that guild, so the
+   *  server can register them with the host the same way it does at boot. */
+  onGuildCreate(
+    handler: (guildId: string, guildName: string, channels: DiscordChannelInfo[]) => void,
+  ): void {
+    this.guildCreateHandler = handler;
+  }
+
+  /** Fired when the bot gains visibility into a *pre-existing* channel — e.g.
+   *  a permission overwrite grants View Channel on a private channel the bot
+   *  was just added to. (channelCreate doesn't fire for channels that already
+   *  existed; this fills that gap.) */
+  onChannelAvailable(handler: (guildId: string, channel: DiscordChannelInfo) => void): void {
+    this.channelAvailableHandler = handler;
   }
 
   // ── Operations ──
@@ -563,6 +587,24 @@ export class DiscordAdapter {
     return result;
   }
 
+  /** All text channels in a single guild, as DiscordChannelInfo. Reads the
+   *  channel cache (populated by the gateway), mirroring getTextChannels but
+   *  scoped to one guild — used when the bot joins a guild after startup. */
+  private guildTextChannels(guild: Guild): DiscordChannelInfo[] {
+    const result: DiscordChannelInfo[] = [];
+    for (const channel of guild.channels.cache.values()) {
+      if (channel.type === ChannelType.GuildText) {
+        result.push({
+          id: channel.id,
+          name: channel.name,
+          type: 'text',
+          parentId: channel.parentId ?? undefined,
+        });
+      }
+    }
+    return result;
+  }
+
   // ── Private ──
 
   private setupEvents(): void {
@@ -610,9 +652,42 @@ export class DiscordAdapter {
       }
     });
 
-    // Newly-joined guilds: warm their member cache too.
+    // Newly-joined guilds: warm their member cache too, and surface the
+    // guild's existing text channels so the host can register them. Without
+    // this, channels in a server the bot is added to *after* startup never
+    // appear in the host's channel list (channelCreate only fires for
+    // channels created later, not the ones that already existed on join).
     this.client.on('guildCreate', (guild) => {
       void this.warmGuildMemberCache(guild);
+      if (this.guildIds?.length && !this.guildIds.includes(guild.id)) return;
+      this.guildCreateHandler?.(guild.id, guild.name, this.guildTextChannels(guild));
+    });
+
+    // Permission overwrites changing on an existing channel: when they flip
+    // the bot from "can't see" to "can see" (i.e. the bot was added to a
+    // private channel), treat it like a newly-available channel. We compare
+    // the bot's View Channel permission before vs after so ordinary edits
+    // (topic, name, slowmode) don't spuriously re-register.
+    this.client.on('channelUpdate', (oldChannel, newChannel) => {
+      if (!('guild' in newChannel) || newChannel.type !== ChannelType.GuildText) return;
+      const guild = newChannel.guild;
+      if (this.guildIds?.length && !this.guildIds.includes(guild.id)) return;
+      const me = guild.members.me;
+      if (!me) return;
+      const VIEW = PermissionsBitField.Flags.ViewChannel;
+      const canViewNow = newChannel.permissionsFor(me)?.has(VIEW) ?? false;
+      if (!canViewNow) return;
+      const couldViewBefore =
+        'permissionsFor' in oldChannel
+          ? (oldChannel.permissionsFor(me)?.has(VIEW) ?? false)
+          : false;
+      if (couldViewBefore) return; // no visibility transition — ignore
+      this.channelAvailableHandler?.(guild.id, {
+        id: newChannel.id,
+        name: newChannel.name,
+        type: 'text',
+        parentId: newChannel.parentId ?? undefined,
+      });
     });
 
     this.client.on('error', (err: Error) => {

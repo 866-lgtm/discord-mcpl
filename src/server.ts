@@ -553,6 +553,9 @@ export class DiscordMcplServer {
       case 'list_channels':
         return await this.discord.listChannels(args.guildId as string);
 
+      case 'refresh_channels':
+        return this.refreshChannels();
+
       case 'fetch_history':
         return await this.discord.fetchHistory(
           args.channelId as string,
@@ -840,6 +843,50 @@ export class DiscordMcplServer {
     }
   }
 
+  /** Register the given descriptors and emit a single `channels/changed`
+   *  notification for the ones that weren't already known. Idempotent:
+   *  re-registering a known channel refreshes its descriptor (e.g. a renamed
+   *  label) but does NOT re-announce it, so repeat calls (channelUpdate
+   *  firing on every edit, or a manual refresh) don't spam the host. Returns
+   *  the descriptors that were newly added. */
+  private registerAndNotifyNew(descriptors: ChannelDescriptor[]): ChannelDescriptor[] {
+    const added: ChannelDescriptor[] = [];
+    for (const d of descriptors) {
+      if (!this.channelManager.get(d.id)) added.push(d);
+      this.channelManager.register(d);
+    }
+    if (added.length > 0 && this.conn && this.mcplEnabled) {
+      this.conn.sendNotification(method.CHANNELS_CHANGED, { added });
+    }
+    return added;
+  }
+
+  /** Re-enumerate every channel currently visible to the bot and register any
+   *  that the host doesn't yet know about. This is the agent-facing catch-all
+   *  for "I was added to a channel/server but don't see it" — it doesn't rely
+   *  on any specific gateway event having fired, so it covers cases the
+   *  event handlers miss (missed events, eventual-consistency gaps, etc.). */
+  private refreshChannels(): {
+    visible: number;
+    added: Array<{ id: string; label: string }>;
+    note: string;
+  } {
+    const textChannels = this.discord.getTextChannels();
+    const descriptors = textChannels.map(({ guildId, guildName, channel }) =>
+      toDescriptor(guildId, guildName, channel),
+    );
+    const added = this.registerAndNotifyNew(descriptors);
+    dbg('refreshChannels', { visible: descriptors.length, added: added.length });
+    return {
+      visible: descriptors.length,
+      added: added.map((d) => ({ id: d.id, label: d.label })),
+      note:
+        added.length > 0
+          ? `Registered ${added.length} newly-visible channel(s).`
+          : 'No new channels — the host already knows about every visible channel.',
+    };
+  }
+
   private handleChannelOpen(params: ChannelsOpenParams): ChannelsOpenResult {
     // Find matching channel by type + address
     const addr = params.address as { guildId?: string; channelId?: string } | undefined;
@@ -959,11 +1006,25 @@ export class DiscordMcplServer {
     this.discord.onChannelCreate((guildId, channel) => {
       if (!this.conn || !this.mcplEnabled) return;
       const guildName = this.discord.getGuildName(guildId);
-      const desc = toDescriptor(guildId, guildName, channel);
-      this.channelManager.register(desc);
-      this.conn.sendNotification(method.CHANNELS_CHANGED, {
-        added: [desc],
-      });
+      this.registerAndNotifyNew([toDescriptor(guildId, guildName, channel)]);
+    });
+
+    // Bot joined a new guild after startup: register all of its existing
+    // text channels so they show up in the host's channel list (channelCreate
+    // only covers channels created *after* the join).
+    this.discord.onGuildCreate((guildId, guildName, channels) => {
+      if (!this.conn || !this.mcplEnabled) return;
+      const descriptors = channels.map((c) => toDescriptor(guildId, guildName, c));
+      const added = this.registerAndNotifyNew(descriptors);
+      dbg('onGuildCreate', { guildId, guildName, total: channels.length, added: added.length });
+    });
+
+    // Bot was granted access to a pre-existing channel (permission overwrite).
+    this.discord.onChannelAvailable((guildId, channel) => {
+      if (!this.conn || !this.mcplEnabled) return;
+      const guildName = this.discord.getGuildName(guildId);
+      const added = this.registerAndNotifyNew([toDescriptor(guildId, guildName, channel)]);
+      dbg('onChannelAvailable', { guildId, channelId: channel.id, added: added.length });
     });
 
     this.discord.onChannelDelete((guildId, channelId) => {

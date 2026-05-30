@@ -36,6 +36,12 @@ class MockDiscordAdapter {
   private _messageHandler?: (msg: DiscordMessageData) => void;
   private _channelCreateHandler?: (guildId: string, channel: DiscordChannelInfo) => void;
   private _channelDeleteHandler?: (guildId: string, channelId: string) => void;
+  private _guildCreateHandler?: (
+    guildId: string,
+    guildName: string,
+    channels: DiscordChannelInfo[],
+  ) => void;
+  private _channelAvailableHandler?: (guildId: string, channel: DiscordChannelInfo) => void;
 
   sentMessages: Array<{ channelId: string; content: string; replyTo?: string }> = [];
   deletedMessages: Array<{ channelId: string; messageId: string }> = [];
@@ -55,6 +61,17 @@ class MockDiscordAdapter {
   }
   onChannelDelete(handler: (guildId: string, channelId: string) => void): void {
     this._channelDeleteHandler = handler;
+  }
+  onGuildCreate(
+    handler: (guildId: string, guildName: string, channels: DiscordChannelInfo[]) => void,
+  ): void {
+    this._guildCreateHandler = handler;
+  }
+  onChannelAvailable(handler: (guildId: string, channel: DiscordChannelInfo) => void): void {
+    this._channelAvailableHandler = handler;
+  }
+  getGuildName(guildId: string): string {
+    return guildId === 'g1' ? 'Test Guild' : guildId;
   }
 
   async sendMessage(channelId: string, content: string, options?: { replyTo?: string }): Promise<{ messageId: string }> {
@@ -110,6 +127,16 @@ class MockDiscordAdapter {
   /** Simulate an incoming Discord message (for push event / channels/incoming tests). */
   simulateMessage(msg: DiscordMessageData): void {
     this._messageHandler?.(msg);
+  }
+
+  /** Simulate the bot joining a new guild after startup. */
+  simulateGuildCreate(guildId: string, guildName: string, channels: DiscordChannelInfo[]): void {
+    this._guildCreateHandler?.(guildId, guildName, channels);
+  }
+
+  /** Simulate the bot being granted access to a pre-existing channel. */
+  simulateChannelAvailable(guildId: string, channel: DiscordChannelInfo): void {
+    this._channelAvailableHandler?.(guildId, channel);
   }
 }
 
@@ -409,6 +436,105 @@ describe('DiscordMcplServer', () => {
     assert.ok(pubResult.delivered);
     assert.equal(discord.sentMessages.length, 1);
     assert.equal(discord.sentMessages[0].content, 'Published message!');
+
+    client.close();
+    await serverPromise;
+  });
+
+  it('guildCreate registers new guild channels via channels/changed', async () => {
+    const { client, serverConn, discord } = await createTestPair();
+    const server = new DiscordMcplServer(discord as unknown as DiscordAdapter);
+    const serverPromise = server.serve(serverConn);
+
+    await mcplHandshake(client);
+
+    // Accept the initial channel registration.
+    const regMsg = await client.nextMessage();
+    if (regMsg.type === 'request') client.sendResponse(regMsg.request.id, {});
+
+    // Bot joins a new guild after startup.
+    discord.simulateGuildCreate('g2', 'Second Guild', [
+      { id: 'c10', name: 'lobby', type: 'text' },
+      { id: 'c11', name: 'random', type: 'text' },
+    ]);
+
+    const changed = await client.nextMessage();
+    assert.equal(changed.type, 'notification');
+    if (changed.type === 'notification') {
+      assert.equal(changed.notification.method, method.CHANNELS_CHANGED);
+      const p = changed.notification.params as { added?: Array<{ id: string }> };
+      assert.equal(p.added?.length, 2);
+      assert.ok(p.added!.some((d) => d.id === 'discord:g2:c10'));
+      assert.ok(p.added!.some((d) => d.id === 'discord:g2:c11'));
+    }
+
+    client.close();
+    await serverPromise;
+  });
+
+  it('channelAvailable registers a newly-permitted channel', async () => {
+    const { client, serverConn, discord } = await createTestPair();
+    const server = new DiscordMcplServer(discord as unknown as DiscordAdapter);
+    const serverPromise = server.serve(serverConn);
+
+    await mcplHandshake(client);
+
+    const regMsg = await client.nextMessage();
+    if (regMsg.type === 'request') client.sendResponse(regMsg.request.id, {});
+
+    // Bot granted access to a pre-existing private channel in g1.
+    discord.simulateChannelAvailable('g1', { id: 'c-private', name: 'secret', type: 'text' });
+
+    const changed = await client.nextMessage();
+    assert.equal(changed.type, 'notification');
+    if (changed.type === 'notification') {
+      assert.equal(changed.notification.method, method.CHANNELS_CHANGED);
+      const p = changed.notification.params as { added?: Array<{ id: string }> };
+      assert.equal(p.added?.length, 1);
+      assert.equal(p.added![0].id, 'discord:g1:c-private');
+    }
+
+    client.close();
+    await serverPromise;
+  });
+
+  it('refresh_channels registers channels visible after startup', async () => {
+    const { client, serverConn, discord } = await createTestPair();
+    const server = new DiscordMcplServer(discord as unknown as DiscordAdapter);
+    const serverPromise = server.serve(serverConn);
+
+    await mcplHandshake(client);
+
+    const regMsg = await client.nextMessage();
+    if (regMsg.type === 'request') client.sendResponse(regMsg.request.id, {});
+
+    // The bot's view now includes a channel not present at boot.
+    discord.getTextChannels = () => [
+      { guildId: 'g1', guildName: 'Test Guild', channel: { id: 'c1', name: 'general', type: 'text' } },
+      { guildId: 'g1', guildName: 'Test Guild', channel: { id: 'c2', name: 'dev', type: 'text' } },
+      { guildId: 'g1', guildName: 'Test Guild', channel: { id: 'c3', name: 'new-room', type: 'text' } },
+    ];
+
+    const callP = client.sendRequest('tools/call', {
+      name: 'refresh_channels',
+      arguments: {},
+    });
+
+    // The refresh emits a channels/changed notification for the new channel.
+    const changed = await client.nextMessage();
+    assert.equal(changed.type, 'notification');
+    if (changed.type === 'notification') {
+      assert.equal(changed.notification.method, method.CHANNELS_CHANGED);
+      const p = changed.notification.params as { added?: Array<{ id: string }> };
+      assert.equal(p.added?.length, 1);
+      assert.equal(p.added![0].id, 'discord:g1:c3');
+    }
+
+    const result = (await callP) as { content: Array<{ type: string; text?: string }> };
+    const payload = JSON.parse(result.content[0].text ?? '{}');
+    assert.equal(payload.visible, 3);
+    assert.equal(payload.added.length, 1);
+    assert.equal(payload.added[0].id, 'discord:g1:c3');
 
     client.close();
     await serverPromise;
