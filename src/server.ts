@@ -425,9 +425,15 @@ export class DiscordMcplServer {
         break;
       }
 
+      // The host emits this as `channels/typing` (McplMethod.ChannelsTyping).
+      // We also accept the legacy `notifications/typing` spelling for safety.
+      case 'channels/typing':
       case 'notifications/typing': {
-        const p = notif.params as { channelId?: string };
-        if (p.channelId) {
+        const p = notif.params as { channelId?: string; op?: 'start' | 'stop' };
+        // Discord has no explicit "stop typing" — the indicator auto-expires a
+        // few seconds after the last trigger. So we act only on 'start' (and a
+        // missing op counts as start); 'stop' is a no-op.
+        if (p.channelId && p.op !== 'stop') {
           const parsed = parseMcplChannelId(p.channelId);
           if (parsed) {
             this.discord.sendTyping(parsed.channelId).catch(() => {});
