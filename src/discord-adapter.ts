@@ -130,7 +130,13 @@ export class DiscordAdapter {
   // ── Lifecycle ──
 
   async connect(): Promise<void> {
-    await this.client.login(this.token);
+    // Resolve only once the gateway READY has populated guilds.cache, so
+    // callers (e.g. registerDiscordChannels) don't enumerate an empty cache.
+    await new Promise<void>((resolve, reject) => {
+      if (this.client.isReady()) { resolve(); return; }
+      this.client.once('ready', () => resolve());
+      this.client.login(this.token).catch(reject);
+    });
   }
 
   async disconnect(): Promise<void> {
@@ -173,6 +179,25 @@ export class DiscordAdapter {
 
   // ── Operations ──
 
+  /** Split text into Discord-safe chunks (<=1900 chars), preferring newline then
+   *  space boundaries; hard-splits over-long runs. Discord rejects content over
+   *  the per-message limit (DiscordAPIError 50035). */
+  private splitForDiscord(text: string, limit = 1900): string[] {
+    if (!text) return [];
+    if (text.length <= limit) return [text];
+    const chunks: string[] = [];
+    let rest = text;
+    while (rest.length > limit) {
+      let cut = rest.lastIndexOf('\n', limit);
+      if (cut < limit * 0.5) cut = rest.lastIndexOf(' ', limit);
+      if (cut < limit * 0.5) cut = limit;
+      chunks.push(rest.slice(0, cut));
+      rest = rest.slice(cut).replace(/^\s+/, '');
+    }
+    if (rest) chunks.push(rest);
+    return chunks;
+  }
+
   async sendMessage(
     channelId: string,
     content: string,
@@ -183,11 +208,16 @@ export class DiscordAdapter {
       throw new Error(`Channel ${channelId} not found or not a text channel`);
     }
     const resolved = await this.resolveOutgoingMentions(channel, content);
-    const msg = await (channel as TextChannel | DMChannel).send({
-      content: resolved,
-      reply: options?.replyTo ? { messageReference: options.replyTo } : undefined,
-    });
-    return { messageId: msg.id };
+    const chunks = this.splitForDiscord(resolved);
+    let lastId = '';
+    for (let i = 0; i < chunks.length; i++) {
+      const sent = await (channel as TextChannel | DMChannel).send({
+        content: chunks[i],
+        reply: i === 0 && options?.replyTo ? { messageReference: options.replyTo } : undefined,
+      });
+      lastId = sent.id;
+    }
+    return { messageId: lastId };
   }
 
   async sendDM(userId: string, content: string): Promise<{ messageId: string; channelId: string }> {
@@ -197,8 +227,10 @@ export class DiscordAdapter {
     // the caller can update sticky-reply state.
     const dm = await user.createDM();
     const resolved = await this.resolveOutgoingMentions(dm, content);
-    const msg = await user.send(resolved);
-    return { messageId: msg.id, channelId: dm.id };
+    const chunks = this.splitForDiscord(resolved);
+    let lastId = '';
+    for (const ch of chunks) { const sent = await user.send(ch); lastId = sent.id; }
+    return { messageId: lastId, channelId: dm.id };
   }
 
   async editMessage(channelId: string, messageId: string, content: string): Promise<void> {

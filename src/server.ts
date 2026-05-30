@@ -733,6 +733,26 @@ export class DiscordMcplServer {
         error: e.message,
         errorName: e.name,
       });
+
+      // Surface the failure back into the agent's chronicle so it is visible
+      // rather than a silent divergence between her memory and the world. The
+      // event uses a "[discord-send-failed]" prefix so recipes can add a wake
+      // policy with a `filter` matching that prefix to enter-without-triggering
+      // (avoiding a retry loop on persistent failures). Without such a policy,
+      // the agent will simply wake on it and may respond.
+      if (this.conn && this.mcplEnabled && isEnabled('discord.messaging', this.enabledFeatureSets)) {
+        const errPreview = (e.message || String(e)).slice(0, 240);
+        this.conn.sendRequest(method.PUSH_EVENT, {
+          featureSet: 'discord.messaging',
+          eventId: `discord_send_failed_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+          timestamp: new Date().toISOString(),
+          origin: { source: 'discord', channelId, kind: 'send-failed', errorName: e.name },
+          payload: { content: [textContent(
+            `[discord-send-failed] Your auto-reply to channel ${channelId} was not delivered: ${errPreview}. ` +
+            `The text remains in your chronicle.`,
+          )] },
+        } satisfies PushEventParams).catch(() => {});
+      }
     }
   }
 
