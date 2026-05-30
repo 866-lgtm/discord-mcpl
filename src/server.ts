@@ -831,11 +831,14 @@ export class DiscordMcplServer {
       .join('\n');
 
     if (!text) {
+      dbg('handlePublish:skip', { channelId: params.channelId, reason: 'empty-text' });
       return { delivered: false, messageId: undefined };
     }
 
+    dbg('handlePublish', { channelId: params.channelId, textLen: text.length, preview: text.slice(0, 80) });
     const result = await this.discord.sendMessage(parsed.channelId, text);
     this.stateTracker.recordSent(result.messageId, parsed.channelId, text);
+    dbg('handlePublish:sent', { channelId: params.channelId, messageId: result.messageId });
 
     return { delivered: true, messageId: result.messageId };
   }
