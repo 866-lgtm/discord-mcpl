@@ -45,7 +45,7 @@ import type {
   ChannelsOutgoingCompleteParams,
 } from '@connectome/mcpl-core';
 
-import type { DiscordAdapter, DiscordMessageData } from './discord-adapter.js';
+import type { DiscordAdapter, DiscordMessageData, DiscordAttachment } from './discord-adapter.js';
 import { toolDefinitions } from './tools.js';
 import { featureSets, isEnabled, featureSetForTool } from './feature-sets.js';
 import { ChannelManager, mcplChannelId, parseMcplChannelId, toDescriptor } from './channels.js';
@@ -950,6 +950,76 @@ export class DiscordMcplServer {
     });
   }
 
+  /** Fetch + convert a message's attachments into MCPL content blocks so the
+   *  agent actually sees them. Images are downloaded and inlined as base64
+   *  image blocks (robust against Discord's expiring CDN URLs); text files are
+   *  inlined as text; anything else degrades to a short note with name + URL.
+   *  Best-effort: a failed fetch becomes a note rather than dropping the message. */
+  private async buildAttachmentBlocks(attachments: DiscordAttachment[]): Promise<ContentBlock[]> {
+    const MAX_IMAGE_BYTES = 4 * 1024 * 1024; // ~4MB (Anthropic caps ~5MB/image)
+    const MAX_TEXT_BYTES = 256 * 1024; // inline cap for text files
+    const TEXT_EXT =
+      /\.(txt|md|markdown|json|jsonl|csv|tsv|log|ya?ml|xml|html?|css|js|mjs|cjs|ts|tsx|jsx|py|rb|go|rs|java|kt|c|h|cpp|hpp|sh|bash|zsh|toml|ini|cfg|conf|sql|diff|patch|env)$/i;
+    const fmt = (n: number) =>
+      n >= 1048576 ? `${(n / 1048576).toFixed(1)}MB` : n >= 1024 ? `${Math.round(n / 1024)}KB` : `${n}B`;
+    const fetchWithTimeout = async (url: string, ms = 15000): Promise<Response> => {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), ms);
+      try {
+        return await fetch(url, { signal: ctrl.signal });
+      } finally {
+        clearTimeout(timer);
+      }
+    };
+
+    const blocks: ContentBlock[] = [];
+    for (const att of attachments) {
+      const ct = (att.contentType || '').toLowerCase();
+      const isImage = ct.startsWith('image/');
+      const isText =
+        ct.startsWith('text/') ||
+        TEXT_EXT.test(att.name) ||
+        (att.contentType === null && att.size > 0 && att.size <= MAX_TEXT_BYTES);
+      try {
+        if (isImage) {
+          if (att.size > MAX_IMAGE_BYTES) {
+            blocks.push(textContent(`[image attachment "${att.name}" (${fmt(att.size)}) too large to inline — ${att.url}]`));
+          } else {
+            const res = await fetchWithTimeout(att.url);
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            const b64 = Buffer.from(await res.arrayBuffer()).toString('base64');
+            blocks.push({ type: 'image', data: b64, mimeType: att.contentType || 'image/png' } as ContentBlock);
+            blocks.push(textContent(`[image attachment: ${att.name}]`));
+          }
+        } else if (isText) {
+          const res = await fetchWithTimeout(att.url);
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          let txt = await res.text();
+          let truncated = false;
+          if (txt.length > MAX_TEXT_BYTES) {
+            txt = txt.slice(0, MAX_TEXT_BYTES);
+            truncated = true;
+          }
+          blocks.push(
+            textContent(`[attachment: ${att.name} (${fmt(att.size)})]\n${txt}${truncated ? '\n…[truncated]' : ''}`),
+          );
+        } else {
+          blocks.push(textContent(`[attachment: ${att.name} (${ct || 'unknown type'}, ${fmt(att.size)}) — not inlined: ${att.url}]`));
+        }
+        dbg('attachment', {
+          name: att.name,
+          contentType: att.contentType,
+          size: att.size,
+          kind: isImage ? 'image' : isText ? 'text' : 'other',
+        });
+      } catch (err) {
+        blocks.push(textContent(`[attachment: ${att.name} — could not fetch (${(err as Error).message}); ${att.url}]`));
+        dbg('attachment:failed', { name: att.name, error: (err as Error).message });
+      }
+    }
+    return blocks;
+  }
+
   private async handleDiscordMessage(msg: DiscordMessageData): Promise<void> {
     const conn = this.conn;
     dbg('handleDiscordMessage:enter', {
@@ -1080,7 +1150,10 @@ export class DiscordMcplServer {
         const open = `<backscroll ${attrs.join(' ')}>`;
         const lines = backscrollMsgs.map((m) => {
           const ts = m.timestamp.toISOString();
-          return `[${ts}] ${m.authorName}: ${m.cleanContent}`;
+          const att = m.attachments && m.attachments.length > 0
+            ? ` [attachments: ${m.attachments.map((a) => a.name).join(', ')}]`
+            : '';
+          return `[${ts}] ${m.authorName}: ${m.cleanContent}${att}`;
         });
         blocks.push([open, ...lines, '</backscroll>'].join('\n'));
       }
@@ -1135,6 +1208,11 @@ export class DiscordMcplServer {
     this.lastChannelId = msg.channelId;
     this.lastInboundMessageId = msg.id;
 
+    // Fetch + inline any attachments (images, text files) so the agent sees
+    // them. Built once and appended to whichever forwarding path we take.
+    const attachmentBlocks =
+      msg.attachments.length > 0 ? await this.buildAttachmentBlocks(msg.attachments) : [];
+
     // If this channel is open, use channels/incoming
     if (channelIsOpen) {
       const incomingParams: ChannelsIncomingParams = {
@@ -1144,7 +1222,7 @@ export class DiscordMcplServer {
           threadId: msg.threadId,
           author: { id: msg.authorId, name: msg.authorName },
           timestamp: msg.timestamp.toISOString(),
-          content: [textContent(renderedContent)],
+          content: [textContent(renderedContent), ...attachmentBlocks],
           metadata: {
             mentions: msg.mentions,
             replyTo: msg.replyToId,
@@ -1191,7 +1269,7 @@ export class DiscordMcplServer {
           isDM,
         } as Record<string, unknown>,
         payload: {
-          content: [textContent(renderedContent)],
+          content: [textContent(renderedContent), ...attachmentBlocks],
         },
       };
 

@@ -27,6 +27,20 @@ export interface DiscordAdapterConfig {
   guildIds?: string[];
 }
 
+/** A file attached to a Discord message (image, text file, etc.). */
+export interface DiscordAttachment {
+  id: string;
+  /** Filename, e.g. "message.txt" or "screenshot.png". */
+  name: string;
+  /** Discord CDN URL (signed; expires after a while). */
+  url: string;
+  /** MIME type Discord reports, e.g. "image/png", "text/plain; charset=utf-8".
+   *  Null when Discord doesn't classify it. */
+  contentType: string | null;
+  /** Size in bytes. */
+  size: number;
+}
+
 export interface DiscordMessageData {
   id: string;
   /** Raw content, mentions encoded as `<@USER_ID>` etc. */
@@ -56,6 +70,8 @@ export interface DiscordMessageData {
    *  the bot isn't explicitly @-mentioned. */
   replyToUserId?: string | null;
   mentions: string[];
+  /** Files attached to the message (images, text files, etc.). Empty when none. */
+  attachments: DiscordAttachment[];
   timestamp: Date;
 }
 
@@ -82,6 +98,8 @@ export interface HistoryMessage {
   /** Content with mentions resolved (@username, #channel, @role). Falls back
    *  to raw content for channel types where discord.js doesn't populate it. */
   cleanContent: string;
+  /** Files attached to the message. Empty when none. */
+  attachments: DiscordAttachment[];
   timestamp: Date;
 }
 
@@ -402,6 +420,7 @@ export class DiscordAdapter {
           isBot: m.author.bot,
           content: m.content,
           cleanContent,
+          attachments: mapAttachments(m),
           timestamp: m.createdAt,
         });
         if (collected.length >= requested) break;
@@ -742,9 +761,29 @@ export class DiscordAdapter {
       // can be treated as direct address regardless of the ping toggle.
       replyToUserId: message.mentions.repliedUser?.id ?? null,
       mentions: message.mentions.users.map((u) => u.id),
+      attachments: mapAttachments(message),
       timestamp: message.createdAt,
     };
   }
+}
+
+/** Map a discord.js message's attachments collection to DiscordAttachment[]. */
+function mapAttachments(message: { attachments?: { values(): IterableIterator<unknown> } }): DiscordAttachment[] {
+  const coll = message.attachments;
+  if (!coll || typeof coll.values !== 'function') return [];
+  const out: DiscordAttachment[] = [];
+  for (const a of coll.values() as IterableIterator<{
+    id: string; name: string | null; url: string; contentType: string | null; size: number;
+  }>) {
+    out.push({
+      id: a.id,
+      name: a.name ?? a.id,
+      url: a.url,
+      contentType: a.contentType ?? null,
+      size: typeof a.size === 'number' ? a.size : 0,
+    });
+  }
+  return out;
 }
 
 function mapChannelType(type: number | undefined): DiscordChannelInfo['type'] {

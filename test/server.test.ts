@@ -345,6 +345,7 @@ describe('DiscordMcplServer', () => {
       guildId: 'g1',
       guildName: 'Test Server',
       mentions: ['bot_123'],
+      attachments: [],
       timestamp: new Date(),
     });
 
@@ -396,6 +397,7 @@ describe('DiscordMcplServer', () => {
       guildId: 'g1',
       guildName: 'Test Server',
       mentions: ['bot_123'],
+      attachments: [],
       timestamp: new Date(),
     });
 
