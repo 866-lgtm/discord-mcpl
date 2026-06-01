@@ -16,7 +16,8 @@
   },
   "dependencies": {
     "@connectome/mcpl-core": "file:../mcpl-core-ts",
-    "discord.js": "^14.16.0"
+    "discord.js": "^14.16.0",
+    "sharp": "^0.33.5"
   },
   "devDependencies": {
     "tsx": "^4.7.0",

@@ -52,6 +52,7 @@ import { ChannelManager, mcplChannelId, parseMcplChannelId, toDescriptor } from 
 import { StateTracker } from './state.js';
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
+import sharp from 'sharp';
 
 /** A Discord message must carry text and/or attachments — reject empty sends. */
 function requireContentOrFiles(content: string, files: OutgoingFile[] | undefined): void {
@@ -81,6 +82,89 @@ function dbg(tag: string, info: Record<string, unknown> = {}): void {
     );
   } catch {
     // Logging is best-effort; never break the server because of it.
+  }
+}
+
+// ============================================================================
+// Image normalization (downsample-on-ingest)
+// ============================================================================
+
+/** Longest edge (px) we keep for inlined images. Matches the ~1568px ceiling
+ *  every major vision model downscales to server-side, so resizing to this is
+ *  perceptually lossless — the model discards anything finer regardless. */
+const IMAGE_LONG_EDGE_MAX = 1568;
+/** JPEG quality when re-encoding opaque images. */
+const IMAGE_JPEG_QUALITY = 85;
+/** Cap on the *encoded* bytes we inline (raw, pre-base64). Anthropic accepts
+ *  ~5MB/image of base64; staying under ~3.5MB raw keeps us comfortably inside. */
+const IMAGE_OUTPUT_RAW_CAP = 3.5 * 1024 * 1024;
+/** Refuse to even download sources larger than this (OOM guard). sharp's own
+ *  pixel limit guards the decoded bitmap against decompression bombs. */
+const IMAGE_FETCH_CEILING = 25 * 1024 * 1024;
+
+interface NormalizedImage {
+  data: string; // base64
+  mimeType: string;
+}
+
+/** Downsample an image to model-max on ingest: resize so the longest edge is
+ *  <= IMAGE_LONG_EDGE_MAX (never upscales), re-encoding to stay under the inline
+ *  byte cap. Opaque images become JPEG; images with alpha stay PNG (flattened to
+ *  JPEG only as a last resort to fit the cap). Already-small images pass through
+ *  untouched. Animated GIFs are left as-is (frame resizing is out of scope) and
+ *  inlined only when already under cap. Returns null when nothing inlinable can
+ *  be produced, letting the caller degrade to a text note. */
+async function normalizeImageForInference(
+  buf: Buffer,
+  declaredCt: string | null,
+): Promise<NormalizedImage | null> {
+  try {
+    const meta = await sharp(buf, { animated: true }).metadata();
+    const longest = Math.max(meta.width ?? 0, meta.height ?? 0);
+    const isAnimated = (meta.pages ?? 1) > 1;
+
+    // Animated: don't resize frames here. Inline as-is if small enough.
+    if (isAnimated) {
+      return buf.length <= IMAGE_OUTPUT_RAW_CAP
+        ? { data: buf.toString('base64'), mimeType: declaredCt || 'image/gif' }
+        : null;
+    }
+
+    // Already within bounds and under cap → inline original bytes unchanged.
+    if (longest > 0 && longest <= IMAGE_LONG_EDGE_MAX && buf.length <= IMAGE_OUTPUT_RAW_CAP) {
+      return { data: buf.toString('base64'), mimeType: declaredCt || `image/${meta.format ?? 'png'}` };
+    }
+
+    // Fresh pipeline per encode (sharp instances aren't safely reusable across
+    // multiple toBuffer() calls). resize() with withoutEnlargement is a no-op
+    // when the image is already within bounds but over the byte cap.
+    const resizeOpts = { width: IMAGE_LONG_EDGE_MAX, height: IMAGE_LONG_EDGE_MAX, fit: 'inside' as const, withoutEnlargement: true };
+    const base = () => sharp(buf).resize(resizeOpts);
+
+    let out: Buffer;
+    let mimeType: string;
+    if (meta.hasAlpha) {
+      out = await base().png({ compressionLevel: 9 }).toBuffer();
+      mimeType = 'image/png';
+    } else {
+      out = await base().jpeg({ quality: IMAGE_JPEG_QUALITY }).toBuffer();
+      mimeType = 'image/jpeg';
+    }
+
+    // Still over cap (large PNG / high-detail photo) → flatten + shrink harder.
+    if (out.length > IMAGE_OUTPUT_RAW_CAP) {
+      out = await sharp(buf)
+        .resize({ width: 1024, height: 1024, fit: 'inside', withoutEnlargement: true })
+        .flatten({ background: '#ffffff' })
+        .jpeg({ quality: 70 })
+        .toBuffer();
+      mimeType = 'image/jpeg';
+      if (out.length > IMAGE_OUTPUT_RAW_CAP) return null;
+    }
+
+    return { data: out.toString('base64'), mimeType };
+  } catch {
+    return null;
   }
 }
 
@@ -968,7 +1052,6 @@ export class DiscordMcplServer {
    *  inlined as text; anything else degrades to a short note with name + URL.
    *  Best-effort: a failed fetch becomes a note rather than dropping the message. */
   private async buildAttachmentBlocks(attachments: DiscordAttachment[]): Promise<ContentBlock[]> {
-    const MAX_IMAGE_BYTES = 4 * 1024 * 1024; // ~4MB (Anthropic caps ~5MB/image)
     const MAX_TEXT_BYTES = 256 * 1024; // inline cap for text files
     const TEXT_EXT =
       /\.(txt|md|markdown|json|jsonl|csv|tsv|log|ya?ml|xml|html?|css|js|mjs|cjs|ts|tsx|jsx|py|rb|go|rs|java|kt|c|h|cpp|hpp|sh|bash|zsh|toml|ini|cfg|conf|sql|diff|patch|env)$/i;
@@ -994,14 +1077,22 @@ export class DiscordMcplServer {
         (att.contentType === null && att.size > 0 && att.size <= MAX_TEXT_BYTES);
       try {
         if (isImage) {
-          if (att.size > MAX_IMAGE_BYTES) {
-            blocks.push(textContent(`[image attachment "${att.name}" (${fmt(att.size)}) too large to inline — ${att.url}]`));
+          if (att.size > IMAGE_FETCH_CEILING) {
+            blocks.push(textContent(`[image attachment "${att.name}" (${fmt(att.size)}) too large to fetch — ${att.url}]`));
           } else {
             const res = await fetchWithTimeout(att.url);
             if (!res.ok) throw new Error(`HTTP ${res.status}`);
-            const b64 = Buffer.from(await res.arrayBuffer()).toString('base64');
-            blocks.push({ type: 'image', data: b64, mimeType: att.contentType || 'image/png' } as ContentBlock);
-            blocks.push(textContent(`[image attachment: ${att.name}]`));
+            const raw = Buffer.from(await res.arrayBuffer());
+            // Downsample to model-max on ingest (resize to ~1568px long edge,
+            // re-encode under the inline cap). This also rescues images that
+            // would previously be dropped for being over the old 4MB cap.
+            const norm = await normalizeImageForInference(raw, att.contentType);
+            if (norm) {
+              blocks.push({ type: 'image', data: norm.data, mimeType: norm.mimeType } as ContentBlock);
+              blocks.push(textContent(`[image attachment: ${att.name}]`));
+            } else {
+              blocks.push(textContent(`[image attachment "${att.name}" (${fmt(att.size)}) could not be inlined — ${att.url}]`));
+            }
           }
         } else if (isText) {
           const res = await fetchWithTimeout(att.url);
