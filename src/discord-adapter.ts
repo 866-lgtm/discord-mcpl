@@ -19,6 +19,8 @@ import {
   type GuildBasedChannel,
   type GuildMember,
   type User,
+  type ChatInputCommandInteraction,
+  type ApplicationCommandDataResolvable,
 } from 'discord.js';
 import { existsSync, statSync } from 'node:fs';
 import { basename } from 'node:path';
@@ -67,6 +69,13 @@ function buildAttachments(files?: OutgoingFile[]): AttachmentBuilder[] {
 export interface DiscordAdapterConfig {
   token: string;
   guildIds?: string[];
+  /** Per-guild channel whitelist. When a guild id has an entry here, only
+   *  the listed channel ids (and threads under them) are visible/handled in
+   *  that guild. Guilds without an entry are unrestricted. */
+  guildChannels?: Record<string, string[]>;
+  /** DM user whitelist. When set, incoming DMs are only handled from these
+   *  user ids; DMs from anyone else are dropped. Unset = all DMs allowed. */
+  dmUsers?: string[];
 }
 
 /** A file attached to a Discord message (image, text file, etc.). */
@@ -151,6 +160,10 @@ export class DiscordAdapter {
   private client: Client;
   private token: string;
   private guildIds?: string[];
+  private guildChannels?: Map<string, Set<string>>;
+  private dmUsers?: Set<string>;
+  private slashCommandHandler?: (interaction: ChatInputCommandInteraction) => void;
+  private guildCommandDefs?: ApplicationCommandDataResolvable[];
 
   private messageHandler?: (msg: DiscordMessageData) => void;
   private editHandler?: (channelId: string, messageId: string, newContent: string) => void;
@@ -168,6 +181,14 @@ export class DiscordAdapter {
   constructor(config: DiscordAdapterConfig) {
     this.token = config.token;
     this.guildIds = config.guildIds;
+    if (config.guildChannels) {
+      this.guildChannels = new Map(
+        Object.entries(config.guildChannels).map(([g, chans]) => [g, new Set(chans)]),
+      );
+    }
+    if (config.dmUsers?.length) {
+      this.dmUsers = new Set(config.dmUsers);
+    }
 
     this.client = new Client({
       intents: [
@@ -234,6 +255,32 @@ export class DiscordAdapter {
 
   onReady(handler: () => void): void {
     this.readyHandler = handler;
+  }
+
+  /** Handler for slash-command (chat input) interactions. */
+  onSlashCommand(handler: (interaction: ChatInputCommandInteraction) => void): void {
+    this.slashCommandHandler = handler;
+  }
+
+  /**
+   * Register guild application (slash) commands on every visible guild
+   * (respecting the guild filter). The defs are remembered so newly-joined
+   * guilds (guildCreate) get them too. Guild commands update instantly,
+   * unlike global commands.
+   */
+  async registerGuildCommands(commands: ApplicationCommandDataResolvable[]): Promise<void> {
+    this.guildCommandDefs = commands;
+    for (const guild of this.client.guilds.cache.values()) {
+      if (this.guildIds?.length && !this.guildIds.includes(guild.id)) continue;
+      try {
+        await guild.commands.set(commands);
+      } catch (err) {
+        console.error(
+          `[discord-mcpl] Failed to register commands in guild ${guild.id}:`,
+          (err as Error).message,
+        );
+      }
+    }
   }
 
   onChannelCreate(handler: (guildId: string, channel: DiscordChannelInfo) => void): void {
@@ -603,6 +650,7 @@ export class DiscordAdapter {
     const result: DiscordChannelInfo[] = [];
     channels.forEach((c: GuildBasedChannel | null) => {
       if (c) {
+        if (!this.channelAllowed(guildId, c.id, c.parentId)) return;
         result.push({
           id: c.id,
           name: c.name,
@@ -651,6 +699,7 @@ export class DiscordAdapter {
       if (this.guildIds && !this.guildIds.includes(guild.id)) continue;
       for (const channel of guild.channels.cache.values()) {
         if (channel.type === ChannelType.GuildText) {
+          if (!this.channelAllowed(guild.id, channel.id, channel.parentId)) continue;
           result.push({
             guildId: guild.id,
             guildName: guild.name,
@@ -673,6 +722,7 @@ export class DiscordAdapter {
   private guildTextChannels(guild: Guild): DiscordChannelInfo[] {
     const result: DiscordChannelInfo[] = [];
     for (const channel of guild.channels.cache.values()) {
+      if (!this.channelAllowed(guild.id, channel.id, channel.parentId)) continue;
       if (channel.type === ChannelType.GuildText) {
         result.push({
           id: channel.id,
@@ -695,15 +745,33 @@ export class DiscordAdapter {
 
     this.client.on('messageUpdate', (_old, newMsg) => {
       if (!newMsg.content) return;
+      // Skip our own edits (e.g. deferred slash-command replies arrive as
+      // edits) — mirrors the self-author check in shouldHandle.
+      if (newMsg.author?.id === this.client.user?.id) return;
+      const editParent =
+        newMsg.channel && 'parentId' in newMsg.channel
+          ? ((newMsg.channel as { parentId?: string | null }).parentId ?? null)
+          : null;
+      if (!this.channelAllowed(newMsg.guildId, newMsg.channelId, editParent)) return;
+      if (!newMsg.guildId && this.dmUsers && newMsg.author && !this.dmUsers.has(newMsg.author.id)) {
+        return;
+      }
       this.editHandler?.(newMsg.channelId, newMsg.id, newMsg.content);
     });
 
     this.client.on('messageDelete', (message) => {
+      const delParent =
+        message.channel && 'parentId' in message.channel
+          ? ((message.channel as { parentId?: string | null }).parentId ?? null)
+          : null;
+      if (!this.channelAllowed(message.guildId, message.channelId, delParent)) return;
       this.deleteHandler?.(message.channelId, message.id);
     });
 
     this.client.on('channelCreate', (channel) => {
       if ('guildId' in channel && channel.guildId) {
+        const parentId = 'parentId' in channel ? (channel.parentId ?? null) : null;
+        if (!this.channelAllowed(channel.guildId, channel.id, parentId)) return;
         this.channelCreateHandler?.(channel.guildId, {
           id: channel.id,
           name: channel.name,
@@ -740,7 +808,25 @@ export class DiscordAdapter {
     this.client.on('guildCreate', (guild) => {
       void this.warmGuildMemberCache(guild);
       if (this.guildIds?.length && !this.guildIds.includes(guild.id)) return;
+      // Register slash commands in guilds joined after startup.
+      if (this.guildCommandDefs) {
+        guild.commands.set(this.guildCommandDefs).catch((err: Error) => {
+          console.error(`[discord-mcpl] Failed to register commands in new guild ${guild.id}:`, err.message);
+        });
+      }
       this.guildCreateHandler?.(guild.id, guild.name, this.guildTextChannels(guild));
+    });
+
+    this.client.on('interactionCreate', (interaction) => {
+      if (!interaction.isChatInputCommand()) return;
+      if (
+        this.guildIds?.length &&
+        interaction.guildId &&
+        !this.guildIds.includes(interaction.guildId)
+      ) {
+        return;
+      }
+      this.slashCommandHandler?.(interaction);
     });
 
     // Permission overwrites changing on an existing channel: when they flip
@@ -754,6 +840,7 @@ export class DiscordAdapter {
       if (this.guildIds?.length && !this.guildIds.includes(guild.id)) return;
       const me = guild.members.me;
       if (!me) return;
+      if (!this.channelAllowed(guild.id, newChannel.id, newChannel.parentId)) return;
       const VIEW = PermissionsBitField.Flags.ViewChannel;
       const canViewNow = newChannel.permissionsFor(me)?.has(VIEW) ?? false;
       if (!canViewNow) return;
@@ -775,10 +862,35 @@ export class DiscordAdapter {
     });
   }
 
+  /** Per-guild channel whitelist check. A guild with no entry in
+   *  `guildChannels` is unrestricted. Threads count as their parent channel
+   *  (a thread under a whitelisted channel is allowed). */
+  private channelAllowed(
+    guildId: string | null | undefined,
+    channelId: string,
+    parentId?: string | null,
+  ): boolean {
+    if (!guildId || !this.guildChannels) return true;
+    const allowed = this.guildChannels.get(guildId);
+    if (!allowed) return true;
+    return allowed.has(channelId) || (parentId != null && allowed.has(parentId));
+  }
+
   private shouldHandle(message: Message): boolean {
     if (message.author.id === this.client.user?.id) return false;
     if (this.guildIds?.length && message.guildId && !this.guildIds.includes(message.guildId)) {
       return false;
+    }
+    // DMs: when a DM user whitelist is configured, drop DMs from anyone else.
+    if (!message.guildId && this.dmUsers && !this.dmUsers.has(message.author.id)) {
+      return false;
+    }
+    if (message.guildId) {
+      const parentId =
+        message.channel && 'parentId' in message.channel
+          ? ((message.channel as { parentId?: string | null }).parentId ?? null)
+          : null;
+      if (!this.channelAllowed(message.guildId, message.channelId, parentId)) return false;
     }
     return true;
   }

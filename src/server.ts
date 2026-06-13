@@ -46,6 +46,7 @@ import type {
 } from '@connectome/mcpl-core';
 
 import type { DiscordAdapter, DiscordMessageData, DiscordAttachment, OutgoingFile } from './discord-adapter.js';
+import type { ChatInputCommandInteraction } from 'discord.js';
 import { toolDefinitions } from './tools.js';
 import { featureSets, isEnabled, featureSetForTool } from './feature-sets.js';
 import { ChannelManager, mcplChannelId, parseMcplChannelId, toDescriptor } from './channels.js';
@@ -237,6 +238,242 @@ export class DiscordMcplServer {
   private outgoingBuffers = new Map<string, { channelId: string; chunks: string[] }>();
 
   constructor(private discord: DiscordAdapter) {}
+
+  /**
+   * Register slash commands with Discord and wire the interaction handler.
+   * Call once after the Discord client is ready (before or after serve()).
+   *
+   * `/undo [turns]` — admin-gated (DISCORD_ADMIN_USERS): asks the host to
+   * revert the agent's last N turns via the `host/command` MCPL method, then
+   * posts what the agent now sees as its latest context message.
+   */
+  async setupSlashCommands(): Promise<void> {
+    this.discord.onSlashCommand((interaction) => {
+      void this.handleSlashCommand(interaction);
+    });
+    await this.discord.registerGuildCommands([
+      {
+        name: 'undo',
+        description: "Undo the agent's last turn(s) — admin only",
+        options: [
+          {
+            type: 4, // INTEGER
+            name: 'messages',
+            description: 'Number of context messages to remove (any participant; default 1)',
+            required: false,
+            min_value: 1,
+            max_value: 50,
+          },
+        ],
+      },
+      {
+        name: 'hide',
+        description: 'Remove a message (or range) from the agent context by link — admin only',
+        options: [
+          {
+            type: 3, // STRING
+            name: 'message',
+            description: 'Message link (or ID) to remove',
+            required: true,
+          },
+          {
+            type: 3, // STRING
+            name: 'to',
+            description: 'End of range: a second message link/ID (inclusive)',
+            required: false,
+          },
+        ],
+      },
+    ]);
+  }
+
+  private async handleSlashCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+    if (interaction.commandName !== 'undo' && interaction.commandName !== 'hide') {
+      await interaction.reply({ content: `Unknown command: ${interaction.commandName}`, ephemeral: true });
+      return;
+    }
+
+    const admins = (process.env.DISCORD_ADMIN_USERS ?? '')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+    if (!admins.includes(interaction.user.id)) {
+      dbg('slash:unauthorized', { command: interaction.commandName, userId: interaction.user.id });
+      await interaction.reply({ content: `Not authorized to use /${interaction.commandName}.`, ephemeral: true });
+      return;
+    }
+
+    if (interaction.commandName === 'hide') {
+      await this.handleHideCommand(interaction);
+      return;
+    }
+
+    const messages = interaction.options.getInteger('messages') ?? 1;
+    const conn = this.conn;
+    if (!conn) {
+      await interaction.reply({ content: 'Host is not connected — cannot undo.', ephemeral: true });
+      return;
+    }
+
+    dbg('slash:undo', { messages, userId: interaction.user.id, channelId: interaction.channelId });
+    // Public reply: the channel should see that history was rewound.
+    await interaction.deferReply();
+
+    try {
+      const result = (await conn.sendRequest(
+        'host/command',
+        {
+          command: 'undo',
+          messages,
+          requesterId: interaction.user.id,
+          requesterName: interaction.user.username,
+        },
+        30000,
+      )) as {
+        ok?: boolean;
+        error?: string;
+        messagesRemoved?: number;
+        lastVisible?: { participant?: string; role?: string; preview?: string } | null;
+      };
+
+      if (!result?.ok) {
+        await interaction.editReply(`⚠️ Undo failed: ${result?.error ?? 'unknown error'}`);
+        return;
+      }
+
+      const lines: string[] = [];
+      const removed = result.messagesRemoved ?? 0;
+      lines.push(
+        `🗑️ Removed the last **${removed}** context message${removed === 1 ? '' : 's'} (branched; old branch preserved).`,
+      );
+      const lv = result.lastVisible;
+      if (lv?.preview) {
+        const who = lv.participant ?? lv.role ?? '?';
+        lines.push(`Last message now visible to the agent — **${who}**:`);
+        lines.push(`> ${lv.preview.replace(/\n/g, '\n> ')}`);
+      } else if (lv) {
+        const who = lv.participant ?? lv.role ?? '?';
+        lines.push(`Last message now visible to the agent — **${who}**: *(empty message)*`);
+      } else {
+        lines.push('(Could not render the post-undo context preview.)');
+      }
+      await interaction.editReply(lines.join('\n'));
+    } catch (err) {
+      dbg('slash:undo-failed', { error: (err as Error).message });
+      await interaction.editReply(`⚠️ Undo failed: ${(err as Error).message}`);
+    }
+  }
+
+  /**
+   * Parse a Discord message link or raw ID into a message id.
+   * Accepts:
+   *   https://discord.com/channels/<guild>/<channel>/<messageId>
+   *   <channel>-<messageId>  (the "Copy ID" with shift on some clients)
+   *   a bare 17–20 digit snowflake
+   */
+  private parseMessageRef(input: string): string | null {
+    const s = input.trim();
+    const link = s.match(/channels\/\d+\/\d+\/(\d+)/);
+    if (link) return link[1];
+    const dashed = s.match(/^\d+-(\d+)$/);
+    if (dashed) return dashed[1];
+    if (/^\d{17,20}$/.test(s)) return s;
+    return null;
+  }
+
+  private async handleHideCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+    const fromRaw = interaction.options.getString('message', true);
+    const toRaw = interaction.options.getString('to');
+    const fromMessageId = this.parseMessageRef(fromRaw);
+    if (!fromMessageId) {
+      await interaction.reply({
+        content: `Could not parse a message link/ID from \`${fromRaw}\`.`,
+        ephemeral: true,
+      });
+      return;
+    }
+    let toMessageId: string | undefined;
+    if (toRaw) {
+      const parsed = this.parseMessageRef(toRaw);
+      if (!parsed) {
+        await interaction.reply({ content: `Could not parse \`${toRaw}\`.`, ephemeral: true });
+        return;
+      }
+      toMessageId = parsed;
+    }
+
+    const conn = this.conn;
+    if (!conn) {
+      await interaction.reply({ content: 'Host is not connected — cannot hide.', ephemeral: true });
+      return;
+    }
+
+    dbg('slash:hide', { fromMessageId, toMessageId, userId: interaction.user.id });
+    await interaction.deferReply();
+
+    try {
+      const result = (await conn.sendRequest(
+        'host/command',
+        {
+          command: 'hide',
+          fromMessageId,
+          toMessageId,
+          requesterId: interaction.user.id,
+          requesterName: interaction.user.username,
+        },
+        30000,
+      )) as {
+        ok?: boolean;
+        error?: string;
+        hidden?: number;
+        hiddenRefs?: Array<{ channelId: string; messageId: string }>;
+        lastVisible?: { participant?: string; role?: string; preview?: string } | null;
+      };
+
+      if (!result?.ok) {
+        await interaction.editReply(`⚠️ Hide failed: ${result?.error ?? 'unknown error'}`);
+        return;
+      }
+
+      // Mark each hidden Discord message with 💤 so the channel shows what's
+      // no longer in the agent's context. Best-effort, in parallel.
+      let reacted = 0;
+      const refs = result.hiddenRefs ?? [];
+      await Promise.all(
+        refs.map(async (ref) => {
+          // channelId may be raw or the "discord:guild:channel" composite.
+          const parsed = parseMcplChannelId(ref.channelId);
+          const channelId = parsed ? parsed.channelId : ref.channelId;
+          try {
+            await this.discord.addReaction(channelId, ref.messageId, '💤');
+            reacted++;
+          } catch (err) {
+            dbg('slash:hide-react-failed', { messageId: ref.messageId, error: (err as Error).message });
+          }
+        }),
+      );
+
+      const n = result.hidden ?? 0;
+      const lines = [
+        `🙈 Removed **${n}** message${n === 1 ? '' : 's'} from the agent's context (redacted in place)` +
+          (reacted > 0 ? `, marked ${reacted} with 💤` : '') +
+          '.',
+      ];
+      const lv = result.lastVisible;
+      if (lv?.preview) {
+        const who = lv.participant ?? lv.role ?? '?';
+        lines.push(`Last message now visible to the agent — **${who}**:`);
+        lines.push(`> ${lv.preview.replace(/\n/g, '\n> ')}`);
+      } else if (lv) {
+        const who = lv.participant ?? lv.role ?? '?';
+        lines.push(`Last message now visible to the agent — **${who}**: *(empty message)*`);
+      }
+      await interaction.editReply(lines.join('\n'));
+    } catch (err) {
+      dbg('slash:hide-failed', { error: (err as Error).message });
+      await interaction.editReply(`⚠️ Hide failed: ${(err as Error).message}`);
+    }
+  }
 
   /**
    * Serve a single connection. Blocks until the connection closes.
@@ -1236,13 +1473,16 @@ export class DiscordMcplServer {
         if (!wasSubscribed) {
           this.subscribedChannels.add(msg.channelId);
           this.saveSubscriptions();
+          // Announce only on a GENUINELY new subscription. Previously this
+          // push was unconditional, so every process restart's first mention
+          // re-emitted the note into the agent's chronicle.
+          blocks.push(
+            `<system>Auto-subscribed to ${where} because you were mentioned. ` +
+              `Ambient (non-mention) messages from this channel will now arrive in your context. ` +
+              `Mentions and DMs always come through regardless of subscriptions. ` +
+              `To stop ambient delivery from here: unsubscribe_channel("${msg.channelId}").</system>`,
+          );
         }
-        blocks.push(
-          `<system>Auto-subscribed to ${where} because you were mentioned. ` +
-            `Ambient (non-mention) messages from this channel will now arrive in your context. ` +
-            `Mentions and DMs always come through regardless of subscriptions. ` +
-            `To stop ambient delivery from here: unsubscribe_channel("${msg.channelId}").</system>`,
-        );
       }
       if (backscrollMsgs.length > 0) {
         const attrs: string[] = [];
@@ -1357,6 +1597,7 @@ export class DiscordMcplServer {
         timestamp: msg.timestamp.toISOString(),
         origin: {
           source: 'discord',
+          messageId: msg.id,
           guildId: msg.guildId,
           guildName: msg.guildName,
           channelId: msg.channelId,
