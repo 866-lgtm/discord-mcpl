@@ -100,6 +100,12 @@ class MockDiscordAdapter {
     ];
   }
 
+  async fetchAround(): Promise<Array<{ id: string; authorId: string; authorName: string; isBot: boolean; content: string; timestamp: Date }>> {
+    return [
+      { id: 'h1', authorId: 'u1', authorName: 'Alice', isBot: false, content: 'Hello', timestamp: new Date() },
+    ];
+  }
+
   async listGuilds(): Promise<Array<{ id: string; name: string; memberCount: number }>> {
     return [{ id: 'g1', name: 'Test Guild', memberCount: 10 }];
   }

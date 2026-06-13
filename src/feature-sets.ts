@@ -65,6 +65,7 @@ export function featureSetForTool(toolName: string): string | undefined {
     case 'delete_channel':
       return 'discord.channels';
     case 'fetch_history':
+    case 'fetch_around':
       return 'discord.history';
     case 'subscribe_channel':
     case 'unsubscribe_channel':

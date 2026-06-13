@@ -546,6 +546,47 @@ export class DiscordAdapter {
     return collected;
   }
 
+  /** Fetch a window of messages centred on `messageId` — the "scroll to a
+   *  message" primitive. Uses Discord's `around` parameter, which returns the
+   *  target message plus roughly half the window on either side of it. This is
+   *  a SINGLE REST fetch (no pagination) and is therefore capped at 100 by the
+   *  Discord API; values above 100 are clamped. The target message itself is
+   *  included in the result. Messages are returned oldest → newest so the
+   *  window reads naturally as a transcript. */
+  async fetchAround(
+    channelId: string,
+    messageId: string,
+    limit = 50,
+  ): Promise<HistoryMessage[]> {
+    const channel = await this.client.channels.fetch(channelId);
+    if (!channel || !('messages' in channel)) {
+      throw new Error(`Channel ${channelId} not found`);
+    }
+    const pageLimit = Math.min(100, Math.max(1, limit));
+    const page = await (channel as TextChannel).messages.fetch({
+      around: messageId,
+      limit: pageLimit,
+    });
+    const collected: HistoryMessage[] = [...page.values()].map((m) => {
+      const rawClean = (m as { cleanContent?: string }).cleanContent;
+      const cleanContent =
+        typeof rawClean === 'string' && rawClean.length > 0 ? rawClean : m.content;
+      return {
+        id: m.id,
+        authorId: m.author.id,
+        authorName: m.author.username,
+        isBot: m.author.bot,
+        content: m.content,
+        cleanContent,
+        attachments: mapAttachments(m),
+        timestamp: m.createdAt,
+      };
+    });
+    // discord.js returns the `around` window unsorted; present oldest → newest.
+    collected.sort((a, b) => a.id.localeCompare(b.id, 'en-US-u-kn-true'));
+    return collected;
+  }
+
   /** Compare two Discord snowflake IDs numerically without BigInt parsing.
    *  Snowflakes are 64-bit so we use locale numeric collation. */
   private snowflakeLte(a: string, b: string): boolean {

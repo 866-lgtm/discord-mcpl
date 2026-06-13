@@ -144,14 +144,53 @@ export const toolDefinitions: ToolDefinition[] = [
   },
   {
     name: 'fetch_history',
-    description: 'Fetch recent message history from a channel',
+    description:
+      'Fetch message history from a channel. By default returns the most recent ' +
+      'messages. Use `before` (a message ID) to scroll further back — pass the ID ' +
+      'of the oldest message you have seen to page backwards through older history. ' +
+      'Use `after` (a message ID) to fetch only messages newer than a given point. ' +
+      'Pagination is automatic, so `limit` may exceed Discord\'s 100-per-request cap.',
     inputSchema: {
       type: 'object',
       properties: {
         channelId: { type: 'string', description: 'Discord channel ID' },
         limit: { type: 'number', description: 'Max messages to fetch (default 50)' },
+        before: {
+          type: 'string',
+          description:
+            'Only fetch messages older than this message ID (exclusive). ' +
+            'Use the oldest ID you already have to page further back.',
+        },
+        after: {
+          type: 'string',
+          description:
+            'Only fetch messages newer than this message ID (exclusive). ' +
+            'Use the newest ID you already have to fetch what is new.',
+        },
       },
       required: ['channelId'],
+    },
+  },
+  {
+    name: 'fetch_around',
+    description:
+      'Scroll to a specific message and fetch the surrounding context. Returns a ' +
+      'window of messages centred on `messageId` (the message itself plus roughly ' +
+      'half the window on either side). Single request, so `limit` is capped at 100.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        channelId: { type: 'string', description: 'Discord channel ID' },
+        messageId: {
+          type: 'string',
+          description: 'The message ID to centre the window on',
+        },
+        limit: {
+          type: 'number',
+          description: 'Total window size, centred on the message (default 50, max 100)',
+        },
+      },
+      required: ['channelId', 'messageId'],
     },
   },
   {

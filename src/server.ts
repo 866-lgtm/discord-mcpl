@@ -891,7 +891,18 @@ export class DiscordMcplServer {
       case 'fetch_history':
         return await this.discord.fetchHistory(
           args.channelId as string,
-          { limit: (args.limit as number) ?? 50 },
+          {
+            limit: (args.limit as number) ?? 50,
+            ...(args.before ? { before: args.before as string } : {}),
+            ...(args.after ? { after: args.after as string } : {}),
+          },
+        );
+
+      case 'fetch_around':
+        return await this.discord.fetchAround(
+          args.channelId as string,
+          args.messageId as string,
+          (args.limit as number) ?? 50,
         );
 
       case 'create_text_channel':
