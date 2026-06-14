@@ -6,6 +6,9 @@
 import { describe, it, beforeEach } from 'node:test';
 import * as assert from 'node:assert/strict';
 import * as net from 'node:net';
+import { writeFileSync, unlinkSync, existsSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 
 import {
   McplConnection,
@@ -94,16 +97,24 @@ class MockDiscordAdapter {
 
   async addReaction(): Promise<void> {}
 
-  async fetchHistory(): Promise<Array<{ id: string; authorId: string; authorName: string; isBot: boolean; content: string; timestamp: Date }>> {
-    return [
-      { id: 'h1', authorId: 'u1', authorName: 'Alice', isBot: false, content: 'Hello', timestamp: new Date() },
-    ];
+  /** Messages the next fetchHistory/fetchAround call should return. Tests set
+   *  this to drive the reconnect catch-up sweep. */
+  historyToReturn: Array<{
+    id: string; authorId: string; authorName: string; isBot: boolean;
+    content: string; cleanContent: string; attachments: never[]; mentionsBot: boolean; timestamp: Date;
+  }> = [];
+  channelMeta = { name: 'general', guildId: 'g1', guildName: 'Test Guild', isDM: false };
+
+  async fetchHistory(): Promise<MockDiscordAdapter['historyToReturn']> {
+    return this.historyToReturn;
   }
 
-  async fetchAround(): Promise<Array<{ id: string; authorId: string; authorName: string; isBot: boolean; content: string; timestamp: Date }>> {
-    return [
-      { id: 'h1', authorId: 'u1', authorName: 'Alice', isBot: false, content: 'Hello', timestamp: new Date() },
-    ];
+  async fetchAround(): Promise<MockDiscordAdapter['historyToReturn']> {
+    return this.historyToReturn;
+  }
+
+  async getChannelMeta(): Promise<MockDiscordAdapter['channelMeta']> {
+    return this.channelMeta;
   }
 
   async listGuilds(): Promise<Array<{ id: string; name: string; memberCount: number }>> {
@@ -546,5 +557,54 @@ describe('DiscordMcplServer', () => {
 
     client.close();
     await serverPromise;
+  });
+
+  it('reconnect sweep delivers missed mentions from a non-subscribed channel', async () => {
+    const wmPath = join(tmpdir(), `discord-mcpl-wm-${process.pid}-sweep.json`);
+    writeFileSync(wmPath, JSON.stringify({ watermarks: { c1: '100' }, dmChannels: [] }));
+    process.env.DISCORD_WATERMARK_FILE = wmPath;
+    try {
+      const { client, serverConn, discord } = await createTestPair();
+      // Two messages arrived while offline: one plain, one @mentioning the bot.
+      // Channel c1 is NOT subscribed, so only the mention should be delivered.
+      const t = new Date();
+      discord.historyToReturn = [
+        { id: '101', authorId: 'u1', authorName: 'Alice', isBot: false, content: 'just chatting', cleanContent: 'just chatting', attachments: [], mentionsBot: false, timestamp: t },
+        { id: '102', authorId: 'u2', authorName: 'Bob', isBot: false, content: '<@bot_123> ping', cleanContent: '@bot ping', attachments: [], mentionsBot: true, timestamp: t },
+      ];
+      const server = new DiscordMcplServer(discord as unknown as DiscordAdapter);
+      const serverPromise = server.serve(serverConn);
+
+      await mcplHandshake(client);
+
+      // Accept channel registration.
+      const regMsg = await client.nextMessage();
+      assert.equal(regMsg.type, 'request');
+      if (regMsg.type === 'request') client.sendResponse(regMsg.request.id, {});
+
+      // Next: the catch-up push/event for the missed mention.
+      const missed = await client.nextMessage();
+      assert.equal(missed.type, 'request');
+      if (missed.type === 'request') {
+        assert.equal(missed.request.method, method.PUSH_EVENT);
+        const p = missed.request.params as PushEventParams;
+        assert.equal(p.eventId, 'discord_missed_c1_102');
+        const origin = p.origin as Record<string, unknown>;
+        assert.equal(origin.isMention, true);
+        assert.equal(origin.isDM, false);
+        const text = (p.payload.content[0] as { text: string }).text;
+        assert.ok(text.includes('count="1"'), 'only the mention should be delivered');
+        assert.ok(text.includes('reason="mention"'));
+        assert.ok(text.includes('Bob'), 'mention author present');
+        assert.ok(!text.includes('just chatting'), 'non-mention line excluded');
+        client.sendResponse(missed.request.id, {});
+      }
+
+      client.close();
+      await serverPromise;
+    } finally {
+      delete process.env.DISCORD_WATERMARK_FILE;
+      if (existsSync(wmPath)) unlinkSync(wmPath);
+    }
   });
 });

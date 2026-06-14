@@ -151,6 +151,12 @@ export interface HistoryMessage {
   cleanContent: string;
   /** Files attached to the message. Empty when none. */
   attachments: DiscordAttachment[];
+  /** True if this message @mentions the bot or is a reply to the bot. Used by
+   *  the reconnect catch-up sweep to pick out missed mentions. Reply-to-bot is
+   *  best-effort for historical fetches: `mentions.repliedUser` is only present
+   *  when the reference resolves, so explicit @mentions are the reliable
+   *  signal here. */
+  mentionsBot: boolean;
   timestamp: Date;
 }
 
@@ -529,6 +535,7 @@ export class DiscordAdapter {
           content: m.content,
           cleanContent,
           attachments: mapAttachments(m),
+          mentionsBot: this.messageMentionsBot(m),
           timestamp: m.createdAt,
         });
         if (collected.length >= requested) break;
@@ -579,6 +586,7 @@ export class DiscordAdapter {
         content: m.content,
         cleanContent,
         attachments: mapAttachments(m),
+        mentionsBot: this.messageMentionsBot(m),
         timestamp: m.createdAt,
       };
     });
@@ -587,10 +595,45 @@ export class DiscordAdapter {
     return collected;
   }
 
+  /** Resolve display metadata for a channel by ID — used by the reconnect
+   *  catch-up sweep to label `<missed>` blocks. Returns nulls for an
+   *  unresolvable channel rather than throwing. */
+  async getChannelMeta(channelId: string): Promise<{
+    name: string | null;
+    guildId: string | null;
+    guildName: string | null;
+    isDM: boolean;
+  }> {
+    const channel = await this.client.channels.fetch(channelId);
+    if (!channel) return { name: null, guildId: null, guildName: null, isDM: true };
+    const c = channel as {
+      name?: string;
+      guildId?: string | null;
+      guild?: { name?: string };
+    };
+    const guildId = c.guildId ?? null;
+    return {
+      name: typeof c.name === 'string' && c.name.length > 0 ? c.name : null,
+      guildId,
+      guildName: c.guild?.name ?? null,
+      isDM: !guildId,
+    };
+  }
+
   /** Compare two Discord snowflake IDs numerically without BigInt parsing.
    *  Snowflakes are 64-bit so we use locale numeric collation. */
   private snowflakeLte(a: string, b: string): boolean {
     return a.localeCompare(b, 'en-US-u-kn-true') <= 0;
+  }
+
+  /** Whether a fetched message addresses the bot — explicit @mention or a
+   *  reply targeting it. Mirrors the live-path logic in convertMessage
+   *  (`mentions.users` + `mentions.repliedUser`). Returns false when the bot
+   *  user isn't known yet. */
+  private messageMentionsBot(m: Message): boolean {
+    const botId = this.client.user?.id;
+    if (!botId) return false;
+    return m.mentions.users.has(botId) || m.mentions.repliedUser?.id === botId;
   }
 
   async sendTyping(channelId: string): Promise<void> {

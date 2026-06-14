@@ -187,11 +187,32 @@ export class DiscordMcplServer {
 
   /** Per-channel watermark of the highest Discord message id forwarded to
    *  the host. Used by the auto-subscribe-on-mention flow to fetch only
-   *  the backscroll Lena hasn't already seen. In-memory only — resets on
-   *  restart (acceptable: after restart, autobio context already has the
-   *  prior conversation, and a fresh first-mention legitimately deserves
-   *  fresh backscroll). */
+   *  the backscroll Lena hasn't already seen, and by the reconnect catch-up
+   *  sweep to find what arrived while the bot was offline.
+   *
+   *  Persisted to `DISCORD_WATERMARK_FILE` when set (alongside the set of DM
+   *  channel IDs, so DMs can be swept too). When unset, it's in-memory only —
+   *  resets on restart, and the catch-up sweep is effectively disabled
+   *  (there's no "since when" anchor to scan from). */
   private forwardedWatermark = new Map<string, string>();
+  /** DM channel IDs we've forwarded from. Tracked (and persisted with the
+   *  watermark) because discord.js can't enumerate past DM channels, so the
+   *  reconnect sweep needs a remembered list of which DMs to re-scan. */
+  private dmChannelIds = new Set<string>();
+  private watermarkLoaded = false;
+  /** Set once the reconnect catch-up sweep has run for the current process,
+   *  so it doesn't re-run if a host reconnects mid-session. */
+  private sweepDone = false;
+
+  /** Max messages to scan per channel during the reconnect catch-up sweep.
+   *  Tunable via DISCORD_CATCHUP_LIMIT; clamped to [1, 300]. Bounds REST cost
+   *  when a channel accumulated a lot while the bot was offline. */
+  private get catchupLimit(): number {
+    const raw = process.env.DISCORD_CATCHUP_LIMIT;
+    if (!raw) return 100;
+    const n = parseInt(raw, 10);
+    return Number.isFinite(n) && n > 0 && n <= 300 ? n : 100;
+  }
 
   /** How many backscroll messages to fetch on first interaction in a
    *  channel. Tunable via DISCORD_BACKSCROLL_LIMIT env var; clamped to
@@ -491,6 +512,15 @@ export class DiscordMcplServer {
     // If MCPL is enabled, register all visible Discord channels
     if (this.mcplEnabled) {
       await this.registerDiscordChannels();
+    }
+
+    // Deliver anything that arrived while the bot was offline (mentions + DMs
+    // everywhere, full missed backscroll for subscribed channels). Best-effort
+    // and one-shot; failures must not block serving.
+    try {
+      await this.runReconnectSweep();
+    } catch (err) {
+      console.error('[discord-mcpl] Reconnect catch-up sweep failed:', (err as Error).message);
     }
 
     // Main loop
@@ -1061,6 +1091,195 @@ export class DiscordMcplServer {
     return this.subscribedChannels.has(channelId);
   }
 
+  // ── Watermark persistence (for offline catch-up) ──
+
+  /** Path to the JSON file backing per-channel watermarks + DM channel IDs.
+   *  When unset, watermarks are in-memory only and the catch-up sweep is a
+   *  no-op (no persisted anchor survives a restart). */
+  private watermarkFile(): string | undefined {
+    const p = process.env.DISCORD_WATERMARK_FILE;
+    return p && p.length > 0 ? p : undefined;
+  }
+
+  /** Lazy-load watermarks + DM channel IDs from disk. Idempotent. */
+  private ensureWatermarkLoaded(): void {
+    if (this.watermarkLoaded) return;
+    this.watermarkLoaded = true;
+    const path = this.watermarkFile();
+    if (!path || !existsSync(path)) return;
+    try {
+      const parsed = JSON.parse(readFileSync(path, 'utf-8'));
+      const marks = parsed?.watermarks;
+      if (marks && typeof marks === 'object') {
+        for (const [chan, id] of Object.entries(marks)) {
+          if (typeof chan === 'string' && typeof id === 'string' && id.length > 0) {
+            this.forwardedWatermark.set(chan, id);
+          }
+        }
+      }
+      if (Array.isArray(parsed?.dmChannels)) {
+        for (const id of parsed.dmChannels) {
+          if (typeof id === 'string' && id.length > 0) this.dmChannelIds.add(id);
+        }
+      }
+      dbg('watermark:loaded', {
+        channels: this.forwardedWatermark.size,
+        dms: this.dmChannelIds.size,
+        path,
+      });
+    } catch (err) {
+      console.error('[discord-mcpl] Failed to load watermarks:', (err as Error).message);
+      dbg('watermark:load-failed', { error: (err as Error).message, path });
+    }
+  }
+
+  /** Persist the watermark map + DM channel set. Best-effort; called after
+   *  each forward so the anchor is current if the process dies. */
+  private saveWatermark(): void {
+    const path = this.watermarkFile();
+    if (!path) return; // in-memory mode
+    try {
+      mkdirSync(dirname(path), { recursive: true });
+      const out = {
+        watermarks: Object.fromEntries(
+          [...this.forwardedWatermark.entries()].sort((a, b) => a[0].localeCompare(b[0])),
+        ),
+        dmChannels: [...this.dmChannelIds].sort(),
+      };
+      writeFileSync(path, JSON.stringify(out, null, 2) + '\n');
+    } catch (err) {
+      console.error('[discord-mcpl] Failed to save watermarks:', (err as Error).message);
+      dbg('watermark:save-failed', { error: (err as Error).message, path });
+    }
+  }
+
+  // ── Reconnect catch-up sweep ──
+
+  /** On (re)connect, deliver what arrived while the bot was offline:
+   *  mentions + DMs from any known channel, plus the full missed backscroll
+   *  for subscribed channels (which already receive ambient delivery). Each
+   *  channel is scanned from its persisted watermark, bounded by catchupLimit.
+   *
+   *  No-op unless a watermark file is configured (without a persisted anchor
+   *  there's no "since when" to scan from) and messaging is enabled. Runs at
+   *  most once per process. */
+  private async runReconnectSweep(): Promise<void> {
+    if (this.sweepDone) return;
+    this.sweepDone = true;
+    const conn = this.conn;
+    if (!conn || !this.mcplEnabled) return;
+    if (!isEnabled('discord.messaging', this.enabledFeatureSets)) return;
+    if (!this.watermarkFile()) {
+      dbg('sweep:skip', { reason: 'no-watermark-file' });
+      return;
+    }
+    this.ensureSubscriptionsLoaded();
+    this.ensureWatermarkLoaded();
+    const botId = this.discord.botUserId;
+
+    // Scan anything we have an anchor for, plus subscribed channels and known
+    // DMs. A channel with no persisted watermark is skipped — there's no
+    // "since" point and we don't want to pull unbounded history; the inline
+    // first-interaction backscroll covers it when it's next touched.
+    const candidates = new Set<string>([
+      ...this.forwardedWatermark.keys(),
+      ...this.subscribedChannels,
+      ...this.dmChannelIds,
+    ]);
+
+    let delivered = 0;
+    for (const channelId of candidates) {
+      const watermark = this.forwardedWatermark.get(channelId);
+      if (!watermark) continue;
+      const isDM = this.dmChannelIds.has(channelId);
+      const isSubscribed = this.subscribedChannels.has(channelId);
+
+      let msgs: Awaited<ReturnType<typeof this.discord.fetchHistory>>;
+      try {
+        msgs = await this.discord.fetchHistory(channelId, {
+          limit: this.catchupLimit,
+          after: watermark,
+        });
+      } catch (err) {
+        dbg('sweep:fetch-failed', { channelId, error: (err as Error).message });
+        continue;
+      }
+      msgs.sort((a, b) => a.timestamp.getTime() - b.timestamp.getTime());
+      // Drop the bot's own past messages and chx no-op triggers, mirroring the
+      // inline backscroll filter.
+      msgs = msgs.filter((m) => m.authorId !== botId && !m.content.startsWith(CHX_NOOP_PREFIX));
+      if (msgs.length === 0) continue;
+
+      const newestId = msgs[msgs.length - 1].id;
+      // Delivery rule: DMs and subscribed channels get the full missed
+      // backscroll; every other known channel gets only mentions.
+      const keepAll = isDM || isSubscribed;
+      const kept = keepAll ? msgs : msgs.filter((m) => m.mentionsBot);
+      if (kept.length === 0) {
+        // Nothing to deliver, but advance the anchor so we don't re-scan these
+        // messages on the next reconnect.
+        this.forwardedWatermark.set(channelId, newestId);
+        continue;
+      }
+      const hadMention = isDM || kept.some((m) => m.mentionsBot);
+
+      const meta = await this.discord.getChannelMeta(channelId).catch(() => null);
+      const attrs: string[] = [];
+      if (meta?.name) attrs.push(`channel="#${meta.name}"`);
+      if (meta?.guildName) attrs.push(`guild=${JSON.stringify(meta.guildName)}`);
+      else if (isDM) attrs.push('dm="true"');
+      attrs.push(`count="${kept.length}"`);
+      attrs.push(`reason="${isDM ? 'dm' : hadMention ? 'mention' : 'backscroll'}"`);
+      const lines = kept.map((m) => {
+        const ts = m.timestamp.toISOString();
+        const att =
+          m.attachments && m.attachments.length > 0
+            ? ` [attachments: ${m.attachments.map((a) => a.name).join(', ')}]`
+            : '';
+        // In a full-backscroll block, flag which lines were the actual pings.
+        const mark = keepAll && m.mentionsBot ? ' (mention)' : '';
+        return `[${ts}] ${m.authorName}${mark}: ${m.cleanContent}${att}`;
+      });
+      const block = [
+        `<missed ${attrs.join(' ')}>`,
+        ...lines,
+        '</missed>',
+      ].join('\n');
+
+      try {
+        await conn.sendRequest(method.PUSH_EVENT, {
+          featureSet: 'discord.messaging',
+          eventId: `discord_missed_${channelId}_${newestId}`,
+          timestamp: new Date().toISOString(),
+          origin: {
+            source: 'discord',
+            channelId,
+            guildId: meta?.guildId ?? null,
+            guildName: meta?.guildName ?? undefined,
+            channelName: meta?.name ?? undefined,
+            isMention: hadMention,
+            isDM,
+          } as Record<string, unknown>,
+          payload: { content: [textContent(block)] },
+        } satisfies PushEventParams);
+        // Advance past everything we scanned (not just what we delivered) so a
+        // mention-only channel doesn't re-surface its non-mention tail later.
+        this.forwardedWatermark.set(channelId, newestId);
+        delivered++;
+      } catch (err) {
+        dbg('sweep:send-failed', { channelId, error: (err as Error).message });
+      }
+    }
+
+    this.saveWatermark();
+    dbg('sweep:done', { channelsDelivered: delivered, scanned: candidates.size });
+    if (delivered > 0) {
+      console.error(
+        `[discord-mcpl] Reconnect catch-up: delivered missed messages from ${delivered} channel(s)`,
+      );
+    }
+  }
+
   // ── Channel Operations ──
 
   private async registerDiscordChannels(): Promise<void> {
@@ -1445,6 +1664,7 @@ export class DiscordMcplServer {
     // ambient messages (and how to opt out). DMs always come through, so no
     // subscription note for them — just the backscroll.
     this.ensureSubscriptionsLoaded();
+    this.ensureWatermarkLoaded();
     const isFirstInteraction = !this.forwardedWatermark.has(msg.channelId);
     let prefixBlock = '';
     if (isFirstInteraction && (isMention || isDM)) {
@@ -1554,8 +1774,11 @@ export class DiscordMcplServer {
     // Advance the watermark so future backscroll on this channel doesn't
     // re-include this message. Set regardless of which forwarding path we
     // take below (channels/incoming vs push/event) — what matters is that
-    // we forwarded it.
+    // we forwarded it. Persist it (and the DM channel, if this is one) so the
+    // reconnect catch-up sweep has a current anchor after a restart.
     this.forwardedWatermark.set(msg.channelId, msg.id);
+    if (isDM) this.dmChannelIds.add(msg.channelId);
+    this.saveWatermark();
     // Update sticky-reply state: this inbound is now the "last
     // communication" for auto-reply routing, and the message we'd
     // replyTo on the next auto-send.
