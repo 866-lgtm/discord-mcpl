@@ -1319,16 +1319,35 @@ export class DiscordMcplServer {
 
       const newestId = msgs[msgs.length - 1].id;
       // Delivery rule: DMs and subscribed channels get the full missed
-      // backscroll; every other known channel gets only mentions.
+      // backscroll; every other known channel gets each mention plus its
+      // immediate vicinity (the ±VICINITY messages around each ping), so the
+      // agent sees the surrounding exchange, not a bare ping line. A
+      // count-window is robust to channel pace (a time window collapses to
+      // nothing in a quiet channel). Vicinity comes from the already-fetched
+      // `msgs` — no extra REST calls.
+      const VICINITY = 7;
       const keepAll = isDM || isSubscribed;
-      const kept = keepAll ? msgs : msgs.filter((m) => m.mentionsBot);
+      const mentionCount = msgs.filter((m) => m.mentionsBot).length;
+      let kept: typeof msgs;
+      if (keepAll) {
+        kept = msgs;
+      } else {
+        const keepIdx = new Set<number>();
+        for (let i = 0; i < msgs.length; i++) {
+          if (!msgs[i].mentionsBot) continue;
+          for (let j = Math.max(0, i - VICINITY); j <= Math.min(msgs.length - 1, i + VICINITY); j++) {
+            keepIdx.add(j);
+          }
+        }
+        kept = [...keepIdx].sort((a, b) => a - b).map((i) => msgs[i]);
+      }
       if (kept.length === 0) {
         // Nothing to deliver, but advance the anchor so we don't re-scan these
         // messages on the next reconnect.
         this.forwardedWatermark.set(channelId, newestId);
         continue;
       }
-      const hadMention = isDM || kept.some((m) => m.mentionsBot);
+      const hadMention = isDM || mentionCount > 0;
 
       const meta = await this.discord.getChannelMeta(channelId).catch(() => null);
       const attrs: string[] = [];
@@ -1338,7 +1357,10 @@ export class DiscordMcplServer {
       attrs.push(`channelId="${channelId}"`);
       if (meta?.guildName) attrs.push(`guild=${JSON.stringify(meta.guildName)}`);
       else if (isDM) attrs.push('dm="true"');
-      attrs.push(`count="${kept.length}"`);
+      // count = number of actual mentions; lines = total delivered (mentions +
+      // their ±2min vicinity) so the agent knows how much is context vs ping.
+      attrs.push(`count="${keepAll ? kept.length : mentionCount}"`);
+      if (!keepAll) attrs.push(`lines="${kept.length}"`);
       attrs.push(`reason="${isDM ? 'dm' : hadMention ? 'mention' : 'backscroll'}"`);
       const lines = kept.map((m) => {
         const ts = m.timestamp.toISOString();
@@ -1346,8 +1368,8 @@ export class DiscordMcplServer {
           m.attachments && m.attachments.length > 0
             ? ` [attachments: ${m.attachments.map((a) => a.name).join(', ')}]`
             : '';
-        // In a full-backscroll block, flag which lines were the actual pings.
-        const mark = keepAll && m.mentionsBot ? ' (mention)' : '';
+        // Flag the actual ping lines so they stand out from vicinity context.
+        const mark = m.mentionsBot ? ' (mention)' : '';
         // Lead each line with the message id so the agent can
         // fetch_around(channelId, id) to read the surrounding conversation.
         return `[${ts} id=${m.id}] ${m.authorName}${mark}: ${m.cleanContent}${att}`;
