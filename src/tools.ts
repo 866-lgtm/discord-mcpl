@@ -248,10 +248,27 @@ export const toolDefinitions: ToolDefinition[] = [
     name: 'list_subscriptions',
     description:
       'List the Discord channels currently subscribed for ambient message ' +
-      'delivery. Returns the channel IDs as an array.',
+      'delivery. Also reports `unsubscribedWithBacklog`: channels you have ' +
+      'unsubscribed from that have since accumulated missed ambient messages.',
     inputSchema: {
       type: 'object',
       properties: {},
+    },
+  },
+  {
+    name: 'channel_missed',
+    description:
+      'Report how much ambient (non-mention, non-DM) traffic you have missed in ' +
+      'a channel since you unsubscribed from it — returns missed message and ' +
+      'character counts. Mentions and DMs are always delivered and are not ' +
+      'counted. Useful for deciding whether to resubscribe. Counts are durable ' +
+      'across restarts and backfill downtime gaps on reconnect.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        channelId: { type: 'string', description: 'Discord channel ID to check' },
+      },
+      required: ['channelId'],
     },
   },
 ];

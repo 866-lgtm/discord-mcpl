@@ -199,6 +199,20 @@ export class DiscordMcplServer {
    *  watermark) because discord.js can't enumerate past DM channels, so the
    *  reconnect sweep needs a remembered list of which DMs to re-scan. */
   private dmChannelIds = new Set<string>();
+  /** Per-channel tally of ambient messages MISSED since the channel was last
+   *  unsubscribed — answers the agent's "how much have I missed in #x since I
+   *  dropped it?" via the `channel_missed` tool. Only channels with an entry
+   *  here (created on unsubscribe, cleared on resubscribe) are tracked.
+   *
+   *  `anchorId` = the watermark at unsubscribe (the "since when" line).
+   *  `talliedThrough` = message id up to which the counts are accurate (the
+   *  cursor); advances on each online ambient drop and on reconnect backfill,
+   *  so the tally stays exact across downtime with no double-counting.
+   *  Persisted with the watermark file. */
+  private missedTally = new Map<
+    string,
+    { anchorId: string; talliedThrough: string; messages: number; characters: number }
+  >();
   private watermarkLoaded = false;
   /** Set once the reconnect catch-up sweep has run for the current process,
    *  so it doesn't re-run if a host reconnects mid-session. */
@@ -955,6 +969,10 @@ export class DiscordMcplServer {
         const wasNew = !this.subscribedChannels.has(channelId);
         this.subscribedChannels.add(channelId);
         if (wasNew) this.saveSubscriptions();
+        // Resubscribing means ambient flows again, so "missed since unsubscribe"
+        // no longer applies — clear the tally.
+        this.ensureWatermarkLoaded();
+        if (this.missedTally.delete(channelId)) this.saveWatermark();
         return wasNew
           ? `Subscribed to ambient messages from channel ${channelId}.`
           : `Already subscribed to channel ${channelId}.`;
@@ -968,20 +986,82 @@ export class DiscordMcplServer {
         }
         const removed = this.subscribedChannels.delete(channelId);
         if (removed) this.saveSubscriptions();
+        // Start (or restart) a missed-ambient tally anchored at the last message
+        // the agent saw here, so it can later ask how much it missed.
+        if (removed) {
+          this.ensureWatermarkLoaded();
+          const anchor = this.forwardedWatermark.get(channelId) ?? '';
+          this.missedTally.set(channelId, {
+            anchorId: anchor,
+            talliedThrough: anchor,
+            messages: 0,
+            characters: 0,
+          });
+          this.saveWatermark();
+        }
         return removed
-          ? `Unsubscribed from ambient messages in channel ${channelId}. Mentions and DMs from there will still arrive.`
+          ? `Unsubscribed from ambient messages in channel ${channelId}. Mentions and DMs from there will still arrive. Use channel_missed("${channelId}") to see how much ambient you miss.`
           : `Channel ${channelId} was not subscribed.`;
       }
 
       case 'list_subscriptions': {
         this.ensureSubscriptionsLoaded();
+        this.ensureWatermarkLoaded();
+        const missed = [...this.missedTally.entries()]
+          .filter(([, t]) => t.messages > 0)
+          .map(([channelId, t]) => ({
+            channelId,
+            missedMessages: t.messages,
+            missedCharacters: t.characters,
+          }))
+          .sort((a, b) => b.missedCharacters - a.missedCharacters);
         return {
           channels: [...this.subscribedChannels].sort(),
           count: this.subscribedChannels.size,
+          unsubscribedWithBacklog: missed,
           note:
             this.subscribedChannels.size === 0
               ? 'No ambient subscriptions. Mentions and DMs are always delivered.'
               : 'Ambient messages from these channels are delivered. Mentions and DMs always come through regardless.',
+        };
+      }
+
+      case 'channel_missed': {
+        this.ensureSubscriptionsLoaded();
+        this.ensureWatermarkLoaded();
+        const channelId = args.channelId as string;
+        if (typeof channelId !== 'string' || channelId.length === 0) {
+          throw new Error('channelId is required');
+        }
+        if (this.subscribedChannels.has(channelId)) {
+          return {
+            channelId,
+            subscribed: true,
+            missedMessages: 0,
+            missedCharacters: 0,
+            note: 'Currently subscribed — ambient messages are being delivered, nothing is being missed.',
+          };
+        }
+        const tally = this.missedTally.get(channelId);
+        if (!tally) {
+          return {
+            channelId,
+            subscribed: false,
+            tracked: false,
+            note: 'Not tracking this channel. A missed-ambient tally starts only after you unsubscribe from a channel you were subscribed to.',
+          };
+        }
+        return {
+          channelId,
+          subscribed: false,
+          tracked: true,
+          missedMessages: tally.messages,
+          missedCharacters: tally.characters,
+          sinceMessageId: tally.anchorId || null,
+          note:
+            'Ambient messages (non-mention, non-DM) you have missed in this channel since you unsubscribed. ' +
+            'Mentions and DMs were still delivered and are not counted. Counts cover the bot\'s online time plus ' +
+            'an on-reconnect backfill of downtime gaps. Resubscribe with subscribe_channel to start receiving these again.',
         };
       }
 
@@ -1122,9 +1202,30 @@ export class DiscordMcplServer {
           if (typeof id === 'string' && id.length > 0) this.dmChannelIds.add(id);
         }
       }
+      const missed = parsed?.missed;
+      if (missed && typeof missed === 'object') {
+        for (const [chan, v] of Object.entries(missed as Record<string, unknown>)) {
+          const e = v as Partial<{
+            anchorId: string;
+            talliedThrough: string;
+            messages: number;
+            characters: number;
+          }>;
+          if (typeof chan === 'string' && chan.length > 0) {
+            this.missedTally.set(chan, {
+              anchorId: typeof e.anchorId === 'string' ? e.anchorId : '',
+              talliedThrough:
+                typeof e.talliedThrough === 'string' ? e.talliedThrough : e.anchorId ?? '',
+              messages: Number.isFinite(e.messages) ? (e.messages as number) : 0,
+              characters: Number.isFinite(e.characters) ? (e.characters as number) : 0,
+            });
+          }
+        }
+      }
       dbg('watermark:loaded', {
         channels: this.forwardedWatermark.size,
         dms: this.dmChannelIds.size,
+        missed: this.missedTally.size,
         path,
       });
     } catch (err) {
@@ -1145,6 +1246,9 @@ export class DiscordMcplServer {
           [...this.forwardedWatermark.entries()].sort((a, b) => a[0].localeCompare(b[0])),
         ),
         dmChannels: [...this.dmChannelIds].sort(),
+        missed: Object.fromEntries(
+          [...this.missedTally.entries()].sort((a, b) => a[0].localeCompare(b[0])),
+        ),
       };
       writeFileSync(path, JSON.stringify(out, null, 2) + '\n');
     } catch (err) {
@@ -1271,12 +1375,66 @@ export class DiscordMcplServer {
       }
     }
 
+    // Fill the downtime gap in any missed-ambient tallies (unsubscribed
+    // channels the agent is tracking) so `channel_missed` stays exact across
+    // outages, not just while online.
+    await this.backfillMissedTallies();
+
     this.saveWatermark();
     dbg('sweep:done', { channelsDelivered: delivered, scanned: candidates.size });
     if (delivered > 0) {
       console.error(
         `[discord-mcpl] Reconnect catch-up: delivered missed messages from ${delivered} channel(s)`,
       );
+    }
+  }
+
+  /** For each tracked unsubscribed channel, count the ambient that arrived
+   *  while we were offline (between `talliedThrough` and now) into its missed
+   *  tally, so the count survives downtime. Uses a dedicated fetch from the
+   *  tally cursor (independent of the sweep's watermark) to avoid any
+   *  double-counting. Bounded by catchupLimit; if a gap exceeds it the count
+   *  is a floor (flagged in `channel_missed`). */
+  private async backfillMissedTallies(): Promise<void> {
+    if (this.missedTally.size === 0) return;
+    const botId = this.discord.botUserId;
+    for (const [channelId, tally] of this.missedTally) {
+      // No cursor (channel unsubscribed before it ever forwarded a message):
+      // nothing to anchor a fetch on — online drops alone carry the count.
+      if (!tally.talliedThrough) continue;
+      let msgs: Awaited<ReturnType<typeof this.discord.fetchHistory>>;
+      try {
+        msgs = await this.discord.fetchHistory(channelId, {
+          limit: this.catchupLimit,
+          after: tally.talliedThrough,
+        });
+      } catch (err) {
+        dbg('missed-backfill:fetch-failed', { channelId, error: (err as Error).message });
+        continue;
+      }
+      // Only ambient counts as "missed": mentions/DMs are (re)delivered by the
+      // sweep, so they were seen. Drop our own messages and chx no-ops too.
+      const ambient = msgs.filter(
+        (m) => !m.mentionsBot && m.authorId !== botId && !m.content.startsWith(CHX_NOOP_PREFIX),
+      );
+      if (ambient.length > 0) {
+        tally.messages += ambient.length;
+        tally.characters += ambient.reduce((n, m) => n + m.cleanContent.length, 0);
+      }
+      // Advance the cursor past everything we fetched (mentions included) so we
+      // don't re-scan it next reconnect.
+      if (msgs.length > 0) {
+        const newest = msgs.reduce((a, b) =>
+          a.id.localeCompare(b.id, 'en-US-u-kn-true') >= 0 ? a : b,
+        );
+        tally.talliedThrough = newest.id;
+      }
+      dbg('missed-backfill:channel', {
+        channelId,
+        added: ambient.length,
+        messages: tally.messages,
+        characters: tally.characters,
+      });
     }
   }
 
@@ -1649,10 +1807,26 @@ export class DiscordMcplServer {
     // flags above via the gate.
     const isMention = isExplicitMention || isReplyToBot;
     if (!isMention && !isDM && !this.isChannelSubscribed(msg.channelId)) {
+      // If we're tracking this channel's missed-ambient (i.e. it was
+      // unsubscribed), tally what we're dropping so the agent can ask later.
+      // Skip the bot's own messages and chx no-op triggers (never "missed").
+      this.ensureWatermarkLoaded();
+      const tally = this.missedTally.get(msg.channelId);
+      if (
+        tally &&
+        msg.authorId !== botId &&
+        !msg.content.startsWith(CHX_NOOP_PREFIX)
+      ) {
+        tally.messages += 1;
+        tally.characters += msg.cleanContent.length;
+        tally.talliedThrough = msg.id;
+        this.saveWatermark();
+      }
       dbg('handleDiscordMessage:drop', {
         reason: 'ambient-not-subscribed',
         channelId: msg.channelId,
         channelName: msg.channelName,
+        tracked: !!tally,
       });
       return;
     }

@@ -70,6 +70,7 @@ export function featureSetForTool(toolName: string): string | undefined {
     case 'subscribe_channel':
     case 'unsubscribe_channel':
     case 'list_subscriptions':
+    case 'channel_missed':
       return 'discord.subscriptions';
     case 'list_guilds':
     case 'list_channels':

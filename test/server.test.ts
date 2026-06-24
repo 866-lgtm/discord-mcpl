@@ -613,6 +613,59 @@ describe('DiscordMcplServer', () => {
       if (existsSync(wmPath)) unlinkSync(wmPath);
     }
   });
+
+  it('tracks missed ambient after unsubscribe and reports via channel_missed', async () => {
+    const { client, serverConn, discord } = await createTestPair();
+    const server = new DiscordMcplServer(discord as unknown as DiscordAdapter);
+    const serverPromise = server.serve(serverConn);
+
+    await mcplHandshake(client);
+    const regMsg = await client.nextMessage();
+    if (regMsg.type === 'request') client.sendResponse(regMsg.request.id, {});
+
+    const call = async (name: string, args: Record<string, unknown>) => {
+      const r = (await client.sendRequest('tools/call', { name, arguments: args })) as {
+        content: Array<{ type: string; text?: string }>;
+      };
+      const text = r.content[0]?.text ?? '';
+      // Object-returning tools (channel_missed) serialize as JSON; string-
+      // returning tools (subscribe/unsubscribe) come through as plain text.
+      try {
+        return JSON.parse(text);
+      } catch {
+        return text;
+      }
+    };
+
+    // Subscribe then unsubscribe c1 — this anchors a missed-ambient tally.
+    await call('subscribe_channel', { channelId: 'c1' });
+    await call('unsubscribe_channel', { channelId: 'c1' });
+
+    // Ambient message in c1 (not a mention, not a DM, now unsubscribed) → dropped + tallied.
+    discord.simulateMessage({
+      id: 'm100', content: 'hello world', cleanContent: 'hello world',
+      authorId: 'u1', authorName: 'Alice', isBot: false,
+      channelId: 'c1', channelName: 'general', guildId: 'g1', guildName: 'Test Server',
+      mentions: [], attachments: [], timestamp: new Date(),
+    } as DiscordMessageData);
+    // Let the floating async message handler run.
+    await new Promise((r) => setTimeout(r, 20));
+
+    const missed = await call('channel_missed', { channelId: 'c1' });
+    assert.equal(missed.subscribed, false);
+    assert.equal(missed.tracked, true);
+    assert.equal(missed.missedMessages, 1);
+    assert.equal(missed.missedCharacters, 'hello world'.length);
+
+    // Resubscribing clears the tally.
+    await call('subscribe_channel', { channelId: 'c1' });
+    const after = await call('channel_missed', { channelId: 'c1' });
+    assert.equal(after.subscribed, true);
+    assert.equal(after.missedMessages, 0);
+
+    client.close();
+    await serverPromise;
+  });
 });
 
 describe('applyMentionCandidates', () => {
