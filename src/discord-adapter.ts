@@ -405,12 +405,54 @@ export class DiscordAdapter {
     return { messageId: lastId };
   }
 
+  /** Resolve a DM recipient that may be a numeric user ID **or** a
+   *  username / handle. A snowflake (17–20 digits) passes through unchanged.
+   *  Otherwise the bot's cached guild members across all shared servers are
+   *  searched case-insensitively against nickname / global name / display name
+   *  / username for a UNIQUE match. The member cache is warmed at startup and
+   *  kept current by gateway events — the same source `resolveOutgoingMentions`
+   *  uses for @handle pings. Throws a clear error on no match or ambiguity so
+   *  the caller knows to pass a numeric ID. */
+  private async resolveRecipientId(recipient: string): Promise<string> {
+    const raw = recipient.trim().replace(/^@/, '');
+    if (/^\d{17,20}$/.test(raw)) return raw; // already a Discord user ID
+    const target = raw.toLowerCase();
+    const selfId = this.client.user?.id;
+    const matches = new Map<string, string>(); // id -> username (dedup across guilds)
+    for (const guild of this.client.guilds.cache.values()) {
+      for (const member of guild.members.cache.values() as IterableIterator<GuildMember>) {
+        if (member.user.id === selfId || member.user.bot) continue;
+        const aliases = [
+          member.nickname,
+          (member.user as User & { globalName?: string | null }).globalName,
+          member.user.displayName,
+          member.user.username,
+        ];
+        if (aliases.some((a) => typeof a === 'string' && a.toLowerCase() === target)) {
+          matches.set(member.user.id, member.user.username);
+        }
+      }
+    }
+    if (matches.size === 1) return [...matches.keys()][0]!;
+    if (matches.size === 0) {
+      throw new Error(
+        `No Discord member matches "${recipient}". Pass a numeric user ID, or the exact ` +
+          `@username / display name of someone in a shared server.`,
+      );
+    }
+    throw new Error(
+      `"${recipient}" is ambiguous — ${matches.size} members match ` +
+        `(${[...matches.values()].slice(0, 5).join(', ')}). Use the numeric user ID.`,
+    );
+  }
+
   async sendDM(
     userId: string,
     content: string,
     options?: { files?: OutgoingFile[] },
   ): Promise<{ messageId: string; channelId: string }> {
-    const user = await this.client.users.fetch(userId);
+    const resolvedId = await this.resolveRecipientId(userId);
+    const user = await this.client.users.fetch(resolvedId);
     // For DMs, the only resolvable user is the recipient. We resolve against
     // the DM channel we're about to send to. Return the DM channel ID too so
     // the caller can update sticky-reply state.

@@ -66,7 +66,7 @@ export const toolDefinitions: ToolDefinition[] = [
     inputSchema: {
       type: 'object',
       properties: {
-        userId: { type: 'string', description: 'Discord user ID' },
+        userId: { type: 'string', description: 'Discord user ID (snowflake), or an @username / display name of a member in a shared server' },
         content: { type: 'string', description: 'Message content (optional if files are attached)' },
         files: FILES_PROP,
       },
