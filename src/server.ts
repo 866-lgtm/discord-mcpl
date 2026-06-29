@@ -47,6 +47,7 @@ import type {
 
 import type { DiscordAdapter, DiscordMessageData, DiscordAttachment, OutgoingFile } from './discord-adapter.js';
 import type { ChatInputCommandInteraction } from 'discord.js';
+import { MessageFlags } from 'discord.js';
 import { toolDefinitions } from './tools.js';
 import { featureSets, isEnabled, featureSetForTool } from './feature-sets.js';
 import { ChannelManager, mcplChannelId, parseMcplChannelId, toDescriptor } from './channels.js';
@@ -327,7 +328,7 @@ export class DiscordMcplServer {
 
   private async handleSlashCommand(interaction: ChatInputCommandInteraction): Promise<void> {
     if (interaction.commandName !== 'undo' && interaction.commandName !== 'hide') {
-      await interaction.reply({ content: `Unknown command: ${interaction.commandName}`, ephemeral: true });
+      await interaction.reply({ content: `Unknown command: ${interaction.commandName}`, flags: MessageFlags.Ephemeral });
       return;
     }
 
@@ -337,7 +338,7 @@ export class DiscordMcplServer {
       .filter(Boolean);
     if (!admins.includes(interaction.user.id)) {
       dbg('slash:unauthorized', { command: interaction.commandName, userId: interaction.user.id });
-      await interaction.reply({ content: `Not authorized to use /${interaction.commandName}.`, ephemeral: true });
+      await interaction.reply({ content: `Not authorized to use /${interaction.commandName}.`, flags: MessageFlags.Ephemeral });
       return;
     }
 
@@ -349,7 +350,7 @@ export class DiscordMcplServer {
     const messages = interaction.options.getInteger('messages') ?? 1;
     const conn = this.conn;
     if (!conn) {
-      await interaction.reply({ content: 'Host is not connected — cannot undo.', ephemeral: true });
+      await interaction.reply({ content: 'Host is not connected — cannot undo.', flags: MessageFlags.Ephemeral });
       return;
     }
 
@@ -426,7 +427,7 @@ export class DiscordMcplServer {
     if (!fromMessageId) {
       await interaction.reply({
         content: `Could not parse a message link/ID from \`${fromRaw}\`.`,
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       });
       return;
     }
@@ -434,7 +435,7 @@ export class DiscordMcplServer {
     if (toRaw) {
       const parsed = this.parseMessageRef(toRaw);
       if (!parsed) {
-        await interaction.reply({ content: `Could not parse \`${toRaw}\`.`, ephemeral: true });
+        await interaction.reply({ content: `Could not parse \`${toRaw}\`.`, flags: MessageFlags.Ephemeral });
         return;
       }
       toMessageId = parsed;
@@ -442,7 +443,7 @@ export class DiscordMcplServer {
 
     const conn = this.conn;
     if (!conn) {
-      await interaction.reply({ content: 'Host is not connected — cannot hide.', ephemeral: true });
+      await interaction.reply({ content: 'Host is not connected — cannot hide.', flags: MessageFlags.Ephemeral });
       return;
     }
 
