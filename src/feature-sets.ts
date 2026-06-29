@@ -11,6 +11,22 @@ export const featureSets: FeatureSetDeclaration[] = [
     uses: ['tools', 'channels.publish'],
     rollback: true,
     hostState: false,
+    // MCPL RFC-001 — tags carried on Discord message events (emits umbrellas
+    // directly, so no host-side implication expansion is needed).
+    tagOntology: {
+      coreTags: [
+        'chat:addressed', 'chat:mention', 'chat:reply', 'chat:dm', 'chat:ambient',
+        'chat:private', 'chat:from-human', 'chat:from-bot', 'chat:thread',
+        'chat:has-image', 'chat:has-audio', 'chat:has-file',
+      ],
+      defaultTreatment: [
+        { tagsAny: ['chat:addressed'], behavior: 'immediate' },
+        { tagsAny: ['chat:ambient', 'chat:from-bot'], behavior: { throttle: { perMs: 120000 } } },
+      ],
+      // Discord-specific extensions (e.g. discord:everyone, discord:slash) may be
+      // emitted in future; consumers should tolerate undeclared tags.
+      open: true,
+    },
   },
   {
     name: 'discord.channels',

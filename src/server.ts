@@ -1994,6 +1994,26 @@ export class DiscordMcplServer {
     const attachmentBlocks =
       msg.attachments.length > 0 ? await this.buildAttachmentBlocks(msg.attachments) : [];
 
+    // MCPL RFC-001 event tags — emit reserved chat:* core (umbrellas included,
+    // so no host-side implication expansion is needed) derived from the address
+    // flags computed above. The host's wake gate routes on these.
+    const eventTags: string[] = (() => {
+      const t = new Set<string>();
+      if (isExplicitMention) t.add('chat:mention');
+      if (isReplyToBot) t.add('chat:reply');
+      if (isDM) { t.add('chat:dm'); t.add('chat:private'); }
+      t.add(isMention || isDM ? 'chat:addressed' : 'chat:ambient');
+      t.add(isBot ? 'chat:from-bot' : 'chat:from-human');
+      if (msg.threadId) t.add('chat:thread');
+      for (const a of msg.attachments) {
+        const ct = (a.contentType || '').toLowerCase();
+        if (ct.startsWith('image/')) t.add('chat:has-image');
+        else if (ct.startsWith('audio/')) t.add('chat:has-audio');
+        else t.add('chat:has-file');
+      }
+      return [...t];
+    })();
+
     // If this channel is open, use channels/incoming
     if (channelIsOpen) {
       const incomingParams: ChannelsIncomingParams = {
@@ -2017,6 +2037,7 @@ export class DiscordMcplServer {
             isBot,
             isDM,
           },
+          tags: eventTags,
         }],
       };
 
@@ -2050,6 +2071,7 @@ export class DiscordMcplServer {
           isBot,
           isDM,
         } as Record<string, unknown>,
+        tags: eventTags, // MCPL RFC-001 — the host routes/gates on these
         payload: {
           content: [textContent(renderedContent), ...attachmentBlocks],
         },
