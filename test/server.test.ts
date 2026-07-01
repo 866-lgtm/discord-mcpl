@@ -387,6 +387,58 @@ describe('DiscordMcplServer', () => {
     await serverPromise;
   });
 
+  it('first inbound DM carries a reply affordance (send_dm by sender name/id)', async () => {
+    const { client, serverConn, discord } = await createTestPair();
+    const server = new DiscordMcplServer(discord as unknown as DiscordAdapter);
+    const serverPromise = server.serve(serverConn);
+
+    await mcplHandshake(client);
+
+    // Accept channel registration
+    const regMsg = await client.nextMessage();
+    if (regMsg.type === 'request') {
+      client.sendResponse(regMsg.request.id, {});
+    }
+
+    // Simulate an inbound DM (guildId null → DM; needs no mention to forward).
+    discord.simulateMessage({
+      id: 'dmmsg1',
+      content: 'hey, can you help?',
+      cleanContent: 'hey, can you help?',
+      authorId: 'u_alice',
+      authorName: 'Alice',
+      isBot: false,
+      channelId: 'dmchan1',
+      channelName: undefined,
+      guildId: null,
+      guildName: undefined,
+      mentions: [],
+      attachments: [],
+      timestamp: new Date(),
+    } as unknown as DiscordMessageData);
+
+    const pushMsg = await client.nextMessage();
+    assert.equal(pushMsg.type, 'request');
+    if (pushMsg.type === 'request') {
+      assert.equal(pushMsg.request.method, 'push/event');
+      const p = pushMsg.request.params as PushEventParams;
+      const text = (p.payload.content[0] as { text?: string }).text ?? '';
+      // The bare body is still there…
+      assert.ok(text.includes('Alice: hey, can you help?'), 'DM body should render the sender');
+      // …plus an explicit, in-context reply affordance so the agent knows it can
+      // reply by name/id rather than needing the bot's own user id (the complaint).
+      assert.ok(text.includes('Direct message from @Alice'), 'DM should announce the sender');
+      assert.ok(text.includes('send_dm("Alice")'), 'DM should suggest replying by sender name');
+      assert.ok(text.includes('send_dm("u_alice")'), 'DM should offer the id fallback');
+      // The chat:dm tags still ride along for the host gate.
+      assert.ok(p.tags?.includes('chat:dm'), 'DM should carry the chat:dm tag');
+      client.sendResponse(pushMsg.request.id, { accepted: true });
+    }
+
+    client.close();
+    await serverPromise;
+  });
+
   it('channels/incoming from Discord message (open channel)', async () => {
     const { client, serverConn, discord } = await createTestPair();
     const server = new DiscordMcplServer(discord as unknown as DiscordAdapter);

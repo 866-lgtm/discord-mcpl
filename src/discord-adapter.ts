@@ -407,12 +407,14 @@ export class DiscordAdapter {
 
   /** Resolve a DM recipient that may be a numeric user ID **or** a
    *  username / handle. A snowflake (17–20 digits) passes through unchanged.
-   *  Otherwise the bot's cached guild members across all shared servers are
-   *  searched case-insensitively against nickname / global name / display name
-   *  / username for a UNIQUE match. The member cache is warmed at startup and
-   *  kept current by gateway events — the same source `resolveOutgoingMentions`
-   *  uses for @handle pings. Throws a clear error on no match or ambiguity so
-   *  the caller knows to pass a numeric ID. */
+   *  Otherwise the bot's cached guild members across all shared servers — plus
+   *  the recipients of any open DM channels (so a reply to someone who DMed the
+   *  bot resolves even with no shared server) — are searched case-insensitively
+   *  against nickname / global name / display name / username for a UNIQUE
+   *  match. The member cache is warmed at startup and kept current by gateway
+   *  events — the same source `resolveOutgoingMentions` uses for @handle pings.
+   *  Throws a clear error on no match or ambiguity so the caller knows to pass a
+   *  numeric ID. */
   private async resolveRecipientId(recipient: string): Promise<string> {
     const raw = recipient.trim().replace(/^@/, '');
     if (/^\d{17,20}$/.test(raw)) return raw; // already a Discord user ID
@@ -431,6 +433,22 @@ export class DiscordAdapter {
         if (aliases.some((a) => typeof a === 'string' && a.toLowerCase() === target)) {
           matches.set(member.user.id, member.user.username);
         }
+      }
+    }
+    // Also match the recipients of open DM channels. Someone who DMed the bot
+    // can share no guild with it, so the guild-member scan above can't see them —
+    // but we hold an open DM channel whose recipient we CAN resolve by name. This
+    // makes a name-based reply to a DM sender work without a shared server.
+    for (const channel of this.client.channels.cache.values()) {
+      const recipient = (channel as { recipient?: User }).recipient;
+      if (!recipient || recipient.id === selfId || recipient.bot) continue;
+      const aliases = [
+        (recipient as User & { globalName?: string | null }).globalName,
+        recipient.displayName,
+        recipient.username,
+      ];
+      if (aliases.some((a) => typeof a === 'string' && a.toLowerCase() === target)) {
+        matches.set(recipient.id, recipient.username);
       }
     }
     if (matches.size === 1) return [...matches.keys()][0]!;
