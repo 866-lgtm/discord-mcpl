@@ -1919,6 +1919,18 @@ export class DiscordMcplServer {
               `To stop ambient delivery from here: unsubscribe_channel("${msg.channelId}").</system>`,
           );
         }
+      } else {
+        // DMs have no subscription semantics, but on the first DM from someone
+        // give the agent an explicit reply affordance — otherwise a DM lands as
+        // a bare "[DM] name: ..." with no in-context hint of how to respond, and
+        // an agent would think it needs the bot's numeric user id (the original
+        // complaint). send_dm resolves the sender's name (guild members OR open
+        // DM recipients); the numeric id is the unambiguous fallback.
+        blocks.push(
+          `<system>Direct message from @${msg.authorName} (user id ${msg.authorId}). ` +
+            `To reply, use send_dm("${msg.authorName}") — or send_dm("${msg.authorId}") if the ` +
+            `name is ambiguous. DMs always reach you; there is nothing to subscribe to.</system>`,
+        );
       }
       if (backscrollMsgs.length > 0) {
         const attrs: string[] = [];

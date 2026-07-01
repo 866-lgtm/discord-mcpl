@@ -62,11 +62,11 @@ export const toolDefinitions: ToolDefinition[] = [
   },
   {
     name: 'send_dm',
-    description: 'Send a direct message to a Discord user, optionally with file attachments',
+    description: "Send a direct message to a Discord user, identified by @username / display name (of someone in a shared server or who has DMed the bot) or by numeric user ID. To reply to a DM you received, pass the sender's name or id. Optionally include file attachments.",
     inputSchema: {
       type: 'object',
       properties: {
-        userId: { type: 'string', description: 'Discord user ID (snowflake), or an @username / display name of a member in a shared server' },
+        userId: { type: 'string', description: 'Discord @username / display name (of a member in a shared server or someone who has DMed the bot), or a numeric user ID (snowflake)' },
         content: { type: 'string', description: 'Message content (optional if files are attached)' },
         files: FILES_PROP,
       },
