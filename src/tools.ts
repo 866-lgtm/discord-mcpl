@@ -17,10 +17,12 @@ export interface ToolDefinition {
 const FILES_PROP = {
   type: 'array',
   description:
-    'Optional file attachments to upload with the message. Each entry is read ' +
-    'from a local filesystem path on the host (e.g. a file you created in your ' +
-    'workspace or sandbox). Up to 10 files per message; size limits are enforced ' +
-    'by Discord.',
+    'Optional file attachments to upload with the message. This (discord-mcpl) ' +
+    'surface uploads by host file PATH — each entry is read from a local ' +
+    'filesystem path on the host (e.g. a file you created in your workspace or ' +
+    'sandbox); it does NOT accept inline base64 bytes. (The portal surface is the ' +
+    'opposite: it wants inline base64 bytes.) Up to 10 files per message; size ' +
+    'limits are enforced by Discord.',
   items: {
     type: 'object',
     properties: {
@@ -32,6 +34,24 @@ const FILES_PROP = {
   },
 };
 
+/**
+ * Shared param descriptions that spell out how this surface's ids differ from
+ * the portal surface, so an agent that learned one does not silently mis-call
+ * the other. discord-mcpl talks to Discord directly; portal/portal-mcpl talks
+ * to a relay and uses a different id scheme.
+ */
+const CHANNEL_ID_DESC =
+  'Discord channel snowflake (the raw numeric channel id). Surface marker: ' +
+  'discord-mcpl namespaces its MCPL channels as `discord:<guildId>:<channelId>` ' +
+  '— a different id space from the portal surface (`portal:<channelId>`).';
+
+/** Contrasts a per-channel Discord snowflake against portal's global relay id. */
+const MESSAGE_ID_KIND =
+  'Discord message snowflake — unique only WITHIN its channel, so you must pass ' +
+  'channelId together with messageId. (The portal surface instead takes a ' +
+  'durable, globally-unique relay message id and needs messageId alone — no ' +
+  'channelId.)';
+
 export const toolDefinitions: ToolDefinition[] = [
   {
     name: 'send_message',
@@ -39,7 +59,7 @@ export const toolDefinitions: ToolDefinition[] = [
     inputSchema: {
       type: 'object',
       properties: {
-        channelId: { type: 'string', description: 'Discord channel ID' },
+        channelId: { type: 'string', description: CHANNEL_ID_DESC },
         content: { type: 'string', description: 'Message content (optional if files are attached)' },
         files: FILES_PROP,
       },
@@ -52,8 +72,8 @@ export const toolDefinitions: ToolDefinition[] = [
     inputSchema: {
       type: 'object',
       properties: {
-        channelId: { type: 'string', description: 'Discord channel ID' },
-        messageId: { type: 'string', description: 'Message ID to reply to' },
+        channelId: { type: 'string', description: CHANNEL_ID_DESC },
+        messageId: { type: 'string', description: 'Message to reply to. ' + MESSAGE_ID_KIND },
         content: { type: 'string', description: 'Reply content (optional if files are attached)' },
         files: FILES_PROP,
       },
@@ -79,8 +99,8 @@ export const toolDefinitions: ToolDefinition[] = [
     inputSchema: {
       type: 'object',
       properties: {
-        channelId: { type: 'string', description: 'Discord channel ID' },
-        messageId: { type: 'string', description: 'Message ID to react to' },
+        channelId: { type: 'string', description: CHANNEL_ID_DESC },
+        messageId: { type: 'string', description: 'Message to react to. ' + MESSAGE_ID_KIND },
         emoji: { type: 'string', description: 'Emoji (unicode or custom :name:)' },
       },
       required: ['channelId', 'messageId', 'emoji'],
@@ -92,8 +112,8 @@ export const toolDefinitions: ToolDefinition[] = [
     inputSchema: {
       type: 'object',
       properties: {
-        channelId: { type: 'string', description: 'Discord channel ID' },
-        messageId: { type: 'string', description: 'Message ID to edit' },
+        channelId: { type: 'string', description: CHANNEL_ID_DESC },
+        messageId: { type: 'string', description: 'Message to edit. ' + MESSAGE_ID_KIND },
         content: { type: 'string', description: 'New message content' },
       },
       required: ['channelId', 'messageId', 'content'],
@@ -105,8 +125,8 @@ export const toolDefinitions: ToolDefinition[] = [
     inputSchema: {
       type: 'object',
       properties: {
-        channelId: { type: 'string', description: 'Discord channel ID' },
-        messageId: { type: 'string', description: 'Message ID to delete' },
+        channelId: { type: 'string', description: CHANNEL_ID_DESC },
+        messageId: { type: 'string', description: 'Message to delete. ' + MESSAGE_ID_KIND },
       },
       required: ['channelId', 'messageId'],
     },
@@ -149,11 +169,13 @@ export const toolDefinitions: ToolDefinition[] = [
       'messages. Use `before` (a message ID) to scroll further back — pass the ID ' +
       'of the oldest message you have seen to page backwards through older history. ' +
       'Use `after` (a message ID) to fetch only messages newer than a given point. ' +
+      'The `before`/`after` cursors are Discord message snowflakes (the portal ' +
+      'surface accepts a relay id or a snowflake there). ' +
       'Pagination is automatic, so `limit` may exceed Discord\'s 100-per-request cap.',
     inputSchema: {
       type: 'object',
       properties: {
-        channelId: { type: 'string', description: 'Discord channel ID' },
+        channelId: { type: 'string', description: CHANNEL_ID_DESC },
         limit: { type: 'number', description: 'Max messages to fetch (default 50)' },
         before: {
           type: 'string',
@@ -180,10 +202,10 @@ export const toolDefinitions: ToolDefinition[] = [
     inputSchema: {
       type: 'object',
       properties: {
-        channelId: { type: 'string', description: 'Discord channel ID' },
+        channelId: { type: 'string', description: CHANNEL_ID_DESC },
         messageId: {
           type: 'string',
-          description: 'The message ID to centre the window on',
+          description: 'Message to centre the window on. ' + MESSAGE_ID_KIND,
         },
         limit: {
           type: 'number',
@@ -212,7 +234,7 @@ export const toolDefinitions: ToolDefinition[] = [
     inputSchema: {
       type: 'object',
       properties: {
-        channelId: { type: 'string', description: 'Channel ID to delete' },
+        channelId: { type: 'string', description: 'Channel to delete. ' + CHANNEL_ID_DESC },
       },
       required: ['channelId'],
     },
@@ -226,7 +248,7 @@ export const toolDefinitions: ToolDefinition[] = [
     inputSchema: {
       type: 'object',
       properties: {
-        channelId: { type: 'string', description: 'Discord channel ID to subscribe to' },
+        channelId: { type: 'string', description: 'Channel to subscribe to. ' + CHANNEL_ID_DESC },
       },
       required: ['channelId'],
     },
@@ -239,7 +261,7 @@ export const toolDefinitions: ToolDefinition[] = [
     inputSchema: {
       type: 'object',
       properties: {
-        channelId: { type: 'string', description: 'Discord channel ID to unsubscribe from' },
+        channelId: { type: 'string', description: 'Channel to unsubscribe from. ' + CHANNEL_ID_DESC },
       },
       required: ['channelId'],
     },
@@ -259,14 +281,17 @@ export const toolDefinitions: ToolDefinition[] = [
     name: 'channel_missed',
     description:
       'Report how much ambient (non-mention, non-DM) traffic you have missed in ' +
-      'a channel since you unsubscribed from it — returns missed message and ' +
-      'character counts. Mentions and DMs are always delivered and are not ' +
-      'counted. Useful for deciding whether to resubscribe. Counts are durable ' +
-      'across restarts and backfill downtime gaps on reconnect.',
+      'a channel since you UNSUBSCRIBED from it — returns missed message and ' +
+      'character counts. Note the baseline is your unsubscribe point, NOT a ' +
+      'read/seen watermark; the portal surface exposes a same-named ' +
+      '`channel_missed` that instead counts since your last-read watermark, so do ' +
+      'not assume identical semantics across surfaces. Mentions and DMs are always ' +
+      'delivered and are not counted. Useful for deciding whether to resubscribe. ' +
+      'Counts are durable across restarts and backfill downtime gaps on reconnect.',
     inputSchema: {
       type: 'object',
       properties: {
-        channelId: { type: 'string', description: 'Discord channel ID to check' },
+        channelId: { type: 'string', description: 'Channel to check. ' + CHANNEL_ID_DESC },
       },
       required: ['channelId'],
     },
