@@ -639,7 +639,7 @@ export class DiscordAdapter {
           authorId: m.author.id,
           authorName: m.author.username,
           isBot: m.author.bot,
-          content: m.content,
+          content: cleanContent,
           cleanContent,
           attachments: mapAttachments(m),
           mentionsBot: this.messageMentionsBot(m),
@@ -690,7 +690,7 @@ export class DiscordAdapter {
         authorId: m.author.id,
         authorName: m.author.username,
         isBot: m.author.bot,
-        content: m.content,
+        content: cleanContent,
         cleanContent,
         attachments: mapAttachments(m),
         mentionsBot: this.messageMentionsBot(m),
@@ -1107,7 +1107,7 @@ export class DiscordAdapter {
     const threadName = (message.thread as { name?: string } | null)?.name;
     return {
       id: message.id,
-      content: message.content,
+      content: cleanContent,
       cleanContent,
       authorId: message.author.id,
       authorName: message.author.username,
