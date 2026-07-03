@@ -330,11 +330,29 @@ export class DiscordMcplServer {
           },
         ],
       },
+      {
+        name: 'unstick',
+        description: 'Rewind blocked turns and re-run until the model stops refusing — admin only',
+        options: [
+          {
+            type: 4, // INTEGER
+            name: 'max',
+            description: 'Max rewind/retry attempts (default 3)',
+            required: false,
+            min_value: 1,
+            max_value: 10,
+          },
+        ],
+      },
     ]);
   }
 
   private async handleSlashCommand(interaction: ChatInputCommandInteraction): Promise<void> {
-    if (interaction.commandName !== 'undo' && interaction.commandName !== 'hide') {
+    if (
+      interaction.commandName !== 'undo' &&
+      interaction.commandName !== 'hide' &&
+      interaction.commandName !== 'unstick'
+    ) {
       await interaction.reply({ content: `Unknown command: ${interaction.commandName}`, flags: MessageFlags.Ephemeral });
       return;
     }
@@ -351,6 +369,11 @@ export class DiscordMcplServer {
 
     if (interaction.commandName === 'hide') {
       await this.handleHideCommand(interaction);
+      return;
+    }
+
+    if (interaction.commandName === 'unstick') {
+      await this.handleUnstickCommand(interaction);
       return;
     }
 
@@ -518,6 +541,51 @@ export class DiscordMcplServer {
     } catch (err) {
       dbg('slash:hide-failed', { error: (err as Error).message });
       await interaction.editReply(`⚠️ Hide failed: ${(err as Error).message}`);
+    }
+  }
+
+  /**
+   * `/unstick [max]` — admin-gated. Asks the host to force the refusal-rewind
+   * loop: redact the turn that fed the refusal and re-run the model, up to
+   * `max` times, until it stops refusing. Commits to real inference runs, so
+   * the host only ACKs here (started) and posts the outcome — what was shed and
+   * whether it cleared — to this channel when the chain resolves.
+   */
+  private async handleUnstickCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+    const max = interaction.options.getInteger('max') ?? undefined;
+    const conn = this.conn;
+    if (!conn) {
+      await interaction.reply({ content: 'Host is not connected — cannot unstick.', flags: MessageFlags.Ephemeral });
+      return;
+    }
+
+    dbg('slash:unstick', { max, userId: interaction.user.id, channelId: interaction.channelId });
+    await interaction.deferReply();
+
+    try {
+      const result = (await conn.sendRequest(
+        'host/command',
+        {
+          command: 'unstick',
+          maxRewinds: max,
+          channelId: interaction.channelId,
+          requesterId: interaction.user.id,
+          requesterName: interaction.user.username,
+        },
+        30000,
+      )) as { ok?: boolean; error?: string; started?: boolean; cap?: number };
+
+      if (!result?.ok) {
+        await interaction.editReply(`⚠️ Unstick failed: ${result?.error ?? 'unknown error'}`);
+        return;
+      }
+      await interaction.editReply(
+        `🔧 Unsticking the agent — rewinding blocked turn(s) and re-running ` +
+          `(up to **${result.cap ?? max ?? 3}**). I'll post the result here.`,
+      );
+    } catch (err) {
+      dbg('slash:unstick-failed', { error: (err as Error).message });
+      await interaction.editReply(`⚠️ Unstick failed: ${(err as Error).message}`);
     }
   }
 
