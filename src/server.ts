@@ -186,6 +186,14 @@ export class DiscordMcplServer {
   private subscribedChannels = new Set<string>();
   private subscriptionsLoaded = false;
 
+  /** Channels opted into live reaction visibility (per-channel, default off).
+   *  Reactions from these channels surface in context but NEVER wake the agent
+   *  (tagged `chat:reaction`, which matches no wake policy). Persisted to
+   *  DISCORD_REACTION_CHANNELS_FILE, or a `.reactions.json` sibling of the
+   *  subscriptions file. */
+  private reactionChannels = new Set<string>();
+  private reactionChannelsLoaded = false;
+
   /** Channels the agent has explicitly MUTED: no ambient, no mention/reply wake,
    *  and no auto-subscribe-on-mention. Dropped at the top of
    *  handleDiscordMessage. Persisted to a sibling of DISCORD_SUBSCRIPTIONS_FILE
@@ -1008,6 +1016,22 @@ export class DiscordMcplServer {
       case 'list_channels':
         return await this.discord.listChannels(args.guildId as string);
 
+      case 'list_emojis':
+        return await this.discord.listEmojis(args.guildId as string | undefined);
+
+      case 'set_reaction_visibility': {
+        this.ensureReactionChannelsLoaded();
+        const channelId = args.channelId as string;
+        const visible = args.visible as boolean;
+        const had = this.reactionChannels.has(channelId);
+        if (visible) this.reactionChannels.add(channelId);
+        else this.reactionChannels.delete(channelId);
+        if (visible !== had) this.saveReactionChannels();
+        return visible
+          ? `Reaction visibility ON for channel ${channelId}. Reactions there now appear in your context as they happen (they never wake you).`
+          : `Reaction visibility OFF for channel ${channelId}.`;
+      }
+
       case 'refresh_channels':
         return this.refreshChannels();
 
@@ -1279,6 +1303,47 @@ export class DiscordMcplServer {
   private isChannelSubscribed(channelId: string): boolean {
     this.ensureSubscriptionsLoaded();
     return this.subscribedChannels.has(channelId);
+  }
+
+  /** Reaction-visibility file: explicit env override, else a `.reactions.json`
+   *  sibling of the subscriptions file. */
+  private reactionChannelsFile(): string | undefined {
+    const p = process.env.DISCORD_REACTION_CHANNELS_FILE;
+    if (p && p.length > 0) return p;
+    const sub = this.subscriptionsFile();
+    return sub ? sub.replace(/(\.json)?$/i, '.reactions.json') : undefined;
+  }
+
+  /** Lazy-load reaction-visibility channels from disk on first access. Idempotent. */
+  private ensureReactionChannelsLoaded(): void {
+    if (this.reactionChannelsLoaded) return;
+    this.reactionChannelsLoaded = true;
+    const path = this.reactionChannelsFile();
+    if (!path || !existsSync(path)) return;
+    try {
+      const parsed = JSON.parse(readFileSync(path, 'utf-8'));
+      if (Array.isArray(parsed)) {
+        for (const id of parsed) {
+          if (typeof id === 'string' && id.length > 0) this.reactionChannels.add(id);
+        }
+      }
+      dbg('reaction-channels:loaded', { count: this.reactionChannels.size, path });
+    } catch (err) {
+      console.error('[discord-mcpl] Failed to load reaction channels:', (err as Error).message);
+      dbg('reaction-channels:load-failed', { error: (err as Error).message, path });
+    }
+  }
+
+  private saveReactionChannels(): void {
+    const path = this.reactionChannelsFile();
+    if (!path) return; // in-memory mode
+    try {
+      mkdirSync(dirname(path), { recursive: true });
+      writeFileSync(path, JSON.stringify([...this.reactionChannels].sort(), null, 2) + '\n');
+    } catch (err) {
+      console.error('[discord-mcpl] Failed to save reaction channels:', (err as Error).message);
+      dbg('reaction-channels:save-failed', { error: (err as Error).message, path });
+    }
   }
 
   /**
@@ -1843,6 +1908,38 @@ export class DiscordMcplServer {
         timestamp: new Date().toISOString(),
         origin: { source: 'discord', channelId },
         payload: { content: [textContent(`[message deleted] ${messageId}`)] },
+      } satisfies PushEventParams).catch(() => {});
+    });
+
+    this.discord.onReaction((ev) => {
+      if (!this.conn || !this.mcplEnabled) return;
+      if (!isEnabled('discord.messaging', this.enabledFeatureSets)) return;
+      // Reaction visibility is a per-channel opt-in (default off). Reactions
+      // NEVER wake the agent — the `chat:reaction` tag matches no wake policy —
+      // they just land in context so the agent sees them when next active.
+      this.ensureReactionChannelsLoaded();
+      if (!this.reactionChannels.has(ev.channelId)) return;
+      const verb = ev.action === 'add' ? 'reacted' : 'removed a reaction';
+      const target = ev.onOwnMessage ? 'your message' : `message ${ev.messageId}`;
+      const line = `[reaction] @${ev.userName} ${verb} ${ev.emoji} on ${target}`;
+      this.conn.sendRequest(method.PUSH_EVENT, {
+        featureSet: 'discord.messaging',
+        eventId: `discord_reaction_${ev.action}_${ev.messageId}_${ev.emojiId ?? ev.emoji}_${ev.userId}_${ev.timestamp.getTime()}`,
+        timestamp: ev.timestamp.toISOString(),
+        origin: {
+          source: 'discord',
+          channelId: ev.channelId,
+          messageId: ev.messageId,
+          guildId: ev.guildId,
+          reactorId: ev.userId,
+          reactorName: ev.userName,
+          emoji: ev.emoji,
+          emojiToken: ev.token,
+          onOwnMessage: ev.onOwnMessage,
+          action: ev.action,
+        } as Record<string, unknown>,
+        tags: ['chat:reaction'],
+        payload: { content: [textContent(line)] },
       } satisfies PushEventParams).catch(() => {});
     });
 

@@ -101,7 +101,7 @@ export const toolDefinitions: ToolDefinition[] = [
       properties: {
         channelId: { type: 'string', description: CHANNEL_ID_DESC },
         messageId: { type: 'string', description: 'Message to react to. ' + MESSAGE_ID_KIND },
-        emoji: { type: 'string', description: 'Emoji (unicode or custom :name:)' },
+        emoji: { type: 'string', description: 'A unicode emoji (e.g. 👍), or a custom server emoji as `:name:` (discover names/ids with list_emojis) or its full `<:name:id>` token.' },
       },
       required: ['channelId', 'messageId', 'emoji'],
     },
@@ -148,6 +148,24 @@ export const toolDefinitions: ToolDefinition[] = [
         guildId: { type: 'string', description: 'Discord guild ID' },
       },
       required: ['guildId'],
+    },
+  },
+  {
+    name: 'list_emojis',
+    description:
+      'List the custom (server) emojis available to use. Put `token` (e.g. ' +
+      '`<:name:id>`) in message content to render one, or pass `reactionArg` ' +
+      '(`:name:`) to add_reaction. Reactions and message emojis draw from this ' +
+      'same set. Returns name, id, animated flag, message `token`, and `reactionArg`.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        guildId: {
+          type: 'string',
+          description:
+            'Optional: limit to one guild (raw guild id). Omit to list custom emojis across all guilds the bot is in.',
+        },
+      },
     },
   },
   {
@@ -237,6 +255,26 @@ export const toolDefinitions: ToolDefinition[] = [
         channelId: { type: 'string', description: 'Channel to delete. ' + CHANNEL_ID_DESC },
       },
       required: ['channelId'],
+    },
+  },
+  {
+    name: 'set_reaction_visibility',
+    description:
+      'Opt a channel in or out of showing emoji reactions live. When ON, reactions ' +
+      'added or removed on ANY message in that channel appear in your context as ' +
+      'they happen — but they NEVER wake you; you just see them next time you are ' +
+      'active. Default OFF, persisted across restarts. (Reactions on history you ' +
+      'fetch always show via fetch_history regardless of this setting.)',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        channelId: { type: 'string', description: CHANNEL_ID_DESC },
+        visible: {
+          type: 'boolean',
+          description: 'true = surface live reactions from this channel; false = stop.',
+        },
+      },
+      required: ['channelId', 'visible'],
     },
   },
   {

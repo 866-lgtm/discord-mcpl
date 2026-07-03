@@ -64,6 +64,7 @@ class MockDiscordAdapter {
   }
   onMessageEdit(): void {}
   onMessageDelete(): void {}
+  onReaction(): void {}
   onReady(): void {}
   onChannelCreate(handler: (guildId: string, channel: DiscordChannelInfo) => void): void {
     this._channelCreateHandler = handler;

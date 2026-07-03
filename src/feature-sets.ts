@@ -17,6 +17,7 @@ export const featureSets: FeatureSetDeclaration[] = [
       coreTags: [
         'chat:addressed', 'chat:mention', 'chat:reply', 'chat:dm', 'chat:ambient',
         'chat:private', 'chat:from-human', 'chat:from-bot', 'chat:thread',
+        'chat:reaction',
         'chat:has-image', 'chat:has-audio', 'chat:has-file',
       ],
       defaultTreatment: [
@@ -74,6 +75,7 @@ export function featureSetForTool(toolName: string): string | undefined {
     case 'reply_message':
     case 'send_dm':
     case 'add_reaction':
+    case 'list_emojis':
     case 'edit_message':
     case 'delete_message':
       return 'discord.messaging';
@@ -89,6 +91,7 @@ export function featureSetForTool(toolName: string): string | undefined {
     case 'unmute_channel':
     case 'list_subscriptions':
     case 'channel_missed':
+    case 'set_reaction_visibility':
       return 'discord.subscriptions';
     case 'list_guilds':
     case 'list_channels':
