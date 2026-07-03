@@ -1281,6 +1281,25 @@ export class DiscordMcplServer {
     return this.subscribedChannels.has(channelId);
   }
 
+  /**
+   * The SINGLE ingestion decision: does a Discord event in this channel enter
+   * the agent's context? Every event type — message create, edit, delete —
+   * must route through here so the filtering rule lives in exactly one place
+   * and can't drift. (It drifted before: edits/deletes bypassed the
+   * subscription check that creates go through, leaking cross-channel edit/
+   * delete markers into agents scoped to the whole guild.)
+   *
+   * Forward iff the channel is subscribed (ambient), OR the event addresses the
+   * bot (mention/reply), OR it's a DM. Non-subscribed ambient — including its
+   * edits and deletes — is dropped.
+   */
+  private shouldEnterContext(
+    channelId: string,
+    opts: { isMention?: boolean; isDM?: boolean } = {},
+  ): boolean {
+    return Boolean(opts.isMention) || Boolean(opts.isDM) || this.isChannelSubscribed(channelId);
+  }
+
   // Mute persistence: DISCORD_MUTED_CHANNELS_FILE, else a sibling of the
   // subscriptions file (…​.muted.json). In-memory when neither is available.
   private mutedFile(): string | undefined {
@@ -1792,9 +1811,16 @@ export class DiscordMcplServer {
       });
     });
 
-    this.discord.onMessageEdit((channelId, messageId, newContent) => {
+    this.discord.onMessageEdit((channelId, messageId, newContent, isDM) => {
       if (!this.conn || !this.mcplEnabled) return;
       if (!isEnabled('discord.messaging', this.enabledFeatureSets)) return;
+      // Same ingestion gate as a create: an edit in a channel we don't ingest
+      // from must not leak in. (Mentions inside an edit are an accepted edge —
+      // the subscription/DM threshold is what closes the cross-channel leak.)
+      if (!this.shouldEnterContext(channelId, { isDM })) {
+        dbg('handleMessageEdit:drop', { channelId, messageId, reason: 'not-subscribed' });
+        return;
+      }
       this.conn.sendRequest(method.PUSH_EVENT, {
         featureSet: 'discord.messaging',
         eventId: `discord_edit_${messageId}`,
@@ -1804,9 +1830,13 @@ export class DiscordMcplServer {
       } satisfies PushEventParams).catch(() => {});
     });
 
-    this.discord.onMessageDelete((channelId, messageId) => {
+    this.discord.onMessageDelete((channelId, messageId, isDM) => {
       if (!this.conn || !this.mcplEnabled) return;
       if (!isEnabled('discord.messaging', this.enabledFeatureSets)) return;
+      if (!this.shouldEnterContext(channelId, { isDM })) {
+        dbg('handleMessageDelete:drop', { channelId, messageId, reason: 'not-subscribed' });
+        return;
+      }
       this.conn.sendRequest(method.PUSH_EVENT, {
         featureSet: 'discord.messaging',
         eventId: `discord_delete_${messageId}`,
@@ -1993,7 +2023,7 @@ export class DiscordMcplServer {
     // backward compatibility only — the wake decision uses the granular
     // flags above via the gate.
     const isMention = isExplicitMention || isReplyToBot;
-    if (!isMention && !isDM && !this.isChannelSubscribed(msg.channelId)) {
+    if (!this.shouldEnterContext(msg.channelId, { isMention, isDM })) {
       // If we're tracking this channel's missed-ambient (i.e. it was
       // unsubscribed), tally what we're dropping so the agent can ask later.
       // Skip the bot's own messages and chx no-op triggers (never "missed").

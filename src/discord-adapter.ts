@@ -214,8 +214,8 @@ export class DiscordAdapter {
   private guildCommandDefs?: ApplicationCommandDataResolvable[];
 
   private messageHandler?: (msg: DiscordMessageData) => void;
-  private editHandler?: (channelId: string, messageId: string, newContent: string) => void;
-  private deleteHandler?: (channelId: string, messageId: string) => void;
+  private editHandler?: (channelId: string, messageId: string, newContent: string, isDM: boolean) => void;
+  private deleteHandler?: (channelId: string, messageId: string, isDM: boolean) => void;
   private readyHandler?: () => void;
   private channelCreateHandler?: (guildId: string, channel: DiscordChannelInfo) => void;
   private channelDeleteHandler?: (guildId: string, channelId: string) => void;
@@ -293,11 +293,11 @@ export class DiscordAdapter {
     this.messageHandler = handler;
   }
 
-  onMessageEdit(handler: (channelId: string, messageId: string, newContent: string) => void): void {
+  onMessageEdit(handler: (channelId: string, messageId: string, newContent: string, isDM: boolean) => void): void {
     this.editHandler = handler;
   }
 
-  onMessageDelete(handler: (channelId: string, messageId: string) => void): void {
+  onMessageDelete(handler: (channelId: string, messageId: string, isDM: boolean) => void): void {
     this.deleteHandler = handler;
   }
 
@@ -947,7 +947,7 @@ export class DiscordAdapter {
       if (!newMsg.guildId && this.dmUsers && newMsg.author && !this.dmUsers.has(newMsg.author.id)) {
         return;
       }
-      this.editHandler?.(newMsg.channelId, newMsg.id, newMsg.content);
+      this.editHandler?.(newMsg.channelId, newMsg.id, newMsg.content, !newMsg.guildId);
     });
 
     this.client.on('messageDelete', (message) => {
@@ -956,7 +956,7 @@ export class DiscordAdapter {
           ? ((message.channel as { parentId?: string | null }).parentId ?? null)
           : null;
       if (!this.channelAllowed(message.guildId, message.channelId, delParent)) return;
-      this.deleteHandler?.(message.channelId, message.id);
+      this.deleteHandler?.(message.channelId, message.id, !message.guildId);
     });
 
     this.client.on('channelCreate', (channel) => {
