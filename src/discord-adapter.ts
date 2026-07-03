@@ -124,6 +124,9 @@ export interface DiscordMessageData {
   mentions: string[];
   /** Files attached to the message (images, text files, etc.). Empty when none. */
   attachments: DiscordAttachment[];
+  /** Emoji reactions on this message at serialization time. Usually empty for a
+   *  freshly-created message; populated on fetch. */
+  reactions?: ReactionSummary[];
   timestamp: Date;
 }
 
@@ -158,7 +161,63 @@ export interface HistoryMessage {
    *  when the reference resolves, so explicit @mentions are the reliable
    *  signal here. */
   mentionsBot: boolean;
+  /** Emoji reactions currently on this message. Empty when none. Populated on
+   *  fetch (history/around); reactions ride along with the message so they are
+   *  visible passively, without ever waking the agent. */
+  reactions?: ReactionSummary[];
   timestamp: Date;
+}
+
+/** One emoji reaction bucket on a message. */
+export interface ReactionSummary {
+  /** Human-readable form: the unicode char, or ':name:' for a custom emoji. */
+  emoji: string;
+  /** Custom-emoji snowflake id, or null for a unicode emoji. */
+  emojiId: string | null;
+  /** Token to reuse this emoji in message content ('<:name:id>' / '<a:name:id>'),
+   *  or the unicode char itself. */
+  token: string;
+  /** Number of users who added this reaction. */
+  count: number;
+  /** True if the bot itself is one of the reactors. */
+  me: boolean;
+}
+
+/** A custom (server) emoji the bot can see and use. */
+export interface DiscordEmojiInfo {
+  id: string;
+  name: string;
+  animated: boolean;
+  /** Paste into message content to render it ('<:name:id>' / '<a:name:id>'). */
+  token: string;
+  /** Pass to add_reaction to react with it (':name:'). */
+  reactionArg: string;
+  guildId: string;
+  guildName: string | null;
+}
+
+/** Render custom-emoji tokens ('<:name:id>' / '<a:name:id>') down to ':name:'
+ *  so message text reads legibly for the model. Unicode emoji are untouched. */
+function renderCustomEmojis(text: string): string {
+  return text.replace(/<a?:(\w+):\d+>/g, (_full, name: string) => `:${name}:`);
+}
+
+/** Summarise the reactions on a discord.js message. Custom emoji become ':name:'
+ *  (full token preserved on `token`); unicode emoji pass through. */
+function extractReactions(m: Message): ReactionSummary[] {
+  const cache = m.reactions?.cache;
+  if (!cache || cache.size === 0) return [];
+  return [...cache.values()].map((r) => {
+    const e = r.emoji;
+    const custom = Boolean(e.id);
+    return {
+      emoji: custom ? `:${e.name}:` : e.name ?? '?',
+      emojiId: e.id ?? null,
+      token: custom ? `<${e.animated ? 'a' : ''}:${e.name}:${e.id}>` : e.name ?? '',
+      count: r.count,
+      me: r.me,
+    };
+  });
 }
 
 /** A possible mention target gathered from the guild/DM: a user or a role,
@@ -256,6 +315,9 @@ export class DiscordAdapter {
         // who've recently messaged (cached opportunistically via
         // messageCreate); inactive members can't be pinged by name.
         GatewayIntentBits.GuildMembers,
+        // Non-privileged. Populates guild.emojis for list_emojis and keeps the
+        // custom-emoji cache fresh (emojiCreate/Update/Delete).
+        GatewayIntentBits.GuildEmojisAndStickers,
       ],
       partials: [Partials.Channel, Partials.Message],
     });
@@ -587,7 +649,26 @@ export class DiscordAdapter {
       throw new Error(`Channel ${channelId} not found`);
     }
     const msg = await (channel as TextChannel).messages.fetch(messageId);
-    await msg.react(emoji);
+    await msg.react(this.resolveReactionEmoji(emoji, msg.guild));
+  }
+
+  /** Turn a caller-supplied emoji into something discord.js `.react()` accepts.
+   *  Unicode chars and the full custom forms ('<:name:id>', 'name:id') pass
+   *  through untouched; a bare ':name:' or 'name' is resolved to a cached custom
+   *  emoji's 'name:id' identifier so custom reactions actually land (a bare name
+   *  is not resolvable by discord.js). Falls back to the input unchanged
+   *  (treated as unicode) when nothing matches. */
+  private resolveReactionEmoji(emoji: string, guild: Guild | null): string {
+    const trimmed = emoji.trim();
+    if (/^<a?:\w+:\d+>$/.test(trimmed) || /^\w+:\d+$/.test(trimmed)) return trimmed;
+    const bare = trimmed.replace(/^:+|:+$/g, '');
+    if (/^\w{2,}$/.test(bare)) {
+      const found =
+        guild?.emojis.cache.find((e) => e.name === bare) ??
+        this.client.emojis.cache.find((e) => e.name === bare);
+      if (found) return found.identifier;
+    }
+    return trimmed;
   }
 
   async fetchHistory(
@@ -632,8 +713,9 @@ export class DiscordAdapter {
           break;
         }
         const rawClean = (m as { cleanContent?: string }).cleanContent;
-        const cleanContent =
+        const rawResolved =
           typeof rawClean === 'string' && rawClean.length > 0 ? rawClean : m.content;
+        const cleanContent = renderCustomEmojis(rawResolved);
         collected.push({
           id: m.id,
           authorId: m.author.id,
@@ -642,6 +724,7 @@ export class DiscordAdapter {
           content: cleanContent,
           cleanContent,
           attachments: mapAttachments(m),
+          reactions: extractReactions(m),
           mentionsBot: this.messageMentionsBot(m),
           timestamp: m.createdAt,
         });
@@ -683,8 +766,9 @@ export class DiscordAdapter {
     });
     const collected: HistoryMessage[] = [...page.values()].map((m) => {
       const rawClean = (m as { cleanContent?: string }).cleanContent;
-      const cleanContent =
+      const rawResolved =
         typeof rawClean === 'string' && rawClean.length > 0 ? rawClean : m.content;
+      const cleanContent = renderCustomEmojis(rawResolved);
       return {
         id: m.id,
         authorId: m.author.id,
@@ -693,6 +777,7 @@ export class DiscordAdapter {
         content: cleanContent,
         cleanContent,
         attachments: mapAttachments(m),
+        reactions: extractReactions(m),
         mentionsBot: this.messageMentionsBot(m),
         timestamp: m.createdAt,
       };
@@ -851,6 +936,39 @@ export class DiscordAdapter {
       }
     });
     return result;
+  }
+
+  /** List the custom (server) emojis the bot can see — the shared palette for
+   *  both message content and reactions. Omit `guildId` to span all guilds. */
+  async listEmojis(guildId?: string): Promise<DiscordEmojiInfo[]> {
+    const guilds: Guild[] = [];
+    if (guildId) {
+      const g = await this.client.guilds.fetch(guildId).catch(() => null);
+      if (!g) throw new Error(`Guild ${guildId} not found`);
+      guilds.push(g);
+    } else {
+      guilds.push(...this.client.guilds.cache.values());
+    }
+    const out: DiscordEmojiInfo[] = [];
+    for (const g of guilds) {
+      let emojis = g.emojis.cache;
+      if (emojis.size === 0) {
+        emojis = await g.emojis.fetch().catch(() => emojis);
+      }
+      emojis.forEach((e) => {
+        if (!e.name) return;
+        out.push({
+          id: e.id,
+          name: e.name,
+          animated: e.animated ?? false,
+          token: `<${e.animated ? 'a' : ''}:${e.name}:${e.id}>`,
+          reactionArg: `:${e.name}:`,
+          guildId: g.id,
+          guildName: g.name,
+        });
+      });
+    }
+    return out;
   }
 
   async createTextChannel(
