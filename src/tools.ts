@@ -258,6 +258,26 @@ export const toolDefinitions: ToolDefinition[] = [
     },
   },
   {
+    name: 'set_reaction_visibility',
+    description:
+      'Opt a channel in or out of showing emoji reactions live. When ON, reactions ' +
+      'added or removed on ANY message in that channel appear in your context as ' +
+      'they happen — but they NEVER wake you; you just see them next time you are ' +
+      'active. Default OFF, persisted across restarts. (Reactions on history you ' +
+      'fetch always show via fetch_history regardless of this setting.)',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        channelId: { type: 'string', description: CHANNEL_ID_DESC },
+        visible: {
+          type: 'boolean',
+          description: 'true = surface live reactions from this channel; false = stop.',
+        },
+      },
+      required: ['channelId', 'visible'],
+    },
+  },
+  {
     name: 'subscribe_channel',
     description:
       'Subscribe to ambient (non-mention) messages from a Discord channel. ' +

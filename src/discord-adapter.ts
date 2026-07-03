@@ -15,6 +15,9 @@ import {
   ChannelType,
   AttachmentBuilder,
   type Message,
+  type MessageReaction,
+  type PartialMessageReaction,
+  type PartialUser,
   type Guild,
   type GuildBasedChannel,
   type GuildMember,
@@ -196,6 +199,27 @@ export interface DiscordEmojiInfo {
   guildName: string | null;
 }
 
+/** An incoming Discord reaction (add or remove) surfaced to the server. */
+export interface ReactionEvent {
+  action: 'add' | 'remove';
+  channelId: string;
+  messageId: string;
+  guildId: string | null;
+  /** Human-readable emoji: the unicode char, or ':name:' for a custom emoji. */
+  emoji: string;
+  emojiId: string | null;
+  /** Token to reuse the emoji ('<:name:id>' / '<a:name:id>'), or the unicode char. */
+  token: string;
+  /** Who added/removed the reaction. */
+  userId: string;
+  userName: string;
+  /** True if the reacted-to message was authored by the bot (a reaction to us). */
+  onOwnMessage: boolean;
+  /** Author id of the reacted-to message, if resolvable. */
+  messageAuthorId: string | null;
+  timestamp: Date;
+}
+
 /** Render custom-emoji tokens ('<:name:id>' / '<a:name:id>') down to ':name:'
  *  so message text reads legibly for the model. Unicode emoji are untouched. */
 function renderCustomEmojis(text: string): string {
@@ -275,6 +299,7 @@ export class DiscordAdapter {
   private messageHandler?: (msg: DiscordMessageData) => void;
   private editHandler?: (channelId: string, messageId: string, newContent: string, isDM: boolean) => void;
   private deleteHandler?: (channelId: string, messageId: string, isDM: boolean) => void;
+  private reactionHandler?: (ev: ReactionEvent) => void;
   private readyHandler?: () => void;
   private channelCreateHandler?: (guildId: string, channel: DiscordChannelInfo) => void;
   private channelDeleteHandler?: (guildId: string, channelId: string) => void;
@@ -319,7 +344,7 @@ export class DiscordAdapter {
         // custom-emoji cache fresh (emojiCreate/Update/Delete).
         GatewayIntentBits.GuildEmojisAndStickers,
       ],
-      partials: [Partials.Channel, Partials.Message],
+      partials: [Partials.Channel, Partials.Message, Partials.Reaction, Partials.User],
     });
 
     this.setupEvents();
@@ -361,6 +386,12 @@ export class DiscordAdapter {
 
   onMessageDelete(handler: (channelId: string, messageId: string, isDM: boolean) => void): void {
     this.deleteHandler = handler;
+  }
+
+  /** Register a handler for incoming Discord reactions (add/remove). The server
+   *  decides per-channel whether to surface these; the adapter always emits. */
+  onReaction(handler: (ev: ReactionEvent) => void): void {
+    this.reactionHandler = handler;
   }
 
   onReady(handler: () => void): void {
@@ -669,6 +700,48 @@ export class DiscordAdapter {
       if (found) return found.identifier;
     }
     return trimmed;
+  }
+
+  /** Resolve a (possibly partial) reaction event and hand it to the registered
+   *  reaction handler. Skips the bot's own reactions and channels it can't see.
+   *  Best-effort: a reaction we can't resolve is dropped, not surfaced as noise. */
+  private async handleReactionEvent(
+    action: 'add' | 'remove',
+    reaction: MessageReaction | PartialMessageReaction,
+    user: User | PartialUser,
+  ): Promise<void> {
+    if (!this.reactionHandler) return;
+    try {
+      if (user.id === this.client.user?.id) return; // ignore our own reactions
+      const full = reaction.partial ? await reaction.fetch() : reaction;
+      const msg = full.message;
+      const guildId = msg.guildId ?? null;
+      const parentId =
+        msg.channel && 'parentId' in msg.channel
+          ? ((msg.channel as { parentId?: string | null }).parentId ?? null)
+          : null;
+      if (!this.channelAllowed(guildId, msg.channelId, parentId)) return;
+      const reactor = user.partial ? await user.fetch().catch(() => user) : user;
+      const e = full.emoji;
+      const custom = Boolean(e.id);
+      const authorId = msg.author?.id ?? null;
+      this.reactionHandler({
+        action,
+        channelId: msg.channelId,
+        messageId: msg.id,
+        guildId,
+        emoji: custom ? `:${e.name}:` : e.name ?? '?',
+        emojiId: e.id ?? null,
+        token: custom ? `<${e.animated ? 'a' : ''}:${e.name}:${e.id}>` : e.name ?? '',
+        userId: reactor.id,
+        userName: reactor.username ?? reactor.id,
+        onOwnMessage: authorId != null && authorId === this.client.user?.id,
+        messageAuthorId: authorId,
+        timestamp: new Date(),
+      });
+    } catch (err) {
+      console.error('[discord-mcpl] reaction event failed:', (err as Error).message);
+    }
   }
 
   async fetchHistory(
@@ -1075,6 +1148,14 @@ export class DiscordAdapter {
           : null;
       if (!this.channelAllowed(message.guildId, message.channelId, delParent)) return;
       this.deleteHandler?.(message.channelId, message.id, !message.guildId);
+    });
+
+    this.client.on('messageReactionAdd', (reaction, user) => {
+      void this.handleReactionEvent('add', reaction, user);
+    });
+
+    this.client.on('messageReactionRemove', (reaction, user) => {
+      void this.handleReactionEvent('remove', reaction, user);
     });
 
     this.client.on('channelCreate', (channel) => {
