@@ -125,17 +125,27 @@ async function normalizeImageForInference(
     const meta = await sharp(buf, { animated: true }).metadata();
     const longest = Math.max(meta.width ?? 0, meta.height ?? 0);
     const isAnimated = (meta.pages ?? 1) > 1;
+    // The pass-through fast paths below may ONLY emit formats the model API
+    // accepts. sharp happily reads svg/tiff/avif/heif too — an SVG small
+    // enough to skip re-encoding used to sail through as `image/svg` and
+    // poison the agent's history with a permanently-400ing block (LabClaude,
+    // 2026-07-11). Non-API formats now fall through to the re-encode
+    // pipeline, which rasterizes them to PNG/JPEG.
+    const API_SAFE_FORMATS = new Set(['jpeg', 'png', 'gif', 'webp']);
+    const apiSafe = API_SAFE_FORMATS.has(meta.format ?? '');
 
     // Animated: don't resize frames here. Inline as-is if small enough.
+    // (Animated non-gif/webp can't be inlined at all — degrade to the
+    // caller's text note rather than emit an unacceptable media type.)
     if (isAnimated) {
-      return buf.length <= IMAGE_OUTPUT_RAW_CAP
-        ? { data: buf.toString('base64'), mimeType: `image/${meta.format ?? 'gif'}` }
+      return apiSafe && buf.length <= IMAGE_OUTPUT_RAW_CAP
+        ? { data: buf.toString('base64'), mimeType: `image/${meta.format}` }
         : null;
     }
 
     // Already within bounds and under cap → inline original bytes unchanged.
-    if (longest > 0 && longest <= IMAGE_LONG_EDGE_MAX && buf.length <= IMAGE_OUTPUT_RAW_CAP) {
-      return { data: buf.toString('base64'), mimeType: `image/${meta.format ?? 'png'}` };
+    if (apiSafe && longest > 0 && longest <= IMAGE_LONG_EDGE_MAX && buf.length <= IMAGE_OUTPUT_RAW_CAP) {
+      return { data: buf.toString('base64'), mimeType: `image/${meta.format}` };
     }
 
     // Fresh pipeline per encode (sharp instances aren't safely reusable across
