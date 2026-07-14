@@ -325,33 +325,6 @@ export const toolDefinitions: ToolDefinition[] = [
     },
   },
   {
-    name: 'subscribe_channel',
-    description:
-      'Subscribe to ambient (non-mention) messages from a Discord channel. ' +
-      'Direct mentions and DMs always come through regardless of subscriptions; ' +
-      'this only controls passive awareness of channel chatter. Persisted across restarts.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        channelId: { type: 'string', description: 'Channel to subscribe to. ' + CHANNEL_ID_DESC },
-      },
-      required: ['channelId'],
-    },
-  },
-  {
-    name: 'unsubscribe_channel',
-    description:
-      'Stop receiving ambient messages from a Discord channel. Mentions and DMs ' +
-      'from that channel will still arrive. Persisted across restarts.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        channelId: { type: 'string', description: 'Channel to unsubscribe from. ' + CHANNEL_ID_DESC },
-      },
-      required: ['channelId'],
-    },
-  },
-  {
     name: 'mute_channel',
     description:
       'Mute a Discord channel entirely: no ambient messages, no wake on @mentions ' +
@@ -370,7 +343,7 @@ export const toolDefinitions: ToolDefinition[] = [
     name: 'unmute_channel',
     description:
       'Un-mute a Discord channel: mentions and DMs reach you again. Does not by ' +
-      'itself re-subscribe ambient — use subscribe_channel for that. Persisted across restarts.',
+      'itself reopen ordinary traffic — use channel_open for that. Persisted across restarts.',
     inputSchema: {
       type: 'object',
       properties: {
