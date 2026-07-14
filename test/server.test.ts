@@ -618,14 +618,15 @@ describe('DiscordMcplServer', () => {
     await serverPromise;
   });
 
-  it('reconnect sweep delivers missed mentions from a non-subscribed channel', async () => {
+  it('reconnect sweep delivers missed mentions with nearby context from a non-subscribed channel', async () => {
     const wmPath = join(tmpdir(), `discord-mcpl-wm-${process.pid}-sweep.json`);
     writeFileSync(wmPath, JSON.stringify({ watermarks: { c1: '100' }, dmChannels: [] }));
     process.env.DISCORD_WATERMARK_FILE = wmPath;
     try {
       const { client, serverConn, discord } = await createTestPair();
       // Two messages arrived while offline: one plain, one @mentioning the bot.
-      // Channel c1 is NOT subscribed, so only the mention should be delivered.
+      // Channel c1 is NOT subscribed, so the mention and its bounded vicinity
+      // should be delivered, while the mention count remains one.
       const t = new Date();
       discord.historyToReturn = [
         { id: '101', authorId: 'u1', authorName: 'Alice', isBot: false, content: 'just chatting', cleanContent: 'just chatting', attachments: [], mentionsBot: false, timestamp: t },
@@ -652,10 +653,11 @@ describe('DiscordMcplServer', () => {
         assert.equal(origin.isMention, true);
         assert.equal(origin.isDM, false);
         const text = (p.payload.content[0] as { text: string }).text;
-        assert.ok(text.includes('count="1"'), 'only the mention should be delivered');
+        assert.ok(text.includes('count="1"'), 'only one delivered line is a mention');
+        assert.ok(text.includes('lines="2"'), 'the nearby context line is included');
         assert.ok(text.includes('reason="mention"'));
         assert.ok(text.includes('Bob'), 'mention author present');
-        assert.ok(!text.includes('just chatting'), 'non-mention line excluded');
+        assert.ok(text.includes('just chatting'), 'nearby non-mention context included');
         client.sendResponse(missed.request.id, {});
       }
 

@@ -15,15 +15,12 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: 24
-
-      - name: Pin mcpl-core to the published package (file: dep is local-dev only)
-        run: npm pkg set 'dependencies.@animalabs/mcpl-core=^0.2.0'
 
       - name: Install dependencies
         run: npm install
@@ -52,17 +49,14 @@ jobs:
       id-token: write
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           # node 24 ships npm >= 11.5.1, required for OIDC publishing.
           node-version: 24
           registry-url: https://registry.npmjs.org
-
-      - name: Pin mcpl-core to the published package (file: dep is local-dev only)
-        run: npm pkg set 'dependencies.@animalabs/mcpl-core=^0.2.0'
 
       - name: Install dependencies
         run: npm install
