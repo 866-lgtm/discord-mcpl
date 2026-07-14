@@ -16,6 +16,7 @@ import {
   ERR_UNKNOWN_CHANNEL,
   ERR_CHECKPOINT_NOT_FOUND,
 } from '@animalabs/mcpl-core';
+import { formatAgentDateTime, resolveAgentTimeZone } from './timezone.js';
 
 import type {
   JsonRpcRequest,
@@ -72,6 +73,7 @@ function requireContentOrFiles(content: string, files: OutgoingFile[] | undefine
  *  Match by prefix (`startsWith`) so trailing whitespace or auto-appended
  *  text doesn't slip through. Case-sensitive: a literal `m continue` only. */
 const CHX_NOOP_PREFIX = 'm continue';
+const AGENT_TIME_ZONE = resolveAgentTimeZone();
 
 // ============================================================================
 // Image normalization (downsample-on-ingest)
@@ -1747,7 +1749,7 @@ export class DiscordMcplServer {
       if (!keepAll) attrs.push(`lines="${kept.length}"`);
       attrs.push(`reason="${isDM ? 'dm' : hadMention ? 'mention' : 'backscroll'}"`);
       const lines = kept.map((m) => {
-        const ts = m.timestamp.toISOString();
+        const ts = formatAgentDateTime(m.timestamp, AGENT_TIME_ZONE);
         const att =
           m.attachments && m.attachments.length > 0
             ? ` [attachments: ${m.attachments.map((a) => a.name).join(', ')}]`
@@ -2374,7 +2376,7 @@ export class DiscordMcplServer {
         attrs.push(`count="${backscrollMsgs.length}"`);
         const open = `<backscroll ${attrs.join(' ')}>`;
         const lines = backscrollMsgs.map((m) => {
-          const ts = m.timestamp.toISOString();
+          const ts = formatAgentDateTime(m.timestamp, AGENT_TIME_ZONE);
           const att = m.attachments && m.attachments.length > 0
             ? ` [attachments: ${m.attachments.map((a) => a.name).join(', ')}]`
             : '';
