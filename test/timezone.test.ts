@@ -1,11 +1,45 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { formatAgentDateTime, resolveAgentTimeZone } from '../src/timezone.js';
+import { formatAgentDateTime, isValidTimeZone, resolveAgentTimeZone } from '../src/timezone.js';
 
 test('formats Discord backscroll times in the configured zone', () => {
   assert.equal(
     formatAgentDateTime(new Date('2026-01-15T12:34:56Z'), 'America/Los_Angeles'),
     '2026-01-15T04:34:56-08:00 [America/Los_Angeles]',
   );
-  assert.throws(() => resolveAgentTimeZone('Not/A_Real_Zone'), /Invalid AGENT_TIMEZONE/);
+});
+
+test('accepts a valid configured zone without warning', () => {
+  const warnings: string[] = [];
+  const original = console.error;
+  console.error = (...args: unknown[]) => { warnings.push(args.map(String).join(' ')); };
+  try {
+    assert.equal(resolveAgentTimeZone('America/Los_Angeles'), 'America/Los_Angeles');
+    assert.equal(warnings.length, 0);
+  } finally {
+    console.error = original;
+  }
+});
+
+test('invalid AGENT_TIMEZONE falls back loudly instead of throwing at import', () => {
+  const systemDefault = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+  const warnings: string[] = [];
+  const original = console.error;
+  console.error = (...args: unknown[]) => { warnings.push(args.map(String).join(' ')); };
+  try {
+    // Must not throw — a throw here kills the stdio child before the MCPL
+    // handshake, and a dead subprocess is never respawned by reconnect.
+    const zone = resolveAgentTimeZone('Amrica/New_York');
+    assert.equal(zone, systemDefault); // same default as when unset
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0], /\[timezone\] Invalid AGENT_TIMEZONE "Amrica\/New_York"/);
+    assert.match(warnings[0], /falling back to system time zone/);
+  } finally {
+    console.error = original;
+  }
+});
+
+test('isValidTimeZone stays exported for hosts that want strictness', () => {
+  assert.equal(isValidTimeZone('America/Los_Angeles'), true);
+  assert.equal(isValidTimeZone('Not/A_Real_Zone'), false);
 });
