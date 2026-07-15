@@ -1070,6 +1070,23 @@ export class DiscordAdapter {
         });
       }
     });
+    // Active threads are not part of guild.channels.fetch(); list them too so
+    // the agent can discover ongoing thread conversations (a thread under a
+    // whitelisted parent is allowed, matching channelAllowed's semantics).
+    try {
+      const active = await guild.channels.fetchActiveThreads();
+      active.threads.forEach((t) => {
+        if (!this.channelAllowed(guildId, t.id, t.parentId)) return;
+        result.push({
+          id: t.id,
+          name: t.name,
+          type: 'thread',
+          parentId: t.parentId ?? undefined,
+        });
+      });
+    } catch {
+      // Thread listing is best-effort; channel listing still stands.
+    }
     return result;
   }
 

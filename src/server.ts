@@ -2351,7 +2351,12 @@ export class DiscordMcplServer {
           ? `#${msg.channelName}${msg.guildName ? ` in ${msg.guildName}` : ''}`
           : `channel ${msg.channelId}`;
         const wasSubscribed = this.subscribedChannels.has(msg.channelId);
-        if (!wasSubscribed) {
+        // DISCORD_AUTO_SUBSCRIBE_ON_MENTION=false keeps mentions from silently
+        // growing the ambient-subscription set (busy multi-bot servers would
+        // otherwise subscribe the agent to every channel it's ever pinged in).
+        // Mentions/DMs still always arrive; only the ambient follow is opt-in.
+        const autoSubscribe = process.env.DISCORD_AUTO_SUBSCRIBE_ON_MENTION !== 'false';
+        if (!wasSubscribed && autoSubscribe) {
           this.subscribedChannels.add(msg.channelId);
           this.saveSubscriptions();
           // Announce only on a GENUINELY new subscription. Previously this
@@ -2362,6 +2367,12 @@ export class DiscordMcplServer {
               `Ambient (non-mention) messages from this channel will now arrive in your context. ` +
               `Mentions and DMs always come through regardless of subscriptions. ` +
               `To stop ambient delivery from here: unsubscribe_channel("${msg.channelId}").</system>`,
+          );
+        } else if (!wasSubscribed) {
+          blocks.push(
+            `<system>You were mentioned in ${where}. You are NOT subscribed to its ambient ` +
+              `(non-mention) traffic; mentions and DMs always reach you. To follow this ` +
+              `channel ambiently: subscribe_channel("${msg.channelId}").</system>`,
           );
         }
       } else {
