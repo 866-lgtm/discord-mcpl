@@ -987,6 +987,15 @@ export class DiscordMcplServer {
     name: string,
     args: Record<string, unknown>,
   ): Promise<unknown> {
+    // Accept MCPL-namespaced channel ids (`discord:<guildId>:<channelId>`)
+    // anywhere a raw snowflake is expected. Host-side modules (e.g.
+    // connectome-host's set_channel_mode) operate on the namespaced form the
+    // wake gate sees; without this, a namespaced id lands in subscription /
+    // mute / watermark sets keyed by raw ids and silently never matches.
+    if (typeof args.channelId === 'string') {
+      const parsed = parseMcplChannelId(args.channelId);
+      if (parsed) args = { ...args, channelId: parsed.channelId };
+    }
     switch (name) {
       // For all send_* tools below: update sticky-reply state so the
       // afterInference hook knows the agent explicitly chose a channel
