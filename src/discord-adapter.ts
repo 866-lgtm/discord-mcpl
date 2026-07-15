@@ -147,6 +147,13 @@ export interface DiscordChannelInfo {
   parentId?: string;
 }
 
+export interface DiscordMemberInfo {
+  id: string;
+  username: string;
+  displayName: string;
+  isBot: boolean;
+}
+
 export interface HistoryMessage {
   id: string;
   authorId: string;
@@ -1009,6 +1016,23 @@ export class DiscordAdapter {
     } finally {
       if (timer) clearTimeout(timer);
     }
+  }
+
+  /** List guild members (humans and bots) so the agent can discover who is
+   *  around and mention them. Warms the member cache first (timeout-guarded —
+   *  see warmGuildMemberCache) and reads from cache, so a portal-disabled
+   *  GuildMembers intent degrades to whatever members are cached rather than
+   *  hanging. */
+  async listMembers(guildId: string): Promise<DiscordMemberInfo[]> {
+    const guild = await this.client.guilds.fetch(guildId);
+    if (!guild) throw new Error(`Guild ${guildId} not found`);
+    await this.warmGuildMemberCache(guild);
+    return guild.members.cache.map((m) => ({
+      id: m.user.id,
+      username: m.user.username,
+      displayName: m.displayName ?? m.user.username,
+      isBot: m.user.bot,
+    }));
   }
 
   /** Produce a human-readable label for a channel id, for use in

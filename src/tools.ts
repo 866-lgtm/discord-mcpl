@@ -151,6 +151,21 @@ export const toolDefinitions: ToolDefinition[] = [
     },
   },
   {
+    name: 'list_members',
+    description:
+      'List the members of a Discord guild (humans and bots) with their ids, ' +
+      'usernames, and display names — use it to see who is around and to get ' +
+      'the id for a real ping: mention someone with <@id> (their numeric id), ' +
+      'not their name in brackets.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        guildId: { type: 'string', description: 'Discord guild ID' },
+      },
+      required: ['guildId'],
+    },
+  },
+  {
     name: 'list_emojis',
     description:
       'List the custom (server) emojis available to use. Put `token` (e.g. ' +
