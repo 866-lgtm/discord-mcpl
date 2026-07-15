@@ -2,7 +2,7 @@
  * MCPL channel management — maps Discord channels to MCPL ChannelDescriptors.
  */
 
-import type { ChannelDescriptor } from '@connectome/mcpl-core';
+import type { ChannelDescriptor } from '@animalabs/mcpl-core';
 import type { DiscordChannelInfo } from './discord-adapter.js';
 
 /** MCPL channel ID format: discord:<guildId>:<channelId> */

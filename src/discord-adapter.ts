@@ -28,6 +28,7 @@ import {
 } from 'discord.js';
 import { existsSync, statSync } from 'node:fs';
 import { basename } from 'node:path';
+import { dbg } from './debug-log.js';
 
 /** Maximum attachments Discord accepts on a single message. */
 const MAX_DISCORD_ATTACHMENTS = 10;
@@ -1182,8 +1183,31 @@ export class DiscordAdapter {
 
   private setupEvents(): void {
     this.client.on('messageCreate', (message: Message) => {
-      if (!this.shouldHandle(message)) return;
-      this.messageHandler?.(this.convertMessage(message));
+      const base = {
+        msgId: message.id,
+        guildId: message.guildId,
+        channelId: message.channelId,
+        authorId: message.author.id,
+        authorIsBot: message.author.bot,
+        messageType: message.type,
+        attachmentCount: message.attachments.size,
+        mentionCount: message.mentions.users.size,
+      };
+      dbg('gateway:message-create', base);
+
+      const dropReason = this.messageFilterReason(message);
+      if (dropReason) {
+        dbg('gateway:message-create-drop', { ...base, reason: dropReason });
+        return;
+      }
+
+      try {
+        this.messageHandler?.(this.convertMessage(message));
+      } catch (err) {
+        const error = err instanceof Error ? err.message : String(err);
+        dbg('gateway:message-create-error', { ...base, error });
+        console.error('[discord-mcpl] Failed to convert Discord message:', error);
+      }
     });
 
     this.client.on('messageUpdate', (_old, newMsg) => {
@@ -1309,7 +1333,67 @@ export class DiscordAdapter {
     });
 
     this.client.on('error', (err: Error) => {
+      dbg('gateway:client-error', { error: err.message });
       console.error('[discord-mcpl] Client error:', err.message);
+    });
+
+    this.client.on('warn', (message: string) => {
+      dbg('gateway:warn', { message });
+    });
+
+    this.client.on('shardReady', (shardId, unavailableGuilds) => {
+      dbg('gateway:shard-ready', {
+        shardId,
+        unavailableGuilds: unavailableGuilds?.size ?? 0,
+        status: this.client.ws.status,
+        pingMs: this.client.ws.ping,
+      });
+    });
+
+    this.client.on('shardDisconnect', (event, shardId) => {
+      dbg('gateway:shard-disconnect', {
+        shardId,
+        code: event.code,
+        reason: event.reason,
+        wasClean: event.wasClean,
+        status: this.client.ws.status,
+        pingMs: this.client.ws.ping,
+      });
+    });
+
+    this.client.on('shardReconnecting', (shardId) => {
+      dbg('gateway:shard-reconnecting', {
+        shardId,
+        status: this.client.ws.status,
+        pingMs: this.client.ws.ping,
+      });
+    });
+
+    this.client.on('shardResume', (shardId, replayedEvents) => {
+      dbg('gateway:shard-resume', {
+        shardId,
+        replayedEvents,
+        status: this.client.ws.status,
+        pingMs: this.client.ws.ping,
+      });
+    });
+
+    this.client.on('shardError', (err, shardId) => {
+      dbg('gateway:shard-error', {
+        shardId,
+        error: err.message,
+        status: this.client.ws.status,
+        pingMs: this.client.ws.ping,
+      });
+      console.error(`[discord-mcpl] Gateway shard ${shardId} error:`, err.message);
+    });
+
+    this.client.on('invalidated', () => {
+      dbg('gateway:invalidated', {
+        status: this.client.ws.status,
+        pingMs: this.client.ws.ping,
+      });
+      console.error('[discord-mcpl] Gateway session invalidated');
     });
   }
 
@@ -1327,23 +1411,25 @@ export class DiscordAdapter {
     return allowed.has(channelId) || (parentId != null && allowed.has(parentId));
   }
 
-  private shouldHandle(message: Message): boolean {
-    if (message.author.id === this.client.user?.id) return false;
+  private messageFilterReason(message: Message): string | null {
+    if (message.author.id === this.client.user?.id) return 'self-authored';
     if (this.guildIds?.length && message.guildId && !this.guildIds.includes(message.guildId)) {
-      return false;
+      return 'guild-not-allowed';
     }
     // DMs: when a DM user whitelist is configured, drop DMs from anyone else.
     if (!message.guildId && this.dmUsers && !this.dmUsers.has(message.author.id)) {
-      return false;
+      return 'dm-user-not-allowed';
     }
     if (message.guildId) {
       const parentId =
         message.channel && 'parentId' in message.channel
           ? ((message.channel as { parentId?: string | null }).parentId ?? null)
           : null;
-      if (!this.channelAllowed(message.guildId, message.channelId, parentId)) return false;
+      if (!this.channelAllowed(message.guildId, message.channelId, parentId)) {
+        return 'channel-not-allowed';
+      }
     }
-    return true;
+    return null;
   }
 
   private convertMessage(message: Message): DiscordMessageData {

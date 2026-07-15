@@ -25,7 +25,7 @@
  */
 
 import * as net from 'node:net';
-import { McplConnection } from '@connectome/mcpl-core';
+import { McplConnection } from '@animalabs/mcpl-core';
 import { DiscordAdapter } from './discord-adapter.js';
 import { DiscordMcplServer } from './server.js';
 import {

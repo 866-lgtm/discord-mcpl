@@ -15,7 +15,8 @@ import {
   ERR_UNKNOWN_FEATURE_SET,
   ERR_UNKNOWN_CHANNEL,
   ERR_CHECKPOINT_NOT_FOUND,
-} from '@connectome/mcpl-core';
+} from '@animalabs/mcpl-core';
+import { formatAgentDateTime, resolveAgentTimeZone } from './timezone.js';
 
 import type {
   JsonRpcRequest,
@@ -43,7 +44,7 @@ import type {
   ContentBlock,
   ChannelsOutgoingChunkParams,
   ChannelsOutgoingCompleteParams,
-} from '@connectome/mcpl-core';
+} from '@animalabs/mcpl-core';
 
 import type { DiscordAdapter, DiscordMessageData, DiscordAttachment, OutgoingFile } from './discord-adapter.js';
 import type { ChatInputCommandInteraction } from 'discord.js';
@@ -53,9 +54,10 @@ import { featureSets, isEnabled, featureSetForTool } from './feature-sets.js';
 import { ChannelManager, mcplChannelId, parseMcplChannelId, toDescriptor } from './channels.js';
 import { saveFiltersFile, type DiscordFilters } from './filters.js';
 import { StateTracker } from './state.js';
-import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import sharp from 'sharp';
+import { dbg } from './debug-log.js';
 
 /** A Discord message must carry text and/or attachments — reject empty sends. */
 function requireContentOrFiles(content: string, files: OutgoingFile[] | undefined): void {
@@ -71,22 +73,7 @@ function requireContentOrFiles(content: string, files: OutgoingFile[] | undefine
  *  Match by prefix (`startsWith`) so trailing whitespace or auto-appended
  *  text doesn't slip through. Case-sensitive: a literal `m continue` only. */
 const CHX_NOOP_PREFIX = 'm continue';
-
-// Diagnostic file logger — bypasses the host's stderr capture (which has been
-// observed to silently drop lines on some host builds). Set DISCORD_MCPL_DEBUG_LOG
-// in the spawn env to a writable absolute path to enable; leave unset for no-op.
-const _DEBUG_LOG_PATH = process.env.DISCORD_MCPL_DEBUG_LOG;
-function dbg(tag: string, info: Record<string, unknown> = {}): void {
-  if (!_DEBUG_LOG_PATH) return;
-  try {
-    appendFileSync(
-      _DEBUG_LOG_PATH,
-      `${new Date().toISOString()} ${tag} ${JSON.stringify(info)}\n`,
-    );
-  } catch {
-    // Logging is best-effort; never break the server because of it.
-  }
-}
+const AGENT_TIME_ZONE = resolveAgentTimeZone();
 
 // ============================================================================
 // Image normalization (downsample-on-ingest)
@@ -1771,7 +1758,7 @@ export class DiscordMcplServer {
       if (!keepAll) attrs.push(`lines="${kept.length}"`);
       attrs.push(`reason="${isDM ? 'dm' : hadMention ? 'mention' : 'backscroll'}"`);
       const lines = kept.map((m) => {
-        const ts = m.timestamp.toISOString();
+        const ts = formatAgentDateTime(m.timestamp, AGENT_TIME_ZONE);
         const att =
           m.attachments && m.attachments.length > 0
             ? ` [attachments: ${m.attachments.map((a) => a.name).join(', ')}]`
@@ -2398,7 +2385,7 @@ export class DiscordMcplServer {
         attrs.push(`count="${backscrollMsgs.length}"`);
         const open = `<backscroll ${attrs.join(' ')}>`;
         const lines = backscrollMsgs.map((m) => {
-          const ts = m.timestamp.toISOString();
+          const ts = formatAgentDateTime(m.timestamp, AGENT_TIME_ZONE);
           const att = m.attachments && m.attachments.length > 0
             ? ` [attachments: ${m.attachments.map((a) => a.name).join(', ')}]`
             : '';
