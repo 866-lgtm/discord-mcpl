@@ -1115,6 +1115,16 @@ export class DiscordMcplServer {
         if (typeof channelId !== 'string' || channelId.length === 0) {
           throw new Error('channelId is required');
         }
+        // Validate before persisting: a mistyped id (e.g. a MESSAGE snowflake)
+        // otherwise "subscribes" successfully while every send to it returns
+        // Unknown Channel and no ambient traffic ever arrives.
+        if (!(await this.discord.channelExists(channelId))) {
+          throw new Error(
+            `No channel with id ${channelId} is visible to this bot — that may be a ` +
+              'message id rather than a channel id. Use list_channels to find the right ' +
+              'channel snowflake; nothing was subscribed.',
+          );
+        }
         const wasNew = !this.subscribedChannels.has(channelId);
         this.subscribedChannels.add(channelId);
         if (wasNew) this.saveSubscriptions();

@@ -1035,6 +1035,20 @@ export class DiscordAdapter {
     }));
   }
 
+  /** True iff the id resolves to a channel the bot can actually see.
+   *  Used to validate agent-supplied ids before they enter persistent
+   *  state (subscriptions) — snowflakes are easy to mix up with message
+   *  ids, and a silently-wrong subscription looks like success while
+   *  every send to it 404s with "Unknown Channel". */
+  async channelExists(channelId: string): Promise<boolean> {
+    try {
+      const ch = await this.client.channels.fetch(channelId);
+      return ch !== null;
+    } catch {
+      return false;
+    }
+  }
+
   /** Produce a human-readable label for a channel id, for use in
    *  sticky-shift notices to the agent. Tries cache then a single
    *  REST fetch; falls back to the raw id if either fails. */
