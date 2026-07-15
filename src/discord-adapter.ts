@@ -559,7 +559,14 @@ export class DiscordAdapter {
       const isLast = i === chunks.length - 1;
       const sent = await (channel as TextChannel | DMChannel).send({
         content: chunks[i] || undefined,
-        reply: i === 0 && options?.replyTo ? { messageReference: options.replyTo } : undefined,
+        // failIfNotExists:false — a stale/deleted/mistyped reply target degrades
+        // to a normal (unthreaded) message instead of failing the whole send
+        // with "message_reference: Unknown message". The content arriving beats
+        // the thread line rendering.
+        reply:
+          i === 0 && options?.replyTo
+            ? { messageReference: options.replyTo, failIfNotExists: false }
+            : undefined,
         files: isLast && attachments.length > 0 ? attachments : undefined,
       });
       lastId = sent.id;
