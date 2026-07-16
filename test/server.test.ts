@@ -54,6 +54,8 @@ class MockDiscordAdapter {
 
   sentMessages: Array<{ channelId: string; content: string; replyTo?: string }> = [];
   deletedMessages: Array<{ channelId: string; messageId: string }> = [];
+  reactions: Array<{ channelId: string; messageId: string; emoji: string }> = [];
+  removedReactions: Array<{ channelId: string; messageId: string; emoji: string }> = [];
   private nextMessageId = 1;
 
   get isConnected(): boolean { return true; }
@@ -102,7 +104,13 @@ class MockDiscordAdapter {
     this.deletedMessages.push({ channelId, messageId });
   }
 
-  async addReaction(): Promise<void> {}
+  async addReaction(channelId: string, messageId: string, emoji: string): Promise<void> {
+    this.reactions.push({ channelId, messageId, emoji });
+  }
+
+  async removeReaction(channelId: string, messageId: string, emoji: string): Promise<void> {
+    this.removedReactions.push({ channelId, messageId, emoji });
+  }
 
   /** Messages the next fetchHistory/fetchAround call should return. Tests set
    *  this to drive the reconnect catch-up sweep. */
@@ -324,6 +332,63 @@ describe('DiscordMcplServer', () => {
     await serverPromise;
   });
 
+  it('tools/call remove_reaction removes only this bot reaction through the adapter', async () => {
+    const { client, serverConn, discord } = await createTestPair();
+    const server = new DiscordMcplServer(discord as unknown as DiscordAdapter);
+    const serverPromise = server.serve(serverConn);
+
+    await mcpHandshake(client);
+
+    const result = (await client.sendRequest('tools/call', {
+      name: 'remove_reaction',
+      arguments: { channelId: 'c1', messageId: 'm1', emoji: '🫥' },
+    })) as { isError?: boolean };
+
+    assert.ok(!result.isError);
+    assert.deepEqual(discord.removedReactions, [
+      { channelId: 'c1', messageId: 'm1', emoji: '🫥' },
+    ]);
+
+    client.close();
+    await serverPromise;
+  });
+
+  it('/undo leaves awareness reactions to the host durable ledger', async () => {
+    const discord = new MockDiscordAdapter();
+    const server = new DiscordMcplServer(discord as unknown as DiscordAdapter) as any;
+    server.conn = {
+      sendRequest: async () => ({
+        ok: true,
+        messagesRemoved: 1,
+        removedRefs: [
+          { serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'm1' },
+        ],
+        lastVisible: null,
+      }),
+    };
+    let reply = '';
+    const interaction = {
+      commandName: 'undo',
+      user: { id: 'admin-1', username: 'Admin' },
+      channelId: 'c1',
+      options: { getInteger: () => 1 },
+      deferReply: async () => {},
+      editReply: async (content: string) => { reply = content; },
+      reply: async () => {},
+    };
+    const previousAdmins = process.env.DISCORD_ADMIN_USERS;
+    process.env.DISCORD_ADMIN_USERS = 'admin-1';
+    try {
+      await server.handleSlashCommand(interaction);
+    } finally {
+      if (previousAdmins === undefined) delete process.env.DISCORD_ADMIN_USERS;
+      else process.env.DISCORD_ADMIN_USERS = previousAdmins;
+    }
+
+    assert.equal(discord.reactions.length, 0);
+    assert.match(reply, /old branch preserved/);
+  });
+
   it('tools/call list_guilds works', async () => {
     const { client, serverConn, discord } = await createTestPair();
     const server = new DiscordMcplServer(discord as unknown as DiscordAdapter);
@@ -381,6 +446,8 @@ describe('DiscordMcplServer', () => {
       const p = pushMsg.request.params as PushEventParams;
       assert.equal(p.featureSet, 'discord.messaging');
       assert.ok(p.payload.content[0].type === 'text');
+      const rendered = (p.payload.content[0] as { text?: string }).text ?? '';
+      assert.ok(!rendered.includes('<backscroll'), 'a closed-channel mention must not auto-fetch history');
       client.sendResponse(pushMsg.request.id, { accepted: true });
     }
 
@@ -486,6 +553,62 @@ describe('DiscordMcplServer', () => {
       assert.equal(p.messages.length, 1);
       assert.equal(p.messages[0].author.name, 'Bob');
       client.sendResponse(inMsg.request.id, { results: [{ messageId: 'dm2', accepted: true }] });
+    }
+
+    client.close();
+    await serverPromise;
+  });
+
+  it('open/close own Discord subscription lifecycle, history, and acknowledgment', async () => {
+    const { client, serverConn, discord } = await createTestPair();
+    const server = new DiscordMcplServer(discord as unknown as DiscordAdapter);
+    const serverPromise = server.serve(serverConn);
+
+    await mcplHandshake(client);
+    const regMsg = await client.nextMessage();
+    if (regMsg.type === 'request') client.sendResponse(regMsg.request.id, {});
+
+    discord.historyToReturn = [{
+      id: 'old1', authorId: 'u1', authorName: 'Alice', isBot: false,
+      content: 'prior context', cleanContent: 'prior context', attachments: [],
+      mentionsBot: false, timestamp: new Date('2026-01-01T00:00:00Z'),
+    }];
+    const opened = await client.sendRequest('channels/open', {
+      channelId: 'discord:g1:c1',
+      type: 'discord',
+      address: { guildId: 'g1', channelId: 'c1' },
+      history: { limit: 10, beforeMessageId: 'trigger1' },
+    }) as ChannelsOpenResult & { history?: ChannelsIncomingParams['messages'] };
+    assert.equal(opened.channel.id, 'discord:g1:c1');
+    assert.equal(opened.history?.length, 1);
+    assert.equal(opened.history?.[0].messageId, 'old1');
+
+    const ack = await client.sendRequest('channels/acknowledge', {
+      channelId: 'discord:g1:c1',
+      messageId: 'trigger1',
+      intent: 'seen-not-opening',
+      value: '👀',
+    }) as { acknowledged: boolean; representation?: string };
+    assert.equal(ack.acknowledged, true);
+    assert.equal(ack.representation, '👀');
+    assert.deepEqual(discord.reactions, [{ channelId: 'c1', messageId: 'trigger1', emoji: '👀' }]);
+
+    const closed = await client.sendRequest('channels/close', {
+      channelId: 'discord:g1:c1',
+    }) as { closed: boolean };
+    assert.equal(closed.closed, true);
+
+    discord.simulateMessage({
+      id: 'after-close', content: 'still there?', cleanContent: 'still there?',
+      authorId: 'u1', authorName: 'Alice', isBot: false,
+      channelId: 'c1', channelName: 'general', guildId: 'g1', guildName: 'Test Guild',
+      mentions: ['bot_123'], attachments: [], timestamp: new Date(),
+    } as DiscordMessageData);
+    const pushed = await client.nextMessage();
+    assert.equal(pushed.type, 'request');
+    if (pushed.type === 'request') {
+      assert.equal(pushed.request.method, 'push/event');
+      client.sendResponse(pushed.request.id, { accepted: true });
     }
 
     client.close();
@@ -692,9 +815,11 @@ describe('DiscordMcplServer', () => {
       }
     };
 
-    // Subscribe then unsubscribe c1 — this anchors a missed-ambient tally.
-    await call('subscribe_channel', { channelId: 'c1' });
-    await call('unsubscribe_channel', { channelId: 'c1' });
+    // Open then close c1 — this anchors a missed-ambient tally.
+    await client.sendRequest('channels/open', {
+      channelId: 'discord:g1:c1', type: 'discord', address: { guildId: 'g1', channelId: 'c1' },
+    });
+    await client.sendRequest('channels/close', { channelId: 'discord:g1:c1' });
 
     // Ambient message in c1 (not a mention, not a DM, now unsubscribed) → dropped + tallied.
     discord.simulateMessage({
@@ -712,8 +837,10 @@ describe('DiscordMcplServer', () => {
     assert.equal(missed.missedMessages, 1);
     assert.equal(missed.missedCharacters, 'hello world'.length);
 
-    // Resubscribing clears the tally.
-    await call('subscribe_channel', { channelId: 'c1' });
+    // Reopening clears the tally.
+    await client.sendRequest('channels/open', {
+      channelId: 'discord:g1:c1', type: 'discord', address: { guildId: 'g1', channelId: 'c1' },
+    });
     const after = await call('channel_missed', { channelId: 'c1' });
     assert.equal(after.subscribed, true);
     assert.equal(after.missedMessages, 0);

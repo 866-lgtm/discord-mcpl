@@ -5,6 +5,14 @@
 import type { ChannelDescriptor } from '@animalabs/mcpl-core';
 import type { DiscordChannelInfo } from './discord-adapter.js';
 
+export type DiscordChannelDescriptor = ChannelDescriptor & {
+  initiallyOpen?: boolean;
+  capabilities?: {
+    history?: { maxMessages?: number; supportsBeforeMessage?: boolean };
+    acknowledgment?: { kind?: string; supportsValue?: boolean };
+  };
+};
+
 /** MCPL channel ID format: discord:<guildId>:<channelId> */
 export function mcplChannelId(guildId: string, channelId: string): string {
   return `discord:${guildId}:${channelId}`;
@@ -22,7 +30,9 @@ export function toDescriptor(
   guildId: string,
   guildName: string,
   channel: DiscordChannelInfo,
-): ChannelDescriptor {
+  initiallyOpen = false,
+  maxHistory = 500,
+): DiscordChannelDescriptor {
   return {
     id: mcplChannelId(guildId, channel.id),
     type: 'discord',
@@ -30,6 +40,11 @@ export function toDescriptor(
     direction: 'bidirectional',
     address: { guildId, channelId: channel.id },
     metadata: { channelType: channel.type, parentId: channel.parentId },
+    initiallyOpen,
+    capabilities: {
+      history: { maxMessages: maxHistory, supportsBeforeMessage: true },
+      acknowledgment: { kind: 'reaction', supportsValue: true },
+    },
   };
 }
 

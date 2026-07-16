@@ -75,6 +75,7 @@ export function featureSetForTool(toolName: string): string | undefined {
     case 'reply_message':
     case 'send_dm':
     case 'add_reaction':
+    case 'remove_reaction':
     case 'list_emojis':
     case 'edit_message':
     case 'delete_message':

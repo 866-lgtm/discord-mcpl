@@ -59,6 +59,23 @@ import { dirname } from 'node:path';
 import sharp from 'sharp';
 import { dbg } from './debug-log.js';
 
+type ChannelOpenRequest = ChannelsOpenParams & {
+  channelId?: string;
+  history?: { limit: number; beforeMessageId?: string; sinceLastSeen?: boolean };
+};
+
+type ChannelOpenResponse = ChannelsOpenResult & {
+  history?: ChannelsIncomingParams['messages'];
+  historyTruncated?: boolean;
+};
+
+interface ChannelAcknowledgeRequest {
+  channelId: string;
+  messageId: string;
+  intent: string;
+  value?: string;
+}
+
 /** A Discord message must carry text and/or attachments — reject empty sends. */
 function requireContentOrFiles(content: string, files: OutgoingFile[] | undefined): void {
   if ((!content || !content.trim()) && (!files || files.length === 0)) {
@@ -175,12 +192,9 @@ export class DiscordMcplServer {
   // communication last happen, in either direction." Tracked in
   // `lastChannelId` below.
 
-  /** Channels the agent has opted into for ambient (non-mention, non-DM)
-   *  message delivery. Mentions and DMs always come through regardless of
-   *  this set — it only gates passive awareness of channel chatter.
-   *  Persisted to `DISCORD_SUBSCRIPTIONS_FILE` (a JSON file of channel IDs)
-   *  so the subscription list survives restarts. Loaded eagerly at the
-   *  first subscription-related call below. */
+  /** Actual runtime subscriptions. Desired state is host-owned and durable in
+   *  Chronicle. `DISCORD_SUBSCRIPTIONS_FILE` is read only as a one-time legacy
+   *  bootstrap hint; channels/open and channels/close reconcile this set. */
   private subscribedChannels = new Set<string>();
   private subscriptionsLoaded = false;
 
@@ -779,16 +793,22 @@ export class DiscordMcplServer {
         }
 
         case method.CHANNELS_OPEN: {
-          const openP = params as unknown as ChannelsOpenParams;
-          const result = this.handleChannelOpen(openP);
+          const openP = params as unknown as ChannelOpenRequest;
+          const result = await this.handleChannelOpen(openP);
           conn.sendResponse(req.id, result);
           break;
         }
 
         case method.CHANNELS_CLOSE: {
           const closeP = params as unknown as ChannelsCloseParams;
-          const closed = this.channelManager.close(closeP.channelId);
-          const result: ChannelsCloseResult = { closed };
+          const result = this.handleChannelClose(closeP);
+          conn.sendResponse(req.id, result);
+          break;
+        }
+
+        case 'channels/acknowledge': {
+          const ack = params as unknown as ChannelAcknowledgeRequest;
+          const result = await this.handleChannelAcknowledge(ack);
           conn.sendResponse(req.id, result);
           break;
         }
@@ -1036,6 +1056,14 @@ export class DiscordMcplServer {
         );
         return 'Reaction added';
 
+      case 'remove_reaction':
+        await this.discord.removeReaction(
+          args.channelId as string,
+          args.messageId as string,
+          args.emoji as string,
+        );
+        return 'Reaction removed';
+
       case 'edit_message':
         await this.discord.editMessage(
           args.channelId as string,
@@ -1110,57 +1138,15 @@ export class DiscordMcplServer {
         return 'Channel deleted';
 
       case 'subscribe_channel': {
-        this.ensureSubscriptionsLoaded();
-        const channelId = args.channelId as string;
-        if (typeof channelId !== 'string' || channelId.length === 0) {
-          throw new Error('channelId is required');
-        }
-        // Validate before persisting: a mistyped id (e.g. a MESSAGE snowflake)
-        // otherwise "subscribes" successfully while every send to it returns
-        // Unknown Channel and no ambient traffic ever arrives.
-        if (!(await this.discord.channelExists(channelId))) {
-          throw new Error(
-            `No channel with id ${channelId} is visible to this bot — that may be a ` +
-              'message id rather than a channel id. Use list_channels to find the right ' +
-              'channel snowflake; nothing was subscribed.',
-          );
-        }
-        const wasNew = !this.subscribedChannels.has(channelId);
-        this.subscribedChannels.add(channelId);
-        if (wasNew) this.saveSubscriptions();
-        // Resubscribing means ambient flows again, so "missed since unsubscribe"
-        // no longer applies — clear the tally.
-        this.ensureWatermarkLoaded();
-        if (this.missedTally.delete(channelId)) this.saveWatermark();
-        return wasNew
-          ? `Subscribed to ambient messages from channel ${channelId}.`
-          : `Already subscribed to channel ${channelId}.`;
+        throw new Error(
+          'subscribe_channel is retired. Use the host channel_open tool with the MCPL channel id.',
+        );
       }
 
       case 'unsubscribe_channel': {
-        this.ensureSubscriptionsLoaded();
-        const channelId = args.channelId as string;
-        if (typeof channelId !== 'string' || channelId.length === 0) {
-          throw new Error('channelId is required');
-        }
-        const removed = this.subscribedChannels.delete(channelId);
-        if (removed) this.saveSubscriptions();
-        // Start (or restart) a missed-ambient tally anchored at the last message
-        // the agent saw here, so it can later ask how much it missed.
-        if (removed) {
-          this.ensureWatermarkLoaded();
-          const anchor = this.forwardedWatermark.get(channelId) ?? '';
-          this.missedTally.set(channelId, {
-            anchorId: anchor,
-            talliedThrough: anchor,
-            messages: 0,
-            characters: 0,
-          });
-          this.saveWatermark();
-        }
-        return removed
-          ? `Unsubscribed from ambient messages in channel ${channelId}. Mentions and DMs from there will still arrive. Use channel_missed("${channelId}") to see how much ambient you miss.`
-          : `Channel ${channelId} was not subscribed.`;
+        throw new Error(
+          'unsubscribe_channel is retired. Use the host channel_close tool with the MCPL channel id.',
+        );
       }
 
       case 'mute_channel': {
@@ -1175,7 +1161,7 @@ export class DiscordMcplServer {
         // Muting implies leaving: drop any ambient subscription so the channel
         // stops delivering; it also won't auto-subscribe back in while muted.
         this.ensureSubscriptionsLoaded();
-        if (this.subscribedChannels.delete(channelId)) this.saveSubscriptions();
+        this.subscribedChannels.delete(channelId);
         return wasNew
           ? `Muted channel ${channelId}: no ambient, no wake on mention/reply, and it will not auto-subscribe you back in. Reverse with unmute_channel("${channelId}").`
           : `Channel ${channelId} was already muted.`;
@@ -1190,7 +1176,7 @@ export class DiscordMcplServer {
         const removed = this.mutedChannels.delete(channelId);
         if (removed) this.saveMuted();
         return removed
-          ? `Unmuted channel ${channelId}. Mentions and DMs will reach you again; use subscribe_channel("${channelId}") to also receive ambient.`
+          ? `Unmuted channel ${channelId}. Direct addresses will reach you again; use channel_open with its MCPL id for ordinary traffic.`
           : `Channel ${channelId} was not muted.`;
       }
 
@@ -1251,7 +1237,7 @@ export class DiscordMcplServer {
           note:
             'Ambient messages (non-mention, non-DM) you have missed in this channel since you unsubscribed. ' +
             'Mentions and DMs were still delivered and are not counted. Counts cover the bot\'s online time plus ' +
-            'an on-reconnect backfill of downtime gaps. Resubscribe with subscribe_channel to start receiving these again.',
+            'an on-reconnect backfill of downtime gaps. Reopen with channel_open to start receiving these again.',
         };
       }
 
@@ -1434,8 +1420,8 @@ export class DiscordMcplServer {
 
   // ── Subscription persistence ──
 
-  /** Path to the JSON file backing ambient-channel subscriptions.
-   *  When unset, subscriptions are in-memory only (lost on restart). */
+  /** Path to the retired subscription file. Read as a bootstrap hint for a
+   *  host whose Chronicle has not yet recorded desired state. */
   private subscriptionsFile(): string | undefined {
     const p = process.env.DISCORD_SUBSCRIPTIONS_FILE;
     return p && p.length > 0 ? p : undefined;
@@ -1460,18 +1446,6 @@ export class DiscordMcplServer {
       // Corrupt or unreadable file: start with empty set; don't fail boot.
       console.error('[discord-mcpl] Failed to load subscriptions:', (err as Error).message);
       dbg('subscriptions:load-failed', { error: (err as Error).message, path });
-    }
-  }
-
-  private saveSubscriptions(): void {
-    const path = this.subscriptionsFile();
-    if (!path) return; // in-memory mode
-    try {
-      mkdirSync(dirname(path), { recursive: true });
-      writeFileSync(path, JSON.stringify([...this.subscribedChannels].sort(), null, 2) + '\n');
-    } catch (err) {
-      console.error('[discord-mcpl] Failed to save subscriptions:', (err as Error).message);
-      dbg('subscriptions:save-failed', { error: (err as Error).message, path });
     }
   }
 
@@ -1886,9 +1860,16 @@ export class DiscordMcplServer {
       return;
     }
 
+    this.ensureSubscriptionsLoaded();
     const textChannels = this.discord.getTextChannels();
     const descriptors = textChannels.map(({ guildId, guildName, channel }) =>
-      toDescriptor(guildId, guildName, channel),
+      toDescriptor(
+        guildId,
+        guildName,
+        channel,
+        this.subscribedChannels.has(channel.id),
+        this.backscrollLimitFor(channel.id),
+      ),
     );
     dbg('registerDiscordChannels:enumerated', {
       count: descriptors.length,
@@ -1942,7 +1923,13 @@ export class DiscordMcplServer {
   } {
     const textChannels = this.discord.getTextChannels();
     const descriptors = textChannels.map(({ guildId, guildName, channel }) =>
-      toDescriptor(guildId, guildName, channel),
+      toDescriptor(
+        guildId,
+        guildName,
+        channel,
+        this.isChannelSubscribed(channel.id),
+        this.backscrollLimitFor(channel.id),
+      ),
     );
     const added = this.registerAndNotifyNew(descriptors);
     dbg('refreshChannels', { visible: descriptors.length, added: added.length });
@@ -1956,25 +1943,120 @@ export class DiscordMcplServer {
     };
   }
 
-  private handleChannelOpen(params: ChannelsOpenParams): ChannelsOpenResult {
-    // Find matching channel by type + address
+  private async handleChannelOpen(params: ChannelOpenRequest): Promise<ChannelOpenResponse> {
+    let desc = params.channelId ? this.channelManager.get(params.channelId) : undefined;
+
+    // Compatibility with hosts that predate exact channelId routing.
     const addr = params.address as { guildId?: string; channelId?: string } | undefined;
-    if (params.type === 'discord' && addr?.guildId && addr?.channelId) {
-      const desc = this.channelManager.openByDiscordId(addr.guildId, addr.channelId);
-      if (desc) {
-        return { channel: desc };
-      }
+    if (!desc && params.type === 'discord' && addr?.guildId && addr?.channelId) {
+      desc = this.channelManager.get(mcplChannelId(addr.guildId, addr.channelId));
     }
 
-    // Try to find by iterating registered channels
-    for (const desc of this.channelManager.getAll()) {
-      if (desc.type === params.type) {
-        this.channelManager.open(desc.id);
-        return { channel: desc };
+    if (!desc) {
+      for (const candidate of this.channelManager.getAll()) {
+        if (candidate.type === params.type) {
+          desc = candidate;
+          break;
+        }
       }
     }
+    if (!desc) throw new Error('No matching channel found');
 
-    throw new Error('No matching channel found');
+    const parsed = parseMcplChannelId(desc.id);
+    if (!parsed) throw new Error(`Invalid Discord channel ID: ${desc.id}`);
+    const result: ChannelOpenResponse = { channel: desc };
+    const requested = params.history?.limit ?? 0;
+    if (requested > 0) {
+      const limit = this.capHistoryLimit(parsed.channelId, Math.min(500, Math.max(0, requested)));
+      const messages = await this.discord.fetchHistory(parsed.channelId, {
+        limit,
+        ...(params.history?.beforeMessageId ? { before: params.history.beforeMessageId } : {}),
+        ...(params.history?.sinceLastSeen
+          ? { after: this.forwardedWatermark.get(parsed.channelId) }
+          : {}),
+      });
+      messages.sort((a, b) => a.timestamp.getTime() - b.timestamp.getTime());
+      result.history = messages.map((message) => ({
+        channelId: desc!.id,
+        messageId: message.id,
+        author: { id: message.authorId, name: message.authorName },
+        timestamp: message.timestamp.toISOString(),
+        content: [textContent(`${message.authorName}: ${message.cleanContent}`)],
+        metadata: {
+          isBot: message.isBot,
+          attachments: message.attachments,
+          reactions: message.reactions ?? [],
+          backscroll: true,
+        },
+      }));
+      result.historyTruncated = requested > limit;
+    }
+
+    // Commit actual lifecycle only after any requested history fetch succeeds,
+    // so a failed open cannot leave Discord subscribed while the host records
+    // the operation as failed.
+    this.channelManager.open(desc.id);
+    this.subscribeRawChannel(parsed.channelId);
+    return result;
+  }
+
+  private handleChannelClose(params: ChannelsCloseParams): ChannelsCloseResult {
+    const desc = this.channelManager.get(params.channelId);
+    const parsed = parseMcplChannelId(params.channelId);
+    const wasOpen = this.channelManager.close(params.channelId);
+    if (parsed) this.unsubscribeRawChannel(parsed.channelId);
+    return { closed: wasOpen || desc !== undefined };
+  }
+
+  private async handleChannelAcknowledge(params: ChannelAcknowledgeRequest): Promise<{
+    acknowledged: boolean;
+    representation?: string;
+    reason?: string;
+  }> {
+    const parsed = parseMcplChannelId(params.channelId);
+    if (!parsed) {
+      return { acknowledged: false, reason: `Invalid Discord channel ID: ${params.channelId}` };
+    }
+    const representation = params.value?.trim() || '👀';
+    try {
+      await this.discord.addReaction(parsed.channelId, params.messageId, representation);
+      return { acknowledged: true, representation };
+    } catch (error) {
+      return { acknowledged: false, reason: (error as Error).message };
+    }
+  }
+
+  private subscribeRawChannel(channelId: string): void {
+    this.ensureSubscriptionsLoaded();
+    if (!this.subscribedChannels.has(channelId)) {
+      this.subscribedChannels.add(channelId);
+    }
+    this.ensureReactionChannelsLoaded();
+    if (!this.reactionChannels.has(channelId)) {
+      this.reactionChannels.add(channelId);
+    }
+    this.ensureWatermarkLoaded();
+    if (this.missedTally.delete(channelId)) this.saveWatermark();
+    this.ensureMutedLoaded();
+    if (this.mutedChannels.delete(channelId)) this.saveMuted();
+  }
+
+  private unsubscribeRawChannel(channelId: string): void {
+    this.ensureSubscriptionsLoaded();
+    const removed = this.subscribedChannels.delete(channelId);
+    this.ensureReactionChannelsLoaded();
+    this.reactionChannels.delete(channelId);
+    if (removed) {
+      this.ensureWatermarkLoaded();
+      const anchor = this.forwardedWatermark.get(channelId) ?? '';
+      this.missedTally.set(channelId, {
+        anchorId: anchor,
+        talliedThrough: anchor,
+        messages: 0,
+        characters: 0,
+      });
+      this.saveWatermark();
+    }
   }
 
   private async handlePublish(params: ChannelsPublishParams): Promise<ChannelsPublishResult> {
@@ -2121,7 +2203,15 @@ export class DiscordMcplServer {
     this.discord.onChannelCreate((guildId, channel) => {
       if (!this.conn || !this.mcplEnabled) return;
       const guildName = this.discord.getGuildName(guildId);
-      this.registerAndNotifyNew([toDescriptor(guildId, guildName, channel)]);
+      this.registerAndNotifyNew([
+        toDescriptor(
+          guildId,
+          guildName,
+          channel,
+          this.isChannelSubscribed(channel.id),
+          this.backscrollLimitFor(channel.id),
+        ),
+      ]);
     });
 
     // Bot joined a new guild after startup: register all of its existing
@@ -2129,7 +2219,14 @@ export class DiscordMcplServer {
     // only covers channels created *after* the join).
     this.discord.onGuildCreate((guildId, guildName, channels) => {
       if (!this.conn || !this.mcplEnabled) return;
-      const descriptors = channels.map((c) => toDescriptor(guildId, guildName, c));
+      const descriptors = channels.map((c) =>
+        toDescriptor(
+          guildId,
+          guildName,
+          c,
+          this.isChannelSubscribed(c.id),
+          this.backscrollLimitFor(c.id),
+        ));
       const added = this.registerAndNotifyNew(descriptors);
       dbg('onGuildCreate', { guildId, guildName, total: channels.length, added: added.length });
     });
@@ -2138,7 +2235,15 @@ export class DiscordMcplServer {
     this.discord.onChannelAvailable((guildId, channel) => {
       if (!this.conn || !this.mcplEnabled) return;
       const guildName = this.discord.getGuildName(guildId);
-      const added = this.registerAndNotifyNew([toDescriptor(guildId, guildName, channel)]);
+      const added = this.registerAndNotifyNew([
+        toDescriptor(
+          guildId,
+          guildName,
+          channel,
+          this.isChannelSubscribed(channel.id),
+          this.backscrollLimitFor(channel.id),
+        ),
+      ]);
       dbg('onChannelAvailable', { guildId, channelId: channel.id, added: added.length });
     });
 
@@ -2320,17 +2425,15 @@ export class DiscordMcplServer {
       return;
     }
 
-    // First-interaction handling: when we're about to forward our very first
-    // message from this channel (this process), pull a chunk of backscroll
-    // so Lena has context. For guild channels reached via mention, also
-    // auto-subscribe and emit a system note so she knows she's now receiving
-    // ambient messages (and how to opt out). DMs always come through, so no
-    // subscription note for them — just the backscroll.
+    // First-interaction handling is retained only for DMs. Guild mentions in
+    // closed channels are deliberately one-shot push events: the host presents
+    // an invitation and the agent chooses whether to open, including how much
+    // history to request. Receiving a mention must not subscribe implicitly.
     this.ensureSubscriptionsLoaded();
     this.ensureWatermarkLoaded();
     const isFirstInteraction = !this.forwardedWatermark.has(msg.channelId);
     let prefixBlock = '';
-    if (isFirstInteraction && (isMention || isDM)) {
+    if (isFirstInteraction && isDM) {
       const watermark = this.forwardedWatermark.get(msg.channelId);
       let backscrollMsgs: Awaited<ReturnType<typeof this.discord.fetchHistory>> = [];
       try {
@@ -2357,50 +2460,13 @@ export class DiscordMcplServer {
       }
 
       const blocks: string[] = [];
-      // System note: only for guild channels (DMs don't have subscription
-      // semantics — they always come through whether Lena likes it or not).
-      if (!isDM) {
-        const where = msg.channelName
-          ? `#${msg.channelName}${msg.guildName ? ` in ${msg.guildName}` : ''}`
-          : `channel ${msg.channelId}`;
-        const wasSubscribed = this.subscribedChannels.has(msg.channelId);
-        // DISCORD_AUTO_SUBSCRIBE_ON_MENTION=false keeps mentions from silently
-        // growing the ambient-subscription set (busy multi-bot servers would
-        // otherwise subscribe the agent to every channel it's ever pinged in).
-        // Mentions/DMs still always arrive; only the ambient follow is opt-in.
-        const autoSubscribe = process.env.DISCORD_AUTO_SUBSCRIBE_ON_MENTION !== 'false';
-        if (!wasSubscribed && autoSubscribe) {
-          this.subscribedChannels.add(msg.channelId);
-          this.saveSubscriptions();
-          // Announce only on a GENUINELY new subscription. Previously this
-          // push was unconditional, so every process restart's first mention
-          // re-emitted the note into the agent's chronicle.
-          blocks.push(
-            `<system>Auto-subscribed to ${where} because you were mentioned. ` +
-              `Ambient (non-mention) messages from this channel will now arrive in your context. ` +
-              `Mentions and DMs always come through regardless of subscriptions. ` +
-              `To stop ambient delivery from here: unsubscribe_channel("${msg.channelId}").</system>`,
-          );
-        } else if (!wasSubscribed) {
-          blocks.push(
-            `<system>You were mentioned in ${where}. You are NOT subscribed to its ambient ` +
-              `(non-mention) traffic; mentions and DMs always reach you. To follow this ` +
-              `channel ambiently: subscribe_channel("${msg.channelId}").</system>`,
-          );
-        }
-      } else {
-        // DMs have no subscription semantics, but on the first DM from someone
-        // give the agent an explicit reply affordance — otherwise a DM lands as
-        // a bare "[DM] name: ..." with no in-context hint of how to respond, and
-        // an agent would think it needs the bot's numeric user id (the original
-        // complaint). send_dm resolves the sender's name (guild members OR open
-        // DM recipients); the numeric id is the unambiguous fallback.
-        blocks.push(
-          `<system>Direct message from @${msg.authorName} (user id ${msg.authorId}). ` +
-            `To reply, use send_dm("${msg.authorName}") — or send_dm("${msg.authorId}") if the ` +
-            `name is ambiguous. DMs always reach you; there is nothing to subscribe to.</system>`,
-        );
-      }
+      // DMs have no subscription semantics. Give the agent an explicit reply
+      // affordance on the first message from a person.
+      blocks.push(
+        `<system>Direct message from @${msg.authorName} (user id ${msg.authorId}). ` +
+          `To reply, use send_dm("${msg.authorName}") — or send_dm("${msg.authorId}") if the ` +
+          `name is ambiguous. DMs always reach you; there is nothing to subscribe to.</system>`,
+      );
       if (backscrollMsgs.length > 0) {
         const attrs: string[] = [];
         if (msg.channelName) attrs.push(`channel="#${msg.channelName}"`);
@@ -2422,7 +2488,7 @@ export class DiscordMcplServer {
         dbg('backscroll:emitted', {
           channelId: msg.channelId,
           backscrollCount: backscrollMsgs.length,
-          autoSubscribed: !isDM,
+          autoSubscribed: false,
         });
       }
     }

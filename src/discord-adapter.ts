@@ -759,6 +759,27 @@ export class DiscordAdapter {
     await msg.react(this.resolveReactionEmoji(emoji, msg.guild));
   }
 
+  async removeReaction(channelId: string, messageId: string, emoji: string): Promise<void> {
+    const channel = await this.client.channels.fetch(channelId);
+    if (!channel || !('messages' in channel)) {
+      throw new Error(`Channel ${channelId} not found`);
+    }
+    const msg = await (channel as TextChannel).messages.fetch(messageId);
+    const selfId = this.client.user?.id;
+    if (!selfId) throw new Error('Discord bot user is not ready');
+
+    const resolved = this.resolveReactionEmoji(emoji, msg.guild);
+    const customId = resolved.match(/(?:<a?:\w+:|^\w+:)(\d+)>?$/)?.[1];
+    const bare = emoji.trim().replace(/^:+|:+$/g, '');
+    const reaction = msg.reactions.cache.find((candidate) =>
+      candidate.emoji.id === customId
+      || candidate.emoji.name === emoji.trim()
+      || candidate.emoji.name === bare
+      || candidate.emoji.toString() === emoji.trim());
+    if (!reaction) return; // Idempotent: the bot's marker is already absent.
+    await reaction.users.remove(selfId);
+  }
+
   /** Turn a caller-supplied emoji into something discord.js `.react()` accepts.
    *  Unicode chars and the full custom forms ('<:name:id>', 'name:id') pass
    *  through untouched; a bare ':name:' or 'name' is resolved to a cached custom
