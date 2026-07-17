@@ -544,9 +544,27 @@ export class DiscordAdapter {
     content: string,
     options?: { replyTo?: string; files?: OutgoingFile[] },
   ): Promise<{ messageId: string }> {
-    const channel = await this.client.channels.fetch(channelId);
+    let channel;
+    try {
+      channel = await this.client.channels.fetch(channelId);
+    } catch (err) {
+      // Discord's bare "Unknown Channel" (10003) gives the agent nothing to
+      // act on — a guessed or message snowflake looks identical to a real
+      // channel id, so point at list_channels instead of re-surfacing it.
+      if ((err as { code?: number }).code === 10003) {
+        throw new Error(
+          `No channel with id ${channelId} is visible to this bot — that may be a ` +
+            'guessed id or a message id rather than a channel id. Use list_channels ' +
+            'to find the right channel snowflake.',
+        );
+      }
+      throw err;
+    }
     if (!channel || !('send' in channel)) {
-      throw new Error(`Channel ${channelId} not found or not a text channel`);
+      throw new Error(
+        `Channel ${channelId} is not a text channel this bot can send to. ` +
+          'Use list_channels to find valid channel ids.',
+      );
     }
     const resolved = await this.resolveOutgoingMentions(channel, content);
     const attachments = buildAttachments(options?.files);
