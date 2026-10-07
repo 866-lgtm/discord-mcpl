@@ -26,3 +26,9 @@ Workspace mount-prefixed paths must first be resolved to the corresponding host 
 The separate portal interface uses inline base64 attachments; that is not the format used by these Discord tools.
 
 Deployments can expose this document through their resident's file-reading tool. Tool definitions do not assume a particular documentation mount exists.
+
+## Channel filters and deliberate reads
+
+Deliberate reads respect the residence's configured channel filters. `list_channels` leaves a channel outside them out of its listing; `list_channel_members`, `fetch_history` and `fetch_around` refuse such a channel whether it's named or given by numeric ID. A thread follows its parent channel.
+
+The other two filters don't restrict deliberate reads. The guild filter decides which guilds' channels are registered, resolvable by name, and delivered. The DM contact list filters incoming DMs.
