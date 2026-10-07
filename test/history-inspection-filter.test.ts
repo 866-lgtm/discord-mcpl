@@ -2,7 +2,8 @@
  * Deliberate history reads respect the channel filters' inspection boundary
  * (guildChannels, a channel admitted by its parent) for numeric channel ids,
  * as list_channels and list_channel_members already do. guildIds and dmUsers
- * stay delivery filters and don't restrict reads.
+ * stay delivery filters and don't restrict reads. A channel lookup that fails
+ * is returned as the tool's error, with nothing read.
  */
 import { describe, it, type TestContext } from 'node:test';
 import * as assert from 'node:assert/strict';
@@ -20,6 +21,7 @@ const THREAD_OF_ALLOWED = '410000000000000005';
 const THREAD_OF_EXCLUDED = '410000000000000006';
 const OTHER_GUILD = '410000000000000007';
 const DM = '410000000000000008';
+const LOOKUP_FAILS = '410000000000000009'; // a channel whose lookup rejects
 
 const channels: Record<string, Record<string, unknown>> = {
   [ALLOWED]: { guildId: G1, parentId: null },
@@ -36,6 +38,7 @@ function adapterWith(t: TestContext, config: Partial<DiscordAdapterConfig>) {
   t.after(() => client.destroy());
   (client.channels as unknown as { fetch: unknown }).fetch = async (id: string) => {
     if (id === DM) return { id, isDMBased: () => true };
+    if (id === LOOKUP_FAILS) throw new Error('Unknown Channel');
     const c = channels[id];
     return c ? { id, isDMBased: () => false, ...c } : null;
   };
@@ -94,6 +97,19 @@ describe('fetch_history and fetch_around by numeric id', () => {
       const res = await server.handleToolCall(tool, args);
       assert.equal(res.isError, true, `${tool} ${args.channelId}`);
       assert.match(res.content[0].text, REFUSAL);
+    }
+    assert.deepEqual(reads, [], 'no history was read');
+  });
+
+  it('returns a failed channel lookup as its error, before any message is read', async (t) => {
+    const { server, reads } = serverWith(t);
+    for (const [tool, args] of [
+      ['fetch_history', { channelId: LOOKUP_FAILS }],
+      ['fetch_around', { channelId: LOOKUP_FAILS, messageId: '420000000000000001' }],
+    ] as const) {
+      const res = await server.handleToolCall(tool, args);
+      assert.equal(res.isError, true, tool);
+      assert.equal(res.content[0].text, 'Unknown Channel', tool);
     }
     assert.deepEqual(reads, [], 'no history was read');
   });
