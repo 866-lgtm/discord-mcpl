@@ -340,3 +340,10 @@ in the git log and PR descriptions.
   (registration, name resolution, delivery) and the DM contact list
   (incoming DMs) keep their meaning and don't restrict deliberate reads; the
   config docs now say what each filter bounds.
+- **`channels/open` backscroll respects the channel filters too.** A
+  channel registered before `guildChannels` narrowed stays registered until
+  restart (`filters_update` and hot reload only add channels), and opening
+  it with `history.limit > 0` read its backscroll with no filter check. That
+  read now gets the same refusal as `fetch_history`, and the open fails
+  before anything is read or subscribed. An open without history is
+  unchanged.

@@ -3,13 +3,15 @@
  * (guildChannels, a channel admitted by its parent) for numeric channel ids,
  * as list_channels and list_channel_members already do. guildIds and dmUsers
  * stay delivery filters and don't restrict reads. A channel lookup that fails
- * is returned as the tool's error, with nothing read.
+ * is returned as the tool's error, with nothing read. The backscroll a
+ * channels/open requests is held to the same boundary.
  */
 import { describe, it, type TestContext } from 'node:test';
 import * as assert from 'node:assert/strict';
 import type { Client } from 'discord.js';
 import { DiscordAdapter, type DiscordAdapterConfig } from '../src/discord-adapter.js';
 import { DiscordMcplServer } from '../src/server.js';
+import { mcplChannelId, toDescriptor } from '../src/channels.js';
 
 const G1 = '400000000000000001'; // a guild with a channel list
 const G2 = '400000000000000002'; // a guild without one
@@ -183,5 +185,69 @@ describe('fetch_history and fetch_around by numeric id', () => {
       `history:${ALLOWED}`, `history:${THREAD_OF_ALLOWED}`, `history:${UNDER_CATEGORY}`,
       `history:${OTHER_GUILD}`, `history:${DM}`, `around:${ALLOWED}`,
     ]);
+  });
+});
+
+describe('channels/open backscroll', () => {
+  // The registry only grows until restart: filters_update and hot reload add
+  // channels, and only a deleted channel leaves. So a channel registered
+  // before guildChannels narrowed can still be named by channels/open.
+  function serverWith(t: TestContext) {
+    const { adapter, reads } = adapterWith(t, {});
+    const server = new DiscordMcplServer(adapter) as unknown as {
+      channelManager: { register(d: unknown): void; isOpen(id: string): boolean };
+      subscribedChannels: Set<string>;
+      handleChannelOpen(params: { channelId: string; type: string; history?: { limit: number } }): Promise<{
+        history?: Array<{ content: Array<{ text: string }> }>;
+      }>;
+    };
+    const kinds = { [ALLOWED]: 'text', [EXCLUDED]: 'text', [THREAD_OF_EXCLUDED]: 'thread', [LOOKUP_FAILS]: 'text' } as const;
+    for (const [id, type] of Object.entries(kinds)) {
+      const name = `${type}-${id.slice(-1)}`;
+      server.channelManager.register(toDescriptor(G1, 'Guild', { id, name, type, label: `#${name} (Guild)` }));
+    }
+    const opened = (id: string) =>
+      server.channelManager.isOpen(mcplChannelId(G1, id)) || server.subscribedChannels.has(id);
+    return { server, reads, opened };
+  }
+
+  it('refuses backscroll from an excluded channel, and a thread under one, before anything is read or opened', async (t) => {
+    const { server, reads, opened } = serverWith(t);
+    for (const id of [EXCLUDED, THREAD_OF_EXCLUDED]) {
+      await assert.rejects(
+        server.handleChannelOpen({ channelId: mcplChannelId(G1, id), type: 'discord', history: { limit: 20 } }),
+        REFUSAL,
+        id,
+      );
+      assert.equal(opened(id), false, `${id} is neither open nor subscribed`);
+    }
+    assert.deepEqual(reads, [], 'no history was read');
+  });
+
+  it('fails the open with a failed channel lookup, before anything is read or opened', async (t) => {
+    const { server, reads, opened } = serverWith(t);
+    await assert.rejects(
+      server.handleChannelOpen({ channelId: mcplChannelId(G1, LOOKUP_FAILS), type: 'discord', history: { limit: 20 } }),
+      /^Error: Unknown Channel$/,
+    );
+    assert.equal(opened(LOOKUP_FAILS), false);
+    assert.deepEqual(reads, [], 'no history was read');
+  });
+
+  it('still returns backscroll from an allowed channel', async (t) => {
+    const { server, reads, opened } = serverWith(t);
+    const result = await server.handleChannelOpen({
+      channelId: mcplChannelId(G1, ALLOWED), type: 'discord', history: { limit: 20 },
+    });
+    assert.match(result.history?.[0]?.content[0]?.text ?? '', new RegExp(`body in ${ALLOWED}`));
+    assert.equal(opened(ALLOWED), true);
+    assert.deepEqual(reads, [`history:${ALLOWED}`]);
+  });
+
+  it('leaves an open without backscroll as it was, since it reads nothing', async (t) => {
+    const { server, reads, opened } = serverWith(t);
+    await server.handleChannelOpen({ channelId: mcplChannelId(G1, EXCLUDED), type: 'discord' });
+    assert.equal(opened(EXCLUDED), true);
+    assert.deepEqual(reads, []);
   });
 });
