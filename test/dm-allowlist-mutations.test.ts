@@ -19,6 +19,8 @@ function fixture(t: TestContext, dmUsers?: string[]) {
   const adapter = new DiscordAdapter({ token: 'unused', ...(dmUsers ? { dmUsers } : {}) });
   const client = (adapter as unknown as { client: Client }).client;
   t.after(() => client.destroy());
+  // The bot's own identity, as login would set it.
+  (client as unknown as { user: { id: string } }).user = { id: 'the-bot' };
   const fetched: string[] = [];
   // A DM channel known only by its id: fetching it names its recipient.
   (client.channels as unknown as { fetch: (id: string) => Promise<unknown> }).fetch = async (id: string) => {
@@ -76,6 +78,28 @@ describe('the DM allowlist on edits and deletes', () => {
     f.emit('messageUpdate', { partial: true }, { ...dm('stranger', 'm-edit', true), content: 'changed words' });
     await f.settle();
     assert.deepEqual(f.pushes, []);
+  });
+
+  it('judges a deletion of the bot\'s own DM by the conversation, not by the bot', async (t) => {
+    const f = fixture(t, ['friend']);
+    const own = (user: string, id: string) => ({
+      ...dm(user, id, true),
+      author: { id: 'the-bot', username: 'bot_name' },
+    });
+    f.emit('messageDelete', own('friend', 'b-friend'));
+    f.emit('messageDelete', own('stranger', 'b-stranger'));
+    await f.settle();
+    assert.equal(f.pushes.length, 1, "only the allowed user's DM");
+    assert.match(f.pushes[0].payload?.content?.[0]?.text ?? '', /^\[message deleted\] b-friend/);
+    assert.deepEqual(f.fetched, [], 'both channels carry their recipient');
+  });
+
+  it('never fetches a channel for an edit, which is judged by its author', async (t) => {
+    const f = fixture(t, ['friend']);
+    f.emit('messageUpdate', { partial: true }, { ...dm('friend', 'm-anon', false), content: 'changed words', author: null });
+    await f.settle();
+    assert.deepEqual(f.pushes, [], 'an edit with no author is refused, as before');
+    assert.deepEqual(f.fetched, [], 'and no lookup holds up a later delete of the message');
   });
 
   it('with no allowlist, forwards every DM deletion and fetches nothing for it', async (t) => {

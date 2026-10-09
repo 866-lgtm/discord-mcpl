@@ -375,7 +375,7 @@ export interface MessageEventInfo {
   /** Guild id, or null for a DM. */
   guildId: string | null;
   authorId?: string;
-  /** For a DM: the conversation's other party, its author unless the
+  /** For a DM delete: the conversation's other party, its author unless the
    *  message is the bot's own, else the channel's recipient. A delete may
    *  name no author, so the DM allowlist judges it by this. */
   dmRecipientId?: string;
@@ -1725,8 +1725,13 @@ export class DiscordAdapter {
    *  A missing guild id is not evidence of a DM: uncached guild messages can
    *  lack it too. Fetch the channel (never the deleted message) only when the
    *  message and cache cannot establish its location or a parent needed by
-   *  the channel allowlist. */
-  private async messageEventInfo(message: Message | PartialMessage): Promise<MessageEventInfo | null> {
+   *  the channel allowlist. With `dmParty`, also resolve a DM's other party
+   *  (dmRecipientId), fetching the channel if need be. Only a delete asks: an
+   *  edit is judged by its author. */
+  private async messageEventInfo(
+    message: Message | PartialMessage,
+    opts: { dmParty?: boolean } = {},
+  ): Promise<MessageEventInfo | null> {
     const authorId = message.author?.id;
     const authorName = message.author?.username;
     let channel: Channel | null | undefined = message.channel ?? this.client.channels.cache.get(message.channelId);
@@ -1755,7 +1760,7 @@ export class DiscordAdapter {
     // only by its id carries no recipient, so then the channel is fetched,
     // once, when a list needs it.
     let dmRecipientId: string | undefined;
-    if (!guildId && channel?.isDMBased()) {
+    if (opts.dmParty && !guildId && channel?.isDMBased()) {
       dmRecipientId = authorId && authorId !== this.client.user?.id
         ? authorId
         : ((channel as { recipientId?: string }).recipientId ?? undefined);
@@ -1778,10 +1783,11 @@ export class DiscordAdapter {
   private forwardMessageEvent(
     message: Message | PartialMessage,
     forward: (info: MessageEventInfo) => void,
+    opts: { dmParty?: boolean } = {},
   ): Promise<void> {
     const messageId = message.id;
     const previous = this.messageEventDeliveries.get(messageId) ?? Promise.resolve();
-    const pending = Promise.allSettled([previous, this.messageEventInfo(message)]).then(([, result]) => {
+    const pending = Promise.allSettled([previous, this.messageEventInfo(message, opts)]).then(([, result]) => {
       if (result.status === 'rejected') throw result.reason;
       if (result.value) forward(result.value);
     });
@@ -1835,7 +1841,7 @@ export class DiscordAdapter {
         return;
       }
       this.deleteHandler?.(channelId, messageId, !info.guildId, info);
-    });
+    }, { dmParty: true });
   }
 
   private setupEvents(): void {
