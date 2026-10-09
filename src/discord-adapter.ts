@@ -1814,7 +1814,7 @@ export class DiscordAdapter {
     const cleanContent = newMsg.cleanContent ?? undefined;
     await this.forwardMessageEvent(newMsg, (info) => {
       if (!info.guildId && this.dmUserRefused(info.authorId)) {
-        dbg('messageUpdate:drop', { msgId: messageId, channelId, reason: 'dm-not-allowed' });
+        dbg('messageUpdate:drop', { msgId: messageId, channelId, reason: info.authorId ? 'dm-not-allowed' : 'dm-party-unknown' });
         return;
       }
       this.editHandler?.(channelId, messageId, content, !info.guildId, { ...info, editedAt, cleanContent });
@@ -1829,7 +1829,9 @@ export class DiscordAdapter {
     const { channelId, id: messageId } = message;
     await this.forwardMessageEvent(message, (info) => {
       if (!info.guildId && this.dmUserRefused(info.dmRecipientId)) {
-        dbg('messageDelete:drop', { msgId: messageId, channelId, reason: 'dm-not-allowed' });
+        // A party that couldn't be resolved (say, a failed channel fetch) is
+        // refused too, but logged apart from a refusal.
+        dbg('messageDelete:drop', { msgId: messageId, channelId, reason: info.dmRecipientId ? 'dm-not-allowed' : 'dm-party-unknown' });
         return;
       }
       this.deleteHandler?.(channelId, messageId, !info.guildId, info);
@@ -2122,8 +2124,9 @@ export class DiscordAdapter {
    * The DM allowlist's one rule, for every way a DM reaches the agent: with
    * a list configured, a DM counts only from a listed user, and one whose
    * user isn't known is refused (fail closed). Creates and edits name their
-   * author. A delete names no one, so it's judged by the DM channel's other
-   * party, its recipient: the only user besides the bot who writes there.
+   * author. A delete is judged by the DM's other party (messageEventInfo's
+   * dmRecipientId): its author unless the message is the bot's own, else the
+   * channel's recipient, since an uncached delete names no author.
    */
   private dmUserRefused(userId: string | undefined): boolean {
     return !!this.dmUsers && (!userId || !this.dmUsers.has(userId));

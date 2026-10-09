@@ -1,9 +1,10 @@
 /**
  * The DM allowlist holds for a DM's edits and deletes as it does for its
  * creates. A refused sender's message never reaches the agent, so neither
- * does its edit or its deletion. A delete names no author, so it is judged
- * by the DM channel's other party, its recipient. discord.js caches every
- * DM it receives, so without this a refused DM's deletion carried its
+ * does its edit or its deletion. A delete is judged by the DM's other party:
+ * its author unless the message is the bot's own, else the DM channel's
+ * recipient, since an uncached delete names no author. discord.js caches
+ * every DM it receives, so without this a refused DM's deletion carried its
  * sender's id and username to the host.
  *
  * Run: node --import tsx --test test/dm-allowlist-mutations.test.ts
