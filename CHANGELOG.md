@@ -197,12 +197,12 @@ in the git log and PR descriptions.
   sender's id and username ("[message deleted] <id> by @name"). A host
   without event coalescing showed it. Deletes now apply the allowlist as
   creates and edits do, by the DM's other party: the author unless the
-  message is the bot's own, else the DM channel's recipient, fetched once
-  if the channel doesn't carry it (if that fetch fails, the deletion is
-  dropped and the failure logged). An allowed user's deletion of a message
-  no longer cached still arrives. A refused user's DM channel now sends the
-  agent no events: the deletion of the bot's own message there (one sent
-  with `send_dm`) no longer arrives either.
+  message is the bot's own, else the DM channel's recipient other than the
+  bot, asked of Discord once if the cache can't name it (if that lookup
+  fails, the deletion is dropped and the failure logged). An allowed user's
+  deletion of a message no longer cached still arrives. A refused user's DM
+  channel now sends the agent no events: the deletion of the bot's own
+  message there (one sent with `send_dm`) no longer arrives either.
 - **The reconnect catch-up sweep bypassed the ingress filters** (issue #60).
   It delivered every missed message in a known DM channel, including DMs from a
   sender since removed from the DM whitelist, and kept sweeping channels of

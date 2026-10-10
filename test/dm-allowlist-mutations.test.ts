@@ -19,7 +19,7 @@ function fixture(
   t: TestContext,
   dmUsers?: string[],
   fetchChannel = async (id: string): Promise<unknown> =>
-    ({ id, type: ChannelType.DM, recipientId: id.replace(/^dm-/, ''), isDMBased: () => true }),
+    ({ id, type: ChannelType.DM, recipientIds: [id.replace(/^dm-/, '')], isDMBased: () => true }),
 ) {
   const adapter = new DiscordAdapter({ token: 'unused', ...(dmUsers ? { dmUsers } : {}) });
   const client = (adapter as unknown as { client: Client }).client;
@@ -27,11 +27,14 @@ function fixture(
   // The bot's own identity, as login would set it.
   (client as unknown as { user: { id: string } }).user = { id: 'the-bot' };
   const fetched: string[] = [];
+  const forced: boolean[] = [];
   // A DM channel known only by its id: fetching it names its recipient.
-  (client.channels as unknown as { fetch: (id: string) => Promise<unknown> }).fetch = async (id: string) => {
-    fetched.push(id);
-    return fetchChannel(id);
-  };
+  (client.channels as unknown as { fetch: (id: string, o?: { force?: boolean }) => Promise<unknown> }).fetch =
+    async (id: string, o?: { force?: boolean }) => {
+      fetched.push(id);
+      forced.push(o?.force === true);
+      return fetchChannel(id);
+    };
   const server = new DiscordMcplServer(adapter) as unknown as Record<string, unknown> & { setupDiscordForwarding(): void };
   const pushes: Array<{ origin?: Record<string, unknown>; payload?: { content?: Array<{ text?: string }> } }> = [];
   server.conn = {
@@ -45,7 +48,7 @@ function fixture(
   server.setupDiscordForwarding();
   const emit = client.emit.bind(client) as (event: string, ...args: unknown[]) => boolean;
   const settle = async () => { for (let i = 0; i < 6; i++) await new Promise<void>((r) => setImmediate(r)); };
-  return { emit, pushes, fetched, settle };
+  return { emit, pushes, fetched, forced, settle };
 }
 
 /** A DM as discord.js hands it over: cached (seen live) with its author and
@@ -53,7 +56,7 @@ function fixture(
 const dm = (user: string, id: string, cached: boolean) => ({
   id, channelId: `dm-${user}`, guildId: null, partial: !cached,
   channel: cached
-    ? { id: `dm-${user}`, type: ChannelType.DM, recipientId: user, isDMBased: () => true }
+    ? { id: `dm-${user}`, type: ChannelType.DM, recipientIds: [user], isDMBased: () => true }
     : { id: `dm-${user}`, type: ChannelType.DM, isDMBased: () => true },
   author: cached ? { id: user, username: `${user}_name` } : null,
   content: cached ? 'words' : null,
@@ -105,6 +108,28 @@ describe('the DM allowlist on edits and deletes', () => {
       errors.mock.calls.some((c) => c.arguments.some((a) => String(a).includes('channel lookup failed: 503'))),
       'the failed fetch is logged with its cause',
     );
+  });
+
+  it("asks Discord for the party when the cached channel can't name it", async (t) => {
+    // discord.js counts a cached DM channel as complete once it has seen a
+    // message there, whatever recipients it has recorded. With only the bot
+    // recorded, its recipientId getter returns the bot's own id; with none,
+    // the getter throws.
+    const f = fixture(t, ['friend']);
+    const cachedWith = (recipientIds?: string[]) => ({
+      id: 'dm-friend', type: ChannelType.DM, isDMBased: () => true,
+      ...(recipientIds ? { recipientIds } : {}),
+      get recipientId(): string {
+        if (!recipientIds) throw new TypeError("Cannot read properties of undefined (reading 'find')");
+        return recipientIds.find((r) => r !== 'the-bot') ?? recipientIds[0];
+      },
+    });
+    f.emit('messageDelete', { ...dm('friend', 'm-only-bot', false), channel: cachedWith(['the-bot']) });
+    f.emit('messageDelete', { ...dm('friend', 'm-none', false), channel: cachedWith() });
+    await f.settle();
+    assert.equal(f.pushes.length, 2, "both of the allowed user's deletions arrive");
+    assert.deepEqual(f.fetched, ['dm-friend', 'dm-friend']);
+    assert.deepEqual(f.forced, [true, true], 'past the cache, which already holds the channel');
   });
 
   it('judges a deletion of the bot\'s own DM by the conversation, not by the bot', async (t) => {

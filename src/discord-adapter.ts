@@ -1755,20 +1755,21 @@ export class DiscordAdapter {
     const parentId = channel && 'parentId' in channel ? channel.parentId : null;
     if (!this.channelAllowed(guildId, message.channelId, parentId)) return null;
     // A DM's other party, for the allowlist (dmUserRefused): the author,
-    // unless the message is the bot's own, else the channel's recipient. A
-    // deletion of an uncached message names no author, and a channel known
-    // only by its id carries no recipient, so then this lookup fetches the
-    // channel, once, and only when a list needs it. (The location lookup
-    // above is separate.) A failed fetch rejects, as that one does, so the
-    // caller logs its cause.
+    // unless the message is the bot's own, else the channel's recipient that
+    // isn't the bot (dmOtherParty). The cache can't always say: a deletion
+    // of an uncached message names no author, a channel known only by its id
+    // carries no recipient, and discord.js counts a cached DM channel as
+    // complete once it has seen a message there, whatever recipients it has
+    // recorded, which may be only the bot. So then this lookup asks Discord
+    // (force: true, past the cache), once, and only when a list needs it.
+    // (The location lookup above is separate.) A failed fetch rejects, as
+    // that one does, so the caller logs its cause.
     let dmRecipientId: string | undefined;
     if (opts.dmParty && !guildId && channel?.isDMBased()) {
-      dmRecipientId = authorId && authorId !== this.client.user?.id
-        ? authorId
-        : ((channel as { recipientId?: string }).recipientId ?? undefined);
+      dmRecipientId = authorId && authorId !== this.client.user?.id ? authorId : this.dmOtherParty(channel);
       if (!dmRecipientId && this.dmUsers) {
-        const fetched = await this.client.channels.fetch(message.channelId);
-        dmRecipientId = (fetched as { recipientId?: string } | null)?.recipientId ?? undefined;
+        const fetched = await this.client.channels.fetch(message.channelId, { force: true });
+        dmRecipientId = this.dmOtherParty(fetched);
       }
     }
     return {
@@ -1777,6 +1778,15 @@ export class DiscordAdapter {
       authorName,
       ...(dmRecipientId ? { dmRecipientId } : {}),
     };
+  }
+
+  /** A DM channel's recipient other than the bot, read from discord.js's
+   *  `recipientIds`. Its `recipientId` getter won't do here: it throws when
+   *  no recipient was ever recorded, and returns the bot's own id when the
+   *  bot is the only one recorded. */
+  private dmOtherParty(channel: unknown): string | undefined {
+    const ids = (channel as { recipientIds?: Array<string | undefined> } | null)?.recipientIds;
+    return ids?.find((id) => !!id && id !== this.client.user?.id);
   }
 
   /** Resolve locations concurrently, but let earlier mutations finish before
