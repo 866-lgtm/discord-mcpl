@@ -15,7 +15,12 @@ import { ChannelType, type Client } from 'discord.js';
 import { DiscordAdapter } from '../src/discord-adapter.js';
 import { DiscordMcplServer } from '../src/server.js';
 
-function fixture(t: TestContext, dmUsers?: string[]) {
+function fixture(
+  t: TestContext,
+  dmUsers?: string[],
+  fetchChannel = async (id: string): Promise<unknown> =>
+    ({ id, type: ChannelType.DM, recipientId: id.replace(/^dm-/, ''), isDMBased: () => true }),
+) {
   const adapter = new DiscordAdapter({ token: 'unused', ...(dmUsers ? { dmUsers } : {}) });
   const client = (adapter as unknown as { client: Client }).client;
   t.after(() => client.destroy());
@@ -25,7 +30,7 @@ function fixture(t: TestContext, dmUsers?: string[]) {
   // A DM channel known only by its id: fetching it names its recipient.
   (client.channels as unknown as { fetch: (id: string) => Promise<unknown> }).fetch = async (id: string) => {
     fetched.push(id);
-    return { id, type: ChannelType.DM, recipientId: id.replace(/^dm-/, ''), isDMBased: () => true };
+    return fetchChannel(id);
   };
   const server = new DiscordMcplServer(adapter) as unknown as Record<string, unknown> & { setupDiscordForwarding(): void };
   const pushes: Array<{ origin?: Record<string, unknown>; payload?: { content?: Array<{ text?: string }> } }> = [];
@@ -73,11 +78,33 @@ describe('the DM allowlist on edits and deletes', () => {
     assert.match(f.pushes[0].payload?.content?.[0]?.text ?? '', /^\[message deleted\] m-partial/);
   });
 
-  it("never forwards a refused sender's edit", async (t) => {
+  it("never forwards a refused sender's edit, and forwards an allowed user's", async (t) => {
     const f = fixture(t, ['friend']);
     f.emit('messageUpdate', { partial: true }, { ...dm('stranger', 'm-edit', true), content: 'changed words' });
+    f.emit('messageUpdate', { partial: true }, { ...dm('friend', 'f-edit', true), content: 'changed words' });
     await f.settle();
-    assert.deepEqual(f.pushes, []);
+    assert.equal(f.pushes.length, 1, "only the allowed user's edit, through the same path");
+    assert.match(JSON.stringify(f.pushes[0]), /f-edit/);
+  });
+
+  it('refuses a deletion whose party a channel lookup cannot name, and says why when the lookup fails', async (t) => {
+    // The fetched channel names no recipient: refused, as an unknown party.
+    const silent = fixture(t, ['friend'], async (id) => ({ id, type: ChannelType.DM, isDMBased: () => true }));
+    silent.emit('messageDelete', dm('friend', 'm-nameless', false));
+    await silent.settle();
+    assert.deepEqual(silent.pushes, []);
+    assert.deepEqual(silent.fetched, ['dm-friend']);
+
+    // The lookup fails: refused too, and the cause reaches the operator log.
+    const errors = t.mock.method(console, 'error', () => {});
+    const failing = fixture(t, ['friend'], async () => { throw new Error('channel lookup failed: 503'); });
+    failing.emit('messageDelete', dm('friend', 'm-unlucky', false));
+    await failing.settle();
+    assert.deepEqual(failing.pushes, []);
+    assert.ok(
+      errors.mock.calls.some((c) => c.arguments.some((a) => String(a).includes('channel lookup failed: 503'))),
+      'the failed fetch is logged with its cause',
+    );
   });
 
   it('judges a deletion of the bot\'s own DM by the conversation, not by the bot', async (t) => {

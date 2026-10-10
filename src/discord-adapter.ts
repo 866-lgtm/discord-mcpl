@@ -1757,15 +1757,17 @@ export class DiscordAdapter {
     // A DM's other party, for the allowlist (dmUserRefused): the author,
     // unless the message is the bot's own, else the channel's recipient. A
     // deletion of an uncached message names no author, and a channel known
-    // only by its id carries no recipient, so then the channel is fetched,
-    // once, when a list needs it.
+    // only by its id carries no recipient, so then this lookup fetches the
+    // channel, once, and only when a list needs it. (The location lookup
+    // above is separate.) A failed fetch rejects, as that one does, so the
+    // caller logs its cause.
     let dmRecipientId: string | undefined;
     if (opts.dmParty && !guildId && channel?.isDMBased()) {
       dmRecipientId = authorId && authorId !== this.client.user?.id
         ? authorId
         : ((channel as { recipientId?: string }).recipientId ?? undefined);
       if (!dmRecipientId && this.dmUsers) {
-        const fetched = await this.client.channels.fetch(message.channelId).catch(() => null);
+        const fetched = await this.client.channels.fetch(message.channelId);
         dmRecipientId = (fetched as { recipientId?: string } | null)?.recipientId ?? undefined;
       }
     }
@@ -1835,8 +1837,8 @@ export class DiscordAdapter {
     const { channelId, id: messageId } = message;
     await this.forwardMessageEvent(message, (info) => {
       if (!info.guildId && this.dmUserRefused(info.dmRecipientId)) {
-        // A party that couldn't be resolved (say, a failed channel fetch) is
-        // refused too, but logged apart from a refusal.
+        // A party that couldn't be resolved (a fetched channel that names no
+        // recipient) is refused too, but logged apart from a refusal.
         dbg('messageDelete:drop', { msgId: messageId, channelId, reason: info.dmRecipientId ? 'dm-not-allowed' : 'dm-party-unknown' });
         return;
       }
