@@ -2129,9 +2129,11 @@ export class DiscordAdapter {
   }
 
   /**
-   * The DM allowlist's one rule, for every way a DM reaches the agent: with
-   * a list configured, a DM counts only from a listed user, and one whose
-   * user isn't known is refused (fail closed). Creates and edits name their
+   * The DM allowlist's one rule, for every DM event delivered to the agent
+   * (creates, live and swept, edits and deletes): with a list configured, a
+   * DM counts only from a listed user, and one whose user isn't known is
+   * refused (fail closed). The agent's own reads, such as fetch_history, are
+   * outside it, as they always were. Creates and edits name their
    * author. A delete is judged by the DM's other party (messageEventInfo's
    * dmRecipientId): its author unless the message is the bot's own, else the
    * channel's recipient, since an uncached delete names no author.
