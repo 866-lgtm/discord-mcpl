@@ -6,7 +6,7 @@
  * watermark. Now a file whose content can't be used is moved aside before its
  * store starts empty, and a file that can't be read, or moved, is never saved
  * over. A save replaces a plain file the server owns atomically, keeping its
- * permissions, and writes anything else in place, as before.
+ * permissions and group, and writes anything else in place, as before.
  *
  * Run: node --import tsx --test test/persisted-stores.test.ts
  */
@@ -14,6 +14,7 @@ import { describe, it, beforeEach, afterEach, type TestContext } from 'node:test
 import * as assert from 'node:assert/strict';
 import fs, {
   chmodSync,
+  chownSync,
   linkSync,
   lstatSync,
   mkdirSync,
@@ -79,7 +80,7 @@ async function withUmask(mask: number, body: () => unknown): Promise<void> {
 }
 
 /** Run `body` with fs[name] wrapped by `wrap`, for the code under test too. */
-async function withFs<K extends 'renameSync' | 'chmodSync' | 'writeFileSync'>(
+async function withFs<K extends 'renameSync' | 'chmodSync' | 'chownSync' | 'writeFileSync'>(
   t: TestContext,
   name: K,
   wrap: (real: (typeof fs)[K]) => (typeof fs)[K],
@@ -232,6 +233,18 @@ describe('a store whose file is left in place', () => {
   });
 });
 
+describe('a store whose file it can write but not read', () => {
+  it("never saves over it, since it can't tell what the file holds", { skip: asRoot }, async (t) => {
+    errors(t);
+    writeFileSync(join(dir, 'muted.json'), '["keep-me"]');
+    chmodSync(join(dir, 'muted.json'), 0o200);
+    const reply = String(await server(t).executeToolCall('mute_channel', { channelId: 'chan-new' }));
+    assert.match(reply, /This change couldn't be saved \(.*couldn't be read.*\), so a restart undoes it\.$/);
+    chmodSync(join(dir, 'muted.json'), 0o600);
+    assert.deepEqual(json('muted.json'), ['keep-me'], 'the file is as it was');
+  });
+});
+
 describe('a store whose file is there and readable, or not there yet', () => {
   it('starts empty with no files, and the first save of each store creates its file', async (t) => {
     const s = server(t);
@@ -293,6 +306,29 @@ describe('writeJsonFile', () => {
     chmodSync(path, 0o660);
     await withUmask(0o022, () => writeJsonFile(path, ['b']));
     assert.equal(statSync(path).mode & 0o777, 0o660);
+  });
+
+  it("keeps the file's group", (t) => {
+    const path = join(dir, 'shared.json');
+    writeJsonFile(path, ['a']);
+    const other = process.getgroups?.().find((gid) => gid !== statSync(path).gid);
+    if (other === undefined) return t.skip('the test user is in no second group');
+    chownSync(path, statSync(path).uid, other);
+    writeJsonFile(path, ['b']);
+    assert.equal(statSync(path).gid, other);
+    assert.deepEqual(JSON.parse(readFileSync(path, 'utf-8')), ['b']);
+  });
+
+  it("writes in place when it can't give the new file the old one's group", async (t) => {
+    const path = join(dir, 'shared.json');
+    writeJsonFile(path, ['a']);
+    const inode = statSync(path).ino;
+    await withFs(t, 'chownSync', () => (() => {
+      throw refuse('EPERM', 'chown to a group the server is not in');
+    }) as typeof fs.chownSync, () => writeJsonFile(path, ['b']));
+    assert.equal(statSync(path).ino, inode, 'the same file, not a replacement');
+    assert.deepEqual(JSON.parse(readFileSync(path, 'utf-8')), ['b']);
+    assert.deepEqual(readdirSync(dir), ['shared.json'], 'no temp file left');
   });
 
   it('makes a fresh temp file at the target permissions, whatever a stale one had', { skip: asRoot }, async (t) => {

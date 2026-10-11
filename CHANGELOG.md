@@ -173,12 +173,14 @@ in the git log and PR descriptions.
   - `mute_channel`, `unmute_channel` and `set_reaction_visibility` now say
     when their change couldn't be saved, so a restart would undo it.
   - A save replaces a plain file the server owns by renaming a temp file
-    over it, with the file's permissions, so a process crash partway
-    through can't leave a torn file. A symlink, a file with other hard
-    links or another owner, and a path that won't take the rename (a
-    directory the server can't write, a bind-mounted file) are written in
-    place, as before, and a file the server can't write is left as it is.
-    The filters file is saved the same way, so a private one stays private.
+    over it, with the file's permissions and group, so a process crash
+    partway through can't leave a torn file. Extended attributes and an
+    ACL on the file itself don't carry over. A symlink, a file with other
+    hard links or another owner, a group the server isn't in, and a path
+    that won't take the rename (a directory the server can't write, a
+    bind-mounted file) are written in place, as before, and a file the
+    server can't write is left as it is. The filters file is saved the
+    same way, so a private one stays private.
 - **A slash command that fails no longer ends the process.** Slash handlers
   run without being awaited, and their rejections were unhandled. On Node
   15 and later, an unhandled rejection exits the process, so a single late

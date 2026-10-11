@@ -16,19 +16,24 @@
  *   when a move aside fails. The store runs in memory meanwhile.
  *
  * Saving (writeJsonFile) replaces a plain file the server owns atomically: a
- * temp file beside it, created with its permissions, renamed over it. So a
- * process crash partway through can't leave a torn file. There's no fsync,
- * so on some filesystems a power loss can still leave it empty, and the
- * reader then moves that aside. Everything else is written in place, as it
- * was before saves were atomic: a symlink, a file with other hard links or
- * another owner, and a file whose directory or name won't take the temp
- * file and rename (no write access to the directory, a bind-mounted file, a
- * name with no room for `.tmp`). A file the server couldn't write in place
- * isn't replaced either.
+ * temp file beside it, created with its permissions and given its group,
+ * renamed over it. So a process crash partway through can't leave a torn
+ * file. There's no fsync, so on some filesystems a power loss can still
+ * leave it empty, and the reader then moves that aside. Everything else is
+ * written in place, as it was before saves were atomic: a symlink, a file
+ * with other hard links or another owner, a group the server isn't in, and
+ * a file whose directory or name won't take the temp file and rename (no
+ * write access to the directory, a bind-mounted file, a name with no room
+ * for `.tmp`). A file the server couldn't write in place isn't replaced
+ * either. What Node can't see doesn't carry over a replacement: extended
+ * attributes and a POSIX ACL on the file itself are lost at the first save
+ * (a directory's default ACL still applies), so a store that needs them
+ * should be a symlink to its file, which is written in place.
  */
 import {
   accessSync,
   chmodSync,
+  chownSync,
   constants,
   lstatSync,
   mkdirSync,
@@ -45,8 +50,8 @@ import { dbg } from './debug-log.js';
 
 /** Paths whose file couldn't be read or moved aside: saving over them could destroy them. */
 const unsaveable = new Set<string>();
-/** The permissions of a file moved aside, for the file the next save writes in its place. */
-const movedAsideModes = new Map<string, number>();
+/** The permissions and group of a file moved aside, for the file the next save writes in its place. */
+const movedAside = new Map<string, { mode: number; gid: number }>();
 /** Errors from the temp file or the rename that mean this path can't be saved that way, so it's written in place. */
 const WRITE_IN_PLACE_ON = new Set(['EACCES', 'EPERM', 'EBUSY', 'EXDEV', 'ENAMETOOLONG']);
 
@@ -71,7 +76,8 @@ export function writeJsonFile(path: string, value: unknown): void {
   const old = lstatIfThere(path);
   // A symlink's own mode means nothing; a file created through one, after its
   // target was moved aside, takes the moved file's mode.
-  const mode = old && !old.isSymbolicLink() ? old.mode & 0o777 : movedAsideModes.get(path);
+  const was = old && !old.isSymbolicLink() ? { mode: old.mode & 0o777, gid: old.gid } : movedAside.get(path);
+  const mode = was?.mode;
   const writeInPlace = () => writeFileSync(path, text, mode === undefined ? undefined : { mode });
   // A rename would turn a symlink into a plain file, split a hard link, or
   // take another user's file over, so only a plain file the server owns, with
@@ -89,6 +95,9 @@ export function writeJsonFile(path: string, value: unknown): void {
     // the temp file is created fresh, never more open than its target.
     rmSync(tmp, { force: true });
     writeFileSync(tmp, text, { mode: mode ?? 0o666, flag: 'wx' });
+    // The temp file is in the server's group. It takes the old file's, and
+    // for a group the server isn't in that fails (EPERM): written in place.
+    if (was && ownUid !== undefined) chownSync(tmp, ownUid, was.gid);
     if (mode !== undefined) chmodSync(tmp, mode); // the bits the umask took
     renameSync(tmp, path);
   } catch (err) {
@@ -131,9 +140,9 @@ export function readJsonFile<T>(path: string, what: string, isShape: (value: unk
   try {
     const file = realpathSync(path);
     const aside = `${file}.unreadable-${new Date().toISOString().replace(/[:.]/g, '-')}`;
-    const mode = statSync(file).mode & 0o777;
+    const { mode, gid } = statSync(file);
     renameSync(file, aside);
-    movedAsideModes.set(path, mode);
+    movedAside.set(path, { mode: mode & 0o777, gid });
     console.error(`[discord-mcpl] Couldn't load ${what} from ${path} (${problem}). Moved it to ${aside}, and starting with none.`);
     dbg('persisted-json:moved-aside', { what, path, aside, problem });
   } catch (err) {
