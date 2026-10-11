@@ -142,6 +142,11 @@ class MockDiscordAdapter {
     return this.historyToReturn;
   }
 
+  /** No channel filters are configured here, so no read is refused. */
+  async inspectionRefusal(): Promise<string | null> {
+    return null;
+  }
+
   async getChannelMeta(): Promise<MockDiscordAdapter['channelMeta']> {
     return this.channelMeta;
   }

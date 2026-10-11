@@ -29,6 +29,6 @@ Deployments can expose this document through their resident's file-reading tool.
 
 ## Channel filters and deliberate reads
 
-The per-guild channel list bounds these reads as well as delivery. `list_channels` leaves a channel outside it out of its listing, and `list_channel_members`, `fetch_history` and `fetch_around` refuse such a channel given by numeric ID. Channel names resolve only among the channels it admits, so an excluded channel isn't found by name either. A thread follows its parent channel. Other tools that take a channel aren't bounded by it; sends aren't.
+The per-guild channel list bounds these reads as well as delivery. `list_channels` leaves a channel outside it out of its listing, and `list_channel_members`, `fetch_history` and `fetch_around` refuse such a channel given by numeric ID, as does a host's `channels/open` that asks for backscroll (it opens the channel without backscroll, which reads nothing). Channel names resolve only among the channels it admits, so an excluded channel isn't found by name either. A thread follows its parent channel. Other tools that take a channel aren't bounded by it; sends aren't.
 
 The other two filters don't restrict deliberate reads. The guild filter decides which guilds' channels are registered, resolvable by name, and delivered. The DM contact list filters incoming DMs.

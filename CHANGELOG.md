@@ -8,15 +8,18 @@ in the git log and PR descriptions.
 ### Upgrade notes
 
 - **`fetch_history` and `fetch_around` now refuse a channel id that the
-  configured channel list (`guildChannels`) excludes.** A resident that
-  reads such a channel by its numeric id today (following a pasted message
-  link, say) will get a refusal naming the channel filters, and nothing is
-  read. The refusal is deliberate: it is the boundary `list_channels` and
-  `list_channel_members` already apply (see the `fetch_history` entry under
-  Fixed). To let a residence read the channel, admit it in `guildChannels`,
-  directly or through its parent (a thread's channel, a channel's
-  category). The same list bounds delivery, so that admits it for delivery
-  too. Guilds without a `guildChannels` entry, and DMs, are unaffected.
+  configured channel list (`guildChannels`) excludes, and so does a host's
+  `channels/open` that asks for backscroll from such a channel.** An open
+  without backscroll still opens it, since it reads nothing. A resident
+  that reads such a channel by its numeric id today (following a pasted
+  message link, say) will get a refusal naming the channel filters, and
+  nothing is read. The refusal is deliberate: it is the boundary
+  `list_channels` and `list_channel_members` already apply (see the
+  `fetch_history` entry under Fixed). To let a residence read the channel,
+  admit it in `guildChannels`, directly or through its parent (a thread's
+  channel, a channel's category). The same list bounds delivery, so that
+  admits it for delivery too. Guilds without a `guildChannels` entry, and
+  DMs, are unaffected.
 
 ### Added
 
@@ -340,3 +343,10 @@ in the git log and PR descriptions.
   (registration, name resolution, delivery) and the DM contact list
   (incoming DMs) keep their meaning and don't restrict deliberate reads; the
   config docs now say what each filter bounds.
+- **`channels/open` backscroll respects the channel filters too.** A
+  channel registered before `guildChannels` narrowed stays registered until
+  restart (`filters_update` and hot reload only add channels), and opening
+  it with `history.limit > 0` read its backscroll with no filter check. That
+  read now gets the same refusal as `fetch_history`, and the open fails
+  before anything is read or subscribed. An open without history is
+  unchanged.

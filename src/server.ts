@@ -2712,6 +2712,16 @@ export class DiscordMcplServer {
     const result: ChannelOpenResponse = { channel: desc };
     const requested = params.history?.limit ?? 0;
     if (requested > 0) {
+      // Backscroll is a deliberate read, so it respects the channel filters'
+      // inspection boundary as fetch_history does. A channel registered
+      // before the filters narrowed stays registered until restart, so the
+      // registry alone doesn't keep it out. A refusal fails the open before
+      // anything is read or subscribed.
+      const refusal = await this.discord.inspectionRefusal(parsed.channelId);
+      if (refusal) {
+        dbg('channel-open:inspection-refused', { channelId: desc.id });
+        throw new Error(refusal);
+      }
       const limit = this.capHistoryLimit(parsed.channelId, Math.min(500, Math.max(0, requested)));
       const messages = await this.discord.fetchHistory(parsed.channelId, {
         limit,
