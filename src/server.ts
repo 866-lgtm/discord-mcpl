@@ -59,7 +59,7 @@ import {
   looksLikeExplicitName,
   type AddressingPath,
 } from './channel-names.js';
-import { explainDiscordError } from './discord-errors.js';
+import { explainDiscordError, type ExplainContext } from './discord-errors.js';
 import { saveFiltersFile, loadFiltersFile, DiscordFiltersState, type DiscordFilters } from './filters.js';
 import { StateTracker } from './state.js';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
@@ -1328,10 +1328,12 @@ export class DiscordMcplServer {
     // of the dozen-odd tools that take a channelId — one chokepoint means no
     // tool can be added later that silently misses it.
     //
-    // Snowflakes and the `discord:<guild>:<channel>` composite pass through
-    // untouched, so this is backwards compatible. A name resolves against the
-    // live channel cache; ambiguity is a hard error listing qualified labels
-    // rather than a silent pick. See channel-names.ts.
+    // A snowflake passes through untouched, so this is backwards compatible.
+    // A name, or the `discord:<guild>:<channel>` composite, is resolved to the
+    // bare channel id: a name against the live channel cache (see
+    // channel-names.ts for how it answers several matches), the composite by
+    // the id it carries.
+    let explain: ExplainContext = {};
     if (typeof args.channelId === 'string' && args.channelId.trim()) {
       const given = args.channelId;
       const path: AddressingPath = isSnowflake(given.trim()) ? 'explicit-id' : 'name-resolved';
@@ -1368,6 +1370,8 @@ export class DiscordMcplServer {
           label: resolved.matched ? channelLabel(resolved.matched) : undefined,
         });
         args = { ...args, channelId: resolved.id };
+        // An error is explained against what the model sent, not this id.
+        explain = { channelGiven: given };
       } else {
         dbg('channel:addressing', { tool: name, path, channelId: given });
       }
@@ -1390,7 +1394,7 @@ export class DiscordMcplServer {
       };
     } catch (err) {
       return {
-        content: [textContent(explainDiscordError(err, args))],
+        content: [textContent(explainDiscordError(err, args, explain))],
         isError: true,
       };
     }

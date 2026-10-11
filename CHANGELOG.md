@@ -152,17 +152,20 @@ in the git log and PR descriptions.
 - **A tool given an id Discord doesn't know says what that means.** Discord
   answers an unknown or unreachable id with two words ("Unknown Channel",
   "Unknown Guild", "Unknown Message", "Unknown User", "Missing Access"). The
-  tool error now keeps them and adds what they mean for the id that was
-  passed, and the cure. For a server channel, that's first to re-send with
-  its `#name`, which either resolves or lists every channel it matches (a
-  thread or DM, which has no name route, is pointed at where its id
-  appeared); for a user, their `@username`. Then it says the id may be
-  mistyped or remembered rather than copied, or the thing deleted or out of
-  the bot's reach, and where real ids show (`list_channels`, `list_guilds`,
-  `fetch_history`, a message's source or author, `list_channel_members`).
-  `list_emojis` now lets Discord's error for an unknown server through, as
-  `list_channels` does, so it gets the same explanation. Other errors are
-  unchanged.
+  tool error now keeps them and adds what they mean for what the model sent,
+  and the cure. For an id, it says the id may be mistyped or remembered
+  rather than copied, or the thing deleted or out of the bot's reach, and
+  where real ids show (`list_channels`, `list_guilds`, `fetch_history`, a
+  message's author, `list_channel_members`). A text, announcement or voice
+  channel can be re-sent by `#name` instead, and a user by `@username` if
+  they share a server with the bot or have DMed it. A thread or DM has no
+  name route, so its id has to be copied from where it was shown. A `#name`
+  that resolved to an id Discord doesn't know is explained as a channel gone
+  since it was seen, not with advice to send the name again. A
+  `create_text_channel` category is explained as a category. `list_emojis`
+  with a `guildId` now lets the guild lookup's own error through, Discord's or
+  not, as `list_channels` does, where every failure there used to read "Guild
+  <id> not found". Other errors pass through unchanged.
 
 ### Fixed
 

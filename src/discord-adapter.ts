@@ -1545,9 +1545,8 @@ export class DiscordAdapter {
     if (guildId) {
       // Discord's own error (Unknown Guild, Missing Access) propagates, as
       // listChannels' does, so the tool error can say what it means.
-      const g = await this.client.guilds.fetch(guildId);
-      if (!g) throw new Error(`Guild ${guildId} not found`);
-      guilds.push(g);
+      // guilds.fetch(id) resolves to the Guild or rejects.
+      guilds.push(await this.client.guilds.fetch(guildId));
     } else {
       guilds.push(...this.client.guilds.cache.values());
     }
