@@ -141,7 +141,9 @@ export function loadFiltersFile(path: string): DiscordFilters | null {
   }
 }
 
-/** Atomic write (tmp + rename) so the poller never reads a half-written file; the file keeps its permissions. */
+/** Saved by writeJsonFile, which keeps the file's permissions: atomically (tmp + rename) for a plain file the
+ *  server owns, and in place for a symlink, a hard-linked or another user's file, or a path that can't take the
+ *  rename. The poller runs on this process's event loop, so it never sees a save half-done either way. */
 export function saveFiltersFile(path: string, filters: DiscordFilters): void {
   writeJsonFile(path, normalizeFilters(filters));
 }

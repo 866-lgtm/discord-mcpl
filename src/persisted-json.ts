@@ -1,72 +1,154 @@
 /**
  * The server's small persisted JSON files: the muted channels, the reaction
- * channels and the watermarks, and the filters file. Each is rewritten whole
- * after every change, so three things matter:
- * - A save writes a temp file beside the old one and renames it over, so a
- *   process crash partway through can't leave a torn file. The new file keeps
- *   the old one's permissions, as an in-place write did, so a private file
- *   stays private. There's no fsync, so a power loss can still leave an empty
- *   file on some filesystems. The reader then moves that aside like any other
- *   unusable file.
- * - A file that can't be read, or isn't the shape its store expects, is moved
- *   aside before the store starts empty. The next save then writes a fresh
- *   file, and leaves the old one for an operator to recover. That includes a
- *   passing read error, such as EIO or EMFILE, where the content may be fine:
- *   the store then runs without its entries until the file is restored.
- * - If even the move fails, nothing saves over that file until a restart
- *   reads it again: its store runs in memory meanwhile. Nothing is destroyed
- *   either way.
+ * channels and the watermarks, each read once and rewritten whole after every
+ * change. The filters file is saved here too; its reader is loadFiltersFile.
+ *
+ * Reading (readJsonFile):
+ * - No file means a store with nothing in it yet.
+ * - A file whose content can't be used, because it isn't JSON or isn't the
+ *   shape its store expects, is moved aside to `<file>.unreadable-<time>`,
+ *   and the store starts empty. For a symlink, the file it names is moved,
+ *   so the link stays. The next save writes a fresh file with the moved one's
+ *   permissions, and leaves the old one for an operator to recover.
+ * - A file that can't be read at all (EACCES, EIO, EMFILE…) says nothing
+ *   about its content, so it stays where it is, and nothing saves over it
+ *   until it's read again: at a restart, or by a new store. The same holds
+ *   when a move aside fails. The store runs in memory meanwhile.
+ *
+ * Saving (writeJsonFile) replaces a plain file the server owns atomically: a
+ * temp file beside it, created with its permissions, renamed over it. So a
+ * process crash partway through can't leave a torn file. There's no fsync,
+ * so on some filesystems a power loss can still leave it empty, and the
+ * reader then moves that aside. Everything else is written in place, as it
+ * was before saves were atomic: a symlink, a file with other hard links or
+ * another owner, and a file whose directory or name won't take the temp
+ * file and rename (no write access to the directory, a bind-mounted file, a
+ * name with no room for `.tmp`). A file the server couldn't write in place
+ * isn't replaced either.
  */
-import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
+import {
+  accessSync,
+  chmodSync,
+  constants,
+  lstatSync,
+  mkdirSync,
+  readFileSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+  type Stats,
+} from 'node:fs';
 import { dirname } from 'node:path';
+import { dbg } from './debug-log.js';
 
-/** Files that couldn't be read or moved aside: saving over them would destroy them. */
+/** Paths whose file couldn't be read or moved aside: saving over them could destroy them. */
 const unsaveable = new Set<string>();
+/** The permissions of a file moved aside, for the file the next save writes in its place. */
+const movedAsideModes = new Map<string, number>();
+/** Errors from the temp file or the rename that mean this path can't be saved that way, so it's written in place. */
+const WRITE_IN_PLACE_ON = new Set(['EACCES', 'EPERM', 'EBUSY', 'EXDEV', 'ENAMETOOLONG']);
 
-/** Write `value` as JSON, whole or not at all. Throws on failure. */
-export function writeJsonFile(path: string, value: unknown): void {
-  if (unsaveable.has(path)) {
-    throw new Error(`${path} couldn't be read or moved aside, so it isn't saved over until a restart reads it again`);
+const errorCode = (err: unknown): string | undefined => (err as NodeJS.ErrnoException).code;
+
+function lstatIfThere(path: string): Stats | undefined {
+  try {
+    return lstatSync(path);
+  } catch (err) {
+    if (errorCode(err) === 'ENOENT') return undefined;
+    throw err;
   }
-  mkdirSync(dirname(path), { recursive: true });
-  const mode = existsSync(path) ? statSync(path).mode & 0o777 : undefined;
-  const tmp = `${path}.tmp`;
-  // Created with the old file's mode, so the temp file is never more open than its target; the chmod covers a stale
-  // temp file a crash left, which writeFileSync's mode doesn't change, and any bits the umask took off.
-  writeFileSync(tmp, JSON.stringify(value, null, 2) + '\n', mode === undefined ? undefined : { mode });
-  if (mode !== undefined) chmodSync(tmp, mode);
-  renameSync(tmp, path);
 }
 
-/** The file's parsed contents, or undefined when there's no file or it was
- *  unusable. An unusable file is moved to `<path>.unreadable-<time>`, and
- *  console.error names both paths. If the move fails, the file is left as it
- *  is and isn't saved over (writeJsonFile). `what` names the store. */
+/** Write `value` as JSON at `path`. Throws on failure. */
+export function writeJsonFile(path: string, value: unknown): void {
+  if (unsaveable.has(path)) {
+    throw new Error(`${path} couldn't be read, so nothing is saved over it until it's read again`);
+  }
+  const text = JSON.stringify(value, null, 2) + '\n';
+  mkdirSync(dirname(path), { recursive: true });
+  const old = lstatIfThere(path);
+  // A symlink's own mode means nothing; a file created through one, after its
+  // target was moved aside, takes the moved file's mode.
+  const mode = old && !old.isSymbolicLink() ? old.mode & 0o777 : movedAsideModes.get(path);
+  const writeInPlace = () => writeFileSync(path, text, mode === undefined ? undefined : { mode });
+  // A rename would turn a symlink into a plain file, split a hard link, or
+  // take another user's file over, so only a plain file the server owns, with
+  // no other name, is replaced.
+  const ownUid = process.getuid?.();
+  if (old && !(old.isFile() && old.nlink === 1 && (ownUid === undefined || old.uid === ownUid))) {
+    writeInPlace();
+    return;
+  }
+  // A file the server couldn't write in place isn't replaced either.
+  if (old) accessSync(path, constants.W_OK);
+  const tmp = `${path}.tmp`;
+  try {
+    // A stale temp file keeps its own mode and owner, so it's never reused:
+    // the temp file is created fresh, never more open than its target.
+    rmSync(tmp, { force: true });
+    writeFileSync(tmp, text, { mode: mode ?? 0o666, flag: 'wx' });
+    if (mode !== undefined) chmodSync(tmp, mode); // the bits the umask took
+    renameSync(tmp, path);
+  } catch (err) {
+    try {
+      rmSync(tmp, { force: true });
+    } catch {
+      // The save's own error is the one to report.
+    }
+    if (!WRITE_IN_PLACE_ON.has(errorCode(err) ?? '')) throw err;
+    writeInPlace();
+  }
+}
+
+/** The file's parsed contents, or undefined when there's no file or it can't
+ *  be used: moved aside, or left in place and not saved over (see the module
+ *  comment). console.error and the debug log say which. `what` names the store. */
 export function readJsonFile<T>(path: string, what: string, isShape: (value: unknown) => value is T): T | undefined {
-  if (!existsSync(path)) return undefined;
+  unsaveable.delete(path); // each read decides afresh
+  let text: string;
+  try {
+    text = readFileSync(path, 'utf-8');
+  } catch (err) {
+    if (errorCode(err) === 'ENOENT') return undefined;
+    unsaveable.add(path);
+    console.error(
+      `[discord-mcpl] Couldn't read ${what} from ${path} (${(err as Error).message}). ` +
+        "Starting with none, and nothing is saved over that file until it's read again.",
+    );
+    dbg('persisted-json:unreadable', { what, path, error: (err as Error).message });
+    return undefined;
+  }
   let problem: string;
   try {
-    const parsed: unknown = JSON.parse(readFileSync(path, 'utf-8'));
+    const parsed: unknown = JSON.parse(text);
     if (isShape(parsed)) return parsed;
     problem = 'not the shape this store expects';
-  } catch (err) {
-    problem = (err as Error).message;
+  } catch {
+    problem = 'not valid JSON'; // JSON.parse's own message quotes the file's text
   }
-  const aside = `${path}.unreadable-${new Date().toISOString().replace(/[:.]/g, '-')}`;
   try {
-    renameSync(path, aside);
+    const file = realpathSync(path);
+    const aside = `${file}.unreadable-${new Date().toISOString().replace(/[:.]/g, '-')}`;
+    const mode = statSync(file).mode & 0o777;
+    renameSync(file, aside);
+    movedAsideModes.set(path, mode);
     console.error(`[discord-mcpl] Couldn't load ${what} from ${path} (${problem}). Moved it to ${aside}, and starting with none.`);
+    dbg('persisted-json:moved-aside', { what, path, aside, problem });
   } catch (err) {
     unsaveable.add(path);
     console.error(
       `[discord-mcpl] Couldn't load ${what} from ${path} (${problem}), or move it aside (${(err as Error).message}). ` +
-        'Starting with none, and nothing is saved over that file until a restart reads it again.',
+        "Starting with none, and nothing is saved over that file until it's read again.",
     );
+    dbg('persisted-json:move-failed', { what, path, problem, error: (err as Error).message });
   }
   return undefined;
 }
 
-export const isJsonArray = (value: unknown): value is unknown[] => Array.isArray(value);
+export const isStringList = (value: unknown): value is string[] =>
+  Array.isArray(value) && value.every((item) => typeof item === 'string');
 
 export const isJsonObject = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value);

@@ -62,7 +62,7 @@ import {
 import { saveFiltersFile, loadFiltersFile, DiscordFiltersState, type DiscordFilters } from './filters.js';
 import { StateTracker } from './state.js';
 import { existsSync, readFileSync } from 'node:fs';
-import { isJsonArray, isJsonObject, readJsonFile, writeJsonFile } from './persisted-json.js';
+import { isJsonObject, isStringList, readJsonFile, writeJsonFile } from './persisted-json.js';
 import sharp from 'sharp';
 import { dbg } from './debug-log.js';
 
@@ -88,6 +88,39 @@ interface ChannelAcknowledgeRequest {
   intent: string;
   value?: string;
 }
+
+interface SavedTally {
+  anchorId: string;
+  talliedThrough?: string;
+  messages: number;
+  characters: number;
+}
+
+/** The watermark file as saveWatermark writes it. A key can be absent in a
+ *  file an earlier version wrote; anything present that isn't what the loader
+ *  reads makes the file one to move aside (readJsonFile) rather than one whose
+ *  entries are dropped and then saved over. */
+function isWatermarkFile(
+  value: unknown,
+): value is { watermarks?: Record<string, string>; dmChannels?: string[]; missed?: Record<string, SavedTally> } {
+  const isTally = (t: unknown): t is SavedTally =>
+    isJsonObject(t) &&
+    typeof t.anchorId === 'string' &&
+    (t.talliedThrough === undefined || typeof t.talliedThrough === 'string') &&
+    Number.isFinite(t.messages) &&
+    Number.isFinite(t.characters);
+  return (
+    isJsonObject(value) &&
+    (value.watermarks === undefined ||
+      (isJsonObject(value.watermarks) && Object.values(value.watermarks).every((id) => typeof id === 'string'))) &&
+    (value.dmChannels === undefined || isStringList(value.dmChannels)) &&
+    (value.missed === undefined || (isJsonObject(value.missed) && Object.values(value.missed).every(isTally)))
+  );
+}
+
+/** What a tool's reply adds when the change it made couldn't be saved. */
+const unsavedNote = (failure: string | null): string =>
+  failure ? ` This change couldn't be saved (${failure}), so a restart undoes it.` : '';
 
 /** A Discord message must carry text and/or attachments — reject empty sends. */
 function requireContentOrFiles(content: string, files: OutgoingFile[] | undefined): void {
@@ -1494,10 +1527,12 @@ export class DiscordMcplServer {
         const had = this.reactionChannels.has(channelId);
         if (visible) this.reactionChannels.add(channelId);
         else this.reactionChannels.delete(channelId);
-        if (visible !== had) this.saveReactionChannels();
-        return visible
-          ? `Reaction visibility ON for channel ${channelId}. Reactions there now appear in your context as they happen (they never wake you).`
-          : `Reaction visibility OFF for channel ${channelId}.`;
+        const unsaved = visible !== had ? this.saveReactionChannels() : null;
+        return (
+          (visible
+            ? `Reaction visibility ON for channel ${channelId}. Reactions there now appear in your context as they happen (they never wake you).`
+            : `Reaction visibility OFF for channel ${channelId}.`) + unsavedNote(unsaved)
+        );
       }
 
       case 'refresh_channels':
@@ -1553,7 +1588,7 @@ export class DiscordMcplServer {
         this.ensureMutedLoaded();
         const wasNew = !this.mutedChannels.has(channelId);
         this.mutedChannels.add(channelId);
-        if (wasNew) this.saveMuted();
+        const unsaved = wasNew ? this.saveMuted() : null;
         // Muting implies leaving: drop any ambient subscription so the channel
         // stops delivering; it also won't auto-subscribe back in while muted.
         this.ensureSubscriptionsLoaded();
@@ -1561,9 +1596,11 @@ export class DiscordMcplServer {
         for (const channel of this.channelManager.getOpen()) {
           if (parseMcplChannelId(channel.id)?.channelId === channelId) this.channelManager.close(channel.id);
         }
-        return wasNew
-          ? `Muted channel ${channelId}: no ambient, no wake on mention/reply, and it will not auto-subscribe you back in. Reverse with unmute_channel("${channelId}").`
-          : `Channel ${channelId} was already muted.`;
+        return (
+          (wasNew
+            ? `Muted channel ${channelId}: no ambient, no wake on mention/reply, and it will not auto-subscribe you back in. Reverse with unmute_channel("${channelId}").`
+            : `Channel ${channelId} was already muted.`) + unsavedNote(unsaved)
+        );
       }
 
       case 'unmute_channel': {
@@ -1573,13 +1610,15 @@ export class DiscordMcplServer {
         }
         this.ensureMutedLoaded();
         const removed = this.mutedChannels.delete(channelId);
-        if (removed) this.saveMuted();
+        const unsaved = removed ? this.saveMuted() : null;
         const compositeId = this.channelManager.getAll()
           .find((channel) => parseMcplChannelId(channel.id)?.channelId === channelId)?.id;
         const target = compositeId ? `channelId "${compositeId}"` : 'its MCPL channel id';
-        return removed
-          ? `Unmuted channel ${channelId}. Direct addresses will reach you again. Ordinary traffic requires channel_open with ${target}. If the host still shows it as open, use channel_close then channel_open with the same id to reconcile.`
-          : `Channel ${channelId} was not muted.`;
+        return (
+          (removed
+            ? `Unmuted channel ${channelId}. Direct addresses will reach you again. Ordinary traffic requires channel_open with ${target}. If the host still shows it as open, use channel_close then channel_open with the same id to reconcile.`
+            : `Channel ${channelId} was not muted.`) + unsavedNote(unsaved)
+        );
       }
 
       case 'list_subscriptions': {
@@ -1915,22 +1954,23 @@ export class DiscordMcplServer {
     this.reactionChannelsLoaded = true;
     const path = this.reactionChannelsFile();
     if (!path) return;
-    const parsed = readJsonFile(path, 'reaction channels', isJsonArray);
+    const parsed = readJsonFile(path, 'reaction channels', isStringList);
     if (!parsed) return;
-    for (const id of parsed) {
-      if (typeof id === 'string' && id.length > 0) this.reactionChannels.add(id);
-    }
+    for (const id of parsed) if (id.length > 0) this.reactionChannels.add(id);
     dbg('reaction-channels:loaded', { count: this.reactionChannels.size, path });
   }
 
-  private saveReactionChannels(): void {
+  /** Save the reaction channels. Returns why the save failed, or null. */
+  private saveReactionChannels(): string | null {
     const path = this.reactionChannelsFile();
-    if (!path) return; // in-memory mode
+    if (!path) return null; // in-memory mode
     try {
       writeJsonFile(path, [...this.reactionChannels].sort());
+      return null;
     } catch (err) {
       console.error('[discord-mcpl] Failed to save reaction channels:', (err as Error).message);
       dbg('reaction-channels:save-failed', { error: (err as Error).message, path });
+      return (err as Error).message;
     }
   }
 
@@ -1973,19 +2013,23 @@ export class DiscordMcplServer {
     this.mutedLoaded = true;
     const path = this.mutedFile();
     if (!path) return;
-    const parsed = readJsonFile(path, 'muted channels', isJsonArray);
+    const parsed = readJsonFile(path, 'muted channels', isStringList);
     if (!parsed) return;
-    for (const id of parsed) if (typeof id === 'string' && id.length > 0) this.mutedChannels.add(id);
+    for (const id of parsed) if (id.length > 0) this.mutedChannels.add(id);
     dbg('muted:loaded', { count: this.mutedChannels.size, path });
   }
 
-  private saveMuted(): void {
+  /** Save the muted channels. Returns why the save failed, or null. */
+  private saveMuted(): string | null {
     const path = this.mutedFile();
-    if (!path) return;
+    if (!path) return null;
     try {
       writeJsonFile(path, [...this.mutedChannels].sort());
+      return null;
     } catch (err) {
       console.error('[discord-mcpl] Failed to save muted channels:', (err as Error).message);
+      dbg('muted:save-failed', { error: (err as Error).message, path });
+      return (err as Error).message;
     }
   }
 
@@ -2010,42 +2054,20 @@ export class DiscordMcplServer {
     this.watermarkLoaded = true;
     const path = this.watermarkFile();
     if (!path) return;
-    const parsed = readJsonFile(path, 'watermarks', isJsonObject);
+    const parsed = readJsonFile(path, 'watermarks', isWatermarkFile);
     if (!parsed) return;
-    const marks = parsed.watermarks;
-    if (marks && typeof marks === 'object') {
-      for (const [chan, id] of Object.entries(marks)) {
-        if (typeof chan === 'string' && typeof id === 'string' && id.length > 0) {
-          this.forwardedWatermark.set(chan, id);
-        }
-      }
+    for (const [chan, id] of Object.entries(parsed.watermarks ?? {})) {
+      if (id.length > 0) this.forwardedWatermark.set(chan, id);
     }
-    if (Array.isArray(parsed.dmChannels)) {
-      for (const id of parsed.dmChannels) {
-        if (typeof id === 'string' && id.length > 0) this.dmChannelIds.add(id);
-      }
-    }
-    const missed = parsed.missed;
-    if (missed && typeof missed === 'object') {
-      for (const [chan, v] of Object.entries(missed as Record<string, unknown>)) {
-        // An entry that isn't an object reads as an empty tally rather than
-        // throwing partway through the load.
-        const e = (v && typeof v === 'object' ? v : {}) as Partial<{
-          anchorId: string;
-          talliedThrough: string;
-          messages: number;
-          characters: number;
-        }>;
-        if (typeof chan === 'string' && chan.length > 0) {
-          this.missedTally.set(chan, {
-            anchorId: typeof e.anchorId === 'string' ? e.anchorId : '',
-            talliedThrough:
-              typeof e.talliedThrough === 'string' ? e.talliedThrough : e.anchorId ?? '',
-            messages: Number.isFinite(e.messages) ? (e.messages as number) : 0,
-            characters: Number.isFinite(e.characters) ? (e.characters as number) : 0,
-          });
-        }
-      }
+    for (const id of parsed.dmChannels ?? []) if (id.length > 0) this.dmChannelIds.add(id);
+    for (const [chan, tally] of Object.entries(parsed.missed ?? {})) {
+      if (chan.length === 0) continue;
+      this.missedTally.set(chan, {
+        anchorId: tally.anchorId,
+        talliedThrough: tally.talliedThrough ?? tally.anchorId,
+        messages: tally.messages,
+        characters: tally.characters,
+      });
     }
     dbg('watermark:loaded', {
       channels: this.forwardedWatermark.size,

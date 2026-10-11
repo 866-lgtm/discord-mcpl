@@ -162,13 +162,23 @@ in the git log and PR descriptions.
   each read once and rewritten whole after every change. When a file
   couldn't be read, its store started empty, and the next save (one
   `mute_channel`, one `set_reaction_visibility`, or the next forwarded
-  message for watermarks) overwrote it with only the new entry. Now a file
-  that can't be read, or isn't the shape its store expects, is moved to
-  `<file>.unreadable-<time>` before the store starts empty, and the error
-  log names both paths, so nothing is overwritten. Until the file is
-  restored, the store runs without its entries. Saves now write a temp
-  file and rename it over the old one, as the filters file already did, so
-  a process crash partway through a save can't leave a torn file.
+  message for watermarks) overwrote it with only the new entry. Now:
+  - A file that isn't JSON, or isn't the shape its store writes, down to
+    each entry, is moved to `<file>.unreadable-<time>` before the store
+    starts empty, and the error log names both paths. Until the file is
+    restored, the store runs without its entries.
+  - A file that can't be read at all, say for its permissions, stays where
+    it is, and nothing is saved over it until the next start reads it. The
+    store runs in memory meanwhile.
+  - `mute_channel`, `unmute_channel` and `set_reaction_visibility` now say
+    when their change couldn't be saved, so a restart would undo it.
+  - A save replaces a plain file the server owns by renaming a temp file
+    over it, with the file's permissions, so a process crash partway
+    through can't leave a torn file. A symlink, a file with other hard
+    links or another owner, and a path that won't take the rename (a
+    directory the server can't write, a bind-mounted file) are written in
+    place, as before, and a file the server can't write is left as it is.
+    The filters file is saved the same way, so a private one stays private.
 - **A slash command that fails no longer ends the process.** Slash handlers
   run without being awaited, and their rejections were unhandled. On Node
   15 and later, an unhandled rejection exits the process, so a single late
