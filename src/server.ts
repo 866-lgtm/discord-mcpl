@@ -486,6 +486,7 @@ export class DiscordMcplServer {
     if (r.status === 'spoken' && r.unvoicedText.length === 0) return;
     const interrupted = r.status === 'interrupted';
     const expired = r.status === 'expired';
+    const failed = r.status === 'failed';
     const secs = (r.playedMs / 1000).toFixed(1);
     const who = r.interruptedBy
       ? `@${r.interruptedBy.username ?? r.interruptedBy.userId}${r.interruptedBy.bot ? ' (bot)' : ''}`
@@ -495,12 +496,26 @@ export class DiscordMcplServer {
     const tail = r.voicedText.length > 120 ? `…${r.voicedText.slice(-120)}` : r.voicedText;
     const head = r.unvoicedText.length > 400 ? `${r.unvoicedText.slice(0, 400)}…` : r.unvoicedText;
     const approx = r.estimated ? ' (boundary approximate)' : '';
+    // A reply still streaming when its utterance ended short isn't voiced
+    // past that point either: say so, so the model re-decides all of it.
+    const rest = r.restUnvoiced ? '\nWhat you went on to say in that reply wasn\'t voiced either.' : '';
     const line = expired
       ? `[voice] Your spoken message waited ${(r.queuedMs / 1000).toFixed(0)}s for the channel to clear and was dropped UNSPOKEN — nothing was heard (and nothing was billed).\n` +
         `Not said: "${head}"\n(The text was still delivered in the text channel as usual. Say it again — possibly shorter — only if it still needs saying.)`
       : interrupted
         ? `[voice] Your spoken message was interrupted by ${who} after ${secs}s${approx}.\n` +
-          `Heard up to: "${tail}"\nNOT heard: "${head}"`
+          `Heard up to: "${tail}"\nNOT heard: "${head}"` + rest
+        : failed
+          ? // Part of it played: it was stopped, for the reason given (the
+            // limit on one reply, say). Nothing played: it couldn't be.
+            (r.playedMs > 0
+              ? `[voice] Your spoken message was stopped after ${secs}s${approx} (${r.failure ?? 'playback failed'}).\n`
+              : `[voice] Your spoken message couldn't be played (${r.failure ?? 'playback failed'}) — nothing was heard.\n`) +
+            // A line whose text is empty is left out rather than quoted empty.
+            (r.playedMs > 0 && tail ? `Heard up to: "${tail}"\n` : '') +
+            (head ? `NOT heard: "${head}"\n` : '') +
+            (rest ? `${rest.slice(1)}\n` : '') +
+            '(The text was still delivered in the text channel as usual.)'
         : `[voice] Your spoken message was cut short by a synthesis error after ${secs}s${approx}.\n` +
           `Heard up to: "${tail}"\nNOT heard: "${head}"\n(The text was still delivered in the text channel as usual.)`;
     this.conn.sendRequest(method.PUSH_EVENT, {
@@ -529,7 +544,12 @@ export class DiscordMcplServer {
       // is context: the text landed in the text channel, nothing to decide.
       // Third-party speech while recently-engaged (the engagement-window
       // rule) is the floor/gate layer's job, not this transport's.
-      tags: [expired ? 'voice:expired' : interrupted ? 'voice:interrupted' : 'voice:truncated'],
+      // 'voice:failed' is context too, like 'voice:truncated': the text
+      // landed in the text channel. The model sees it on its next turn (the
+      // next person to speak wakes it), and can say the line again then if it
+      // still needs saying. Some causes pass (a slow start, the limit on one
+      // reply), so it isn't an operator's fault to fix each time.
+      tags: [expired ? 'voice:expired' : interrupted ? 'voice:interrupted' : failed ? 'voice:failed' : 'voice:truncated'],
       payload: { content: [textContent(line)] },
     } satisfies PushEventParams).catch(() => {});
   }
