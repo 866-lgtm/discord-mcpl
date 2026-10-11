@@ -796,7 +796,7 @@ export class DiscordAdapter {
   async sendMessage(
     channelId: string,
     content: string,
-    options?: { replyTo?: string; files?: OutgoingFile[] },
+    options?: { replyTo?: string; files?: OutgoingFile[]; requireReplyTarget?: boolean },
   ): Promise<{ messageId: string }> {
     const channel = await this.client.channels.fetch(channelId);
     if (!channel || !('send' in channel)) {
@@ -815,8 +815,13 @@ export class DiscordAdapter {
         content: chunks[i] || undefined,
         // A reply to a message that's gone fails rather than posting
         // unthreaded: discord.js sends fail_if_not_exists from the client's
-        // failIfNotExists option, true by default and never changed here.
-        reply: i === 0 && options?.replyTo ? { messageReference: options.replyTo } : undefined,
+        // failIfNotExists option, true by default. requireReplyTarget states
+        // it for a reply whose target the server chose (a latestFrom
+        // selection), so that one keeps failing whatever the default for
+        // other replies becomes (#58 makes them post unthreaded instead).
+        reply: i === 0 && options?.replyTo
+          ? { messageReference: options.replyTo, ...(options.requireReplyTarget ? { failIfNotExists: true } : {}) }
+          : undefined,
         files: isLast && attachments.length > 0 ? attachments : undefined,
       });
       lastId = sent.id;

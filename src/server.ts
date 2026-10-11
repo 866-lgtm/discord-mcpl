@@ -1419,7 +1419,7 @@ export class DiscordMcplServer {
         const result = await this.discord.sendMessage(
           channelId,
           content,
-          { replyTo, files },
+          { replyTo, files, ...(target ? { requireReplyTarget: true } : {}) },
         );
         this.stateTracker.recordSent(result.messageId, channelId, content);
         const shifted = this.markOutboundSend(channelId);

@@ -301,7 +301,7 @@ describe('resolveLatestFrom', () => {
     assert.ok(!r.ok && /2 member\(s\) here couldn't be resolved to names/.test(r.message), JSON.stringify(r));
   });
 
-  it('sends every reply with fail_if_not_exists, discord.js\'s default, so a reply to a message that\'s gone fails rather than posting unthreaded', async (t) => {
+  it('sends a latestFrom reply with fail_if_not_exists whatever the default for other replies', async (t) => {
     const adapter = new DiscordAdapter({ token: 'unused' });
     const client = (adapter as unknown as { client: Client }).client;
     t.after(() => client.destroy());
@@ -320,15 +320,22 @@ describe('resolveLatestFrom', () => {
         mention_everyone: false, mentions: [], mention_roles: [], attachments: [], embeds: [], pinned: false, type: 0,
       };
     });
-    // A reply by exact id and one to a latestFrom selection reach the adapter the same way.
+    const reference = (i: number) => bodies[i].message_reference as Record<string, unknown>;
+    // Today discord.js's default (failIfNotExists: true) covers every reply.
     await adapter.sendMessage('dm1', 'by id', { replyTo: '1200000000000000001' });
-    await adapter.sendMessage('dm1', 'by latestFrom', { replyTo: '1200000000000000002' });
-    assert.equal(bodies.length, 2);
-    for (const [i, id] of ['1200000000000000001', '1200000000000000002'].entries()) {
-      const reference = bodies[i].message_reference as Record<string, unknown>;
-      assert.equal(reference.message_id, id);
-      assert.equal(reference.fail_if_not_exists, true, `send ${i + 1} carries discord.js's default`);
-    }
+    await adapter.sendMessage('dm1', 'by latestFrom', { replyTo: '1200000000000000002', requireReplyTarget: true });
+    assert.equal(reference(0).fail_if_not_exists, true, "a reply by id carries discord.js's default");
+    assert.equal(reference(1).fail_if_not_exists, true);
+    // With the default for other replies false, as #58 makes it, a reply by
+    // id posts unthreaded when its target is gone, and a latestFrom reply,
+    // whose target the server chose, still fails.
+    (client.options as { failIfNotExists: boolean }).failIfNotExists = false;
+    await adapter.sendMessage('dm1', 'by id', { replyTo: '1200000000000000003' });
+    await adapter.sendMessage('dm1', 'by latestFrom', { replyTo: '1200000000000000004', requireReplyTarget: true });
+    assert.equal(reference(2).fail_if_not_exists, false, 'a plain reply follows the default');
+    assert.equal(reference(3).fail_if_not_exists, true, 'a latestFrom reply keeps failing');
+    assert.deepEqual(bodies.map((b) => (b.message_reference as { message_id: string }).message_id),
+      ['1200000000000000001', '1200000000000000002', '1200000000000000003', '1200000000000000004']);
   });
 });
 
@@ -425,7 +432,7 @@ describe('reply and reaction tools', () => {
     const f = serverFixture();
     const res = await f.call('reply_message', { latestFrom: 'Ra', content: 'answering you' });
     assert.ok(!res.isError, res.content[0].text);
-    assert.deepEqual(f.calls[0].options, { replyTo: '200000000000000030', files: undefined });
+    assert.deepEqual(f.calls[0].options, { replyTo: '200000000000000030', files: undefined, requireReplyTarget: true }, 'a target the server chose must exist');
     const receipt = JSON.parse(res.content[0].text);
     assert.equal(receipt.messageId, '300000000000000001');
     assert.equal(receipt.target.messageId, '200000000000000030');

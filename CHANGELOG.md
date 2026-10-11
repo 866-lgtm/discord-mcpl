@@ -19,12 +19,12 @@ in the git log and PR descriptions.
     `list_channels` and `list_channel_members`, it reads only what the
     configured filters admit: a channel in a guild `guildIds` lists, admitted
     by `guildChannels` (a thread by its parent's entry), and for a DM, one
-    whose other party `dmUsers` lists. When the cache can't name a DM's other
-    party (a channel known only from the bot's own message), Discord is asked
-    once, and a party it still can't name is refused. Anything else is refused, by ID or by
-    name, before its history or members are read, and the filters are
-    checked again after the reads, so a change made meanwhile refuses the
-    action.
+    whose other party `dmUsers` lists. When the cache can't name a DM's
+    other party (a channel known only from the bot's own message), Discord
+    is asked once, and a party it still can't name is refused. Anything else
+    is refused, by ID or by name, before its history or members are read,
+    and the filters are checked again after the reads, so a change made
+    meanwhile refuses the action.
   - **A name must match one identity.** That is among everyone who can read
     the channel (for a public thread, its parent's viewers as well as its
     joined members; for a private thread, its members and the parent's
@@ -46,8 +46,10 @@ in the git log and PR descriptions.
     code points so no emoji is split. `add_reaction` and `remove_reaction`
     return `{ result, target }` for a `latestFrom` selection.
   - **A reply to a message that's gone fails** instead of posting
-    unthreaded, by discord.js's default (`fail_if_not_exists`), for a
-    `latestFrom` selection as for an exact ID.
+    unthreaded. Today discord.js's default (`fail_if_not_exists`) does that
+    for every reply. A `latestFrom` reply also asks for it explicitly, since
+    its target was chosen for it, so it keeps failing if the default for
+    other replies changes (#58 makes them post unthreaded instead).
   - **Selectors:** both are nullable and neither is required, so sparse
     calls and all-properties calls with the unused one null both work. Only
     omission and null mean absent: a string is a selector given, blank
