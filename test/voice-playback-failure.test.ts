@@ -76,6 +76,9 @@ test('a player that refuses an item settles it as failed, uncleared, and the nex
   // Never 'cleared': the billing gate stays shut for an item the player refused.
   assert.deepEqual(summary(events), [`failed:u1:0:${refusal}`, `failed:u2:0:${refusal}`]);
   assert.equal(played.length, 2, 'the second item reached the player after the first failed');
+  for (const resource of played as AudioResource[]) {
+    assert.equal(resource.playStream.destroyed, true, "a refused item's resource is released");
+  }
   assert.equal(internals.current, null, 'nothing is left marked as playing');
   await until(() => internals.playing === false, 'the pump to finish');
 });
@@ -157,6 +160,79 @@ test('an item a failed listener queues while the queue is being settled is still
   assert.deepEqual(summary(events), ['failed:u1:0:gate broke', 'failed:u1-again:0:player refused']);
   assert.equal(played.length, 1, 'the replacement reached the player without another play()');
   await until(() => internals.playing === false, 'the pump to finish');
+});
+
+type PlayerInternals = SinkInternals & {
+  playingTimeoutMs: number;
+  current: { interruptedBy: unknown } | null;
+};
+
+/** A real AudioPlayer, as connect() makes it, but with no voice connection. */
+const realPlayer = () => createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Play } });
+
+test('an accepted item that never gets audio fails when the wait for Playing runs out, instead of being reported spoken', async (t) => {
+  noUnhandledRejections(t);
+  const player = realPlayer();
+  const { sink, internals, events } = sinkWith(player);
+  (internals as PlayerInternals).playingTimeoutMs = 100;
+  // As when the TTS provider is unavailable at clearance: no audio ever comes.
+  sink.play({ id: 'u1', stream: new PassThrough() });
+  await until(() => events.some((e) => e.type === 'failed'), 'the item to fail');
+  assert.deepEqual(summary(events), ['cleared:u1', 'failed:u1:0:no audio reached the player within 0.1s']);
+  assert.equal(internals.current, null);
+  await until(() => internals.playing === false, 'the pump to finish');
+});
+
+test("the player's error for the playing stream fails the item with that error, where it was reported finished", async (t) => {
+  noUnhandledRejections(t);
+  const player = realPlayer();
+  const { sink, internals, events } = sinkWith(player);
+  // 200 ms of silence, and the stream left open, so the item is still playing.
+  const pcm = new PassThrough();
+  pcm.write(Buffer.alloc(48_000 * 2 * 2 / 5));
+  sink.play({ id: 'u1', stream: pcm });
+  await until(() => events.some((e) => e.type === 'started'), 'the item to start');
+  pcm.destroy(new Error('stream broke'));
+  await until(() => events.some((e) => e.type === 'failed'), 'the item to fail');
+  const last = summary(events).at(-1)!;
+  assert.match(last, /^failed:u1:\d+:stream broke$/);
+  await until(() => internals.playing === false, 'the pump to finish');
+});
+
+test('a throw while an item plays settles it, with what was queued, and a barge-in before it still reads as interrupted', async (t) => {
+  noUnhandledRejections(t);
+  const player = realPlayer();
+  const realStop = player.stop.bind(player);
+  t.after(() => realStop(true));
+  // The stop after the Playing wait runs out throws, so the pump's outer
+  // catch settles the item still current, and the one queued behind it.
+  player.stop = () => { throw new Error('stop broke'); };
+  const { sink, internals, events } = sinkWith(player);
+  (internals as PlayerInternals).playingTimeoutMs = 100;
+  // A listener queues a replacement when u1 fails. The queue was taken before
+  // u1 was settled, so the replacement isn't swept up with u2: it is played.
+  let requeued = false;
+  sink.onEvent((ev) => {
+    if (ev.type === 'failed' && ev.id === 'u1' && !requeued) { requeued = true; sink.play({ id: 'u1-again', stream: new PassThrough() }); }
+  });
+  sink.play({ id: 'u1', stream: new PassThrough() });
+  sink.play({ id: 'u2', stream: new PassThrough() });
+  await until(() => events.filter((e) => e.type === 'failed').length === 3, 'all three items to settle');
+  assert.deepEqual(summary(events), [
+    'cleared:u1', 'failed:u1:0:stop broke', 'failed:u2:0:stop broke',
+    'cleared:u1-again', 'failed:u1-again:0:stop broke',
+  ]);
+  await until(() => internals.playing === false, 'the pump to stop');
+
+  // Someone barges in on the next item just before the same throw.
+  const by = { userId: 'h1', username: 'human', bot: false };
+  sink.play({ id: 'u3', stream: new PassThrough() });
+  await until(() => events.some((e) => e.type === 'cleared' && e.id === 'u3'), 'u3 to clear');
+  (internals as PlayerInternals).current!.interruptedBy = by;
+  await until(() => events.length >= 7, 'u3 to settle');
+  const settled = events.at(-1)!;
+  assert.equal(settled.type, 'interrupted');
+  assert.deepEqual((settled as Extract<SinkEvent, { type: 'interrupted' }>).by, by);
 });
 
 // ── VoiceOutput and the server: what a failed item becomes ─────────────────
@@ -242,6 +318,26 @@ test('an item refused before clearance bills nothing and reports how long it was
   assert.ok(reports[0]!.queuedMs >= 15, `queued until it failed (${reports[0]!.queuedMs} ms)`);
 });
 
+test('a finished utterance that never had audio is not counted as fully played, and nothing heard is exact', () => {
+  const provider = new FakeProvider();
+  const sink = new FakeSink();
+  const out = new VoiceOutput({ textChannels: null }, provider, { voiceId: 'v1' }, sink, () => {});
+  const reports: UtteranceReport[] = [];
+  out.onReport((r) => reports.push(r));
+
+  out.handleChunk('inf1', 'discord:g:100', 'Hello there.');
+  out.handleComplete('inf1');
+  sink.emit({ type: 'cleared', id: 'inf1' });
+  // The fake provider sends no audio, so audioMs stays 0.
+  sink.emit({ type: 'finished', id: 'inf1', playedMs: 0 });
+
+  assert.equal(reports.length, 1);
+  assert.equal(reports[0]!.status, 'spoken');
+  assert.equal(reports[0]!.voicedText, '', 'nothing is counted as voiced');
+  assert.equal(reports[0]!.unvoicedText, 'Hello there.');
+  assert.equal(reports[0]!.estimated, false, 'nothing heard is an exact boundary');
+});
+
 test('the server tells the model a failed utterance could not be played, tagged voice:failed', () => {
   const server = new DiscordMcplServer({} as unknown as DiscordAdapter);
   const sent: Array<{ method: string; params: Record<string, any> }> = [];
@@ -279,5 +375,24 @@ test('the server tells the model a failed utterance could not be played, tagged 
     partial,
     "[voice] Your spoken message couldn't be played (Cannot play a resource that has already ended.) after 1.5s.\n" +
       'Heard up to: "Hello"\nNOT heard: " there."\n(The text was still delivered in the text channel as usual.)',
+  );
+
+  // An estimated boundary says so.
+  internals.handleVoiceReport({ ...base, playedMs: 1500, voicedText: 'Hello', unvoicedText: ' there.', estimated: true });
+  assert.match(sent[2]!.params.payload.content[0].text, /^\[voice\] .* after 1\.5s \(boundary approximate\)\.\nHeard up to: "Hello"\n/);
+
+  // An empty side is left out rather than quoted empty: audio played, but no
+  // character of it counts as heard; and everything heard, then a failure.
+  internals.handleVoiceReport({ ...base, playedMs: 200, voicedText: '', unvoicedText: 'Hello there.', estimated: false });
+  assert.equal(
+    sent[3]!.params.payload.content[0].text,
+    "[voice] Your spoken message couldn't be played (Cannot play a resource that has already ended.) after 0.2s.\n" +
+      'NOT heard: "Hello there."\n(The text was still delivered in the text channel as usual.)',
+  );
+  internals.handleVoiceReport({ ...base, playedMs: 2000, voicedText: 'Hello there.', unvoicedText: '', estimated: false });
+  assert.equal(
+    sent[4]!.params.payload.content[0].text,
+    "[voice] Your spoken message couldn't be played (Cannot play a resource that has already ended.) after 2.0s.\n" +
+      'Heard up to: "Hello there."\n(The text was still delivered in the text channel as usual.)',
   );
 });

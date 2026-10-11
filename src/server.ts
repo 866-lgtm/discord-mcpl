@@ -504,8 +504,11 @@ export class DiscordMcplServer {
           `Heard up to: "${tail}"\nNOT heard: "${head}"`
         : failed
           ? `[voice] Your spoken message couldn't be played (${r.failure ?? 'playback failed'})` +
-            (r.playedMs > 0 ? ` after ${secs}s${approx}.\nHeard up to: "${tail}"\n` : ' — nothing was heard.\n') +
-            `NOT heard: "${head}"\n(The text was still delivered in the text channel as usual.)`
+            (r.playedMs > 0 ? ` after ${secs}s${approx}.\n` : ' — nothing was heard.\n') +
+            // A line whose text is empty is left out rather than quoted empty.
+            (r.playedMs > 0 && tail ? `Heard up to: "${tail}"\n` : '') +
+            (head ? `NOT heard: "${head}"\n` : '') +
+            '(The text was still delivered in the text channel as usual.)'
         : `[voice] Your spoken message was cut short by a synthesis error after ${secs}s${approx}.\n` +
           `Heard up to: "${tail}"\nNOT heard: "${head}"\n(The text was still delivered in the text channel as usual.)`;
     this.conn.sendRequest(method.PUSH_EVENT, {
@@ -534,8 +537,10 @@ export class DiscordMcplServer {
       // is context: the text landed in the text channel, nothing to decide.
       // Third-party speech while recently-engaged (the engagement-window
       // rule) is the floor/gate layer's job, not this transport's.
-      // 'voice:failed' is context too: the text landed, and playback
-      // failing is the operator's to fix.
+      // 'voice:failed' is context too, unlike 'voice:expired': a playback
+      // fault isn't a decision for the model, since saying it again would
+      // meet the same fault. The text landed, and the fault is the
+      // operator's to fix.
       tags: [expired ? 'voice:expired' : interrupted ? 'voice:interrupted' : failed ? 'voice:failed' : 'voice:truncated'],
       payload: { content: [textContent(line)] },
     } satisfies PushEventParams).catch(() => {});

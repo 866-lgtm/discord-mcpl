@@ -174,18 +174,25 @@ in the git log and PR descriptions.
   playing and its utterance waiting for an outcome. Such an item is now
   settled with a new terminal sink event, `failed`, and the sink goes on to
   the next one. A refused item is never `cleared`, so its text is never
-  billed. Any other throw in playback settles the playing and queued items
-  the same way, and nothing a `failed` listener queues meanwhile waits for
-  the next `play()`. `VoiceOutput` ends a failed utterance as it does an
-  interrupted one: it stops synthesis and drops the rest of that inference.
+  billed. An item the player accepts but doesn't start within 10 s, or
+  doesn't finish within 300 s, fails too, naming which wait ran out. It used
+  to be reported as spoken in full though nothing was heard, as when the TTS
+  provider is unavailable at clearance. An item whose stream the player
+  reports an error for fails with that error, where it was reported as
+  finished. A barge-in still reports `interrupted`. Any other throw in
+  playback settles the playing and queued items the same way, and nothing a
+  `failed` listener queues meanwhile waits for the next `play()`.
+  `VoiceOutput` ends a failed utterance as it does an interrupted one: it
+  stops synthesis and drops the rest of that inference.
   It reports status `failed` with the reason, and the model is told the
   message couldn't be played, tagged `voice:failed`. Like `voice:truncated`,
   that tag is context, not a wake: the text landed in the text channel, and
-  a player that fails is the operator's to fix. The voice-chat harness
+  unlike an expired item's words, saying it again would meet the same fault,
+  which is the operator's to fix. The voice-chat harness
   (`scripts/voice-chat.ts`) treats `failed` like an interruption: it stops
   the model's stream, its transcript and history keep only what was heard,
   and the model is told on its next turn, without one being started for it.
-  An interruption that comes while the model is still generating no longer
-  overwrites the previous turn's history and then keeps everything generated
-  so far, heard or not. Raised in #69's review, the same class as #70's
-  slash-command fix.
+  An interruption that came while the model was still generating used to
+  overwrite the previous turn's history and then keep everything generated so
+  far, heard or not; it now keeps only what was heard. Raised in #69's
+  review, the same class as #70's slash-command fix.
