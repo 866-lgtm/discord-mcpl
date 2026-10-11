@@ -164,23 +164,32 @@ in the git log and PR descriptions.
   `mute_channel`, one `set_reaction_visibility`, or the next forwarded
   message for watermarks) overwrote it with only the new entry. Now:
   - A file that isn't JSON, or isn't the shape its store writes, down to
-    each entry, is moved to `<file>.unreadable-<time>` before the store
-    starts empty, and the error log names both paths. Until the file is
-    restored, the store runs without its entries.
-  - A file that can't be read at all, say for its permissions, stays where
-    it is, and nothing is saved over it until the next start reads it. The
-    store runs in memory meanwhile.
+    each entry, keeps its place: a copy goes to `<file>.unreadable-<time>`,
+    the file itself is emptied, and the store starts empty. The error log
+    names the copy. The file keeps its permissions, owner, group and links.
+    To restore the copy, stop the server first, since a running server
+    saves over its file. A leading byte-order mark is no longer a reason.
+  - A file that can't be read at all, say for its permissions, stays as it
+    is, and nothing is saved over it until the next start reads it. So does
+    one whose copy or emptying fails. The store runs in memory meanwhile.
   - `mute_channel`, `unmute_channel` and `set_reaction_visibility` now say
-    when their change couldn't be saved, so a restart would undo it.
+    when their store couldn't be saved, every time they're called, so that
+    until a later save succeeds, a restart would undo the change.
+    `set_reaction_visibility` now refuses a missing `channelId`, as the
+    other two do.
   - A save replaces a plain file the server owns by renaming a temp file
     over it, with the file's permissions and group, so a process crash
     partway through can't leave a torn file. Extended attributes and an
     ACL on the file itself don't carry over. A symlink, a file with other
     hard links or another owner, a group the server isn't in, and a path
     that won't take the rename (a directory the server can't write, a
-    bind-mounted file) are written in place, as before, and a file the
-    server can't write is left as it is. The filters file is saved the
-    same way, so a private one stays private.
+    read-only filesystem around a bind-mounted file, a filesystem without
+    permissions) are written in place, as before, where a crash partway
+    through can still tear the file. A file the server can't write is left
+    as it is.
+  - The filters file is saved the same way. So a private one now stays
+    private, a symlinked or hard-linked one is written through rather than
+    replaced, and a read-only one is refused rather than replaced.
 - **A slash command that fails no longer ends the process.** Slash handlers
   run without being awaited, and their rejections were unhandled. On Node
   15 and later, an unhandled rejection exits the process, so a single late
