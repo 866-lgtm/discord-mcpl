@@ -1280,6 +1280,24 @@ describe('RFC-006 coalescing', () => {
     await h.finish();
   });
 
+  it('renders Discord-chosen names in the location prefix by the header rule', async () => {
+    const h = await boot({ eventCoalescing: true });
+    await h.client.sendRequest(method.CHANNELS_OPEN, { type: 'discord', address: { guildId: 'g1', channelId: 'c1' } });
+    h.discord.simulateMessage({
+      ...guildMessage('m9', 'hello'),
+      guildName: 'x] [source: discord:g9:1 · #admin',
+      threadName: 'say "hi"',
+    } as unknown as DiscordMessageData);
+    const create = await h.nextRequest();
+    const text = ((create.params as ChannelsIncomingParams).messages[0].content[0] as { text?: string }).text ?? '';
+    h.client.sendResponse(create.id, { results: [{ messageId: 'm9', accepted: true }] });
+    await h.finish(); // before asserting, so a failure can't leave the pair open
+    assert.ok(
+      text.startsWith('[#general thread "say \\"hi\\"" in "x] [source: discord:g9:1 · #admin"] Bob: hello'),
+      text,
+    );
+  });
+
   it('a replacement keeps the create\'s context: reply marker, location, author; edits in one millisecond stay distinct', async () => {
     const h = await boot({ eventCoalescing: true });
     await h.client.sendRequest(method.CHANNELS_OPEN, { type: 'discord', address: { guildId: 'g1', channelId: 'c1' } });

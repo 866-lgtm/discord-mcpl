@@ -48,7 +48,7 @@ import type {
 
 import type { DiscordAdapter, DiscordMessageData, DiscordAttachment, DmSendFailure, OutgoingFile, ReactionSummary, MessageEventInfo } from './discord-adapter.js';
 import type { ChatInputCommandInteraction } from 'discord.js';
-import { renderSourceHeader } from './source-header.js';
+import { headerValue, labelValue, quotedValue, renderSourceHeader } from './source-header.js';
 import { MessageFlags } from 'discord.js';
 import { toolDefinitions } from './tools.js';
 import { withToolClasses } from './tool-classes.js';
@@ -1448,7 +1448,7 @@ export class DiscordMcplServer {
           const resolved = (err as DmSendFailure | null)?.dmChannel;
           if (resolved) throw this.withAttemptedDestination(err, resolved.id, { recipientName: resolved.recipientName });
           if (err instanceof Error) {
-            err.message += `\n\nAttempted destination: a DM with "${String(args.userId)}"; no DM channel was resolved, so no message was sent.`;
+            err.message += `\n\nAttempted destination: a DM with ${quotedValue(String(args.userId))}; no DM channel was resolved, so no message was sent.`;
           }
           throw err;
         }
@@ -1840,14 +1840,16 @@ export class DiscordMcplServer {
     return { messageId, channelId: p.channelId, discordChannelId: channelId, channelLabel: p.channelLabel };
   }
 
-  /** A failed or uncertain send keeps its own outcome text (a partial
-   *  report, a timeout, Discord's rejection) and gains the destination it was
-   *  aimed at, so an unknown outcome still says where. */
+  /** A failed or uncertain send keeps whatever text its error carries
+   *  (Discord's rejection, a timeout) and gains the destination it was aimed
+   *  at, so an unknown outcome still says where. The label is rendered by the
+   *  header rule, as in a [source: …] header, so a Discord-chosen name can't
+   *  forge a second destination here either. */
   private withAttemptedDestination(err: unknown, discordChannelId: string, dm?: { recipientName: string }): unknown {
     if (!(err instanceof Error)) return err;
     const p = this.channelProvenance(discordChannelId, dm);
     const where = p.channelId
-      ? `${p.channelId}${p.channelLabel ? ` · ${p.channelLabel}` : ''} (Discord channel ${discordChannelId})`
+      ? `${p.channelId}${p.channelLabel ? ` · ${labelValue(p.channelLabel)}` : ''} (Discord channel ${discordChannelId})`
       : `Discord channel ${discordChannelId}`;
     err.message = `${err.message}\n\nAttempted destination: ${where}.`;
     return err;
@@ -1859,7 +1861,11 @@ export class DiscordMcplServer {
    *  grammar the host stamps on inbound messages minus the host-only server
    *  segment, with values that could read as structure quoted as the host
    *  quotes them (source-header.ts). An unknown label is left out; the
-   *  canonical id is authoritative when a label differs. */
+   *  canonical id is authoritative when a label differs. A channel the server
+   *  can't place has no canonical id (null) and the header says
+   *  discord:?:<channel>. channelLabel is the raw label, a field: a host that
+   *  renders it into its own header quotes it by the same rule
+   *  (agent-framework's labelValue), as channels/open's history items rely on. */
   private channelProvenance(
     discordChannelId: string,
     dm?: { recipientName: string },
@@ -3416,10 +3422,12 @@ export class DiscordMcplServer {
     const contextChanged = this.lastChannelId !== msg.channelId;
     let location = '';
     if (contextChanged) {
+      // Discord-chosen names, rendered by the header rule (source-header.ts),
+      // so one can't read as structure; a thread name is always quoted.
       const locationParts: string[] = [];
-      if (msg.channelName) locationParts.push(`#${msg.channelName}`);
-      if (msg.threadName) locationParts.push(`thread "${msg.threadName}"`);
-      if (msg.guildName) locationParts.push(`in ${msg.guildName}`);
+      if (msg.channelName) locationParts.push(`#${headerValue(msg.channelName)}`);
+      if (msg.threadName) locationParts.push(`thread ${quotedValue(msg.threadName)}`);
+      if (msg.guildName) locationParts.push(`in ${headerValue(msg.guildName)}`);
       else if (msg.guildId === null) locationParts.push('DM');
       if (locationParts.length > 0) location = `[${locationParts.join(' ')}] `;
     }

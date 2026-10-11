@@ -25,10 +25,12 @@
  *   would. One that an invisible character hides is quoted already;
  * - every other value is rendered as is. A header is always one line.
  *
- * A well-formed emoji sequence keeps its zero-width joiners and variation
- * selectors raw. Channel and display names carry emoji, and an escaped
- * `❤\ufe0f-cats` is a name the reader can't type back (agent-framework#269;
- * the same rule as the framework's).
+ * An emoji sequence led by a pictographic character keeps its zero-width
+ * joiners, skin tones and variation selectors raw: channel and display names
+ * carry emoji, and an escaped `❤\ufe0f-cats` is a name the reader can't type
+ * back (agent-framework#269). A keycap (`1\ufe0f\u20e3`) or a tag-sequence
+ * flag isn't led by one, so its invisible characters are escaped, as they
+ * are in the framework's copy of this rule; the two renderings keep one rule.
  */
 
 /**
@@ -53,12 +55,12 @@ const QUOTED_ESCAPES = new RegExp(`(${EMOJI_SEQUENCE.source})|${UNSEEN.source}`,
 
 /** A header field: quoted when it could read as structure, else as is. */
 export function headerValue(value: string): string {
-  return STRUCTURAL.test(value) || UNSEEN_OUTSIDE_EMOJI.test(value.replace(EMOJI_SEQUENCE, '')) ? quoted(value) : value;
+  return STRUCTURAL.test(value) || UNSEEN_OUTSIDE_EMOJI.test(value.replace(EMOJI_SEQUENCE, '')) ? quotedValue(value) : value;
 }
 
 /** The label: also quoted when it begins with one of the header's own words. */
 export function labelValue(label: string): string {
-  return /^\s*(?:thread|reply\s+to|unscoped)(?:\s|$)/i.test(label) ? quoted(label) : headerValue(label);
+  return /^\s*(?:thread|reply\s+to|unscoped)(?:\s|$)/i.test(label) ? quotedValue(label) : headerValue(label);
 }
 
 /** The standalone header: `[source: <canonical id> · <label>]`, the label left out when unknown. */
@@ -67,7 +69,7 @@ export function renderSourceHeader(channelId: string, label?: string | null): st
 }
 
 /** A value as a quoted, escaped string literal that always stays on one line. */
-function quoted(value: string): string {
+export function quotedValue(value: string): string {
   // JSON.stringify escapes the C0 controls, quotes and backslashes, but
   // leaves DEL, the C1 controls (U+0085 NEL breaks a line), U+2028 / U+2029,
   // invisible characters and non-ASCII spaces literal: escape those visibly

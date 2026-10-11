@@ -865,7 +865,8 @@ export class DiscordAdapter {
     // the DM channel we're about to send to. Return the DM channel ID too so
     // the caller can update sticky-reply state.
     const dm = await user.createDM();
-    const recipientName = user.displayName ?? user.username;
+    // The username, as the registry's DM descriptor names the DM.
+    const recipientName = user.username;
     try {
       const resolved = await this.resolveOutgoingMentions(dm, content);
       const attachments = buildAttachments(options?.files);
@@ -889,7 +890,7 @@ export class DiscordAdapter {
     }
   }
 
-  /** The recipient's name for a cached DM channel, or null when the channel
+  /** The recipient's username for a cached DM channel, or null when the channel
    *  isn't cached, isn't a DM, or its recipient can't be read. Labels a DM
    *  the channel registry hasn't seen. */
   getCachedDmRecipientName(channelId: string): string | null {
@@ -897,7 +898,7 @@ export class DiscordAdapter {
     if (!channel || channel.type !== ChannelType.DM) return null;
     try {
       const recipient = (channel as DMChannel).recipient;
-      return recipient ? (recipient.displayName ?? recipient.username) : null;
+      return recipient ? recipient.username : null; // as the registry's DM descriptor names it
     } catch {
       return null; // reading the recipient needs the logged-in user
     }

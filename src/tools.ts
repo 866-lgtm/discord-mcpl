@@ -42,13 +42,15 @@ const MESSAGE_ID_KIND =
   'Also supply the channel containing it.';
 
 const RECEIPT_PROVENANCE =
-  ' The result names where it went: channelId (canonical, discord:<guild|dm>:<channel>), ' +
-  'discordChannelId and channelLabel. A failed or uncertain send keeps its own outcome text and ' +
-  'adds the attempted destination. The canonical id is authoritative when a label differs.';
+  ' The result names where it went: channelId (canonical, discord:<guild|dm>:<channel>, or null ' +
+  'when the server can\'t place the channel), discordChannelId and channelLabel. A failed or ' +
+  'uncertain send keeps its own outcome text and adds the attempted destination. The canonical id ' +
+  'is authoritative when a label differs.';
 
 const HISTORY_PROVENANCE =
   ' Each message names its channel: a source header [source: <canonical id> · <label>], plus ' +
-  'channelId (canonical, discord:<guild|dm>:<channel>) and channelLabel. The canonical id is ' +
+  'channelId (canonical, discord:<guild|dm>:<channel>) and channelLabel. A channel the server can\'t ' +
+  'place has channelId null and a header id of discord:?:<channel>. The canonical id is ' +
   'authoritative when a label differs.';
 
 export const toolDefinitions: ToolDefinition[] = [
