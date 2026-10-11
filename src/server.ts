@@ -57,11 +57,14 @@ import { headerValue, labelValue, quotedValue, renderSourceHeader } from './sour
 import { MessageFlags } from 'discord.js';
 import {
   boundedReply,
+  clip,
   controlOutcomeUnknown,
   describeCancel,
   describeMarkers,
   describeRelease,
   describeRetract,
+  hostCount,
+  hostRefusal,
   isCancelReceipt,
   isReleaseReceipt,
   isRetractReceipt,
@@ -72,8 +75,11 @@ import {
   renderEntry,
   renderListPage,
   summarizeControl,
+  summarizeMarkers,
   surgeryOutcomeUnknown,
   unreadable,
+  unreadableControl,
+  unreadableSurgery,
   type BoundedReply,
 } from './awareness-marks.js';
 import { toolDefinitions } from './tools.js';
@@ -134,6 +140,25 @@ function errorText(err: unknown): string {
   } catch {
     return `[an unprintable ${typeof err}]`;
   }
+}
+
+/**
+ * An applied /undo's or /hide's `lastVisible`, the message the agent now
+ * sees last, read field by field: a field that isn't text is left out rather
+ * than read as text. `ifAbsent` stands in when the host sent none.
+ */
+function lastVisibleLines(lastVisible: unknown, ifAbsent?: string): string[] {
+  if (!isJsonObject(lastVisible)) return ifAbsent ? [ifAbsent] : [];
+  const text = (v: unknown): string | undefined => (typeof v === 'string' && v !== '' ? v : undefined);
+  const who = text(lastVisible.participant) ?? text(lastVisible.role) ?? '?';
+  const preview = lastVisible.preview;
+  if (typeof preview === 'string' && preview !== '') {
+    return [`Last message now visible to the agent — **${who}**:`, `> ${preview.replace(/\n/g, '\n> ')}`];
+  }
+  return [
+    `Last message now visible to the agent — **${who}**: ` +
+      (preview === undefined || preview === null || preview === '' ? '*(empty message)*' : "*(a preview this server can't read)*"),
+  ];
 }
 
 interface SavedTally {
@@ -371,7 +396,7 @@ export class DiscordMcplServer {
   /** Whether each host connection makes 💤 awareness marks a choice (its
    *  `host/command` has the `marks` verb): probed once per connection, on
    *  first need, with commands that arrive meanwhile sharing the probe. Only
-   *  a definite answer is kept. */
+   *  an answer the host gave is kept; a failed request is asked again. */
   private readonly marksSupport = new WeakMap<McplConnection, Promise<boolean | { reason: string }>>();
   // Note: the location-header transition tracker and the sticky-reply
   // channel are the same thing — both want to know "where did
@@ -842,6 +867,7 @@ export class DiscordMcplServer {
 
     const messages = interaction.options.getInteger('messages') ?? 1;
     const marks = readMarksChoice(interaction);
+    const marksChosen = marks === 'addressed' || marks === 'all';
     const conn = this.conn;
     if (!conn) {
       await interaction.reply({ content: 'Host is not connected — cannot undo.', flags: MessageFlags.Ephemeral });
@@ -861,22 +887,14 @@ export class DiscordMcplServer {
       await this.acknowledge(interaction, boundedReply(support === false
         ? "⚠️ Undo refused: this host can't make awareness marks a choice — its undo places 💤 marks that " +
           'follow branches. Upgrade the host (an agent framework with the `marks` host command) to undo from Discord.'
-        : `⚠️ Undo not sent: couldn't confirm that this host makes awareness marks a choice (${support.reason}). ` +
-          'Nothing was changed; try again.'));
+        : `⚠️ Undo not sent: couldn't learn whether this host makes awareness marks a choice (${support.reason}). ` +
+          'Nothing was changed.'));
       return;
     }
 
-    let result: {
-      ok?: boolean;
-      error?: string;
-      code?: string;
-      messagesRemoved?: number;
-      /** The host's SurgeryMarkerReceipt, unverified: describeMarkers reads it. */
-      markers?: unknown;
-      lastVisible?: { participant?: string; role?: string; preview?: string } | null;
-    };
+    let result: unknown;
     try {
-      result = (await conn.sendRequest(
+      result = await conn.sendRequest(
         'host/command',
         {
           command: 'undo',
@@ -886,51 +904,52 @@ export class DiscordMcplServer {
           requesterName: interaction.user.username,
         },
         30000,
-      )) as typeof result;
+      );
     } catch (err) {
       // The request may have reached the host before this failed: what it
       // did is unknown, not undone.
-      dbg('slash:undo-failed', { error: (err as Error).message });
+      dbg('slash:undo-failed', { error: errorText(err) });
       await this.acknowledge(
         interaction,
-        boundedReply(surgeryOutcomeUnknown('Undo', (err as Error).message)),
-        surgeryOutcomeUnknown('Undo'),
+        boundedReply(surgeryOutcomeUnknown('Undo', marksChosen, errorText(err))),
+        surgeryOutcomeUnknown('Undo', marksChosen),
       );
       return;
     }
 
-    if (!result?.ok) {
-      await this.acknowledge(interaction, boundedReply(
-        `⚠️ Undo failed${result?.code ? ` (${result.code})` : ''}: ${result?.error ?? 'unknown error'}`,
-      ));
+    // Only `ok: false` is the host's refusal. An answer without a boolean
+    // `ok` may still have been applied, so it's shown as sent, never as a failure.
+    const answer: Record<string, unknown> = isJsonObject(result) ? result : {};
+    if (answer.ok === false) {
+      await this.acknowledge(interaction, boundedReply(hostRefusal('Undo', answer)));
+      return;
+    }
+    if (answer.ok !== true) {
+      await this.acknowledge(
+        interaction,
+        boundedReply(unreadableSurgery('undo', result, marksChosen), result),
+        surgeryOutcomeUnknown('Undo', marksChosen),
+      );
       return;
     }
 
-    {
-      const lines: string[] = [];
-      const removed = result.messagesRemoved ?? 0;
-      lines.push(
-        `🗑️ Removed the last **${removed}** context message${removed === 1 ? '' : 's'} (branched; old branch preserved).`,
-      );
-      lines.push(describeMarkers(result.markers));
-      const lv = result.lastVisible;
-      if (lv?.preview) {
-        const who = lv.participant ?? lv.role ?? '?';
-        lines.push(`Last message now visible to the agent — **${who}**:`);
-        lines.push(`> ${lv.preview.replace(/\n/g, '\n> ')}`);
-      } else if (lv) {
-        const who = lv.participant ?? lv.role ?? '?';
-        lines.push(`Last message now visible to the agent — **${who}**: *(empty message)*`);
-      } else {
-        lines.push('(Could not render the post-undo context preview.)');
-      }
-      // The undo is applied: a reply that can't be shown never reads as its failure.
-      await this.acknowledge(
-        interaction,
-        boundedReply(lines.join('\n'), result),
-        `🗑️ Undo applied: removed ${removed} context message${removed === 1 ? '' : 's'}.`,
-      );
-    }
+    // The undo is applied, so a reply always goes out: each field is read
+    // only once its type is checked, and a reply that can't be shown never
+    // reads as the undo's failure.
+    const removed = hostCount(answer.messagesRemoved);
+    const lines = [
+      removed === undefined
+        ? '🗑️ Undo applied (branched; old branch preserved); the number of context messages removed was not given.'
+        : `🗑️ Removed the last **${removed}** context message${removed === 1 ? '' : 's'} (branched; old branch preserved).`,
+      describeMarkers(answer.markers),
+      ...lastVisibleLines(answer.lastVisible, '(Could not render the post-undo context preview.)'),
+    ];
+    await this.acknowledge(
+      interaction,
+      boundedReply(lines.join('\n'), result),
+      `🗑️ Undo applied: ${removed === undefined ? 'the number of context messages removed was not given' : `removed ${removed} context message${removed === 1 ? '' : 's'}`}. ` +
+        summarizeMarkers(answer.markers),
+    );
   }
 
   /**
@@ -949,24 +968,32 @@ export class DiscordMcplServer {
     try {
       await interaction.editReply(reply);
     } catch (err) {
-      dbg('slash:reply-failed', { error: (err as Error).message });
+      dbg('slash:reply-failed', { error: errorText(err) });
       try {
         await interaction.editReply(boundedReply(
-          `${outcome ? `${outcome} ` : ''}(The full reply couldn't be shown: ${(err as Error).message}.)`,
+          `${outcome ? `${outcome} ` : ''}(The full reply couldn't be shown: ${errorText(err)}.)`,
         ));
       } catch (again) {
-        dbg('slash:reply-failed-again', { error: (again as Error).message });
+        // Nothing reached the operator. What the command did, or may have
+        // done, still mustn't vanish: stderr keeps it.
+        console.error(
+          `[discord-mcpl] /${interaction.commandName}: Discord refused its reply twice (${errorText(again)})` +
+            (outcome ? `, so the operator wasn't told: ${outcome}` : '.'),
+        );
       }
     }
   }
 
   /**
-   * Does the connected host make 💤 awareness marks a choice? Probed with
-   * `host/command {command: 'marks', action: 'list'}` once per connection,
-   * and commands arriving while the probe is out share it: a host with the
-   * verb answers `ok`, and an older one answers "Unknown host command".
-   * Anything else (a timeout, another error) proves neither, so it isn't
-   * kept and the next command asks again.
+   * Does the connected host make 💤 awareness marks a choice? Asked with a
+   * `marks` request that names no action, so the host reads nothing to
+   * answer it. Every agent framework with host/command answers a verb it
+   * lacks with "Unknown host command"; a host with the verb answers anything
+   * else (agent-framework#250 refuses the missing action). Either answer
+   * settles it and is kept for the connection, and commands arriving while
+   * the probe is out share it. A request that fails (a timeout, a host that
+   * refuses host commands outright) settles nothing: it isn't kept, and the
+   * next command asks again.
    */
   private hostMarksSupport(conn: McplConnection): Promise<boolean | { reason: string }> {
     const known = this.marksSupport.get(conn);
@@ -979,28 +1006,26 @@ export class DiscordMcplServer {
   }
 
   private async probeMarksSupport(conn: McplConnection): Promise<boolean | { reason: string }> {
-    let result: { ok?: boolean; error?: string } | undefined;
+    let answer: unknown;
     try {
-      result = (await conn.sendRequest('host/command', { command: 'marks', action: 'list' }, 15000)) as typeof result;
+      answer = await conn.sendRequest('host/command', { command: 'marks' }, 15000);
     } catch (err) {
-      return { reason: (err as Error).message };
+      return { reason: errorText(err) };
     }
-    const supported = result?.ok === true;
-    if (!supported && !/unknown host command/i.test(result?.error ?? '')) {
-      return { reason: result?.error ?? 'no answer' };
-    }
+    const error = isJsonObject(answer) && typeof answer.error === 'string' ? answer.error : '';
+    const supported = !/unknown host command/i.test(error);
     dbg('slash:marks-support', { supported });
     return supported;
   }
 
   /**
-   * `/marks action [target] [page]` — the awareness journal's operator
-   * controls (agent-framework `host/command` `marks`). list shows the
-   * journal newest first, a page at a time, or one entry in full by its id;
-   * cancel, retract and release each answer with what the host's receipt
-   * says. Every reply fits one Discord message: a longer one is cut visibly
-   * with the full answer attached. Ephemeral: the marks themselves are the
-   * public part.
+   * `/marks list [target] [page]` and `/marks cancel|retract|release target`
+   * — the awareness journal's operator controls (agent-framework
+   * `host/command` `marks`). list shows the journal newest first, a page at
+   * a time, or one entry in full by its id; cancel, retract and release each
+   * answer with what the host's receipt says. Every reply fits one Discord
+   * message: a longer one is cut visibly with the full answer attached.
+   * Ephemeral: the marks themselves are the public part.
    */
   private async handleMarksCommand(interaction: ChatInputCommandInteraction): Promise<void> {
     const action = interaction.options.getString('action', true);
@@ -1029,12 +1054,12 @@ export class DiscordMcplServer {
     if (support !== true) {
       await this.acknowledge(interaction, boundedReply(support === false
         ? "This host doesn't have awareness-mark controls (no `marks` host command). Upgrade the host to use `/marks`."
-        : `Couldn't reach the host's awareness-mark controls (${support.reason}). Try again.`));
+        : `Couldn't learn whether this host has awareness-mark controls (${support.reason}). Nothing was sent.`));
       return;
     }
-    let result: { ok?: boolean; error?: string; code?: string; awareness?: unknown };
+    let result: unknown;
     try {
-      result = (await conn.sendRequest(
+      result = await conn.sendRequest(
         'host/command',
         {
           command: 'marks',
@@ -1045,29 +1070,42 @@ export class DiscordMcplServer {
           requesterName: interaction.user.username,
         },
         30000,
-      )) as typeof result;
+      );
     } catch (err) {
-      dbg('slash:marks-failed', { action, error: (err as Error).message });
+      dbg('slash:marks-failed', { action, error: errorText(err) });
       // A read that failed changed nothing. A control may have reached the
       // host first: its outcome is unknown, never "failed".
       if (action === 'list') {
-        await this.acknowledge(interaction, boundedReply(`⚠️ /marks list failed: ${(err as Error).message}`));
+        await this.acknowledge(interaction, boundedReply(`⚠️ /marks list failed: ${errorText(err)}`));
       } else {
         await this.acknowledge(
           interaction,
-          boundedReply(controlOutcomeUnknown(action, target, (err as Error).message)),
+          boundedReply(controlOutcomeUnknown(action, target, errorText(err))),
           controlOutcomeUnknown(action, target),
         );
       }
       return;
     }
-    if (!result?.ok) {
-      await this.acknowledge(interaction, boundedReply(
-        `⚠️ /marks ${action} failed${result?.code ? ` (${result.code})` : ''}: ${result?.error ?? 'unknown error'}`,
-      ));
+    // Only `ok: false` is the host's refusal. Any other answer without a
+    // boolean `ok` is shown as sent: a control may have been applied.
+    const response: Record<string, unknown> = isJsonObject(result) ? result : {};
+    if (response.ok === false) {
+      await this.acknowledge(interaction, boundedReply(hostRefusal(`/marks ${action}`, response)));
       return;
     }
-    const answer = result.awareness;
+    if (response.ok !== true) {
+      if (action === 'list') {
+        await this.acknowledge(interaction, boundedReply(unreadable('/marks list', result), result));
+      } else {
+        await this.acknowledge(
+          interaction,
+          boundedReply(unreadableControl(action, target, result), result),
+          controlOutcomeUnknown(action, target),
+        );
+      }
+      return;
+    }
+    const answer = response.awareness;
     if (action === 'list') {
       const views = Array.isArray(answer) && answer.every(isView) ? answer : null;
       if (!views) {
@@ -1132,6 +1170,7 @@ export class DiscordMcplServer {
     }
 
     const marks = readMarksChoice(interaction);
+    const marksChosen = marks === 'addressed' || marks === 'all';
     const conn = this.conn;
     if (!conn) {
       await interaction.reply({ content: 'Host is not connected — cannot hide.', flags: MessageFlags.Ephemeral });
@@ -1141,117 +1180,142 @@ export class DiscordMcplServer {
     dbg('slash:hide', { fromMessageId, toMessageId, marks, userId: interaction.user.id });
     await interaction.deferReply();
 
-    // On a host with the `marks` verb the framework places the chosen marks
-    // and reports them. On an older one, the only marks are this server's own
-    // one-shot reactions, placed below for `all` (it can't tell which hidden
-    // messages addressed the agent, so `addressed` is refused there).
-    const support = await this.hostMarksSupport(conn);
-    if (support !== true && support !== false) {
-      await this.acknowledge(interaction, boundedReply(
-        `⚠️ Hide not sent: couldn't confirm whether this host makes awareness marks a choice (${support.reason}). ` +
-          'Nothing was changed; try again.',
-      ));
-      return;
+    // Only a marks choice needs to know the host. With none, the request is
+    // the plain hide, and both kinds of host mark nothing for it. With one,
+    // a host with the `marks` verb places the chosen marks and reports them;
+    // on an older one the only marks are this server's own one-shot
+    // reactions, placed below for `all` (it can't tell which hidden messages
+    // addressed the agent, so `addressed` is refused there).
+    let support: boolean | undefined;
+    if (marksChosen) {
+      const known = await this.hostMarksSupport(conn);
+      if (typeof known !== 'boolean') {
+        await this.acknowledge(interaction, boundedReply(
+          `⚠️ Hide not sent: couldn't learn whether this host makes awareness marks a choice (${known.reason}). ` +
+            'Nothing was changed.',
+        ));
+        return;
+      }
+      if (!known && marks === 'addressed') {
+        await this.acknowledge(interaction, boundedReply(
+          "⚠️ Hide not sent: this host can't tell which hidden messages addressed the agent, so `marks: addressed` " +
+            "isn't available here. Choose `all`, or leave marks out.",
+        ));
+        return;
+      }
+      support = known;
     }
-    if (!support && marks === 'addressed') {
-      await this.acknowledge(interaction, boundedReply(
-        "⚠️ Hide not sent: this host can't tell which hidden messages addressed the agent, so `marks: addressed` " +
-          "isn't available here. Choose `all`, or leave marks out.",
-      ));
-      return;
-    }
+    // Only a host with the verb is sent a marks choice, the one thing it
+    // could schedule a 💤 batch for.
+    const batchPossible = support === true;
 
-    let result: {
-      ok?: boolean;
-      error?: string;
-      code?: string;
-      hidden?: number;
-      hiddenRefs?: Array<{ channelId: string; messageId: string }>;
-      /** The host's SurgeryMarkerReceipt, unverified: describeMarkers reads it. */
-      markers?: unknown;
-      lastVisible?: { participant?: string; role?: string; preview?: string } | null;
-    };
+    let result: unknown;
     try {
-      result = (await conn.sendRequest(
+      result = await conn.sendRequest(
         'host/command',
         {
           command: 'hide',
           fromMessageId,
           toMessageId,
-          ...(support && marks ? { marks } : {}),
+          ...(batchPossible ? { marks } : {}),
           requesterId: interaction.user.id,
           requesterName: interaction.user.username,
         },
         30000,
-      )) as typeof result;
+      );
     } catch (err) {
-      dbg('slash:hide-failed', { error: (err as Error).message });
+      dbg('slash:hide-failed', { error: errorText(err) });
       await this.acknowledge(
         interaction,
-        boundedReply(surgeryOutcomeUnknown('Hide', (err as Error).message)),
-        surgeryOutcomeUnknown('Hide'),
+        boundedReply(surgeryOutcomeUnknown('Hide', batchPossible, errorText(err))),
+        surgeryOutcomeUnknown('Hide', batchPossible),
       );
       return;
     }
 
-    if (!result?.ok) {
-      await this.acknowledge(interaction, boundedReply(
-        `⚠️ Hide failed${result?.code ? ` (${result.code})` : ''}: ${result?.error ?? 'unknown error'}`,
-      ));
+    // Only `ok: false` is the host's refusal. An answer without a boolean
+    // `ok` may still have been applied, so it's shown as sent, never as a failure.
+    const answer: Record<string, unknown> = isJsonObject(result) ? result : {};
+    if (answer.ok === false) {
+      await this.acknowledge(interaction, boundedReply(hostRefusal('Hide', answer)));
+      return;
+    }
+    if (answer.ok !== true) {
+      await this.acknowledge(
+        interaction,
+        boundedReply(unreadableSurgery('hide', result, batchPossible), result),
+        surgeryOutcomeUnknown('Hide', batchPossible),
+      );
       return;
     }
 
-    {
-
-      // This server's own 💤 reactions only on a host positively known to
-      // lack the verb, where the operator chose `all` and the framework
-      // reported no marks of its own. A host with the verb that omits its
-      // receipt is reported as such, never supplemented: reactions placed
-      // here would bypass its journal and its cancel. Any receipt at all,
-      // even one this server can't read, is shown and never supplemented.
-      // Best-effort, in parallel.
-      const reported = markersReported(result.markers);
-      let reacted = 0;
-      const refs = support === false && marks === 'all' && !reported ? result.hiddenRefs ?? [] : [];
-      await Promise.all(
-        refs.map(async (ref) => {
-          // channelId may be raw or the "discord:guild:channel" composite.
-          const parsed = parseMcplChannelId(ref.channelId);
-          const channelId = parsed ? parsed.channelId : ref.channelId;
-          try {
-            await this.discord.addReaction(channelId, ref.messageId, '💤');
-            reacted++;
-          } catch (err) {
-            dbg('slash:hide-react-failed', { messageId: ref.messageId, error: (err as Error).message });
-          }
-        }),
-      );
-
-      const n = result.hidden ?? 0;
-      const lines = [
-        `🙈 Removed **${n}** message${n === 1 ? '' : 's'} from the agent's context (redacted in place).`,
-        reported || support
-          ? describeMarkers(result.markers)
-          : marks === 'all'
-            ? `Marks: this host doesn't place them, so this server reacted 💤 itself on ${reacted} of ${refs.length}.`
-            : 'Marks: none (not chosen).',
-      ];
-      const lv = result.lastVisible;
-      if (lv?.preview) {
-        const who = lv.participant ?? lv.role ?? '?';
-        lines.push(`Last message now visible to the agent — **${who}**:`);
-        lines.push(`> ${lv.preview.replace(/\n/g, '\n> ')}`);
-      } else if (lv) {
-        const who = lv.participant ?? lv.role ?? '?';
-        lines.push(`Last message now visible to the agent — **${who}**: *(empty message)*`);
+    // The hide is applied, so a reply always goes out: each field is read
+    // only once its type is checked, each reaction stands alone, and a reply
+    // that can't be shown never reads as the hide's failure.
+    //
+    // Any receipt the host sent, even one this server can't read, is its
+    // account of marks, shown and never supplemented. So is a host with the
+    // verb that sent none: reactions placed here would bypass its journal
+    // and its cancel. This server reacts 💤 itself only on a host known to
+    // lack the verb, for `all`, when the host reported nothing.
+    let marksFull: string;
+    let marksShort: string;
+    if (markersReported(answer.markers) || support === true) {
+      marksFull = describeMarkers(answer.markers);
+      marksShort = summarizeMarkers(answer.markers);
+    } else if (support === false) {
+      const refs = Array.isArray(answer.hiddenRefs) ? answer.hiddenRefs : undefined;
+      if (refs === undefined) {
+        marksFull = marksShort =
+          "Marks: this host doesn't place them, and it gave no list of hidden messages this server can read, so this server placed none.";
+      } else {
+        const { placed, firstFailure } = await this.reactSleeping(refs);
+        marksFull = `Marks: this host doesn't place them, so this server reacted 💤 itself on ${placed} of ${refs.length}` +
+          `${firstFailure === undefined ? '' : ` (the first failure: ${clip(firstFailure, 200)})`}.`;
+        marksShort = `Marks: this server reacted 💤 itself on ${placed} of ${refs.length}; these have no cancel.`;
       }
-      // The hide is applied: a reply that can't be shown never reads as its failure.
-      await this.acknowledge(
-        interaction,
-        boundedReply(lines.join('\n'), result),
-        `🙈 Hide applied: removed ${n} message${n === 1 ? '' : 's'} from the agent's context.`,
-      );
+    } else {
+      marksFull = marksShort = 'Marks: none.';
     }
+
+    const n = hostCount(answer.hidden);
+    const lines = [
+      n === undefined
+        ? "🙈 Hide applied (redacted in place); the number of messages removed from the agent's context was not given."
+        : `🙈 Removed **${n}** message${n === 1 ? '' : 's'} from the agent's context (redacted in place).`,
+      marksFull,
+      ...lastVisibleLines(answer.lastVisible),
+    ];
+    await this.acknowledge(
+      interaction,
+      boundedReply(lines.join('\n'), result),
+      `🙈 Hide applied: ${n === undefined ? 'the number of messages removed was not given' : `removed ${n} message${n === 1 ? '' : 's'} from the agent's context`}. ` +
+        marksShort,
+    );
+  }
+
+  /**
+   * React 💤 on each message an older host hid, in parallel. Each message's
+   * whole step, reading the host's reference to it included, stands alone:
+   * one that fails is counted and the rest go on.
+   */
+  private async reactSleeping(refs: unknown[]): Promise<{ placed: number; firstFailure?: string }> {
+    const failures = await Promise.all(refs.map(async (ref): Promise<string | undefined> => {
+      if (!isJsonObject(ref) || typeof ref.channelId !== 'string' || typeof ref.messageId !== 'string') {
+        return "the host's reference to a hidden message couldn't be read";
+      }
+      // channelId may be raw or the "discord:guild:channel" composite.
+      const parsed = parseMcplChannelId(ref.channelId);
+      try {
+        await this.discord.addReaction(parsed ? parsed.channelId : ref.channelId, ref.messageId, '💤');
+        return undefined;
+      } catch (err) {
+        dbg('slash:hide-react-failed', { messageId: ref.messageId, error: errorText(err) });
+        return errorText(err);
+      }
+    }));
+    const failed = failures.filter((f): f is string => f !== undefined);
+    return { placed: refs.length - failed.length, firstFailure: failed[0] };
   }
 
   /**

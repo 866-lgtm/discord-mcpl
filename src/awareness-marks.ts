@@ -56,9 +56,9 @@ export const markersReported = (markers: unknown): boolean => markers !== undefi
 
 /**
  * The reply's account of marks, saying what the receipt says and no more: a
- * queued mark is requested, not yet seen on Discord. A receipt this server
- * can't read (a status it doesn't know, a field it reads missing) is shown
- * as sent, never described as something else or left out.
+ * queued mark is requested, not yet confirmed on Discord. A receipt this
+ * server can't read (a status it doesn't know, a field it reads missing) is
+ * shown as sent, never described as something else or left out.
  */
 export function describeMarkers(markers: unknown): string {
   if (!markersReported(markers)) return 'Marks: this host reported nothing about 💤 marks.';
@@ -75,8 +75,9 @@ export function describeMarkers(markers: unknown): string {
   const tail = extras.length ? ` (${extras.join('; ')})` : '';
   switch (markers.status) {
     case 'none':
+      // The receipt's scope can't tell an explicit none from one left out.
       return markers.scope === 'none'
-        ? `Marks: none (not chosen).${tail}`
+        ? `Marks: none.${tail}`
         : `Marks: none placed — nothing removed fell within "${markers.scope}".${tail}`;
     case 'queued':
       return `Marks: ${plural(markers.queued, '💤 mark')} requested (${markers.scope}; batch \`${markers.batchId}\`) — ` +
@@ -86,6 +87,30 @@ export function describeMarkers(markers: unknown): string {
     case 'unresolved':
       return `Marks: unresolved — ${markers.error}. Batch \`${markers.batchId}\` may still be delivered later; ` +
         `check \`/marks list\`.${tail}`;
+  }
+}
+
+/** A batch id or other host text inside a one-line account. */
+const SHORT_TEXT_MAX = 100;
+
+/**
+ * The marks in one bounded line, for the short account of an applied /undo
+ * or /hide when its full reply can't be shown: what the receipt says was
+ * scheduled and the batch to find it by, never what Discord confirmed.
+ */
+export function summarizeMarkers(markers: unknown): string {
+  if (!markersReported(markers)) return 'Marks: the host reported nothing about them.';
+  if (!isMarkersReceipt(markers)) return "Marks: the host's receipt couldn't be read; `/marks list` shows the journal.";
+  const batch = (id: string): string => `batch \`${clip(id, SHORT_TEXT_MAX)}\``;
+  switch (markers.status) {
+    case 'none':
+      return markers.scope === 'none' ? 'Marks: none.' : 'Marks: none placed.';
+    case 'queued':
+      return `Marks: ${plural(markers.queued, '💤 mark')} requested (${batch(markers.batchId)}).`;
+    case 'not-scheduled':
+      return 'Marks: not scheduled.';
+    case 'unresolved':
+      return `Marks: unresolved (${batch(markers.batchId)}); check \`/marks list\`.`;
   }
 }
 
@@ -115,7 +140,10 @@ export interface BatchView {
   adds: Counts;
   removals: Counts;
   unresolvedAttempts: number;
-  /** What a pre-journal ledger recorded about this batch's refs. */
+  /** What a pre-journal ledger recorded about this batch's refs, all counts:
+   *  the refs it imported, those whose last recorded action was an add (a
+   *  removal) it saw applied, and the attempts whose outcome it never
+   *  recorded. */
   legacy?: { entries: number; lastAddConfirmed: number; lastRemoveConfirmed: number; outcomesUnrecorded: number };
 }
 
@@ -167,11 +195,24 @@ export interface ReleaseReceipt {
 export const REPLY_LIMIT = 2000;
 
 const isNum = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
+
+/** A count as the host gave it, or undefined when it gave none it can be
+ *  read as: a missing count is reported as not given, never as zero. */
+export const hostCount = (v: unknown): number | undefined => (Number.isInteger(v) && (v as number) >= 0 ? (v as number) : undefined);
+
 const isObj = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
 
-/** Cut text to `max` characters, marking the cut. */
+/**
+ * Cut text to `max` UTF-16 units (its `length`), marking the cut. The cut
+ * falls between code points, so it never leaves half of a surrogate pair,
+ * such as one of 💤's two units.
+ */
 export function clip(text: string, max: number): string {
-  return text.length <= max ? text : `${text.slice(0, Math.max(0, max - 1))}…`;
+  if (text.length <= max) return text;
+  let end = Math.max(0, max - 1);
+  const before = text.charCodeAt(end - 1);
+  if (before >= 0xd800 && before <= 0xdbff) end -= 1;
+  return `${text.slice(0, end)}…`;
 }
 
 /** A value as the host sent it, as a JSON block. */
@@ -189,11 +230,10 @@ const counts = (c: Counts | undefined): string => {
 
 const when = (ms: number | undefined): string => (isNum(ms) ? `<t:${Math.floor(ms / 1000)}:f>` : 'unknown time');
 
-const legacyText = (l: BatchView['legacy']): string =>
-  l
-    ? `imported history: ${plural(l.entries, 'entry', 'entries')} (last add confirmed on ${l.lastAddConfirmed}, ` +
-      `last removal confirmed on ${l.lastRemoveConfirmed}; ${plural(l.outcomesUnrecorded, 'attempt')} with unrecorded outcomes — any may have landed)`
-    : '';
+const legacyText = (l: NonNullable<BatchView['legacy']>): string =>
+  `imported history: ${plural(l.entries, 'entry', 'entries')}, of which ${l.lastAddConfirmed} last had an add confirmed ` +
+  `and ${l.lastRemoveConfirmed} a removal confirmed` +
+  (l.outcomesUnrecorded > 0 ? `; ${plural(l.outcomesUnrecorded, 'attempt')} with unrecorded outcomes — any may have landed` : '');
 
 /** A long free-text field (a held reason) in a summary line. */
 const SUMMARY_TEXT_MAX = 80;
@@ -230,7 +270,10 @@ export function detailText(v: AwarenessView): string {
     if (v.released) lines.push(`Released ${when(v.released.at)}${v.released.by ? ` by ${v.released.by}` : ''}.`);
     lines.push(`Adds: ${counts(v.adds)}. Removals on its messages: ${counts(v.removals)}.`);
     if (v.unresolvedAttempts) lines.push(`${plural(v.unresolvedAttempts, 'request')} on its messages on the wire or with unknown outcome — any may land.`);
-    if (v.legacy) lines.push(`${legacyText(v.legacy)[0]!.toUpperCase()}${legacyText(v.legacy).slice(1)}.`);
+    if (v.legacy) {
+      const legacy = legacyText(v.legacy);
+      lines.push(`${legacy[0]!.toUpperCase()}${legacy.slice(1)}.`);
+    }
   }
   return lines.join('\n');
 }
@@ -271,7 +314,7 @@ const HEADING_RESERVE = 220;
 export function renderListPage(views: AwarenessView[], pageNumber: number, budget = REPLY_LIMIT): string {
   if (views.length === 0) return 'No awareness-mark batches or retracts in the journal.';
   const pages = paginate(views, budget);
-  if (pageNumber > pages.length) {
+  if (pageNumber < 1 || pageNumber > pages.length) {
     return `The journal has ${plural(views.length, 'entry', 'entries')} on ${plural(pages.length, 'page')}; there is no page ${pageNumber}.`;
   }
   const lines = pages[pageNumber - 1]!;
@@ -422,7 +465,17 @@ export function boundedReply(text: string, full?: unknown, budget = REPLY_LIMIT)
  */
 export function summarizeControl(action: string, target: string | undefined, answer: unknown): string {
   if (action === 'cancel' && isCancelReceipt(answer)) {
-    return `✅ Cancelled ${answer.kind} \`${answer.target}\`: ${plural(answer.cancelled, 'request')} will never be sent; cancel removes nothing from Discord.`;
+    // The short account keeps what cancel couldn't stop: requests that may
+    // still land, or may already have landed.
+    const mayLand = [
+      ...(answer.inFlight ? [`${answer.inFlight} on the wire may still land`] : []),
+      ...(answer.unknown ? [`${answer.unknown} with unknown outcome may have landed`] : []),
+      ...(answer.legacyOutcomesUnrecorded
+        ? [`${plural(answer.legacyOutcomesUnrecorded, 'imported attempt')} with unrecorded outcomes may have landed`]
+        : []),
+    ];
+    return `✅ Cancelled ${answer.kind} \`${answer.target}\`: ${plural(answer.cancelled, 'request')} will never be sent; ` +
+      `cancel removes nothing from Discord${mayLand.length ? `: ${mayLand.join('; ')}` : ''}.`;
   }
   if (action === 'retract' && isRetractReceipt(answer)) {
     return `✅ Retract \`${answer.requestId}\`: ${plural(answer.removalsQueued, 'removal')} requested, not yet confirmed on Discord.`;
@@ -443,16 +496,45 @@ export function controlOutcomeUnknown(action: string, target: string | undefined
     : action === 'retract'
       ? 'already have queued the removals'
       : 'already have queued the release';
-  const look = target && target !== 'all' ? `\`/marks list target:${target}\`` : '`/marks list`';
-  return `⚠️ /marks ${action} outcome unknown${error ? ` (${error})` : ''}: the host may ${effect}. Check ${look} before trying again.`;
+  return `⚠️ /marks ${action} outcome unknown${error ? ` (${error})` : ''}: the host may ${effect}. ${controlCheck(target)}`;
 }
+
+const controlCheck = (target: string | undefined): string =>
+  `Check ${target && target !== 'all' ? `\`/marks list target:${target}\`` : '`/marks list`'} before trying again.`;
+
+/** Before retrying an /undo or /hide that may have been applied: the agent's
+ *  context, and, when marks were chosen, the journal for a batch it scheduled. */
+const surgeryCheck = (marksChosen: boolean): string =>
+  `Check the agent's context${marksChosen ? ', and `/marks list` for a 💤 batch it may have scheduled,' : ''} before trying again.`;
 
 /**
  * An /undo or /hide whose request failed in transit: the host may have
  * applied it. Without `error`, it's the short account kept when the reply
  * can't be shown.
  */
-export function surgeryOutcomeUnknown(command: 'Undo' | 'Hide', error?: string): string {
+export function surgeryOutcomeUnknown(command: 'Undo' | 'Hide', marksChosen: boolean, error?: string): string {
   return `⚠️ ${command} outcome unknown${error ? ` (${error})` : ''}: the host may or may not have applied it. ` +
-    "Check the agent's context before trying again.";
+    surgeryCheck(marksChosen);
+}
+
+/**
+ * An /undo or /hide answer without a boolean `ok`: not a refusal, so the
+ * host may have applied it. Shown as sent, with the check before retrying.
+ */
+export function unreadableSurgery(command: 'undo' | 'hide', answer: unknown, marksChosen: boolean): string {
+  return `⚠️ The host answered /${command} in a shape this server can't read, so it may have been applied; ` +
+    `here it is as sent:\n${asSent(answer)}\n${surgeryCheck(marksChosen)}`;
+}
+
+/** A /marks control's answer without a boolean `ok`, as unreadableSurgery. */
+export function unreadableControl(action: string, target: string | undefined, answer: unknown): string {
+  return `⚠️ The host answered /marks ${action} in a shape this server can't read, so it may have been applied; ` +
+    `here it is as sent:\n${asSent(answer)}\n${controlCheck(target)}`;
+}
+
+/** The host's refusal (`ok: false`) of a command, with its code when it gave one. */
+export function hostRefusal(command: string, answer: Record<string, unknown>): string {
+  const code = isStr(answer.code) && answer.code !== '' ? ` (${answer.code})` : '';
+  const error = isStr(answer.error) && answer.error !== '' ? answer.error : 'unknown error';
+  return `⚠️ ${command} failed${code}: ${error}`;
 }

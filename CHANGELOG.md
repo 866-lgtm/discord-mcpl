@@ -13,7 +13,9 @@ in the git log and PR descriptions.
   without it, `/undo` is refused for every option, so a deployment that
   takes this release before its host does loses `/undo` from Discord until
   the host upgrades. Each connection asks the host again, so `/undo`
-  returns once the upgraded host reconnects.
+  returns once the upgraded host reconnects. To tell whether a host has
+  the command, run `/marks list`: on a host without it, the reply says the
+  host has no awareness-mark controls.
 - **`/undo` and `/hide` mark nothing unless `marks` is chosen.** `/hide`
   used to react 💤 on every hidden message by default; choose `marks: all`
   for that. The admin commands' entry under Changed has the details.
@@ -302,20 +304,30 @@ in the git log and PR descriptions.
   (anima-research/agent-framework#250), `/undo` and `/hide` take an optional
   `marks` choice: `none` (the default), `addressed` or `all`. The host places
   the marks and returns a `markers` receipt, and the reply says what it
-  scheduled: requested, not yet seen on Discord. A new admin command,
-  `/marks list|cancel|retract|release [target] [page]`, shows the host's
-  journal and acts on it, ephemerally:
+  scheduled: requested, not yet confirmed on Discord. A new admin command,
+  `/marks list [target] [page]` and `/marks cancel|retract|release target`,
+  shows the host's journal and acts on it, ephemerally:
   - `list` pages the journal newest first, each page within one Discord
     reply. `list target:<id>` shows one batch or retract in full, imported
     history included.
   - cancel, retract and release each answer with what that action's receipt
     says. Cancel keeps its limits: confirmed marks stay, and in-flight or
     unknown requests may still land.
-  - A reply too long for one message is cut visibly, with the whole answer
-    attached. An answer in a shape this server can't read is shown as sent.
+  - A reply too long for one message is cut visibly, with what it shows
+    attached in full: the host's answer, or for `list target:` the entry.
+    An answer in a shape this server can't read is shown as sent. Only the
+    host's `ok: false` reads as a failure: any other answer to `/undo`,
+    `/hide` or a `/marks` control is shown with a warning that it may have
+    been applied.
 
-  Each connection probes the host once (`marks list`) to learn which kind it
-  is.
+  To learn which kind of host it has, a connection asks with a `marks`
+  request that names no action, which the host answers without reading its
+  journal. It asks only when the command depends on the answer: `/undo`,
+  `/marks`, and a `/hide` with marks chosen. A `/hide` with none sends the
+  plain hide to either kind of host. The connection keeps the host's
+  answer; a probe whose request fails (a timeout, a host that refuses host
+  commands) stops the command with nothing changed, and the next command
+  asks again.
   - On a host without the verb, `/undo` is **refused** whatever the option.
     Such a host's undo places marks that follow branches: they are
     re-applied on every switch, with no frozen audience and no cancel, so no
@@ -324,11 +336,10 @@ in the git log and PR descriptions.
   - On such a host, `/hide` no longer reacts 💤 on every hidden message. It
     reacts itself only for `marks: all`, and refuses `addressed`, since it
     can't tell which messages addressed the agent. With no choice, nothing
-    is marked. A host with the verb that omits its receipt is reported as
-    such and never supplemented, since reactions placed here would bypass
-    its journal and its cancel.
-  - A probe that proves nothing either way (a timeout, another error) stops
-    the command with nothing changed, and the next command asks again.
+    is marked. A reaction that fails leaves the rest, and the reply gives
+    the count placed and the first failure's reason. A host with the verb
+    that omits its receipt is reported as such and never supplemented,
+    since reactions placed here would bypass its journal and its cancel.
 
 - **A tool given an id Discord doesn't know says what that means.** Discord
   answers an unknown or unreachable id with two words ("Unknown Channel",
