@@ -13,6 +13,9 @@
  * Semantics (unchanged from the env-only implementation):
  *   - guildIds unset/empty          -> ALL guilds allowed
  *   - guildChannels[gid] unset      -> all channels in that guild
+ *   - guildChannels[gid] set        -> the listed channels and their threads;
+ *                                      a listed category admits the channels
+ *                                      under it and their threads
  *   - dmUsers unset/empty           -> ALL DM users allowed
  *
  * File schema:
