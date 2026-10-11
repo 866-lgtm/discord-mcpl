@@ -216,11 +216,12 @@ async function main(): Promise<void> {
     tcpServer.listen(tcpPort, '127.0.0.1');
 
     // A failure to listen (the port taken) emits 'error' with no listener
-    // yet, which ends the process, as it should.
+    // yet, which ends the process, as it should. serveTcp's own listener
+    // goes on only once it's listening.
     await new Promise<void>((resolve) => tcpServer.once('listening', resolve));
 
-    // Accept and serve one connection at a time
-    await serveTcp(server, tcpServer);
+    // One client at a time, for as long as the process runs.
+    serveTcp(tcpServer, (conn) => server.serve(conn));
   }
 }
 

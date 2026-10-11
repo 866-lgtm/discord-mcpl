@@ -308,14 +308,15 @@ in the git log and PR descriptions.
 
 ### Fixed
 
-- **With `--tcp`, an error the TCP server emits while a client is being
-  served is logged, and serving goes on.** Such an error is, say, an accept
-  that fails for the next client. Before, mcpl-core's `acceptTcp` (0.2.1
-  here) left an 'error' listener behind for each accepted connection, which
-  swallowed it unseen. A release carrying anima-research/mcpl-core-ts#12
-  stops that leak, and with it nothing would have heard the error, so the
-  process would have ended. An error while the server waits for a client
-  still ends the process, as before.
+- **With `--tcp`, the server serves one client at a time and keeps serving
+  through what it can survive.** An error the TCP server emits (an accept
+  that fails, say) is logged whenever it comes, whether a client is being
+  served or not; before, one that came while no client was served ended the
+  process. A client that connects while another is served is refused at
+  once; before, it was left connected and never read, holding its
+  connection open until the process exited, and a reset on it ended the
+  process. A client whose serving fails ends only its own connection, and
+  the next client is served.
 - **A refused DM's deletion no longer reaches the agent.** With a DM
   allowlist set, a refused sender's DM was never forwarded, but its deletion
   was: discord.js caches every DM it receives, so the tombstone carried the
