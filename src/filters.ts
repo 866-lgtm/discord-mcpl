@@ -29,8 +29,8 @@
  * deleted file) as suppression does, so staleness is a property of the
  * plane, not of any one key.
  */
-import { readFileSync, writeFileSync, renameSync, statSync, mkdirSync, existsSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { readFileSync, statSync, existsSync } from 'node:fs';
+import { writeJsonFile } from './persisted-json.js';
 import { createHash } from 'node:crypto';
 
 export interface DiscordFilters {
@@ -118,7 +118,8 @@ export function parseFiltersFromEnv(env: NodeJS.ProcessEnv = process.env): Disco
  *  present-but-not-string[] key therefore invalidates the whole load. */
 export function loadFiltersFile(path: string): DiscordFilters | null {
   try {
-    const raw: unknown = JSON.parse(readFileSync(path, 'utf-8'));
+    // An editor's byte-order mark isn't part of the JSON.
+    const raw: unknown = JSON.parse(readFileSync(path, 'utf-8').replace(/^\uFEFF/, ''));
     if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return null;
     const r = raw as Record<string, unknown>;
     const out: DiscordFilters = {};
@@ -141,12 +142,11 @@ export function loadFiltersFile(path: string): DiscordFilters | null {
   }
 }
 
-/** Atomic write (tmp + rename) so the poller never reads a half-written file. */
+/** Saved by writeJsonFile, which keeps the file's permissions: atomically (tmp + rename) for a plain file the
+ *  server owns, and in place for a symlink, a hard-linked or another user's file, or a path that can't take the
+ *  rename. The poller runs on this process's event loop, so it never sees a save half-done either way. */
 export function saveFiltersFile(path: string, filters: DiscordFilters): void {
-  mkdirSync(dirname(path), { recursive: true });
-  const tmp = `${path}.tmp`;
-  writeFileSync(tmp, JSON.stringify(normalizeFilters(filters), null, 2) + '\n');
-  renameSync(tmp, path);
+  writeJsonFile(path, normalizeFilters(filters));
 }
 
 export function filtersFileMtime(path: string): number | null {

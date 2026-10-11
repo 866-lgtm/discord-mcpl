@@ -62,8 +62,8 @@ import {
 import { explainDiscordError, type ExplainContext } from './discord-errors.js';
 import { saveFiltersFile, loadFiltersFile, DiscordFiltersState, type DiscordFilters } from './filters.js';
 import { StateTracker } from './state.js';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { existsSync, readFileSync } from 'node:fs';
+import { isId, isJsonObject, readJsonFile, usableIds, writeJsonFile, type Usable } from './persisted-json.js';
 import sharp from 'sharp';
 import { dbg } from './debug-log.js';
 
@@ -89,6 +89,76 @@ interface ChannelAcknowledgeRequest {
   intent: string;
   value?: string;
 }
+
+interface SavedTally {
+  anchorId: string;
+  talliedThrough?: string;
+  messages: number;
+  characters: number;
+}
+
+interface SavedWatermarks {
+  watermarks?: Record<string, string>;
+  dmChannels?: string[];
+  missed?: Record<string, SavedTally>;
+}
+
+/** What the watermark store can use of its file. saveWatermark writes an
+ *  object with three keys, any of which a file from an earlier version may
+ *  lack: `watermarks`, channel ids to message ids; `dmChannels`, a list of
+ *  ids; and `missed`, channel ids to tallies. A tally has a string anchorId,
+ *  finite messages and characters, and talliedThrough a string or absent, as
+ *  every version since the tally began (9884f70) has written it. Anything
+ *  else can't be used, so readJsonFile keeps it in the copy it makes, and
+ *  loads the rest. */
+function usableWatermarks(value: unknown): Usable<SavedWatermarks> {
+  if (!isJsonObject(value)) return { value: null, unusable: 'not an object' };
+  let others = 0;
+  const out: SavedWatermarks = {};
+  for (const [key, entries] of Object.entries(value)) {
+    if (key === 'watermarks' && isJsonObject(entries)) {
+      out.watermarks = {};
+      for (const [channel, id] of Object.entries(entries)) {
+        if (isId(channel) && isId(id)) out.watermarks[channel] = id;
+        else others++;
+      }
+    } else if (key === 'dmChannels' && Array.isArray(entries)) {
+      out.dmChannels = entries.filter(isId);
+      others += entries.length - out.dmChannels.length;
+    } else if (key === 'missed' && isJsonObject(entries)) {
+      out.missed = {};
+      for (const [channel, tally] of Object.entries(entries)) {
+        if (
+          isId(channel) &&
+          isJsonObject(tally) &&
+          typeof tally.anchorId === 'string' &&
+          (tally.talliedThrough === undefined || typeof tally.talliedThrough === 'string') &&
+          Number.isFinite(tally.messages) &&
+          Number.isFinite(tally.characters)
+        ) {
+          const { anchorId, talliedThrough, messages, characters, ...extra } = tally;
+          out.missed[channel] = {
+            anchorId,
+            ...(talliedThrough === undefined ? {} : { talliedThrough }),
+            messages,
+            characters,
+          } as SavedTally;
+          others += Object.keys(extra).length;
+        } else {
+          others++;
+        }
+      }
+    } else {
+      others++;
+    }
+  }
+  return { value: out, unusable: others ? `${others} ${others === 1 ? 'entry' : 'entries'} the store doesn't write` : null };
+}
+
+/** What a tool's reply adds when its store's configured file couldn't be
+ *  saved. True whatever the failure: the store as it is now isn't on disk. */
+const unsavedNote = (store: string, failure: string | null): string =>
+  failure ? ` The ${store} couldn't be saved (${failure}), so as it stands now it wouldn't survive a restart.` : '';
 
 /** A Discord message must carry text and/or attachments — reject empty sends. */
 function requireContentOrFiles(content: string, files: OutgoingFile[] | undefined): void {
@@ -269,6 +339,9 @@ export class DiscordMcplServer {
    *  subscriptions file. */
   private reactionChannels = new Set<string>();
   private reactionChannelsLoaded = false;
+  /** The file may not hold reactionChannels as it is now: a change wasn't
+   *  saved, or the file couldn't be read, copied aside or rewritten. */
+  private reactionChannelsUnsaved = false;
 
   /** Resolved when the host's first featureSets/update (either form) has
    *  been processed — the signal that §5.3 policy is settled and pushes
@@ -292,6 +365,8 @@ export class DiscordMcplServer {
    *  (…​.muted.json), or DISCORD_MUTED_CHANNELS_FILE if set. */
   private mutedChannels = new Set<string>();
   private mutedLoaded = false;
+  /** The file may not hold mutedChannels as it is now, as reactionChannelsUnsaved. */
+  private mutedUnsaved = false;
 
   /** Per-channel watermark of the highest Discord message id forwarded to
    *  the host. Used by the auto-subscribe-on-mention flow to fetch only
@@ -322,6 +397,9 @@ export class DiscordMcplServer {
     { anchorId: string; talliedThrough: string; messages: number; characters: number }
   >();
   private watermarkLoaded = false;
+  /** Why the last watermark save failed, or null when it succeeded, so a
+   *  failure is logged when it starts or changes rather than per message. */
+  private watermarkSaveFailure: string | null = null;
   /** Set once the reconnect catch-up sweep has run for the current process,
    *  so it doesn't re-run if a host reconnects mid-session. */
   private sweepDone = false;
@@ -1544,18 +1622,27 @@ export class DiscordMcplServer {
         return await this.discord.listEmojis(args.guildId as string | undefined);
 
       case 'set_reaction_visibility': {
-        this.ensureReactionChannelsLoaded();
         const channelId = args.channelId as string;
+        if (typeof channelId !== 'string' || channelId.length === 0) {
+          throw new Error('channelId is required');
+        }
+        this.ensureReactionChannelsLoaded();
         const visible = args.visible as boolean;
-        const had = this.reactionChannels.has(channelId);
+        const changed = visible !== this.reactionChannels.has(channelId);
         if (visible) this.reactionChannels.add(channelId);
         else this.reactionChannels.delete(channelId);
-        if (visible !== had) this.saveReactionChannels();
-        if (!visible) return `Reaction visibility OFF for channel ${channelId}.`;
+        // Saved when the call changes the list or the file may not hold it,
+        // so the reply says whenever a configured file doesn't hold the list
+        // as it stands.
+        const unsaved = changed || this.reactionChannelsUnsaved ? this.saveReactionChannels() : null;
+        const note = unsavedNote('reaction channel list', unsaved);
+        if (!visible) return `Reaction visibility OFF for channel ${channelId}.` + note;
         // A muted channel delivers nothing: the opt-in is kept, and takes effect once the mute is lifted.
-        return this.isChannelMuted(channelId)
-          ? `Reaction visibility ON for channel ${channelId}, but the channel is muted: its reactions reach you once unmute_channel lifts the mute (they never wake you).`
-          : `Reaction visibility ON for channel ${channelId}. Reactions there now appear in your context as they happen (they never wake you).`;
+        return (
+          (this.isChannelMuted(channelId)
+            ? `Reaction visibility ON for channel ${channelId}, but the channel is muted: its reactions reach you once unmute_channel lifts the mute (they never wake you).`
+            : `Reaction visibility ON for channel ${channelId}. Reactions there now appear in your context as they happen (they never wake you).`) + note
+        );
       }
 
       case 'refresh_channels':
@@ -1611,7 +1698,9 @@ export class DiscordMcplServer {
         this.ensureMutedLoaded();
         const wasNew = !this.mutedChannels.has(channelId);
         this.mutedChannels.add(channelId);
-        if (wasNew) this.saveMuted();
+        // Saved as in set_reaction_visibility: when the call changes the list
+        // or the file may not hold it.
+        const unsaved = wasNew || this.mutedUnsaved ? this.saveMuted() : null;
         // Muting implies leaving: drop any ambient subscription so the channel
         // stops delivering; it also won't auto-subscribe back in while muted.
         // Its reaction visibility goes too, as a close drops it
@@ -1621,13 +1710,17 @@ export class DiscordMcplServer {
         this.ensureSubscriptionsLoaded();
         this.subscribedChannels.delete(channelId);
         this.ensureReactionChannelsLoaded();
-        if (this.reactionChannels.delete(channelId)) this.saveReactionChannels();
+        const reactionsUnsaved = this.reactionChannels.delete(channelId) ? this.saveReactionChannels() : null;
         for (const channel of this.channelManager.getOpen()) {
           if (parseMcplChannelId(channel.id)?.channelId === channelId) this.channelManager.close(channel.id);
         }
-        return wasNew
-          ? `Muted channel ${channelId}: no ambient, no wake on mention/reply, and it will not auto-subscribe you back in. Reverse with unmute_channel("${channelId}").`
-          : `Channel ${channelId} was already muted.`;
+        return (
+          (wasNew
+            ? `Muted channel ${channelId}: no ambient, no wake on mention/reply, and it will not auto-subscribe you back in. Reverse with unmute_channel("${channelId}").`
+            : `Channel ${channelId} was already muted.`) +
+          unsavedNote('muted channel list', unsaved) +
+          unsavedNote('reaction channel list', reactionsUnsaved)
+        );
       }
 
       case 'unmute_channel': {
@@ -1637,13 +1730,15 @@ export class DiscordMcplServer {
         }
         this.ensureMutedLoaded();
         const removed = this.mutedChannels.delete(channelId);
-        if (removed) this.saveMuted();
+        const unsaved = removed || this.mutedUnsaved ? this.saveMuted() : null; // as in mute_channel
         const compositeId = this.channelManager.getAll()
           .find((channel) => parseMcplChannelId(channel.id)?.channelId === channelId)?.id;
         const target = compositeId ? `channelId "${compositeId}"` : 'its MCPL channel id';
-        return removed
-          ? `Unmuted channel ${channelId}. Direct addresses will reach you again. Ordinary traffic requires channel_open with ${target}. If the host still shows it as open, use channel_close then channel_open with the same id to reconcile.`
-          : `Channel ${channelId} was not muted.`;
+        return (
+          (removed
+            ? `Unmuted channel ${channelId}. Direct addresses will reach you again. Ordinary traffic requires channel_open with ${target}. If the host still shows it as open, use channel_close then channel_open with the same id to reconcile.`
+            : `Channel ${channelId} was not muted.`) + unsavedNote('muted channel list', unsaved)
+        );
       }
 
       case 'list_subscriptions': {
@@ -1978,30 +2073,27 @@ export class DiscordMcplServer {
     if (this.reactionChannelsLoaded) return;
     this.reactionChannelsLoaded = true;
     const path = this.reactionChannelsFile();
-    if (!path || !existsSync(path)) return;
-    try {
-      const parsed = JSON.parse(readFileSync(path, 'utf-8'));
-      if (Array.isArray(parsed)) {
-        for (const id of parsed) {
-          if (typeof id === 'string' && id.length > 0) this.reactionChannels.add(id);
-        }
-      }
-      dbg('reaction-channels:loaded', { count: this.reactionChannels.size, path });
-    } catch (err) {
-      console.error('[discord-mcpl] Failed to load reaction channels:', (err as Error).message);
-      dbg('reaction-channels:load-failed', { error: (err as Error).message, path });
-    }
+    if (!path) return;
+    const read = readJsonFile(path, 'reaction channels', usableIds, []);
+    for (const id of read.value) this.reactionChannels.add(id);
+    this.reactionChannelsUnsaved = !read.held;
+    dbg('reaction-channels:loaded', { count: this.reactionChannels.size, path });
   }
 
-  private saveReactionChannels(): void {
+  /** Save the reaction channels. Returns why the save failed, or null, as
+   *  with no file configured, when the list is in memory by choice. */
+  private saveReactionChannels(): string | null {
     const path = this.reactionChannelsFile();
-    if (!path) return; // in-memory mode
+    if (!path) return null; // in-memory mode
     try {
-      mkdirSync(dirname(path), { recursive: true });
-      writeFileSync(path, JSON.stringify([...this.reactionChannels].sort(), null, 2) + '\n');
+      writeJsonFile(path, [...this.reactionChannels].sort());
+      this.reactionChannelsUnsaved = false;
+      return null;
     } catch (err) {
+      this.reactionChannelsUnsaved = true;
       console.error('[discord-mcpl] Failed to save reaction channels:', (err as Error).message);
       dbg('reaction-channels:save-failed', { error: (err as Error).message, path });
+      return (err as Error).message;
     }
   }
 
@@ -2043,26 +2135,27 @@ export class DiscordMcplServer {
     if (this.mutedLoaded) return;
     this.mutedLoaded = true;
     const path = this.mutedFile();
-    if (!path || !existsSync(path)) return;
-    try {
-      const parsed = JSON.parse(readFileSync(path, 'utf-8'));
-      if (Array.isArray(parsed)) {
-        for (const id of parsed) if (typeof id === 'string' && id.length > 0) this.mutedChannels.add(id);
-      }
-      dbg('muted:loaded', { count: this.mutedChannels.size, path });
-    } catch (err) {
-      console.error('[discord-mcpl] Failed to load muted channels:', (err as Error).message);
-    }
+    if (!path) return;
+    const read = readJsonFile(path, 'muted channels', usableIds, []);
+    for (const id of read.value) this.mutedChannels.add(id);
+    this.mutedUnsaved = !read.held;
+    dbg('muted:loaded', { count: this.mutedChannels.size, path });
   }
 
-  private saveMuted(): void {
+  /** Save the muted channels. Returns why the save failed, or null, as
+   *  saveReactionChannels. */
+  private saveMuted(): string | null {
     const path = this.mutedFile();
-    if (!path) return;
+    if (!path) return null;
     try {
-      mkdirSync(dirname(path), { recursive: true });
-      writeFileSync(path, JSON.stringify([...this.mutedChannels].sort(), null, 2) + '\n');
+      writeJsonFile(path, [...this.mutedChannels].sort());
+      this.mutedUnsaved = false;
+      return null;
     } catch (err) {
+      this.mutedUnsaved = true;
       console.error('[discord-mcpl] Failed to save muted channels:', (err as Error).message);
+      dbg('muted:save-failed', { error: (err as Error).message, path });
+      return (err as Error).message;
     }
   }
 
@@ -2086,52 +2179,24 @@ export class DiscordMcplServer {
     if (this.watermarkLoaded) return;
     this.watermarkLoaded = true;
     const path = this.watermarkFile();
-    if (!path || !existsSync(path)) return;
-    try {
-      const parsed = JSON.parse(readFileSync(path, 'utf-8'));
-      const marks = parsed?.watermarks;
-      if (marks && typeof marks === 'object') {
-        for (const [chan, id] of Object.entries(marks)) {
-          if (typeof chan === 'string' && typeof id === 'string' && id.length > 0) {
-            this.forwardedWatermark.set(chan, id);
-          }
-        }
-      }
-      if (Array.isArray(parsed?.dmChannels)) {
-        for (const id of parsed.dmChannels) {
-          if (typeof id === 'string' && id.length > 0) this.dmChannelIds.add(id);
-        }
-      }
-      const missed = parsed?.missed;
-      if (missed && typeof missed === 'object') {
-        for (const [chan, v] of Object.entries(missed as Record<string, unknown>)) {
-          const e = v as Partial<{
-            anchorId: string;
-            talliedThrough: string;
-            messages: number;
-            characters: number;
-          }>;
-          if (typeof chan === 'string' && chan.length > 0) {
-            this.missedTally.set(chan, {
-              anchorId: typeof e.anchorId === 'string' ? e.anchorId : '',
-              talliedThrough:
-                typeof e.talliedThrough === 'string' ? e.talliedThrough : e.anchorId ?? '',
-              messages: Number.isFinite(e.messages) ? (e.messages as number) : 0,
-              characters: Number.isFinite(e.characters) ? (e.characters as number) : 0,
-            });
-          }
-        }
-      }
-      dbg('watermark:loaded', {
-        channels: this.forwardedWatermark.size,
-        dms: this.dmChannelIds.size,
-        missed: this.missedTally.size,
-        path,
+    if (!path) return;
+    const { value: saved } = readJsonFile(path, 'watermarks', usableWatermarks, {});
+    for (const [chan, id] of Object.entries(saved.watermarks ?? {})) this.forwardedWatermark.set(chan, id);
+    for (const id of saved.dmChannels ?? []) this.dmChannelIds.add(id);
+    for (const [chan, tally] of Object.entries(saved.missed ?? {})) {
+      this.missedTally.set(chan, {
+        anchorId: tally.anchorId,
+        talliedThrough: tally.talliedThrough ?? tally.anchorId,
+        messages: tally.messages,
+        characters: tally.characters,
       });
-    } catch (err) {
-      console.error('[discord-mcpl] Failed to load watermarks:', (err as Error).message);
-      dbg('watermark:load-failed', { error: (err as Error).message, path });
     }
+    dbg('watermark:loaded', {
+      channels: this.forwardedWatermark.size,
+      dms: this.dmChannelIds.size,
+      missed: this.missedTally.size,
+      path,
+    });
   }
 
   /** Persist the watermark map + DM channel set. Best-effort; called after
@@ -2140,7 +2205,6 @@ export class DiscordMcplServer {
     const path = this.watermarkFile();
     if (!path) return; // in-memory mode
     try {
-      mkdirSync(dirname(path), { recursive: true });
       const out = {
         watermarks: Object.fromEntries(
           [...this.forwardedWatermark.entries()].sort((a, b) => a[0].localeCompare(b[0])),
@@ -2150,10 +2214,22 @@ export class DiscordMcplServer {
           [...this.missedTally.entries()].sort((a, b) => a[0].localeCompare(b[0])),
         ),
       };
-      writeFileSync(path, JSON.stringify(out, null, 2) + '\n');
+      writeJsonFile(path, out);
+      if (this.watermarkSaveFailure !== null) console.error('[discord-mcpl] Saved watermarks again.');
+      this.watermarkSaveFailure = null;
     } catch (err) {
-      console.error('[discord-mcpl] Failed to save watermarks:', (err as Error).message);
-      dbg('watermark:save-failed', { error: (err as Error).message, path });
+      const failure = (err as Error).message;
+      // Saved after every forward, so a lasting failure is logged when it
+      // starts or its reason changes, not once per message.
+      if (failure !== this.watermarkSaveFailure) {
+        console.error(
+          '[discord-mcpl] Failed to save watermarks:',
+          failure,
+          '(logged again only if the reason changes; a later success is logged too)',
+        );
+      }
+      this.watermarkSaveFailure = failure;
+      dbg('watermark:save-failed', { error: failure, path });
     }
   }
 
@@ -2674,6 +2750,8 @@ export class DiscordMcplServer {
     this.ensureReactionChannelsLoaded();
     if (!this.reactionChannels.has(channelId)) {
       this.reactionChannels.add(channelId);
+      // Not saved here, so the next set_reaction_visibility saves it.
+      this.reactionChannelsUnsaved = true;
     }
     this.ensureWatermarkLoaded();
     if (this.missedTally.delete(channelId)) this.saveWatermark();
@@ -2685,7 +2763,9 @@ export class DiscordMcplServer {
     this.ensureSubscriptionsLoaded();
     const removed = this.subscribedChannels.delete(channelId);
     this.ensureReactionChannelsLoaded();
-    // Saved, so a restart doesn't bring back the reactions a close turned off.
+    // Saved, so a restart doesn't bring back the reactions a close turned
+    // off. A failed save sets reactionChannelsUnsaved, so the next
+    // set_reaction_visibility saves again and says so if it fails.
     if (this.reactionChannels.delete(channelId)) this.saveReactionChannels();
     if (removed) {
       this.ensureWatermarkLoaded();

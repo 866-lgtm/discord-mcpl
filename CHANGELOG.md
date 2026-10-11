@@ -186,6 +186,52 @@ in the git log and PR descriptions.
   `set_reaction_visibility` says so, and that opt-in takes effect once the
   mute is lifted. The reconnect catch-up sweep now skips a muted channel
   too, where it used to push its missed mentions after a restart.
+- **An unreadable state file no longer loses everything in it at the next
+  save.** The muted channels, the reaction channels and the watermarks are
+  each read once and rewritten whole after every change. When a file
+  couldn't be read, its store started empty, and the next save (one
+  `mute_channel`, one `set_reaction_visibility`, or the next forwarded
+  message for watermarks) overwrote it with only the new entry. Now:
+  - A file that isn't exactly what its store writes (not JSON, the wrong
+    shape, or entries the store doesn't write, such as the `null` a
+    missing `channelId` left in the reaction list) is first copied to
+    `<file>.unreadable-<hash>`, named by its content so the same content
+    is kept once, and flushed to disk. Then the file itself is rewritten
+    with the entries its store can use, or emptied when there are none,
+    and the store starts with those. The error log names the copy. The
+    file keeps its mode, owner, group and links. A leading byte-order mark
+    is no longer a reason, in the filters file too.
+  - A file that can't be read at all, say for its permissions, stays as it
+    is, and nothing is saved over it until the next start reads it. So does
+    one whose copy or rewrite fails. The store runs in memory meanwhile.
+  - The server owns these files while it runs, and every save writes the
+    whole store over the file, so to edit one or restore a copy, stop the
+    server first.
+  - `mute_channel`, `unmute_channel` and `set_reaction_visibility` save when
+    the call changes their store, or when its file may not hold it (an earlier
+    save failed, or the file couldn't be read). When that save fails, the
+    reply says so, and that as it stands the store wouldn't survive a restart.
+    `mute_channel` also saves the reaction list when it drops the channel's
+    visibility, and its reply says so when that save fails.
+    `set_reaction_visibility` now refuses a missing `channelId`, as the other
+    two do. A watermark save that keeps failing is logged when it starts, when
+    its reason changes and when it succeeds again, rather than for every
+    forwarded message.
+  - A save replaces a plain file the server owns by renaming a temp file
+    over it, given the file's mode and group before any content goes in,
+    so a process crash partway through can't leave a torn file. Extended
+    attributes and an ACL on the file itself don't carry over. A symlink,
+    a file with other hard links or another owner, a group the server
+    isn't in, and a path that won't take the rename (a directory the
+    server can't write, a read-only filesystem around a bind-mounted file,
+    a filesystem without permissions) are written in place, as before,
+    where a crash partway through can still tear the file; the log says
+    so the first time a path is written in place for an error. A file the
+    server can't write is left as it is, and a full disk fails the save
+    rather than writing in place, so the file keeps what was last saved.
+  - The filters file is saved the same way. So a private one now stays
+    private, a symlinked or hard-linked one is written through rather than
+    replaced, and a read-only one is refused rather than replaced.
 - **A slash command that fails no longer ends the process.** Slash handlers
   run without being awaited, and their rejections were unhandled. On Node
   15 and later, an unhandled rejection exits the process, so a single late
