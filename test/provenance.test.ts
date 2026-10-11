@@ -33,6 +33,8 @@ function fixture(opts: {
     },
     getCachedChannelMeta: (id: string) => opts.cached?.[id] ?? null,
     getCachedDmRecipientName: (id: string) => opts.dmRecipients?.[id] ?? null,
+    // #65's read gate: no channel filters are configured here.
+    async inspectionRefusal() { return null; },
     async fetchHistory() { return [item('901', 'first'), item('902', 'second')]; },
     async fetchAround() { return [item('905', 'around')]; },
     async sendMessage(channelId: string, _content: string, options?: unknown) {

@@ -93,13 +93,22 @@ function buildAttachments(files?: OutgoingFile[]): AttachmentBuilder[] {
 
 export interface DiscordAdapterConfig {
   token: string;
+  /** Guild filter: only these guilds' channels are registered with the host,
+   *  resolvable by name, and delivered. It doesn't restrict a deliberate read
+   *  by channel id; reads follow guildChannels. */
   guildIds?: string[];
   /** Per-guild channel whitelist. When a guild id has an entry here, only
    *  the listed channel ids (and threads under them) are visible/handled in
-   *  that guild. Guilds without an entry are unrestricted. */
+   *  that guild. It also bounds deliberate inspection: list_channels leaves
+   *  channels outside it out of its listing, list_channel_members refuses
+   *  them with its own check, and fetch_history and fetch_around refuse them
+   *  through inspectionRefusal. Guilds without an entry are unrestricted. An
+   *  entry applies only to a guild that guildIds lists too (normalizeFilters
+   *  drops the rest). */
   guildChannels?: Record<string, string[]>;
   /** DM user whitelist. When set, incoming DMs are only handled from these
-   *  user ids; DMs from anyone else are dropped. Unset = all DMs allowed. */
+   *  user ids; DMs from anyone else are dropped. Unset = all DMs allowed.
+   *  It filters incoming DMs only; it doesn't restrict reads or sends. */
   dmUsers?: string[];
 }
 
@@ -294,6 +303,15 @@ export interface ReactionEvent {
 
 /** Render custom-emoji tokens ('<:name:id>' / '<a:name:id>') down to ':name:'
  *  so message text reads legibly for the model. Unicode emoji are untouched. */
+/** A guild thread the client knows only partly: built from an event that
+ *  carried its type but not its channel, so discord.js keeps its parentId
+ *  null until a thread event or a fetch fills it in. The channel allowlist
+ *  can't place it until then, since a thread counts as its channel. */
+function threadChannelUnknown(channel: unknown): boolean {
+  const c = channel as { isThread?: () => boolean; parentId?: string | null } | null | undefined;
+  return !!c && typeof c.isThread === 'function' && c.isThread() && c.parentId == null;
+}
+
 function renderCustomEmojis(text: string): string {
   return text.replace(/<a?:(\w+):\d+>/g, (_full, name: string) => `:${name}:`);
 }
@@ -510,6 +528,9 @@ export class DiscordAdapter {
   private dmUsers?: Set<string>;
   /** In-flight mutation deliveries, ordered per Discord message. */
   private messageEventDeliveries = new Map<string, Promise<void>>();
+  /** Creates waiting for their thread to be fetched, per channel, so later
+   *  ones in the same thread are delivered after it, in order. */
+  private threadLookups = new Map<string, Promise<void>>();
   private slashCommandHandler?: (interaction: ChatInputCommandInteraction) => void;
   private guildCommandDefs?: ApplicationCommandDataResolvable[];
 
@@ -1057,6 +1078,10 @@ export class DiscordAdapter {
       const full = reaction.partial ? await reaction.fetch() : reaction;
       const msg = full.message;
       const guildId = msg.guildId ?? null;
+      // A create still waiting for its thread's lookup goes first, so a
+      // reaction never arrives before the message it's on.
+      await this.threadLookups.get(msg.channelId);
+      if (guildId && threadChannelUnknown(msg.channel)) await this.lookUpThread(msg.channelId);
       const parentId =
         msg.channel && 'parentId' in msg.channel
           ? ((msg.channel as { parentId?: string | null }).parentId ?? null)
@@ -1571,9 +1596,10 @@ export class DiscordAdapter {
   async listEmojis(guildId?: string): Promise<DiscordEmojiInfo[]> {
     const guilds: Guild[] = [];
     if (guildId) {
-      const g = await this.client.guilds.fetch(guildId).catch(() => null);
-      if (!g) throw new Error(`Guild ${guildId} not found`);
-      guilds.push(g);
+      // Discord's own error (Unknown Guild, Missing Access) propagates, as
+      // listChannels' does, so the tool error can say what it means.
+      // guilds.fetch(id) resolves to the Guild or rejects.
+      guilds.push(await this.client.guilds.fetch(guildId));
     } else {
       guilds.push(...this.client.guilds.cache.values());
     }
@@ -1690,12 +1716,15 @@ export class DiscordAdapter {
     // Packet guild identity alone does not establish whether an uncached
     // channel is a thread under an allowlisted parent. Fetch only when that
     // missing parent could affect the decision; a directly allowed channel
-    // or a channel with known parent metadata needs no lookup.
+    // or a channel with known parent metadata needs no lookup. A partial
+    // thread has the parentId key with a null value, so the key alone isn't
+    // knowing it. The fetch is forced, since discord.js would otherwise hand
+    // back that same cached partial.
     const needsParent = guildId
-      && !(channel && 'parentId' in channel)
+      && (!(channel && 'parentId' in channel) || threadChannelUnknown(channel))
       && !this.channelAllowed(guildId, message.channelId);
     if ((!guildId && !channel?.isDMBased()) || needsParent) {
-      channel = await this.client.channels.fetch(message.channelId);
+      channel = await this.client.channels.fetch(message.channelId, { force: true });
       guildId ??= channel && 'guildId' in channel ? channel.guildId : null;
     }
     if (!guildId && !channel?.isDMBased()) {
@@ -1721,7 +1750,10 @@ export class DiscordAdapter {
   ): Promise<void> {
     const messageId = message.id;
     const previous = this.messageEventDeliveries.get(messageId) ?? Promise.resolve();
-    const pending = Promise.allSettled([previous, this.messageEventInfo(message)]).then(([, result]) => {
+    // A create still waiting for its thread's lookup goes first, so an edit
+    // or delete never overtakes the message it changes.
+    const created = this.threadLookups.get(message.channelId);
+    const pending = Promise.allSettled([previous, created, this.messageEventInfo(message)]).then(([, , result]) => {
       if (result.status === 'rejected') throw result.reason;
       if (result.value) forward(result.value);
     });
@@ -1786,19 +1818,21 @@ export class DiscordAdapter {
       };
       dbg('gateway:message-create', base);
 
-      const dropReason = this.messageFilterReason(message);
-      if (dropReason) {
-        dbg('gateway:message-create-drop', { ...base, reason: dropReason });
+      // A thread the client knows only partly is fetched before the filters
+      // decide, and this channel's later creates wait behind that fetch, so
+      // they're delivered in order.
+      const waiting = this.threadLookups.get(message.channelId);
+      if (waiting || (message.guildId && threadChannelUnknown(message.channel))) {
+        const next = (waiting ?? this.lookUpThread(message.channelId))
+          .then(() => this.acceptMessage(message, base))
+          .catch((err) => console.error('[discord-mcpl] Failed to deliver a thread message:', (err as Error).message));
+        this.threadLookups.set(message.channelId, next);
+        void next.finally(() => {
+          if (this.threadLookups.get(message.channelId) === next) this.threadLookups.delete(message.channelId);
+        });
         return;
       }
-
-      try {
-        this.messageHandler?.(this.convertMessage(message));
-      } catch (err) {
-        const error = err instanceof Error ? err.message : String(err);
-        dbg('gateway:message-create-error', { ...base, error });
-        console.error('[discord-mcpl] Failed to convert Discord message:', error);
-      }
+      this.acceptMessage(message, base);
     });
 
     this.client.on('messageUpdate', (oldMsg, newMsg) => {
@@ -1996,8 +2030,17 @@ export class DiscordAdapter {
   }
 
   /** Per-guild channel whitelist check. A guild with no entry in
-   *  `guildChannels` is unrestricted. Threads count as their parent channel
-   *  (a thread under a whitelisted channel is allowed). */
+   *  `guildChannels` is unrestricted. A listed id admits that channel or
+   *  thread. A listed channel also admits its threads, and a listed category
+   *  admits the channels under it and, through them, their threads (a
+   *  forum's posts included). So a thread is allowed whenever its channel
+   *  is, and also when it's listed itself.
+   *
+   *  `parentId` is the channel's own parent: a category for a channel, the
+   *  channel for a thread. A thread's channel may itself be admitted only
+   *  through its category, one level further up, so that level is read from
+   *  the client's channel cache (guild channels are always cached under the
+   *  GUILDS intent). An uncached parent stays excluded. */
   private channelAllowed(
     guildId: string | null | undefined,
     channelId: string,
@@ -2006,7 +2049,71 @@ export class DiscordAdapter {
     if (!guildId || !this.guildChannels) return true;
     const allowed = this.guildChannels.get(guildId);
     if (!allowed) return true;
+    if (parentId != null && !allowed.has(channelId) && !allowed.has(parentId)) {
+      const parent = this.client.channels.cache.get(parentId) as { parentId?: string | null } | undefined;
+      if (parent?.parentId != null && allowed.has(parent.parentId)) return true;
+    }
     return allowed.has(channelId) || (parentId != null && allowed.has(parentId));
+  }
+
+  /** Apply the ingress filters to a created message, and deliver it if they pass. */
+  private acceptMessage(message: Message, base: Record<string, unknown>): void {
+    const dropReason = this.messageFilterReason(message);
+    if (dropReason) {
+      dbg('gateway:message-create-drop', { ...base, reason: dropReason });
+      return;
+    }
+    try {
+      this.messageHandler?.(this.convertMessage(message));
+    } catch (err) {
+      const error = err instanceof Error ? err.message : String(err);
+      dbg('gateway:message-create-error', { ...base, error });
+      console.error('[discord-mcpl] Failed to convert Discord message:', error);
+    }
+  }
+
+  /** Fetch a thread so the cache holds its channel (threadChannelUnknown).
+   *  Forced, since discord.js would otherwise return the cached partial. The
+   *  REST client's own timeout and retries bound the wait (15 s a try, three
+   *  retries, by default), so creates waiting behind it are held at most
+   *  that long. If the fetch fails, the thread stays as it was, and the
+   *  filters decide on what's known: a thread whose channel is unknown is
+   *  admitted only if it's listed itself. That failure is logged, since the
+   *  thread's messages may then be filtered out though its channel is
+   *  admitted. */
+  private async lookUpThread(channelId: string): Promise<void> {
+    try {
+      await this.client.channels.fetch(channelId, { force: true });
+    } catch (err) {
+      const error = (err as Error).message;
+      dbg('gateway:thread-lookup-failed', { channelId, error });
+      console.error(
+        `[discord-mcpl] Couldn't look up thread ${channelId} to find its channel (${error}). ` +
+          'Its events are filtered without it, so they pass only if the thread is listed itself.',
+      );
+    }
+  }
+
+  /** Why a deliberate read of this channel is refused by the channel filters,
+   *  or null when it isn't. It is the boundary list_channels and
+   *  list_channel_members already apply: guildChannels, with a channel's
+   *  parent (a thread's channel, a channel's category) admitting it too.
+   *  DMs and guilds without a guildChannels entry pass; guildIds and dmUsers
+   *  bound delivery, not reads. */
+  async inspectionRefusal(channelId: string): Promise<string | null> {
+    const channel = await this.client.channels.fetch(channelId);
+    // A lookup that finds nothing can't be placed, so it fails closed, with
+    // the not-found error the read itself would give.
+    if (!channel) throw new Error(`Channel ${channelId} not found`);
+    // A DM passes: the DM list filters incoming DMs only.
+    if (channel.isDMBased()) return null;
+    const guildId = 'guildId' in channel ? channel.guildId : null;
+    const parentId = 'parentId' in channel ? channel.parentId : null;
+    if (this.channelAllowed(guildId, channelId, parentId)) return null;
+    return (
+      `Channel ${channelId} is outside this residence's configured channel filters — ` +
+      'filters bound inspection as well as delivery. Nothing was read.'
+    );
   }
 
   private messageFilterReason(message: Message): string | null {

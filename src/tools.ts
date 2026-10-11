@@ -206,7 +206,9 @@ export const toolDefinitions: ToolDefinition[] = [
     description:
       'Show the active event filters: which guilds/channels can deliver events to you ' +
       '(guild whitelist, optional per-guild channel whitelist) and which users may DM you. ' +
-      'null means unrestricted. Filters gate delivery only — the bot must also be a ' +
+      'null means unrestricted. Filters gate delivery, and the per-guild channel list also ' +
+      'bounds list_channels, list_channel_members, fetch_history and fetch_around, which refuse ' +
+      'a channel outside it. The bot must also be a ' +
       'member of a guild to see it at all. Reports the config plane\'s desired-vs-effective ' +
       'state (live / stale / unavailable — whitelists and suppression share one lifecycle, so ' +
       'a broken filters file makes ALL of them stale together) and reaction-suppression state ' +
@@ -355,7 +357,8 @@ export const toolDefinitions: ToolDefinition[] = [
     description:
       'Mute a Discord channel entirely: no ambient messages, no wake on @mentions ' +
       'or replies, and it will NOT auto-subscribe you back in when mentioned. Also ' +
-      'drops any existing ambient subscription and closes the bridge channel. Use this ' +
+      'drops any existing ambient subscription, turns off its reaction visibility and ' +
+      'closes the bridge channel. Use this ' +
       'to stay out of a channel that keeps pulling you in. Persisted across restarts. ' +
       'Reverse with unmute_channel and explicitly reopen to restore ambient traffic. ' +
       'If the host still lists it as open, use channel_close before channel_open.',
@@ -370,8 +373,9 @@ export const toolDefinitions: ToolDefinition[] = [
   {
     name: 'unmute_channel',
     description:
-      'Un-mute a Discord channel: mentions and DMs reach you again. Ordinary traffic ' +
-      'stays stopped until channel_open with its MCPL channel id. If the host still lists ' +
+      'Un-mute a Discord channel: mentions and DMs reach you again. Ordinary traffic, and ' +
+      'reactions unless set_reaction_visibility turned them on during the mute, stay stopped ' +
+      'until channel_open with its MCPL channel id. If the host still lists ' +
       'it as open, use channel_close then channel_open to reconcile. Persisted across restarts.',
     inputSchema: {
       type: 'object',
