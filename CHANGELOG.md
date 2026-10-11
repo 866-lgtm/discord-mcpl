@@ -14,25 +14,36 @@ in the git log and PR descriptions.
   disabled: "Automatic delivery notice: this connection did not forward your
   DM because this sender is outside its configured contacts. It sends this
   notice at most once per 24 hours." The DM itself is still never forwarded
-  and never wakes the agent. Each refused message notifies at most once
-  (duplicates and catch-up included), each sender at most once per 24 hours,
-  and all senders together at most 10 times an hour (past that, a refused DM
-  gets none and is logged `ceiling-reached`), so a wave of new accounts can't
-  become a burst of outbound DMs. A message older than the notice state never
-  notifies, whether it arrives live or through catch-up. Each attempt is
-  reserved durably before sending and never retried; its outcome (sent,
-  failed, unknown) is recorded after, and an attempt interrupted in between is
-  reported as unknown at the next start. State lives in
-  `$XDG_STATE_HOME/discord-mcpl/<bot user id>/dm-notices.json` (override:
-  `DISCORD_DM_NOTICES_FILE`) and holds no message bodies. It keeps each
-  sender for 7 days after their latest refusal or notice, and a refusal
-  while notices are off writes nothing; turning them on starts from that
-  moment, so nothing refused while they were off is notified later. If it
-  can't be read or written, notices are suspended. The agent turns notices
-  on and off with `filters_update {setDmNotice}`, which works with or
-  without a filters file. `filters_get` shows the setting and whether the
-  state is persisted. Every refused DM leaves one operator log line (sender
-  id, message id, notice outcome) without its body.
+  and never wakes the agent. A notice can go to a DM refused live, from the
+  moment Discord connects, or to one the reconnect catch-up finds in a DM
+  channel the bot already knows; a DM from a sender the bot has never seen,
+  sent while it's offline, is never seen and gets none. Each refused message
+  notifies at most once (duplicates and catch-up included), each sender at
+  most once per 24 hours, and all senders together at most 10 times an hour
+  (past that, a refused DM gets none and is logged `ceiling-reached`), so a
+  wave of new accounts can't become a burst of outbound DMs. Past the
+  ceiling, a sender the state doesn't hold yet isn't recorded either, so such
+  a wave costs no writes, and a later sight of their message can still
+  notify. A message older than the notice state never notifies, whether it
+  arrives live or through catch-up. Each attempt is reserved durably before
+  sending and never retried; its outcome (sent, failed, unknown) is recorded
+  after, and an attempt interrupted in between is reported as unknown at the
+  next start. A reservation that can't be made durable sends nothing and is
+  withdrawn. State lives in
+  `$XDG_STATE_HOME/discord-mcpl/<bot user id>/dm-notices.json`, or under
+  `~/.local/state` when `XDG_STATE_HOME` is unset (override:
+  `DISCORD_DM_NOTICES_FILE`), and holds no message bodies. It keeps each
+  sender for 7 days after their latest refusal or notice, dropping them when
+  it next changes while notices are on; a refusal while notices are off
+  writes nothing, and turning them on starts from that moment, so nothing
+  refused while they were off is notified later. If it can't be read or
+  written, notices are suspended, and a refusal decided meanwhile gets no
+  notice; nothing retries it. The agent turns notices on and off with
+  `filters_update {setDmNotice}`, which works with or without a filters
+  file; turning them off stops every notice not yet reserved, while one
+  already being sent still goes out. `filters_get` shows the setting and
+  whether the state is persisted. Every refused DM leaves one operator log
+  line (sender id, message id, notice outcome) without its body.
 
 - **RFC-006 event coalescing** (agent-framework #197, mcpl #5). When the host
   advertises `eventCoalescing`, a message create carries its stable subject
@@ -185,8 +196,13 @@ in the git log and PR descriptions.
   decision as live delivery (guild, channel and thread parent, DM author),
   evaluated after the history fetch, so a filter change made while the fetch
   was pending applies. A channel whose identity can't be resolved isn't
-  delivered on a guess; it waits for the next sweep. Withheld messages are
-  never rendered, and a withheld DM goes through the refusal notice rule.
+  delivered on a guess. It's held back, its watermark untouched, and tried
+  again at the next start (the sweep runs once per process), unless a
+  message forwarded live in it moves its watermark past what was held first.
+  Withheld messages are never rendered, and a withheld DM goes through the
+  refusal notice rule: its channel's watermark moves past it once it's
+  decided, or after 30 seconds if the notice state's disk hasn't answered by
+  then, and only ever forward.
 
 - **Ghost "[message edited]" events.** Discord emits `messageUpdate` for more
   than content edits: link-preview / embed refreshes re-send old messages with

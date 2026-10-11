@@ -5,11 +5,11 @@
  */
 import { describe, it, type TestContext } from 'node:test';
 import * as assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync, chmodSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, chmodSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { ChannelType, Collection, MessageType, type Client } from 'discord.js';
-import { DiscordAdapter, type DmRefusal } from '../src/discord-adapter.js';
+import { DM_REFUSALS_HELD, DiscordAdapter, type DmRefusal } from '../src/discord-adapter.js';
 import { DiscordMcplServer } from '../src/server.js';
 import { DM_NOTICE_TEXT, snowflakeAt } from '../src/dm-notices.js';
 
@@ -64,6 +64,9 @@ async function harness(t: TestContext, opts: {
   /** Start as index.ts does but connect no host, as in TCP mode before its
    *  first client: no host connection and no message forwarding. */
   noHost?: boolean;
+  /** Runs once Discord's client exists and before the server handles
+   *  refusals, as when Discord reports refusals before index.ts gets there. */
+  beforeRefusals?: (emit: (authorId: string, opts?: { id?: string; channelId?: string }) => void) => void;
 } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'dm-refusal-'));
   const env = { wm: process.env.DISCORD_WATERMARK_FILE, notices: process.env.DISCORD_DM_NOTICES_FILE };
@@ -157,6 +160,7 @@ async function harness(t: TestContext, opts: {
     server.enabledFeatureSets = new Set(['discord.messaging']);
     server.setupDiscordForwarding();
   }
+  opts.beforeRefusals?.(emit);
   // As index.ts does at startup: refusals are handled from here on, and the
   // notice state's floor predates the sweep.
   await server.setupDmRefusals();
@@ -302,6 +306,9 @@ describe('live refusals', () => {
     h.failNoticesWith(Object.assign(new Error('Service Unavailable'), { status: 503 }));
     h.emit('server-error', { id: freshId(5) });
     await h.settle();
+    h.failNoticesWith(Object.assign(new Error('You are being rate limited.'), { status: 429 }));
+    h.emit('rate-limited-us', { id: freshId(6) });
+    await h.settle();
     h.failNoticesWith(null);
     h.emit('blocked-us', { id: freshId(3) });
     h.emit('flaky', { id: freshId(4) });
@@ -311,6 +318,9 @@ describe('live refusals', () => {
     assert.ok(h.logs.some((l) => /sender flaky.*notice unknown: socket hang up/.test(l)));
     assert.ok(h.logs.some((l) => /sender server-error.*notice unknown: Service Unavailable/.test(l)),
       'a 5xx may have posted it, so it is unknown, not failed');
+    assert.ok(h.logs.some((l) => /sender rate-limited-us.*notice unknown: You are being rate limited/.test(l)),
+      'a 429 is refused before Discord evaluates it, so an earlier attempt may have posted: unknown');
+    assert.equal(JSON.parse(readFileSync(h.noticesPath, 'utf-8')).senders['rate-limited-us'].lastNotice.outcome, 'unknown');
   });
 
   it('records a notice whose channel lookup failed as failed, since nothing was sent', async (t) => {
@@ -351,6 +361,22 @@ describe('live refusals', () => {
     await h.settle();
     assert.deepEqual(h.notices, [{ channelId: 'dm-stranger', content: DM_NOTICE_TEXT }]);
     assert.ok(h.logs.some((l) => /\(live\): sender stranger, message \d+; notice sent/.test(l)));
+  });
+
+  it('decides the refusals Discord reported before the server handled them, once it does', async (t) => {
+    const keep = mkdtempSync(join(tmpdir(), 'dm-notice-early-'));
+    t.after(() => rmSync(keep, { recursive: true, force: true }));
+    const noticesPath = join(keep, 'dm-notices.json');
+    await harness(t, { dmUsers: ['friend'], noticesPath }); // a state with notices on, as a restart finds it
+    const early = freshId(1);
+    const h = await harness(t, {
+      dmUsers: ['friend'], noticesPath, notices: 'as-saved', noHost: true,
+      beforeRefusals: (emit) => emit('stranger', { id: early }),
+    });
+    await h.settle();
+    assert.deepEqual(h.notices, [{ channelId: 'dm-stranger', content: DM_NOTICE_TEXT }]);
+    assert.ok(h.logs.some((l) => l.includes(`(live): sender stranger, message ${early}; notice sent`)),
+      'decided and logged like any other refusal');
   });
 });
 
@@ -540,6 +566,75 @@ describe('the reconnect catch-up sweep applies the live ingress decision', () =>
     assert.equal(h.notices.length, 1);
     assert.ok(h.logs.some((l) => /\(sweep\): sender stranger.*notice already-handled/.test(l)));
   });
+
+  /** Hold every flush of the server's notice state until released, the
+   *  first one signalling that it was reached. */
+  function holdFlushes(h: Awaited<ReturnType<typeof harness>>) {
+    let reached!: () => void;
+    let release!: () => void;
+    const atFlush = new Promise<void>((resolve) => { reached = resolve; });
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    type Sync = (handle: unknown, what: string) => Promise<void>;
+    const state = (h.server as unknown as { dmNotices: { sync: Sync } }).dmNotices;
+    const sync = state.sync;
+    state.sync = async (handle, what) => {
+      reached();
+      await gate;
+      return sync(handle, what);
+    };
+    return { atFlush, release };
+  }
+
+  it('moves past a channel whose refusals are still being decided once its wait runs out, and says so', async (t) => {
+    const h = await harness(t, {
+      dmUsers: ['friend'],
+      watermarks: { 'dm-chan-4': '100' },
+      dmChannels: ['dm-chan-4'],
+      history: async () => [historyMessage(freshId(1), 'stranger', 'refused words')],
+    });
+    (h.server as unknown as { sweepDecisionWaitMs: number }).sweepDecisionWaitMs = 50;
+    const disk = holdFlushes(h); // the notice state's disk stops answering
+    await h.server.runReconnectSweep(); // finishes, though the decision doesn't
+    assert.notEqual(h.server.forwardedWatermark.get('dm-chan-4'), '100', 'the watermark moved on');
+    assert.ok(h.logs.some((l) => /Catch-up moved past channel dm-chan-4 with refused DMs still being decided after 0\.05s/.test(l)));
+    disk.release();
+    await h.settle();
+    assert.equal(h.notices.length, 1, 'decided once the disk answers, and its notice goes out then');
+  });
+
+  it('keeps a channel\'s watermark when the push to the host fails', async (t) => {
+    const h = await harness(t, {
+      dmUsers: ['friend'],
+      watermarks: { 'dm-chan-5': '100' },
+      dmChannels: ['dm-chan-5'],
+      history: async () => [historyMessage(freshId(1), 'friend', 'missed words')],
+    });
+    (h.server.conn as { sendRequest: unknown }).sendRequest = async () => { throw new Error('host went away'); };
+    await h.server.runReconnectSweep();
+    assert.equal(h.server.forwardedWatermark.get('dm-chan-5'), '100', 'not moved past what never reached the host');
+  });
+
+  it('moves a watermark only forward, keeping a newer one the live path set while it waited', async (t) => {
+    const h = await harness(t, {
+      dmUsers: ['friend'],
+      watermarks: { 'dm-chan-6': '100' },
+      dmChannels: ['dm-chan-6'],
+      history: async () => [historyMessage(freshId(1), 'stranger', 'refused words')],
+    });
+    const disk = holdFlushes(h);
+    const sweep = h.server.runReconnectSweep();
+    await disk.atFlush; // the sweep waits for the refusal's decision
+    const newer = freshId(50);
+    h.emit('friend', { id: newer, channelId: 'dm-chan-6', content: 'live words' });
+    for (let i = 0; i < 100 && h.server.forwardedWatermark.get('dm-chan-6') !== newer; i++) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    assert.equal(h.server.forwardedWatermark.get('dm-chan-6'), newer, 'the live path forwarded a newer message');
+    disk.release();
+    await sweep;
+    assert.equal(h.server.forwardedWatermark.get('dm-chan-6'), newer, 'the sweep did not move it back');
+    await h.settle();
+  });
 });
 
 describe('the notice setting', () => {
@@ -595,6 +690,29 @@ describe('the notice setting', () => {
     assert.deepEqual(JSON.parse(readFileSync(path, 'utf-8')), { dmUsers: ['friend', 'new-friend'] });
     assert.equal(JSON.parse(readFileSync(h.noticesPath, 'utf-8')).enabled, false);
   });
+
+  it('applies a whitelist change, and says so, when the notice setting beside it could not be saved', async (t) => {
+    const dir = mkdtempSync(join(tmpdir(), 'dm-notice-tool-'));
+    const prev = process.env.DISCORD_FILTERS_FILE;
+    const path = join(dir, 'filters.json');
+    writeFileSync(path, JSON.stringify({ dmUsers: ['friend'] }));
+    process.env.DISCORD_FILTERS_FILE = path;
+    t.after(() => {
+      if (prev === undefined) delete process.env.DISCORD_FILTERS_FILE; else process.env.DISCORD_FILTERS_FILE = prev;
+      rmSync(dir, { recursive: true, force: true });
+    });
+    const h = await harness(t, { dmUsers: ['friend'] }); // notices on
+    mkdirSync(`${h.noticesPath}.tmp`); // the notice state's next write can't make its temp file
+    const res = await h.server.filtersUpdate({ setDmNotice: false, setDmUsers: ['friend', 'new-friend'] }) as unknown as {
+      applied: { dmUsers: string[] | null; dmNotice: boolean | null }; notes: string[];
+    };
+    assert.deepEqual(res.applied.dmUsers, ['friend', 'new-friend'], 'the whitelist change is applied');
+    assert.deepEqual(JSON.parse(readFileSync(path, 'utf-8')), { dmUsers: ['friend', 'new-friend'] }, 'and written');
+    assert.ok(res.notes.some((n) => /^The whitelist change was applied, but the notice setting was not: could not save the DM notice setting/.test(n)),
+      res.notes.join('\n'));
+    assert.equal(res.applied.dmNotice, true, 'the notice setting is as it was');
+    assert.equal(JSON.parse(readFileSync(h.noticesPath, 'utf-8')).enabled, true);
+  });
 });
 
 describe('adapter surfaces', () => {
@@ -622,6 +740,33 @@ describe('adapter surfaces', () => {
     emit('anyone', 'g1');
     emit('stranger', null);
     assert.deepEqual(refusals, [{ messageId: '12345', channelId: 'chan', authorId: 'stranger', origin: 'live' }]);
+  });
+
+  it('holds refusals heard before a handler is registered, up to a bound, and hands them over in order', (t) => {
+    const { adapter, client } = adapterFixture(t, { token: 'unused', dmUsers: ['friend'] });
+    adapter.onMessage(() => {});
+    const logs: string[] = [];
+    t.mock.method(console, 'error', (...args: unknown[]) => { logs.push(args.map(String).join(' ')); });
+    const emit = (id: string) =>
+      (client.emit as (event: string, ...args: unknown[]) => boolean)('messageCreate', {
+        id, channelId: 'chan', guildId: null, channel: null,
+        author: { id: 'stranger', username: 'stranger', bot: false },
+        content: 'secret', cleanContent: 'secret', type: MessageType.Default,
+        attachments: new Collection(), createdAt: new Date(),
+        mentions: { users: new Collection(), roles: new Collection(), repliedUser: null },
+      });
+    const ids = Array.from({ length: DM_REFUSALS_HELD + 2 }, (_, i) => String(1000 + i));
+    for (const id of ids) emit(id);
+    const past = logs.filter((l) => l.includes(`before refusals were handled, past the ${DM_REFUSALS_HELD} held until then`));
+    assert.equal(past.length, 2, 'each refusal past the bound still leaves its line');
+    assert.ok(past[0].includes(`sender stranger, message ${ids[DM_REFUSALS_HELD]}; no notice`));
+    assert.ok(!logs.some((l) => l.includes('secret')), 'no body in the log');
+    const refusals: DmRefusal[] = [];
+    adapter.onDmRefused((ev) => refusals.push(ev));
+    assert.deepEqual(refusals.map((r) => r.messageId), ids.slice(0, DM_REFUSALS_HELD), 'the held ones, in order');
+    emit('5000');
+    assert.equal(refusals.at(-1)?.messageId, '5000', 'later ones go straight to the handler');
+    assert.equal(refusals.length, DM_REFUSALS_HELD + 1);
   });
 
   it('decides history with the live rules, including a thread under an allowed parent', (t) => {
@@ -686,6 +831,21 @@ describe('adapter surfaces', () => {
       (err: Error & { notPosted?: unknown; status?: unknown }) => err.notPosted === undefined && err.status === 503,
       'a send that failed may still have posted',
     );
+  });
+
+  it('marks a lookup that finds no channel, or one it cannot send in, as never posted', async (t) => {
+    const { adapter, client } = adapterFixture(t, { token: 'unused' });
+    const answers: unknown[] = [null, { id: 'no-send' }];
+    t.mock.method(client.channels, 'fetch', async () => answers.shift());
+    const posts = t.mock.method(client.rest, 'post', async () => ({}));
+    for (const id of ['gone', 'no-send']) {
+      await assert.rejects(
+        adapter.sendDmNotice(id, DM_NOTICE_TEXT, 'dmn3'),
+        (err: Error & { notPosted?: unknown }) => err.notPosted === true && /not found or not a text channel/.test(err.message),
+        id,
+      );
+    }
+    assert.equal(posts.mock.callCount(), 0);
   });
 
   it('reports channel kind only when it is known', async (t) => {

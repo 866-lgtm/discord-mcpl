@@ -1668,7 +1668,8 @@ export class DiscordMcplServer {
             'they are not Discord-side permissions — the bot must also be a member of a guild to see it.' +
             (path
               ? ''
-              : ' Hot updates are disabled: set DISCORD_FILTERS_FILE in the environment (one restart) to enable filters_update.'),
+              : ' Hot whitelist updates are disabled: set DISCORD_FILTERS_FILE in the environment (one restart) to enable ' +
+                'them. filters_update setDmNotice works without it.'),
         };
       }
 
@@ -1698,7 +1699,7 @@ export class DiscordMcplServer {
       notes.push(
         setDmNotice
           ? 'Senders whose DMs the whitelist refuses will get the automatic delivery notice (at most once per 24 hours each).'
-          : 'Refused DMs are now dropped without any notice to their senders.',
+          : 'Refused DMs are now dropped without any notice to their senders. A notice already reserved and being sent still goes out.',
       );
       if (unconfirmed) notes.push(`The notice setting is in effect but not confirmed durable: ${unconfirmed}`);
     };
@@ -2300,15 +2301,18 @@ export class DiscordMcplServer {
       }
       // A channel is a DM only when that's known: recorded as one when a DM
       // was forwarded, or reported so by Discord. A failed lookup is never
-      // read as "no guild, so a DM"; the channel waits for the next sweep,
-      // its watermark untouched.
+      // read as "no guild, so a DM"; the channel is held back, its watermark
+      // untouched. The sweep runs once per process, so it's tried again at
+      // the next start, unless a message forwarded live in it first moves
+      // its watermark past what was held.
       const isDM = this.dmChannelIds.has(channelId) || meta?.isDM === true;
       const guildId = isDM ? null : (meta?.guildId ?? null);
       if (!isDM && !guildId) {
         dbg('sweep:identity-unresolved', { channelId });
         console.error(
           `[discord-mcpl] Catch-up held back channel ${channelId}: neither its guild nor DM identity could be ` +
-            'resolved, so its missed messages were not delivered; the next sweep tries again',
+            'resolved, so its missed messages were not delivered. It is tried again at the next start, unless a ' +
+            'message forwarded live in it before then moves its watermark past them.',
         );
         continue;
       }
@@ -2327,13 +2331,21 @@ export class DiscordMcplServer {
       });
       // Refused DMs are decided alongside delivery, which doesn't wait for
       // them; the watermark only moves past this batch once all of them are
-      // (advance). Their notices go out without holding up the sweep.
+      // decided, or the wait for them runs out (advance). Their notices go
+      // out without holding up the sweep. Moving past a refusal means the
+      // sweep never sees it again, so one decided while the notice state
+      // can't be read or written gets no notice, now or later.
       const refusalsDecided = refusedDms.map(
         (m) => this.handleDmRefusal({ messageId: m.id, channelId, authorId: m.authorId, origin: 'sweep' }).decided,
       );
       const advance = async () => {
-        if (refusalsDecided.length) await Promise.all(refusalsDecided);
-        this.forwardedWatermark.set(channelId, newestId);
+        if (refusalsDecided.length) await this.awaitSweepDecisions(channelId, refusalsDecided);
+        // Only forward: the live path may have moved it past this batch
+        // while the sweep waited.
+        const current = this.forwardedWatermark.get(channelId);
+        if (!current || newestId.localeCompare(current, 'en-US-u-kn-true') > 0) {
+          this.forwardedWatermark.set(channelId, newestId);
+        }
       };
       for (const [reason, count] of withheld) {
         if (reason === 'self-authored') continue;
@@ -2918,18 +2930,43 @@ export class DiscordMcplServer {
   });
   /** The notice state's opening, once its path was known. */
   private dmNoticesOpening: Promise<void> | null = null;
+  /** How long the catch-up sweep waits for a channel's refused DMs to be
+   *  decided before moving past them (see awaitSweepDecisions). */
+  private sweepDecisionWaitMs = 30_000;
 
   /** Start handling refused DMs, whether or not a host is connected:
    *  index.ts calls this right after constructing the server, as it calls
-   *  setupSlashCommands. Every refusal from then on gets its notice decision
-   *  and log line. Resolves once the notice state is open; a refusal heard
-   *  meanwhile waits for it. */
+   *  setupSlashCommands. The adapter hands over the refusals it held since
+   *  Discord connected, so every refusal gets its notice decision and log
+   *  line. Resolves once the notice state is open; a refusal heard meanwhile
+   *  waits for it. */
   async setupDmRefusals(): Promise<void> {
     this.discord.onDmRefused((ev) => {
       void this.handleDmRefusal(ev).settled;
     });
     this.dmNoticeState();
     await this.dmNoticesOpening;
+  }
+
+  /** Wait for a channel's refused DMs to be decided, at most
+   *  sweepDecisionWaitMs. Each decision waits on the notice state's disk, and
+   *  one write that never answers would otherwise stop the whole catch-up.
+   *  A decision still pending is recorded when the disk answers, and its
+   *  notice, if one is due, can't go out before then; the worst case is a
+   *  notice never sent. */
+  private async awaitSweepDecisions(channelId: string, decided: Promise<unknown>[]): Promise<void> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const ranOut = new Promise<true>((resolve) => {
+      timer = setTimeout(() => resolve(true), this.sweepDecisionWaitMs);
+    });
+    const late = await Promise.race([Promise.allSettled(decided).then(() => false), ranOut]);
+    clearTimeout(timer);
+    if (late) {
+      console.error(
+        `[discord-mcpl] Catch-up moved past channel ${channelId} with refused DMs still being decided after ` +
+          `${this.sweepDecisionWaitMs / 1000}s: the notice state's disk hasn't answered. They're decided when it does.`,
+      );
+    }
   }
 
   private dmNoticeState(): DmNoticeState {
@@ -2946,7 +2983,11 @@ export class DiscordMcplServer {
   /**
    * A DM the allowlist refused, live or swept. It is never forwarded; its
    * sender is told at most once per 24 hours, and each refusal leaves one
-   * operator log line without the message body.
+   * operator log line without the message body. The live path hears every
+   * refused DM while the bot is connected. The sweep only reaches DM
+   * channels the bot already knows, ones it forwarded a DM in, so a DM from
+   * a sender the bot has never seen, sent while it was offline, is never
+   * seen and gets no notice.
    *
    * `decided` resolves when the decision attempt has finished: a notice due
    * is durably reserved by then, and a suspended decision has no
@@ -2971,10 +3012,13 @@ export class DiscordMcplServer {
             await this.discord.sendDmNotice(ev.channelId, DM_NOTICE_TEXT, `dmn${ev.messageId}`);
           } catch (err) {
             // Only a definite rejection counts as failed: the send never
-            // started, or Discord refused the request (a 4xx other than rate
-            // limiting). A 5xx, a timeout or a dropped connection may still
-            // have posted it, so it's unknown. Either way the reservation
-            // stands; no retry.
+            // started, or Discord refused the request. A 4xx other than 429 is
+            // Discord evaluating it, and with the enforced nonce an earlier
+            // attempt that had posted would have been returned instead. A 429
+            // is refused before Discord evaluates the request, so it can't rule
+            // out an earlier attempt of it that posted, and it's unknown, like
+            // a 5xx, a timeout or a dropped connection, which may have posted
+            // it. Either way the reservation stands; no retry.
             const e = err as { status?: unknown; notPosted?: unknown; message?: unknown };
             const status = typeof e.status === 'number' ? e.status : null;
             const rejected = e.notPosted === true || (status !== null && status >= 400 && status < 500 && status !== 429);
@@ -2984,7 +3028,10 @@ export class DiscordMcplServer {
           const unsaved = await state.recordOutcome(ev.authorId, ev.messageId, result);
           outcome = `${result}${detail}${unsaved ? `; its outcome was not saved durably (${unsaved})` : ''}`;
         } else if (decision === 'suspended') {
-          outcome = `suspended (${state.status().error ?? 'notice state unavailable'})`;
+          // The state names why it isn't persisted. When it is again by now,
+          // the decision's reservation couldn't be made durable and its
+          // withdrawal then was (see DmNoticeState.decide).
+          outcome = `suspended (${state.status().error ?? 'its reservation could not be made durable, so it was withdrawn'})`;
         }
         console.error(
           `[discord-mcpl] DM refused by the DM allowlist (${ev.origin}): sender ${ev.authorId}, ` +

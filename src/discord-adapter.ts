@@ -98,6 +98,9 @@ export interface DiscordAdapterConfig {
   dmUsers?: string[];
 }
 
+/** How many refusals the adapter holds while no handler is registered. */
+export const DM_REFUSALS_HELD = 100;
+
 /** A DM the DM allowlist refused: its identity only, never its body. */
 export interface DmRefusal {
   messageId: string;
@@ -526,6 +529,9 @@ export class DiscordAdapter {
   private deleteAccept?: (channelId: string) => boolean;
   private reactionHandler?: (ev: ReactionEvent) => void;
   private dmRefusedHandler?: (ev: DmRefusal) => void;
+  /** Refusals heard before onDmRefused registered a handler (Discord
+   *  connects before the server exists), handed over when it does. */
+  private heldDmRefusals: DmRefusal[] = [];
   private readyHandler?: () => void;
   private channelCreateHandler?: (guildId: string, channel: DiscordChannelInfo) => void;
   private channelDeleteHandler?: (guildId: string, channelId: string) => void;
@@ -636,9 +642,28 @@ export class DiscordAdapter {
   }
 
   /** Register a handler for DMs the DM allowlist refused at the gateway.
-   *  It receives the refusal's identity only, never the message body. */
+   *  It receives the refusal's identity only, never the message body. The
+   *  refusals heard before it was registered are handed to it first, in
+   *  order (see refuseDm). */
   onDmRefused(handler: (ev: DmRefusal) => void): void {
     this.dmRefusedHandler = handler;
+    for (const ev of this.heldDmRefusals.splice(0)) handler(ev);
+  }
+
+  /** Hand a refusal to the handler, or hold it until one is registered, up
+   *  to DM_REFUSALS_HELD. Past that, a refusal still leaves its operator log
+   *  line, without a notice decision. */
+  private refuseDm(ev: DmRefusal): void {
+    if (this.dmRefusedHandler) {
+      this.dmRefusedHandler(ev);
+    } else if (this.heldDmRefusals.length < DM_REFUSALS_HELD) {
+      this.heldDmRefusals.push(ev);
+    } else {
+      console.error(
+        `[discord-mcpl] DM refused by the DM allowlist (${ev.origin}) before refusals were handled, past the ` +
+          `${DM_REFUSALS_HELD} held until then: sender ${ev.authorId}, message ${ev.messageId}; no notice`,
+      );
+    }
   }
 
   onReady(handler: () => void): void {
@@ -1810,7 +1835,7 @@ export class DiscordAdapter {
         dbg('gateway:message-create-drop', { ...base, reason: dropReason });
         if (dropReason === 'dm-user-not-allowed') {
           // The body stays here; only the refusal's identity leaves.
-          this.dmRefusedHandler?.({
+          this.refuseDm({
             messageId: message.id,
             channelId: message.channelId,
             authorId: message.author.id,

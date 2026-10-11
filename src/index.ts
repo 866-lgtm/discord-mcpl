@@ -129,10 +129,11 @@ async function main(): Promise<void> {
   const server = new DiscordMcplServer(discord, voice);
   // Refused DMs are handled from here on, whether or not a host is connected
   // (TCP mode waits for its first client): each gets its notice decision and
-  // operator log line. A new notice state's floor is the server's
-  // construction, just above. Discord connected earlier, so a refusal it
-  // reported before then went unheard; it predates the floor, so it would
-  // get no notice either way, and the sweep may still log it.
+  // operator log line. Discord connected earlier, so the adapter has held
+  // the refusals it heard since then, and hands them over here. A new notice
+  // state's floor is the moment the state is created, here once the bot
+  // user id is known, so a held refusal from before it gets no notice, only
+  // its log line.
   await server.setupDmRefusals();
 
   // The filters plane state (whitelists + reaction suppression share one

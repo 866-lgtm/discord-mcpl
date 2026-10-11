@@ -10,10 +10,11 @@
  *
  *   - floorId: a Discord snowflake. A message older than it never
  *     notifies, on any path: a gateway event can carry an older message as
- *     well as the catch-up sweep can. It moves to the moment notices are
- *     turned on, so nothing refused before then notifies later: while they
- *     are off nothing is recorded, and a new state starts off. It also
- *     follows the retention horizon below.
+ *     well as the catch-up sweep can. A new state's floor is the moment the
+ *     state is created, and turning notices on moves it to that moment, so
+ *     nothing refused before then notifies later: while they are off nothing
+ *     is recorded, and a new state starts off. It also follows the retention
+ *     horizon below.
  *   - per sender, lastHandledId: the newest refused message already handled.
  *     A message whose id isn't newer never notifies again.
  *   - per sender, lastNotice: the last notice's message, when it was
@@ -29,14 +30,20 @@
  * counts the senders whose last notice was reserved within the hour. Each
  * sender has at most one notice a day, so that is every notice reserved
  * within the hour, durable with the rest of the state. Past the ceiling, a
- * refused DM gets no notice; it is still handled, so it never notifies
- * later.
+ * refused DM gets no notice. A sender the state already holds is recorded
+ * as handled, so that message never notifies later. A sender it doesn't
+ * hold yet isn't recorded at all, so a wave of new accounts adds no senders
+ * and costs no writes: the file grows by at most the ceiling's worth of new
+ * senders an hour. Their message got no notice, so a later sight of it can
+ * still notify, within the usual limits.
  *
  * A sender is kept for DM_NOTICE_RETENTION_MS after their latest refusal
- * or notice, then dropped, and the floor follows that horizon, so a message
- * from before it can't notify once its sender is gone. The file holds the
- * senders refused within the retention while notices were on, not everyone
- * ever refused.
+ * or notice, and dropped when the state next changes while notices are on,
+ * and the floor follows that horizon, so a message from before it can't
+ * notify once its sender is gone. While notices are off nothing is written,
+ * so the state keeps the senders it held. The file holds the senders
+ * refused within the retention while notices were on, not everyone ever
+ * refused.
  *
  * The same file holds the resident's on/off setting for notices. It is off
  * until the resident turns it on with filters_update setDmNotice: a bot
@@ -46,7 +53,11 @@
  *
  * The state lives in its own file, separate from the filters file. If it
  * can't be read or written, notices are suspended rather than sent without a
- * durable limit; refusals themselves are unaffected.
+ * durable limit; refusals themselves are unaffected. A refusal decided
+ * meanwhile gets no notice, and nothing retries it: only a later sight of
+ * the same message decides it again, such as a duplicate gateway event, or
+ * the catch-up at the next start for a refusal heard live in a DM channel
+ * the bot knows (the catch-up moves its watermark past what it decided).
  *
  * The file is read and written asynchronously, so a slow disk never stalls
  * the gateway, and the state's operations (open, decide, recordOutcome,
@@ -167,7 +178,8 @@ function parseNoticeFile(raw: unknown): NoticeFile | null {
       const n = s.lastNotice as Record<string, unknown> | null;
       if (typeof n !== 'object' || n === null) return null;
       if (typeof n.messageId !== 'string' || !SNOWFLAKE_RE.test(n.messageId)) return null;
-      if (typeof n.at !== 'number' || !Number.isFinite(n.at)) return null;
+      // Within Date's range, so an interrupted reservation's time can be printed.
+      if (typeof n.at !== 'number' || Number.isNaN(new Date(n.at).getTime())) return null;
       if (typeof n.outcome !== 'string' || !OUTCOMES.has(n.outcome)) return null;
       lastNotice = { messageId: n.messageId, at: n.at, outcome: n.outcome as DmNoticeOutcome };
     }
@@ -187,7 +199,8 @@ export class DmNoticeState {
   /** The state as the file holds it (see commit), or null while it can't be read. */
   private file: NoticeFile | null = null;
   private path: string | null = null;
-  private error: string | null = 'not opened yet (the bot user id is not known)';
+  /** Why the state isn't persisted right now, or null when it is. */
+  private error: string | null = 'not opened yet';
   /** Settles when the last operation called so far has finished. */
   private tail: Promise<void> = Promise.resolve();
   private readonly now: () => number;
@@ -229,6 +242,7 @@ export class DmNoticeState {
   private async load(path: string): Promise<void> {
     this.path = path;
     this.file = null;
+    this.error = 'opening';
     let text: string | null = null;
     try {
       text = await readFile(path, 'utf-8');
@@ -283,9 +297,10 @@ export class DmNoticeState {
   }
 
   /** Settle a reserved notice's outcome. Resolves to null once that is
-   *  durable, else to why not. If the file couldn't be replaced, the
-   *  reservation stays pending there and is reported as interrupted
-   *  (unknown) the next time the state is opened. */
+   *  durable, else to why not. The state keeps the outcome either way, so
+   *  the next write that succeeds records it. Until one does, the file holds
+   *  the reservation pending, and if none does before the process ends, the
+   *  next open reports it as interrupted (unknown). */
   recordOutcome(
     authorId: string,
     messageId: string,
@@ -297,10 +312,15 @@ export class DmNoticeState {
       if (!file || !prev?.lastNotice || prev.lastNotice.messageId !== messageId) {
         return 'its reservation is no longer in the notice state';
       }
-      return this.commit({
+      const next: NoticeFile = {
         ...file,
         senders: { ...file.senders, [authorId]: { ...prev, lastNotice: { ...prev.lastNotice, outcome } } },
-      });
+      };
+      const error = await this.commit(next);
+      // Kept even when the file couldn't take it, so a later write carries
+      // the outcome rather than the reservation's pending.
+      if (error) this.file = next;
+      return error;
     });
   }
 
@@ -326,11 +346,14 @@ export class DmNoticeState {
 
   /**
    * Decide one refused DM's notice and record it durably. While notices are
-   * on, every refusal advances its sender's lastHandledId, so a later
-   * catch-up of the same message can't notify; while they are off, nothing
-   * is recorded (see setEnabled's floor). A `notify` result is returned only
-   * after the reservation is durable; while the file can't be written
-   * durably, notices are suspended (checked again on the next refusal).
+   * on, a refusal advances its sender's lastHandledId, so a later catch-up of
+   * the same message can't notify; past the hourly ceiling, a sender the
+   * state doesn't hold yet is the exception, and nothing is written. While
+   * they are off, nothing is recorded (see setEnabled's floor). A `notify`
+   * result is returned only after the reservation is durable; while the
+   * file can't be written durably, notices are suspended (checked again on
+   * the next refusal), and a reservation that couldn't be made durable is
+   * withdrawn, since nothing is sent for it.
    */
   decide(messageId: string, authorId: string): Promise<DmNoticeDecision> {
     return this.serially(async () => {
@@ -352,6 +375,10 @@ export class DmNoticeState {
         Object.values(file.senders).filter(
           (s) => s.lastNotice !== undefined && now - s.lastNotice.at < DM_NOTICE_CEILING_WINDOW_MS,
         ).length >= DM_NOTICE_HOURLY_CEILING;
+      // Past the ceiling, a sender the state doesn't hold yet isn't recorded,
+      // so a wave of new accounts adds no senders and costs no writes. Their
+      // message got no notice, so a later sight of it can still notify.
+      if (atCeiling && !prev) return 'ceiling-reached';
       const reserve = !inWindow && !atCeiling;
       const lastNotice: LastNotice | undefined = reserve
         ? { messageId, at: now, outcome: 'pending' }
@@ -364,19 +391,38 @@ export class DmNoticeState {
       }
       senders[authorId] = { lastHandledId: messageId, ...(lastNotice ? { lastNotice } : {}) };
       const next: NoticeFile = { ...file, floorId, senders };
-      if (await this.commit(next)) return 'suspended';
+      if (await this.commit(next)) {
+        if (reserve) {
+          // The reservation isn't durable, so nothing is sent for it. Withdraw
+          // it: the message is handled, and the sender keeps their earlier
+          // notice, if any. Once that's written, no open reports the
+          // never-sent notice as interrupted. The state holds the withdrawal
+          // even if this write fails too, so the next write that succeeds
+          // records it.
+          const handled: SenderState = {
+            lastHandledId: messageId,
+            ...(prev?.lastNotice ? { lastNotice: prev.lastNotice } : {}),
+          };
+          const withdrawn: NoticeFile = { ...next, senders: { ...senders, [authorId]: handled } };
+          await this.commit(withdrawn);
+          this.file = withdrawn;
+        }
+        return 'suspended';
+      }
       if (reserve) return 'notify';
       return inWindow ? 'rate-limited' : 'ceiling-reached';
     });
   }
 
-  /** Write `next` and make it the state. The state always matches what the
-   *  file holds: a write that failed before replacing the file changes
-   *  nothing, and one that replaced the file but couldn't flush its
-   *  directory still leaves `next` as the state (this is the file's only
-   *  writer, so a reread would return the same), with the error kept until
-   *  a later write is durable. Resolves to null once `next` is durable, else
-   *  to the error. */
+  /** Write `next` and make it the state. The state matches what the file
+   *  holds: a write that failed before replacing the file changes nothing,
+   *  and one that replaced the file but couldn't flush its directory still
+   *  leaves `next` as the state (this is the file's only writer, so a reread
+   *  would return the same), with the error kept until a later write is
+   *  durable. Two callers keep a change the file couldn't take, for the next
+   *  write that succeeds to carry: a settled outcome (recordOutcome) and a
+   *  withdrawn reservation (decide). Resolves to null once `next` is
+   *  durable, else to the error. */
   private async commit(next: NoticeFile): Promise<string | null> {
     try {
       await this.write(next);
@@ -393,7 +439,8 @@ export class DmNoticeState {
   /** Durable replace: the new content is flushed before it takes the old
    *  file's place, and the rename is flushed with its directory, so a
    *  reservation that returned has survived a host crash. Private to the
-   *  bot's user (0600 file, 0700 directory). A failure before the rename
+   *  bot's user: a 0600 file, in a directory created 0700 when it doesn't
+   *  exist (an existing one keeps its mode). A failure before the rename
    *  leaves the old file in place; one after it is an UnflushedReplace. */
   private async write(file: NoticeFile): Promise<void> {
     if (!this.path) throw new Error('DM notice state has no path');

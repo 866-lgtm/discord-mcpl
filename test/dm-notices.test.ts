@@ -4,7 +4,8 @@
  * hour across senders, nothing for messages older than the state,
  * reservation before send, suspension when the state can't be persisted,
  * operations in the order they were called, and a state that matches its
- * file after a failed write.
+ * file after a failed write, apart from a settled outcome or a withdrawn
+ * reservation, which it keeps for the next write that succeeds.
  */
 import { describe, it, type TestContext } from 'node:test';
 import * as assert from 'node:assert/strict';
@@ -249,21 +250,40 @@ describe('DM notice state', () => {
       assert.equal(await state.decide(idAt(T0 + 1000, i), `knocker-${i}`), 'notify');
     }
     const over = idAt(T0 + 2000);
+    const before = readFileSync(f.path, 'utf-8');
     assert.equal(await state.decide(over, 'one-too-many'), 'ceiling-reached');
-    assert.deepEqual(f.onDisk().senders['one-too-many'], { lastHandledId: over }, 'handled, with nothing reserved');
+    assert.equal(readFileSync(f.path, 'utf-8'), before, 'a sender the state does not hold is not recorded: nothing is written');
 
     // The ceiling is counted from the file, so a restart doesn't reset it.
     f.clock.set(T0 + DM_NOTICE_CEILING_WINDOW_MS - 1);
     const restarted = f.make();
     await restarted.open(f.path);
     assert.equal(await restarted.decide(idAt(T0 + 3000), 'another'), 'ceiling-reached');
-    assert.equal(await restarted.decide(over, 'one-too-many'), 'already-handled', 'a message held by the ceiling never notifies later');
+    assert.equal(await restarted.decide(over, 'one-too-many'), 'ceiling-reached', 'still unrecorded while the ceiling holds');
 
     // An hour after those notices, the ceiling has room again; each sender's
     // own 24-hour limit still stands.
     f.clock.set(T0 + DM_NOTICE_CEILING_WINDOW_MS);
-    assert.equal(await restarted.decide(idAt(T0 + HOUR, 1), 'one-too-many'), 'notify', 'a later message, once there is room');
+    assert.equal(await restarted.decide(over, 'one-too-many'), 'notify', 'a later sight of an unrecorded message can notify');
     assert.equal(await restarted.decide(idAt(T0 + HOUR, 2), 'knocker-0'), 'rate-limited', 'its own day, not the ceiling');
+  });
+
+  it('records a sender it already holds as handled past the ceiling, keeping their earlier notice', async (t) => {
+    const f = fixture(t);
+    const state = f.make();
+    await f.openOn(state);
+    // A sender notified yesterday: held, and outside their own day by now.
+    assert.equal(await state.decide(idAt(T0 + 1000), 'regular'), 'notify');
+    f.clock.set(T0 + DM_NOTICE_WINDOW_MS + HOUR);
+    const now = T0 + DM_NOTICE_WINDOW_MS + HOUR;
+    for (let i = 0; i < DM_NOTICE_HOURLY_CEILING; i++) {
+      assert.equal(await state.decide(idAt(now, i), `knocker-${i}`), 'notify');
+    }
+    const held = idAt(now, 100);
+    assert.equal(await state.decide(held, 'regular'), 'ceiling-reached');
+    assert.equal(f.onDisk().senders.regular.lastHandledId, held, 'handled, so that message never notifies later');
+    assert.equal(f.onDisk().senders.regular.lastNotice.messageId, idAt(T0 + 1000), 'their earlier notice is kept');
+    assert.equal(await state.decide(held, 'regular'), 'already-handled');
   });
 
   it('suspends notices while the state file is invalid, without touching it, and resumes once it is removed', async (t) => {
@@ -349,6 +369,67 @@ describe('DM notice state', () => {
     assert.equal(f.interrupted.length, 1, 'the file never learned the outcome, so it is reported as interrupted');
   });
 
+  it('keeps an outcome its write could not save, so the next write that succeeds records it', async (t) => {
+    const f = fixture(t);
+    const state = f.make();
+    await f.openOn(state);
+    assert.equal(await state.decide(idAt(T0 + 1000), 'stranger'), 'notify');
+    f.failing.add('file');
+    assert.match(await state.recordOutcome('stranger', idAt(T0 + 1000), 'sent') ?? '', /file flush failed/);
+    f.failing.clear();
+    assert.equal(await state.decide(idAt(T0 + 2000), 'other'), 'notify', 'a later write that succeeds');
+    assert.equal(f.onDisk().senders.stranger.lastNotice.outcome, 'sent', 'carries the outcome, not the pending');
+    await f.make().open(f.path);
+    assert.deepEqual(f.interrupted.map((i) => i.authorId), ['other'], 'only the notice still pending is reported');
+  });
+
+  it('withdraws a reservation its write could not save, and keeps the withdrawal for the next write that succeeds', async (t) => {
+    const f = fixture(t);
+    const state = f.make();
+    await f.openOn(state);
+    f.failing.add('file'); // both the reservation's write and the withdrawal's fail before replacing the file
+    assert.equal(await state.decide(idAt(T0 + 1000), 'stranger'), 'suspended');
+    assert.equal(f.onDisk().senders.stranger, undefined, 'the file was not replaced');
+    f.failing.clear();
+    assert.equal(await state.decide(idAt(T0 + 1000), 'stranger'), 'already-handled', 'the state holds it as handled');
+    assert.equal(await state.decide(idAt(T0 + 2000), 'other'), 'notify', 'a later write that succeeds');
+    assert.deepEqual(f.onDisk().senders.stranger, { lastHandledId: idAt(T0 + 1000) }, 'records the withdrawal');
+  });
+
+  it('treats a reservation time outside Date\'s range as an invalid file, rather than failing to open', async (t) => {
+    const f = fixture(t);
+    const state = f.make();
+    await f.openOn(state);
+    assert.equal(await state.decide(idAt(T0 + 1000), 'stranger'), 'notify'); // left pending
+    const file = f.onDisk();
+    file.senders.stranger.lastNotice.at = 8.64e15 + 1;
+    writeFileSync(f.path, JSON.stringify(file));
+    const reopened = f.make();
+    await reopened.open(f.path); // resolves, so startup goes on
+    assert.match(reopened.status().error ?? '', /not a valid DM notice state file/);
+    assert.equal(await reopened.decide(idAt(T0 + 2000), 'other'), 'suspended');
+    assert.deepEqual(f.interrupted, []);
+  });
+
+  it('says only that the state is not opened yet, or opening, until it is open', async (t) => {
+    const f = fixture(t);
+    let reached!: () => void;
+    let release!: () => void;
+    const atFlush = new Promise<void>((resolve) => { reached = resolve; });
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const state = new DmNoticeState({
+      now: () => T0,
+      sync: async (handle) => { reached(); await gate; await handle.sync(); },
+    });
+    assert.deepEqual(state.status(), { path: null, persisted: false, enabled: null, error: 'not opened yet' });
+    const opened = state.open(f.path); // a new state: its first write waits at the flush
+    await atFlush;
+    assert.equal(state.status().error, 'opening');
+    release();
+    await opened;
+    assert.deepEqual(state.status(), { path: f.path, persisted: true, enabled: false });
+  });
+
   describe('when the directory flush fails after the file was replaced, the state is what the file holds', () => {
     if (process.platform === 'win32') return;
 
@@ -372,18 +453,20 @@ describe('DM notice state', () => {
       assert.equal(state.status().persisted, true, 'that write was durable');
     });
 
-    it('a reservation is not sent, its window stands, and a durable write later lets notices resume', async (t) => {
+    it('a reservation is not sent but withdrawn, so no open reports it, and a durable write later lets notices resume', async (t) => {
       const f = fixture(t);
       const state = f.make();
       await f.openOn(state);
       f.failing.add('directory');
       assert.equal(await state.decide(idAt(T0 + 1000), 'stranger'), 'suspended', 'no dispatch without a durable reservation');
       assert.match(state.status().error ?? '', /flushing its directory failed/);
-      assert.equal(f.onDisk().senders.stranger.lastNotice.outcome, 'pending', 'the file holds the reservation');
+      assert.deepEqual(f.onDisk().senders.stranger, { lastHandledId: idAt(T0 + 1000) },
+        'the file holds the message as handled, and no reservation');
       f.failing.clear();
-      assert.equal(await state.decide(idAt(T0 + 2000), 'stranger'), 'rate-limited', 'memory kept the reservation the file holds');
-      assert.equal(await state.decide(idAt(T0 + 3000), 'other'), 'notify');
-      assert.equal(f.onDisk().senders.stranger.lastNotice.messageId, idAt(T0 + 1000));
+      await f.make().open(f.path);
+      assert.deepEqual(f.interrupted, [], 'so no open reports a notice that was never sent');
+      assert.equal(await state.decide(idAt(T0 + 1000), 'stranger'), 'already-handled');
+      assert.equal(await state.decide(idAt(T0 + 2000), 'stranger'), 'notify', 'no notice went out, so no window started');
     });
 
     it('a recorded outcome stays recorded through later writes', async (t) => {
