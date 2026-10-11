@@ -182,11 +182,14 @@ describe('a store whose file has content it can not use', () => {
     mkdirSync(join(dir, 'real'));
     writeFileSync(join(dir, 'real', 'muted.json'), 'not json');
     chmodSync(join(dir, 'real', 'muted.json'), 0o600);
+    const other = process.getgroups?.().find((gid) => gid !== statSync(join(dir, 'real', 'muted.json')).gid);
+    if (other !== undefined) chownSync(join(dir, 'real', 'muted.json'), statSync(join(dir, 'real')).uid, other);
     symlinkSync(join(dir, 'real', 'muted.json'), join(dir, 'muted.json'));
     await withUmask(0o022, () => server(t).executeToolCall('mute_channel', { channelId: 'chan-new' }));
     assert.ok(lstatSync(join(dir, 'muted.json')).isSymbolicLink(), 'the link is still a link');
     assert.deepEqual(JSON.parse(readFileSync(join(dir, 'real', 'muted.json'), 'utf-8')), ['chan-new']);
     assert.equal(statSync(join(dir, 'real', 'muted.json')).mode & 0o777, 0o600);
+    if (other !== undefined) assert.equal(statSync(join(dir, 'real', 'muted.json')).gid, other, "the moved file's group");
     const moved = readdirSync(join(dir, 'real')).filter((f) => f.startsWith('muted.json.unreadable-'));
     assert.equal(moved.length, 1, 'the file the link names was moved aside, beside itself');
   });

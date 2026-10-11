@@ -35,6 +35,7 @@ import {
   chmodSync,
   chownSync,
   constants,
+  existsSync,
   lstatSync,
   mkdirSync,
   readFileSync,
@@ -78,11 +79,20 @@ export function writeJsonFile(path: string, value: unknown): void {
   // target was moved aside, takes the moved file's mode.
   const was = old && !old.isSymbolicLink() ? { mode: old.mode & 0o777, gid: old.gid } : movedAside.get(path);
   const mode = was?.mode;
-  const writeInPlace = () => writeFileSync(path, text, mode === undefined ? undefined : { mode });
+  const ownUid = process.getuid?.();
+  const writeInPlace = () => {
+    const creating = !existsSync(path); // a link whose file was moved aside, say
+    writeFileSync(path, text, mode === undefined ? undefined : { mode });
+    if (!creating || !was || ownUid === undefined) return;
+    try {
+      chownSync(path, ownUid, was.gid); // the moved file's group, as for a replaced file
+    } catch {
+      // A group the server isn't in: the file stays in the server's, as when it's written in place.
+    }
+  };
   // A rename would turn a symlink into a plain file, split a hard link, or
   // take another user's file over, so only a plain file the server owns, with
   // no other name, is replaced.
-  const ownUid = process.getuid?.();
   if (old && !(old.isFile() && old.nlink === 1 && (ownUid === undefined || old.uid === ownUid))) {
     writeInPlace();
     return;
