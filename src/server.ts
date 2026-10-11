@@ -46,7 +46,7 @@ import type {
   ChannelsOutgoingCompleteParams,
 } from '@animalabs/mcpl-core';
 
-import type { DiscordAdapter, DiscordMessageData, DiscordAttachment, OutgoingFile, ReactionSummary, MessageEventInfo, DmRefusal, DmSendFailure } from './discord-adapter.js';
+import type { DiscordAdapter, DiscordMessageData, DiscordAttachment, OutgoingFile, ReactionSummary, MessageEventInfo, DmRefusal, DmSendFailure, ThreadPlace } from './discord-adapter.js';
 import { LATEST_FROM_WINDOW } from './discord-adapter.js';
 import { DM_NOTICE_TEXT, DmNoticeState, resolveDmNoticesPath, type DmNoticeDecision } from './dm-notices.js';
 
@@ -113,6 +113,37 @@ function errorText(err: unknown): string {
   } catch {
     return `[an unprintable ${typeof err}]`;
   }
+}
+
+/** Where a message sits, as the location prefix and the reconnect sweep's
+ *  `<missed>` header name it. Posted in a thread, that is the channel the
+ *  thread hangs off and the thread itself, named by its id when it has no
+ *  name; otherwise it is the message's channel. A part that isn't known is
+ *  null. */
+function messagePlace(channelName: string | null | undefined, thread: ThreadPlace): { channel: string | null; thread: string | null } {
+  return thread.threadId
+    ? { channel: thread.threadParentName ?? null, thread: thread.threadName ?? thread.threadId }
+    : { channel: channelName ?? null, thread: null };
+}
+
+/** A thread message's identity, as every lane that delivers it carries it
+ *  (channels/incoming metadata, a push's origin, the sweep's): the thread's
+ *  name and the channel it hangs off, each left out when it isn't known.
+ *  No MCPL threadId: that names a thread within a channel, and a Discord
+ *  thread is its own channel, already named by the channel id. Empty for a
+ *  message that isn't in a thread. */
+function threadFields(thread: ThreadPlace): { threadName?: string; threadParentName?: string } {
+  if (!thread.threadId) return {};
+  return {
+    ...(thread.threadName ? { threadName: thread.threadName } : {}),
+    ...(thread.threadParentName ? { threadParentName: thread.threadParentName } : {}),
+  };
+}
+
+/** The place tag every lane gives a message posted in a thread: `chat:thread`
+ *  (the host documents it as "Occurred in a thread"). */
+function threadTags(thread: ThreadPlace): string[] {
+  return thread.threadId ? ['chat:thread'] : [];
 }
 
 interface SavedTally {
@@ -2800,10 +2831,16 @@ export class DiscordMcplServer {
       }
       const hadMention = isDM || mentionCount > 0;
 
+      // The channel is named as the live location names it: a thread by the
+      // channel it hangs off and the thread itself.
+      const thread: ThreadPlace = meta ?? {};
+      const place = messagePlace(meta?.name, thread);
       const attrs: string[] = [];
-      if (meta?.name) attrs.push(`channel="#${meta.name}"`);
+      if (place.channel) attrs.push(`channel=${JSON.stringify(`#${place.channel}`)}`);
+      if (place.thread) attrs.push(`thread=${JSON.stringify(place.thread)}`);
       // channelId is load-bearing: it's what fetch_around/fetch_history need to
       // let the agent jump to any of these messages and read the full context.
+      // For a thread it is the thread's own id.
       attrs.push(`channelId="${channelId}"`);
       if (meta?.guildName) attrs.push(`guild=${JSON.stringify(meta.guildName)}`);
       else if (isDM) attrs.push('dm="true"');
@@ -2841,10 +2878,17 @@ export class DiscordMcplServer {
             channelId,
             guildId: meta?.guildId ?? null,
             guildName: meta?.guildName ?? undefined,
+            // The composite id the host registers and routes by, as a live
+            // push's origin carries it.
+            mcplChannelId: mcplChannelId(guildId ?? 'dm', channelId),
             channelName: meta?.name ?? undefined,
+            ...threadFields(thread),
             isMention: hadMention,
             isDM,
           } as Record<string, unknown>,
+          // The place tag only: the block's messages share their channel, but
+          // not whether each mentions the bot or who wrote it.
+          ...(threadTags(thread).length > 0 ? { tags: threadTags(thread) } : {}),
           payload: { content: [textContent(block)] },
         } satisfies PushEventParams);
       } catch (err) {
@@ -3217,13 +3261,15 @@ export class DiscordMcplServer {
   /** Push-event origin for an edit/delete. Carries the guild (and the composite
    *  channel id) so the host places the event in the right channel — without
    *  it a guild channel's edit was reconstructed as `discord:dm:<channelId>` —
-   *  plus the message and author ids when the adapter knows them. */
+   *  the thread's fields when the message is in one, as its create carried
+   *  them, plus the message and author ids when the adapter knows them. */
   private messageEventOrigin(channelId: string, messageId: string, info?: MessageEventInfo): Record<string, unknown> {
     const guildId = info?.guildId ?? null;
     return {
       source: 'discord',
       channelId,
       ...(guildId ? { guildId, mcplChannelId: mcplChannelId(guildId, channelId) } : {}),
+      ...threadFields(info ?? {}),
       messageId,
       ...(info?.authorId ? { authorId: info.authorId } : {}),
       ...(info?.authorName ? { authorName: info.authorName } : {}),
@@ -3299,7 +3345,7 @@ export class DiscordMcplServer {
       eventId: `discord_edit_${messageId}_${timestamp}_${mem ? ++mem.edits : ++this.editSeq}`,
       timestamp,
       origin: this.messageEventOrigin(channelId, messageId, info),
-      tags: ['chat:edited'],
+      tags: ['chat:edited', ...threadTags(info ?? {})],
       payload: { content },
       // RFC-006: replace the unread original; append once it was read.
       ...(this.hostCoalescing?.pushEvents
@@ -3328,7 +3374,7 @@ export class DiscordMcplServer {
       eventId: `discord_delete_${messageId}_${timestamp}_${++this.editSeq}`,
       timestamp,
       origin: this.messageEventOrigin(channelId, messageId, info),
-      tags: ['chat:deleted'],
+      tags: ['chat:deleted', ...threadTags(info ?? {})],
       // The deletion notice (RFC-006 §6): shown only if a model read a
       // version of the message; an unread message is withdrawn without trace.
       payload: { content: [textContent(`[message deleted] ${messageId}${info?.authorName ? ` by @${info.authorName}` : ''}`)] },
@@ -4003,14 +4049,12 @@ export class DiscordMcplServer {
       // prefix's own words (` in <guild>`): a text channel's name never has
       // one, but a voice, stage or forum channel's can.
       const locationParts: string[] = [];
-      const channelPart = (name: string) => `#${/\s/.test(name) ? quotedValue(name) : headerValue(name)}`;
-      if (msg.threadId) {
-        // Posted in a thread: name the channel it hangs off, then the thread.
-        if (msg.threadParentName) locationParts.push(channelPart(msg.threadParentName));
-        locationParts.push(`thread ${quotedValue(msg.threadName ?? msg.threadId)}`);
-      } else if (msg.channelName) {
-        locationParts.push(channelPart(msg.channelName));
+      // Posted in a thread: the channel it hangs off, then the thread.
+      const place = messagePlace(msg.channelName, msg);
+      if (place.channel) {
+        locationParts.push(`#${/\s/.test(place.channel) ? quotedValue(place.channel) : headerValue(place.channel)}`);
       }
+      if (place.thread) locationParts.push(`thread ${quotedValue(place.thread)}`);
       if (msg.guildName) locationParts.push(`in ${headerValue(msg.guildName)}`);
       else if (msg.guildId === null) locationParts.push('DM');
       if (locationParts.length > 0) location = `[${locationParts.join(' ')}] `;
@@ -4066,7 +4110,7 @@ export class DiscordMcplServer {
       if (isDM) { t.add('chat:dm'); t.add('chat:private'); }
       t.add(isMention || isDM ? 'chat:addressed' : 'chat:ambient');
       t.add(isBot ? 'chat:from-bot' : 'chat:from-human');
-      if (msg.threadId) t.add('chat:thread');
+      for (const tag of threadTags(msg)) t.add(tag);
       for (const a of msg.attachments) {
         const ct = (a.contentType || '').toLowerCase();
         if (ct.startsWith('image/')) t.add('chat:has-image');
@@ -4110,7 +4154,7 @@ export class DiscordMcplServer {
             replyToAuthorName: msg.replyToUserName ?? undefined,
             channelName: msg.channelName,
             guildName: msg.guildName,
-            threadName: msg.threadName,
+            ...threadFields(msg),
             rawContent: msg.content,
             isMention,
             isExplicitMention,
@@ -4168,8 +4212,7 @@ export class DiscordMcplServer {
           mcplChannelId: channelMcplId,
           channelName: msg.channelName,
           // Display only; the composite channel id already names the thread.
-          threadName: msg.threadName,
-          threadParentName: msg.threadParentName ?? undefined,
+          ...threadFields(msg),
           authorId: msg.authorId,
           authorName: msg.authorName,
           replyTo: msg.replyToId,

@@ -145,7 +145,34 @@ export interface DiscordAttachment {
   forwardedSnapshotIndex?: number;
 }
 
-export interface DiscordMessageData {
+/** Where a message sits when its channel is a thread. Discord threads are
+ *  channels, so a message posted in one has the thread as its channel. These
+ *  fields name that thread, never one a message started: that is discord.js
+ *  `message.thread`, a different conversation. All are absent when the
+ *  channel isn't a thread. The adapter reads them in one place
+ *  (`threadPlace`), for creates, edits and deletes, and channel lookups. */
+export interface ThreadPlace {
+  /** The thread the message was posted in, which is its channel, so this
+   *  equals the channel id. */
+  threadId?: string;
+  /** The thread's name, when it's known. */
+  threadName?: string;
+  /** Name of the channel the thread hangs off: null when it isn't known. */
+  threadParentName?: string | null;
+}
+
+/** A channel's display metadata, for the reconnect sweep's `<missed>` blocks
+ *  (getChannelMeta, getCachedChannelMeta): its name, guild, whether it is a
+ *  DM (null when its kind isn't known), and its thread fields when it is a
+ *  thread. */
+export interface ChannelMeta extends ThreadPlace {
+  name: string | null;
+  guildId: string | null;
+  guildName: string | null;
+  isDM: boolean | null;
+}
+
+export interface DiscordMessageData extends ThreadPlace {
   id: string;
   /** Raw content, mentions encoded as `<@USER_ID>` etc. */
   content: string;
@@ -162,14 +189,6 @@ export interface DiscordMessageData {
   guildId: string | null;
   /** Guild name (e.g. "My Server"). `null` for DMs. */
   guildName: string | null;
-  /** The thread the message was posted IN, when it was (Discord threads are
-   *  channels, so this equals `channelId`). Never the thread a message
-   *  started: that is discord.js `message.thread`, a different conversation. */
-  threadId?: string;
-  /** Thread name when the message is in a thread. */
-  threadName?: string;
-  /** Name of the channel a thread hangs off, when the message is in a thread. */
-  threadParentName?: string | null;
   replyToId?: string;
   /** User id of the author of the message this message is in reply to.
    *  Populated for reply messages regardless of whether the sender left
@@ -427,8 +446,9 @@ export function buildForwardedContent(
  *  so neither forwards nor system messages can regress to empty on
  *  backscroll or the reconnect catch-up sweep — history replays missed
  *  messages through fetchHistory, not the live path. */
-/** Author/location context forwarded with an edit or delete event. */
-export interface MessageEventInfo {
+/** Author/location context forwarded with an edit or delete event, the
+ *  thread included when the message's channel is one (ThreadPlace). */
+export interface MessageEventInfo extends ThreadPlace {
   /** Guild id, or null for a DM. */
   guildId: string | null;
   authorId?: string;
@@ -1350,36 +1370,21 @@ export class DiscordAdapter {
    *  catch-up sweep to label `<missed>` blocks. Returns nulls for an
    *  unresolvable channel rather than throwing; `isDM` is null when the
    *  channel's kind isn't known. */
-  async getChannelMeta(channelId: string): Promise<{
-    name: string | null;
-    guildId: string | null;
-    guildName: string | null;
-    isDM: boolean | null;
-  }> {
+  async getChannelMeta(channelId: string): Promise<ChannelMeta> {
     const channel = await this.client.channels.fetch(channelId);
-    return this.extractChannelMeta(channel);
+    return this.extractChannelMeta(channel, channelId);
   }
 
   /** Cache-only variant of getChannelMeta: gateway-cache lookup, no REST,
    *  synchronous. Null when the channel isn't cached (as opposed to cached
    *  but metadata-sparse) — callers decide whether to fall back to REST. */
-  getCachedChannelMeta(channelId: string): {
-    name: string | null;
-    guildId: string | null;
-    guildName: string | null;
-    isDM: boolean | null;
-  } | null {
+  getCachedChannelMeta(channelId: string): ChannelMeta | null {
     const channel = this.client.channels.cache.get(channelId);
     if (!channel) return null;
-    return this.extractChannelMeta(channel);
+    return this.extractChannelMeta(channel, channelId);
   }
 
-  private extractChannelMeta(channel: unknown): {
-    name: string | null;
-    guildId: string | null;
-    guildName: string | null;
-    isDM: boolean | null;
-  } {
+  private extractChannelMeta(channel: unknown, channelId: string): ChannelMeta {
     if (!channel) return { name: null, guildId: null, guildName: null, isDM: null };
     const c = channel as {
       name?: string;
@@ -1397,6 +1402,25 @@ export class DiscordAdapter {
       guildId,
       guildName: c.guild?.name ?? null,
       isDM,
+      ...this.threadPlace(channel, channelId),
+    };
+  }
+
+  /** The thread a message in this channel was posted in, when the channel is
+   *  a thread (ThreadPlace); nothing otherwise. The parent is looked up in
+   *  the client's channel cache by parentId, as channelAllowed does, rather
+   *  than through discord.js `ThreadChannel.parent`: that getter goes through
+   *  the thread's guild and throws when it has none, and a throw while
+   *  converting a message drops the whole message, where an unknown parent
+   *  should cost only its name. */
+  private threadPlace(channel: unknown, channelId: string): ThreadPlace {
+    const c = channel as { isThread?: () => boolean; name?: string | null; parentId?: string | null } | null | undefined;
+    if (!c || typeof c.isThread !== 'function' || !c.isThread()) return {};
+    const parent = c.parentId ? (this.client.channels.cache.get(c.parentId) as { name?: string } | undefined) : undefined;
+    return {
+      threadId: channelId,
+      ...(typeof c.name === 'string' && c.name.length > 0 ? { threadName: c.name } : {}),
+      threadParentName: typeof parent?.name === 'string' && parent.name.length > 0 ? parent.name : null,
     };
   }
 
@@ -2114,6 +2138,7 @@ export class DiscordAdapter {
     }
     return {
       guildId: guildId ?? null,
+      ...this.threadPlace(channel, message.channelId),
       authorId,
       authorName,
       ...(dmRecipientId ? { dmRecipientId } : {}),
@@ -2605,14 +2630,6 @@ export class DiscordAdapter {
       ? channel.name
       : null;
     const guildName = message.guild?.name ?? null;
-    // A message posted IN a thread: Discord threads are channels, so its
-    // channelId is the thread and its parent is the channel it hangs off.
-    // (`message.thread` is the thread a message STARTED — not where it was
-    // posted, so it must never stand in for this.)
-    const inThread = (message.channel as { isThread?: () => boolean } | null)?.isThread?.() === true;
-    const threadParentName = inThread
-      ? ((message.channel as { parent?: { name?: string } | null }).parent?.name ?? null)
-      : undefined;
     // `cleanContent` resolves <@id>, <@&roleId>, <#channelId> to
     // @username / @role / #channel (with raw-content fallback), forwarded
     // messages carry their body in messageSnapshots, not content, and Discord
@@ -2634,9 +2651,10 @@ export class DiscordAdapter {
       channelName,
       guildId: message.guildId ?? null,
       guildName,
-      ...(inThread
-        ? { threadId: message.channelId, ...(channelName ? { threadName: channelName } : {}), threadParentName }
-        : {}),
+      // A message posted IN a thread names that thread, which is its channel.
+      // (`message.thread` is the thread a message STARTED, not where it was
+      // posted, so it never stands in for this.)
+      ...this.threadPlace(message.channel, message.channelId),
       replyToId: refType === 0 ? (message.reference?.messageId ?? undefined) : undefined,
       // mentions.repliedUser is the User the reply targets — distinct
       // from mentions.users (which only includes them if the sender

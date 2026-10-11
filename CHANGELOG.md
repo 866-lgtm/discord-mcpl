@@ -23,10 +23,17 @@ in the git log and PR descriptions.
 - **`chat:thread` now marks messages posted in a thread, and no longer marks
   a message that started one.** A host gate or filter rule keyed on the tag
   will match different messages after this upgrade: messages inside threads
-  now carry it, forum posts included (a forum post is a thread), and a
-  channel message that spawned a thread no longer does. The old matches were
-  the wrong ones (see "Thread fields name the thread a message was posted
-  in" under Fixed), but a rule tuned to them is worth checking.
+  now carry it, forum posts included (a forum post is a thread), and so do
+  their edits, their deletions and the reconnect sweep's blocks of them,
+  while a channel message that spawned a thread no longer does. The old
+  matches were the wrong ones (see "Thread fields name the thread a message
+  was posted in" under Fixed), but a rule tuned to them is worth checking.
+- **A message that started a thread no longer carries that thread's id as
+  its MCPL `threadId`, and no message carries one now.** A host that keys
+  conversations by channel and thread filed such a message under the thread
+  it started; it now files it under its channel alone, with the channel's
+  other messages. A message posted in a thread was already filed under the
+  thread's own channel id and stays there.
 
 ### Added
 
@@ -490,10 +497,26 @@ in the git log and PR descriptions.
   as `thread "…"`, and sent to the host with that thread's id as its MCPL
   `threadId`, while messages actually posted in a thread carried none. Now a
   message posted in a thread is tagged `chat:thread` and located as
-  `[#parent thread "name" …]`, and a thread starter carries no thread
-  fields. MCPL `threadId` (a thread *within* a channel) is no longer sent:
-  a Discord thread is its own channel, already named by `channelId`, so a
-  host keying conversations by thread no longer splits one channel in two.
+  `[#parent thread "name" …]`, and a message that started a thread, in a
+  text or announcement channel, carries no thread fields. A forum post's
+  first message is posted in the post itself, which is a thread, so it is
+  marked as in that thread like the replies under it. MCPL `threadId` (a
+  thread *within* a channel) is no longer sent: a Discord thread is its own
+  channel, already named by `channelId`, so a host keying conversations by
+  thread no longer splits one channel in two. Instead a thread message
+  carries `threadName` (the thread's name) and `threadParentName` (the
+  channel it hangs off, new), each left out when it isn't known: in the
+  `channels/incoming` metadata, in a push's origin, and in the origins of
+  its edits and deletions, which are tagged `chat:thread` too. A thread the
+  client knew only partly is looked up before its message is converted, so
+  its message is named as any other thread's.
+- **The reconnect sweep names a thread as the live path does.** A thread's
+  missed messages were headed `<missed channel="#<thread name>" …>`, as if
+  the thread were a channel of its own name, and pushed without tags. The
+  header now reads `<missed channel="#<parent>" thread="<name>" …>`, the push
+  carries `chat:thread` and the thread's fields, and every sweep push, a
+  DM's included, now carries the `mcplChannelId` a live push's origin
+  carries.
 - **DM whitelist fails closed on edits.** With `DISCORD_DM_USERS` set, a DM
   edit whose author is unknown (uncached message) was forwarded because the
   check required an author; it is now dropped, like creates.
