@@ -413,7 +413,13 @@ describe('DiscordMcplServer', () => {
       assert.equal(receipt.accepted, true);
 
       errors = t.mock.method(console, 'error', () => {});
-      // Its enable is well formed and its disable isn't: neither may apply.
+      // The Request form of the same malformed update is answered with an error.
+      await assert.rejects(
+        client.sendRequest('featureSets/update', { enabled: ['discord.history'], disabled: 'discord.messaging' }),
+        (err: { code?: number; message?: string }) =>
+          err.code === -32603 && /disabled must be a list of feature-set names/.test(String(err.message)),
+      );
+      // Its enable is well formed and its disable isn't: neither may apply, in either form.
       client.sendNotification('featureSets/update', { enabled: ['discord.history'], disabled: 'discord.messaging' });
       history = (await client.sendRequest('tools/call', {
         name: 'fetch_history', arguments: { channelId: 'discord:g1:c1' },
