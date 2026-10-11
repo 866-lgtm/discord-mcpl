@@ -70,7 +70,7 @@ are speaking, you are cut off mid-word and a report tells you exactly which of y
 voiced and which were lost. User turns may note "[interrupted you after: ...]" — that means the \
 rest of that sentence was never heard; don't refer to unvoiced content as if it was said. A note \
 that playback of your last reply failed, or that it couldn't be played, means the same: the room \
-heard only what the note quotes, or nothing.`;
+heard your reply up to where the note's quote ends, or nothing.`;
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates] });
 const anthropic = new Anthropic(); // ANTHROPIC_API_KEY from env
