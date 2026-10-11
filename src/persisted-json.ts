@@ -146,13 +146,21 @@ export function readJsonFile<T>(
   } catch {
     problem = 'not valid JSON'; // JSON.parse's own message quotes the file's text
   }
-  // Named by content: a copy already kept under this name holds these bytes.
-  const aside = `${path}.unreadable-${createHash('sha256').update(bytes).digest('hex').slice(0, 12)}`;
+  // Named by content, so the same content is kept once. A copy already under
+  // that name is checked byte for byte, since an operator may have edited it
+  // in place; then this content gets a name of its own, by time.
+  let aside = `${path}.unreadable-${createHash('sha256').update(bytes).digest('hex').slice(0, 12)}`;
   try {
-    copyFileSync(path, aside, constants.COPYFILE_EXCL);
+    try {
+      copyFileSync(path, aside, constants.COPYFILE_EXCL);
+    } catch (err) {
+      if (errorCode(err) !== 'EEXIST' || readFileSync(aside).equals(bytes)) throw err;
+      aside = `${path}.unreadable-${new Date().toISOString().replace(/[:.]/g, '-')}`;
+      copyFileSync(path, aside, constants.COPYFILE_EXCL);
+    }
   } catch (err) {
-    // EEXIST: an earlier read kept this very content, as when the emptying
-    // keeps failing across restarts. One copy is enough.
+    // EEXIST here: an earlier read kept these very bytes, as when the
+    // emptying keeps failing across restarts. One copy is enough.
     if (errorCode(err) !== 'EEXIST') {
       unsaveable.add(path);
       console.error(

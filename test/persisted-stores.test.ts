@@ -258,6 +258,15 @@ describe('a store whose file is left in place', () => {
       return (real as (...a: unknown[]) => void)(p, ...rest);
     }) as typeof fs.writeFileSync, () => server(t).ensureMutedLoaded());
     assert.equal(asides('muted.json').length, 1, 'one copy of the same content');
+    // An operator edits that copy in place; the next read keeps the
+    // original's bytes under a name of their own.
+    writeFileSync(join(dir, asides('muted.json')[0]), '["chan-fixed"]');
+    await withFs(t, 'writeFileSync', (real) => ((p: fs.PathOrFileDescriptor, ...rest: unknown[]) => {
+      if (String(p).endsWith('.tmp')) throw refuse('ENOSPC', 'no space');
+      return (real as (...a: unknown[]) => void)(p, ...rest);
+    }) as typeof fs.writeFileSync, () => server(t).ensureMutedLoaded());
+    const kept = asides('muted.json').map((f) => readFileSync(join(dir, f), 'utf-8')).sort();
+    assert.deepEqual(kept, ['["chan-fixed"]', 'not json'], 'the edited copy and the original bytes both stay');
   });
 
   it("leaves a file it can't read where it is, refuses to save over it, and reads it again in a new store", { skip: asRoot }, async (t) => {
