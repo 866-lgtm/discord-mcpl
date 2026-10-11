@@ -53,6 +53,17 @@ const HISTORY_PROVENANCE =
   'place has channelId null and a header id of discord:?:<channel>. The canonical id is ' +
   'authoritative when a label differs.';
 
+const TARGET_RULE =
+  'Give exactly one of messageId or latestFrom; the other may be omitted or null. ';
+
+const LATEST_FROM_DESC =
+  'Instead of messageId: the author whose newest message to target, as @username, display name, ' +
+  'or numeric user id (people and bots alike). Picks their newest message (never a system notice) among the 100 most ' +
+  'recent in the channel, resolved once when the call runs; an ambiguous name returns choices, ' +
+  'a name that can\'t be checked against the channel\'s members is refused (use the numeric id), ' +
+  'and no match in that window is refused rather than guessed. The result echoes the chosen ' +
+  'message (id, author, time, excerpt).';
+
 export const toolDefinitions: ToolDefinition[] = [
   {
     name: 'send_message',
@@ -74,11 +85,12 @@ export const toolDefinitions: ToolDefinition[] = [
       type: 'object',
       properties: {
         channelId: { type: 'string', description: CHANNEL_ID_DESC },
-        messageId: { type: 'string', description: 'Message to reply to. ' + MESSAGE_ID_KIND },
+        messageId: { type: ['string', 'null'], description: TARGET_RULE + 'Message to reply to. ' + MESSAGE_ID_KIND },
+        latestFrom: { type: ['string', 'null'], description: TARGET_RULE + LATEST_FROM_DESC },
         content: { type: 'string', description: 'Reply content (optional if files are attached)' },
         files: FILES_PROP,
       },
-      required: ['channelId', 'messageId'],
+      required: ['channelId'],
     },
   },
   {
@@ -101,10 +113,11 @@ export const toolDefinitions: ToolDefinition[] = [
       type: 'object',
       properties: {
         channelId: { type: 'string', description: CHANNEL_ID_DESC },
-        messageId: { type: 'string', description: 'Message to react to. ' + MESSAGE_ID_KIND },
+        messageId: { type: ['string', 'null'], description: TARGET_RULE + 'Message to react to. ' + MESSAGE_ID_KIND },
+        latestFrom: { type: ['string', 'null'], description: TARGET_RULE + LATEST_FROM_DESC },
         emoji: { type: 'string', description: 'A unicode emoji (e.g. 👍), or a custom server emoji as `:name:` (discover names/ids with list_emojis) or its full `<:name:id>` token.' },
       },
-      required: ['channelId', 'messageId', 'emoji'],
+      required: ['channelId', 'emoji'],
     },
   },
   {
@@ -114,10 +127,11 @@ export const toolDefinitions: ToolDefinition[] = [
       type: 'object',
       properties: {
         channelId: { type: 'string', description: CHANNEL_ID_DESC },
-        messageId: { type: 'string', description: 'Message whose reaction should be removed. ' + MESSAGE_ID_KIND },
+        messageId: { type: ['string', 'null'], description: TARGET_RULE + 'Message whose reaction should be removed. ' + MESSAGE_ID_KIND },
+        latestFrom: { type: ['string', 'null'], description: TARGET_RULE + LATEST_FROM_DESC },
         emoji: { type: 'string', description: 'The unicode or custom emoji previously added by this bot.' },
       },
-      required: ['channelId', 'messageId', 'emoji'],
+      required: ['channelId', 'emoji'],
     },
   },
   {
@@ -166,7 +180,7 @@ export const toolDefinitions: ToolDefinition[] = [
   },
   {
     name: 'list_channel_members',
-    description: "List people associated with a Discord channel, with IDs and display names. For a guild channel: members who can view it; for a thread: joined members; for a DM: participants. Check scope, note and truncated. This does not report who is online or reading now. Use fetch_history for messages.",
+    description: "List people associated with a Discord channel, with IDs and display names. For a guild channel: members who can view it; for a thread: joined members; for a DM: participants. Check scope, note and truncated, and for a thread unresolved (members listed by id only, whose names couldn't be read) and possiblyIncomplete (Discord returned one full page, so there may be more). This does not report who is online or reading now. Use fetch_history for messages.",
     inputSchema: {
       type: 'object',
       properties: {
@@ -206,7 +220,9 @@ export const toolDefinitions: ToolDefinition[] = [
     description:
       'Show the active event filters: which guilds/channels can deliver events to you ' +
       '(guild whitelist, optional per-guild channel whitelist) and which users may DM you. ' +
-      'null means unrestricted. Filters gate delivery, and the per-guild channel list also ' +
+      'null means unrestricted. dmNotice says whether senders of refused DMs get an automatic ' +
+      'delivery notice (off until you turn it on), and whether its state is `persisted` (notices are ' +
+      'suspended while it is not). Filters gate delivery, and the per-guild channel list also ' +
       'bounds list_channels, list_channel_members, fetch_history and fetch_around, which refuse ' +
       'a channel outside it. The bot must also be a ' +
       'member of a guild to see it at all. Reports the config plane\'s desired-vs-effective ' +
@@ -226,8 +242,9 @@ export const toolDefinitions: ToolDefinition[] = [
   {
     name: 'filters_update',
     description:
-      'Hot-adjust the event filters — takes effect immediately, no restart. Requires ' +
-      'DISCORD_FILTERS_FILE to be configured (filters_get tells you). If the guild filter ' +
+      'Hot-adjust the event filters — takes effect immediately, no restart. Guild and DM ' +
+      'whitelist changes require DISCORD_FILTERS_FILE to be configured (filters_get tells you); ' +
+      'setDmNotice does not. If the guild filter ' +
       'is currently unrestricted, the first add/remove materializes it as the list of all ' +
       'current guilds first, so nothing silently drops. Newly-allowed guilds have their ' +
       'channels registered right away. Reaction-suppression entries are operator-owned and ' +
@@ -258,6 +275,16 @@ export const toolDefinitions: ToolDefinition[] = [
           description:
             'Replace the DM-user whitelist with these user ids. CAREFUL: an empty array ' +
             'means UNRESTRICTED (DMs from anyone), matching the env-unset semantics. Omit to leave DMs unchanged.',
+        },
+        setDmNotice: {
+          type: 'boolean',
+          description:
+            'Whether a sender whose DM the whitelist refuses gets an automatic delivery notice from this ' +
+            'connection (at most once per 24 hours per sender, and at most 10 an hour across all senders; ' +
+            'it never quotes or forwards their message). Off by default, so refused DMs are dropped without ' +
+            'any notice until you set it true. Setting it false stops every notice not yet reserved; one already ' +
+            'being sent still goes out. Saved with the notice state, so it ' +
+            'works and survives restarts even when DISCORD_FILTERS_FILE is not configured. Omit to leave it unchanged.',
         },
       },
     },

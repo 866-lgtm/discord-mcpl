@@ -8,15 +8,18 @@ in the git log and PR descriptions.
 ### Upgrade notes
 
 - **`fetch_history` and `fetch_around` now refuse a channel id that the
-  configured channel list (`guildChannels`) excludes.** A resident that
-  reads such a channel by its numeric id today (following a pasted message
-  link, say) will get a refusal naming the channel filters, and nothing is
-  read. The refusal is deliberate: it is the boundary `list_channels` and
-  `list_channel_members` already apply (see the `fetch_history` entry under
-  Fixed). To let a residence read the channel, admit it in `guildChannels`,
-  directly or through its parent (a thread's channel, a channel's
-  category). The same list bounds delivery, so that admits it for delivery
-  too. Guilds without a `guildChannels` entry, and DMs, are unaffected.
+  configured channel list (`guildChannels`) excludes, and so does a host's
+  `channels/open` that asks for backscroll from such a channel.** An open
+  without backscroll still opens it, since it reads nothing. A resident
+  that reads such a channel by its numeric id today (following a pasted
+  message link, say) will get a refusal naming the channel filters, and
+  nothing is read. The refusal is deliberate: it is the boundary
+  `list_channels` and `list_channel_members` already apply (see the
+  `fetch_history` entry under Fixed). To let a residence read the channel,
+  admit it in `guildChannels`, directly or through its parent (a thread's
+  channel, a channel's category). The same list bounds delivery, so that
+  admits it for delivery too. Guilds without a `guildChannels` entry, and
+  DMs, are unaffected.
 
 ### Added
 
@@ -49,6 +52,99 @@ in the git log and PR descriptions.
   channel name with a space (a voice or stage channel's can have one) is
   quoted too, so it can't carry the prefix's own words. `channelLabel`
   keeps the raw label.
+
+- **`latestFrom` for replies and reactions.** `reply_message`, `add_reaction`
+  and `remove_reaction` accept `latestFrom` (an @username, display name,
+  numeric user ID, `<@id>` or `@id`, bots included) as the exclusive
+  alternative to `messageId`. It targets that author's newest message among
+  the 100 most recent in the channel, resolved once when the call runs and
+  frozen for the action. Only a message someone wrote counts: a system
+  notice (a pin, a join, a thread start) is never their latest message,
+  though a bot's reply to a slash command is the bot's.
+  - **The filters bound it, before and after its reads.** Like
+    `list_channels` and `list_channel_members`, it reads only what the
+    configured filters admit: a channel in a guild `guildIds` lists, admitted
+    by `guildChannels` (a thread by its parent's entry), and for a DM, one
+    whose other party `dmUsers` lists. When the cache can't name a DM's
+    other party (a channel known only from the bot's own message), Discord
+    is asked once, and a party it still can't name is refused. Anything else
+    is refused, by ID or by name, before its history or members are read,
+    and the filters are checked again after the reads, so a change made
+    meanwhile refuses the action.
+  - **A name must match one identity.** That is among everyone who can read
+    the channel (for a public thread, its parent's viewers as well as its
+    joined members; for a private thread, its members and the parent's
+    viewers who can manage threads) plus the window's authors, by username or
+    display name: a member's server nickname or global display name, and for
+    an author no longer there, the account's. A collision returns choices,
+    and no match in the window is refused rather than guessed. A name that
+    can't be checked against the channel's members is refused in favor of
+    the numeric ID: when the member list fails, lists members it couldn't
+    name, or is a thread's listing of exactly one page (100), which may be
+    cut short. A guild whose member-cache warm-up failed is remembered for 10
+    minutes, so names there are refused at once rather than each waiting out
+    another download, and a warm-up is skipped when the cache already holds
+    every member. A `latestFrom` of `@` alone names no one and is refused
+    before anything is read, and an empty channel is refused as having
+    nothing to choose from.
+  - **The result echoes the chosen message:** its ID, author (by display
+    name), channel, time, and an excerpt of at most 80 characters, cut by
+    code points so no emoji is split. `add_reaction` and `remove_reaction`
+    return `{ result, target }` for a `latestFrom` selection.
+  - **A reply to a message that's gone fails** instead of posting
+    unthreaded. Today discord.js's default (`fail_if_not_exists`) does that
+    for every reply. A `latestFrom` reply also asks for it explicitly, since
+    its target was chosen for it, so it keeps failing if the default for
+    other replies changes (#58 makes them post unthreaded instead).
+  - **Selectors:** both are nullable and neither is required, so sparse
+    calls and all-properties calls with the unused one null both work. Only
+    omission and null mean absent: a string is a selector given, blank
+    included, so two given are refused, and a blank one alone names nothing.
+    Each of the three tools now refuses a call with no `messageId` or
+    `latestFrom`, or with a non-string one; a `reply_message` without
+    `messageId` used to post unthreaded.
+  - **`list_channel_members`** reports, for a thread, `unresolved` (members
+    listed by ID only, whose names couldn't be read) and
+    `possiblyIncomplete` (Discord returned exactly one page of members).
+- **A refused DM's sender can be told** (issue #60). Once the agent turns
+  notices on (`filters_update {setDmNotice: true}`; they're off by default, so
+  upgrading starts no messages to anyone), when the DM whitelist refuses a DM,
+  the connector posts one plain notice in that DM channel, with mentions
+  disabled: "Automatic delivery notice: this connection did not forward your
+  DM because this sender is outside its configured contacts. It sends this
+  notice at most once per 24 hours." The DM itself is still never forwarded
+  and never wakes the agent. A notice can go to a DM refused live, from the
+  moment Discord connects, or to one the reconnect catch-up finds in a DM
+  channel the bot already knows; a DM from a sender the bot has never seen,
+  sent while it's offline, is never seen and gets none. Each refused message
+  notifies at most once (duplicates and catch-up included), each sender at
+  most once per 24 hours, and all senders together at most 10 times an hour
+  (past that, a refused DM gets none and is logged `ceiling-reached`), so a
+  wave of new accounts can't become a burst of outbound DMs. Past the
+  ceiling, a sender the state doesn't hold yet isn't recorded either, so such
+  a wave costs no writes, and a later sight of their message can still
+  notify. A message older than the notice state never notifies, whether it
+  arrives live or through catch-up. Each attempt is reserved durably before
+  sending and never retried; its outcome (sent, failed, unknown) is recorded
+  after, and an attempt interrupted in between is reported as unknown at the
+  next start. A reservation that can't be made durable sends nothing and is
+  withdrawn. State lives in
+  `$XDG_STATE_HOME/discord-mcpl/<bot user id>/dm-notices.json`, or under
+  `~/.local/state` when `XDG_STATE_HOME` is unset (override:
+  `DISCORD_DM_NOTICES_FILE`), and holds no message bodies. It keeps each
+  sender for 7 days after their latest refusal or notice, dropping them when
+  it next changes while notices are on; a refusal while notices are off
+  writes nothing, and turning them on starts from that moment, so nothing
+  refused while they were off is notified later. If it can't be read or
+  written, notices are suspended, and a refusal decided meanwhile gets no
+  notice; nothing retries it, though a later sight of the same message
+  (a duplicate event, or the next start's catch-up in a DM channel the bot
+  knows) decides it afresh. The agent turns notices on and off with
+  `filters_update {setDmNotice}`, which works with or without a filters
+  file; turning them off stops every notice not yet reserved, while one
+  already being sent still goes out. `filters_get` shows the setting and
+  whether the state is persisted. Every refused DM leaves one operator log
+  line (sender id, message id, notice outcome) without its body.
 
 - **RFC-006 event coalescing** (agent-framework #197, mcpl #5). When the host
   advertises `eventCoalescing`, a message create carries its stable subject
@@ -212,6 +308,40 @@ in the git log and PR descriptions.
 
 ### Fixed
 
+- **A refused DM's deletion no longer reaches the agent.** With a DM
+  allowlist set, a refused sender's DM was never forwarded, but its deletion
+  was: discord.js caches every DM it receives, so the tombstone carried the
+  sender's id and username ("[message deleted] <id> by @name"). A host
+  without event coalescing showed it. Deletes now apply the allowlist too.
+  Creates and edits are judged by their author; a delete, which may name no
+  author, by the DM's other party: the author unless the message is the
+  bot's own, else the DM channel's recipient other than the bot, asked of
+  Discord once if the cache can't name it. If Discord can't confirm the
+  party (the lookup fails, or names no one), the deletion is withheld, as a
+  create from an unknown user is, and the operator log says so with its
+  channel and message. An allowed user's deletion of a message no longer
+  cached still arrives while discord.js holds the DM channel; a deletion in
+  a DM channel it doesn't hold (say, just after a restart) never reaches the
+  adapter, as before. The list as it is when the deletion arrives decides,
+  as for edits, so a sender removed from it is out for the deletion of a
+  message delivered before the removal too. A refused user's DM channel now
+  sends the agent no events: the deletion of the bot's own message there
+  (one sent with `send_dm`) no longer arrives either.
+- **The reconnect catch-up sweep bypassed the ingress filters** (issue #60).
+  It delivered every missed message in a known DM channel, including DMs from a
+  sender since removed from the DM whitelist, and kept sweeping channels of
+  guilds removed from the guild filter. The sweep now applies the same ingress
+  decision as live delivery (guild, channel and thread parent, DM author),
+  evaluated after the history fetch, so a filter change made while the fetch
+  was pending applies. A channel whose identity can't be resolved isn't
+  delivered on a guess. It's held back, its watermark untouched, and tried
+  again at the next start (the sweep runs once per process), unless a
+  message forwarded live in it moves its watermark past what was held first.
+  Withheld messages are never rendered, and a withheld DM goes through the
+  refusal notice rule: its channel's watermark moves past it once it's
+  decided, or after 30 seconds if the notice state's disk hasn't answered by
+  then, and only ever forward.
+
 - **Ghost "[message edited]" events.** Discord emits `messageUpdate` for more
   than content edits: link-preview / embed refreshes re-send old messages with
   `edited_timestamp` still null. Those reached the agent as fresh edits of
@@ -370,3 +500,10 @@ in the git log and PR descriptions.
   (registration, name resolution, delivery) and the DM contact list
   (incoming DMs) keep their meaning and don't restrict deliberate reads; the
   config docs now say what each filter bounds.
+- **`channels/open` backscroll respects the channel filters too.** A
+  channel registered before `guildChannels` narrowed stays registered until
+  restart (`filters_update` and hot reload only add channels), and opening
+  it with `history.limit > 0` read its backscroll with no filter check. That
+  read now gets the same refusal as `fetch_history`, and the open fails
+  before anything is read or subscribed. An open without history is
+  unchanged.

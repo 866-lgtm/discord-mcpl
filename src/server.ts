@@ -46,7 +46,12 @@ import type {
   ChannelsOutgoingCompleteParams,
 } from '@animalabs/mcpl-core';
 
-import type { DiscordAdapter, DiscordMessageData, DiscordAttachment, DmSendFailure, OutgoingFile, ReactionSummary, MessageEventInfo } from './discord-adapter.js';
+import type { DiscordAdapter, DiscordMessageData, DiscordAttachment, OutgoingFile, ReactionSummary, MessageEventInfo, DmRefusal, DmSendFailure } from './discord-adapter.js';
+import { LATEST_FROM_WINDOW } from './discord-adapter.js';
+import { DM_NOTICE_TEXT, DmNoticeState, resolveDmNoticesPath, type DmNoticeDecision } from './dm-notices.js';
+
+/** How much of a latestFrom target's text its receipt echoes. */
+const LATEST_FROM_EXCERPT = 80;
 import type { ChatInputCommandInteraction } from 'discord.js';
 import { headerValue, labelValue, quotedValue, renderSourceHeader } from './source-header.js';
 import { MessageFlags } from 'discord.js';
@@ -1592,19 +1597,21 @@ export class DiscordMcplServer {
         const content = (args.content as string | undefined) ?? '';
         const files = args.files as OutgoingFile[] | undefined;
         requireContentOrFiles(content, files);
+        const { messageId: replyTo, target } = await this.resolveTargetMessage(channelId, args);
         let result: { messageId: string };
         try {
           result = await this.discord.sendMessage(
             channelId,
             content,
-            { replyTo: args.messageId as string, files },
+            { replyTo, files, ...(target ? { requireReplyTarget: true } : {}) },
           );
         } catch (err) {
           throw this.withAttemptedDestination(err, channelId);
         }
         this.stateTracker.recordSent(result.messageId, channelId, content);
         const shifted = this.markOutboundSend(channelId);
-        return this.augmentSendResult(result.messageId, channelId, shifted);
+        const receipt = await this.augmentSendResult(result.messageId, channelId, shifted);
+        return target ? { ...receipt, target } : receipt;
       }
 
       case 'send_dm': {
@@ -1630,21 +1637,19 @@ export class DiscordMcplServer {
         return this.augmentSendResult(result.messageId, result.channelId, shifted, { recipientName: result.recipientName });
       }
 
-      case 'add_reaction':
-        await this.discord.addReaction(
-          args.channelId as string,
-          args.messageId as string,
-          args.emoji as string,
-        );
-        return 'Reaction added';
+      case 'add_reaction': {
+        const channelId = args.channelId as string;
+        const { messageId, target } = await this.resolveTargetMessage(channelId, args);
+        await this.discord.addReaction(channelId, messageId, args.emoji as string);
+        return target ? { result: 'Reaction added', target } : 'Reaction added';
+      }
 
-      case 'remove_reaction':
-        await this.discord.removeReaction(
-          args.channelId as string,
-          args.messageId as string,
-          args.emoji as string,
-        );
-        return 'Reaction removed';
+      case 'remove_reaction': {
+        const channelId = args.channelId as string;
+        const { messageId, target } = await this.resolveTargetMessage(channelId, args);
+        await this.discord.removeReaction(channelId, messageId, args.emoji as string);
+        return target ? { result: 'Reaction removed', target } : 'Reaction removed';
+      }
 
       case 'edit_message':
         await this.discord.editMessage(
@@ -1866,6 +1871,10 @@ export class DiscordMcplServer {
           guildIds: f.guildIds ?? null,
           guildChannels: f.guildChannels ?? null,
           dmUsers: f.dmUsers ?? null,
+          // Whether refused DM senders get the automatic notice, and whether
+          // its per-sender limit is durable right now (when it isn't, notices
+          // are suspended; refusals are unaffected).
+          dmNotice: this.dmNoticeState().status(),
           plane: this.filtersState.planeStatus(),
           reactionSuppression: {
             ...this.filtersState.suppressionStatus(),
@@ -1884,7 +1893,8 @@ export class DiscordMcplServer {
             'they are not Discord-side permissions — the bot must also be a member of a guild to see it.' +
             (path
               ? ''
-              : ' Hot updates are disabled: set DISCORD_FILTERS_FILE in the environment (one restart) to enable filters_update.'),
+              : ' Hot whitelist updates are disabled: set DISCORD_FILTERS_FILE in the environment (one restart) to enable ' +
+                'them. filters_update setDmNotice works without it.'),
         };
       }
 
@@ -1896,10 +1906,84 @@ export class DiscordMcplServer {
     }
   }
 
+  /** The target of a reply or reaction: exactly one of messageId or
+   *  latestFrom, each a string or null. Only omission and null mean absent:
+   *  a string, blank included, is a selector given, so a blank one beside
+   *  another is two, and a blank one alone names nothing. A latestFrom
+   *  selection is resolved once, its message id frozen for the action, and
+   *  echoed back so the resident can recognize what was chosen. */
+  private async resolveTargetMessage(
+    channelId: string,
+    args: Record<string, unknown>,
+  ): Promise<{ messageId: string; target?: Record<string, unknown> }> {
+    const selector = (value: unknown, name: string): string | undefined => {
+      if (value === undefined || value === null) return undefined;
+      if (typeof value !== 'string') throw new Error(`${name} must be a string or null; nothing was done.`);
+      return value;
+    };
+    const messageId = selector(args.messageId, 'messageId');
+    const latestFrom = selector(args.latestFrom, 'latestFrom');
+    if (messageId !== undefined && latestFrom !== undefined) {
+      throw new Error('Give messageId or latestFrom, not both; nothing was done.');
+    }
+    if (messageId === undefined && latestFrom === undefined) {
+      throw new Error('Give exactly one of messageId or latestFrom; nothing was done.');
+    }
+    if (messageId !== undefined) {
+      if (!messageId.trim()) throw new Error('messageId is blank, so it names no message; nothing was done.');
+      return { messageId: messageId.trim() };
+    }
+    if (!latestFrom!.trim()) throw new Error('latestFrom is blank, so it names no one; nothing was done.');
+    const r = await this.discord.resolveLatestFrom(channelId, latestFrom!);
+    if (!r.ok) throw new Error(r.message);
+    // Cut by code points, never inside a surrogate pair: at most
+    // LATEST_FROM_EXCERPT characters, its ellipsis included.
+    const text = Array.from(r.message.cleanContent.replace(/\s+/g, ' ').trim());
+    return {
+      messageId: r.message.id,
+      target: {
+        messageId: r.message.id,
+        author: { id: r.authorId, name: r.authorLabel },
+        // The raw Discord id, named as such: in receipts `channelId` is the
+        // canonical discord:<guild|dm>:<channel> form.
+        discordChannelId: channelId,
+        timestamp: r.message.timestamp.toISOString(),
+        excerpt: text.length > LATEST_FROM_EXCERPT ? `${text.slice(0, LATEST_FROM_EXCERPT - 1).join('')}…` : text.join(''),
+        selectedBy:
+          `latestFrom "${latestFrom}": their newest message among the ${LATEST_FROM_WINDOW} most recent ` +
+          'in this channel when this call ran (not a claim about what you have seen)',
+      },
+    };
+  }
+
   /** Hot-apply a whitelist change: mutate the filters file (source of truth),
    *  swap the adapter's in-memory filters, and register any newly-visible
    *  channels with the host. See tools.ts for the argument semantics. */
   private async filtersUpdate(args: Record<string, unknown>): Promise<unknown> {
+    // The notice setting lives in the DM notice state, not the filters file,
+    // so it works (and survives restarts) whether or not a filters file is
+    // configured. Alone, it needs nothing else; alongside whitelist changes
+    // it's applied after them, so a refused filter change applies nothing.
+    if (args.setDmNotice !== undefined && typeof args.setDmNotice !== 'boolean') {
+      throw new Error('setDmNotice must be true or false.');
+    }
+    const setDmNotice = args.setDmNotice as boolean | undefined;
+    const applyNotice = async (notes: string[]): Promise<void> => {
+      if (setDmNotice === undefined) return;
+      const unconfirmed = await this.dmNoticeState().setEnabled(setDmNotice);
+      notes.push(
+        setDmNotice
+          ? 'Senders whose DMs the whitelist refuses will get the automatic delivery notice (at most once per 24 hours each).'
+          : 'Refused DMs are now dropped without any notice to their senders. A notice already reserved and being sent still goes out.',
+      );
+      if (unconfirmed) notes.push(`The notice setting is in effect but not confirmed durable: ${unconfirmed}`);
+    };
+    const filterChange = ['addGuilds', 'removeGuilds', 'setDmUsers'].some((k) => args[k] !== undefined);
+    if (setDmNotice !== undefined && !filterChange) {
+      const notes: string[] = [];
+      await applyNotice(notes);
+      return { applied: { dmNotice: this.dmNoticeState().status().enabled }, notes };
+    }
     const path = process.env.DISCORD_FILTERS_FILE;
     if (!path) {
       throw new Error(
@@ -1997,6 +2081,12 @@ export class DiscordMcplServer {
       `[discord-mcpl] filters updated via tool (guilds +${diff.addedGuilds.length}/-${diff.removedGuilds.length})`,
     );
 
+    try {
+      await applyNotice(notes);
+    } catch (err) {
+      notes.push(`The whitelist change was applied, but the notice setting was not: ${(err as Error).message}`);
+    }
+
     const applied = this.discord.getFilters();
     if (diff.removedGuilds.length) {
       notes.push(
@@ -2008,6 +2098,7 @@ export class DiscordMcplServer {
         guildIds: applied.guildIds ?? null,
         guildChannels: applied.guildChannels ?? null,
         dmUsers: applied.dmUsers ?? null,
+        dmNotice: this.dmNoticeState().status().enabled,
       },
       guildsNowDelivering: diff.addedGuilds,
       guildsStoppedDelivering: diff.removedGuilds,
@@ -2508,7 +2599,6 @@ export class DiscordMcplServer {
       }
       const watermark = this.forwardedWatermark.get(channelId);
       if (!watermark) continue;
-      const isDM = this.dmChannelIds.has(channelId);
       const isSubscribed = this.subscribedChannels.has(channelId);
 
       let msgs: Awaited<ReturnType<typeof this.discord.fetchHistory>>;
@@ -2528,6 +2618,80 @@ export class DiscordMcplServer {
       if (msgs.length === 0) continue;
 
       const newestId = msgs[msgs.length - 1].id;
+
+      // Cache-first, REST only as fallback; a failed lookup leaves a trace
+      // instead of silently shipping a name-less block (issue #28). Resolved
+      // before anything is delivered, because the ingress decision below
+      // needs the channel's identity.
+      let meta = this.discord.getCachedChannelMeta(channelId);
+      if (!meta) {
+        meta = await this.discord.getChannelMeta(channelId).catch((err) => {
+          dbg('sweep:channel-meta-failed', { channelId, error: (err as Error).message });
+          return null;
+        });
+      }
+      // A channel is a DM only when that's known: recorded as one when a DM
+      // was forwarded, or reported so by Discord. A failed lookup is never
+      // read as "no guild, so a DM"; the channel is held back, its watermark
+      // untouched. The sweep runs once per process, so it's tried again at
+      // the next start, unless a message forwarded live in it first moves
+      // its watermark past what was held.
+      const isDM = this.dmChannelIds.has(channelId) || meta?.isDM === true;
+      const guildId = isDM ? null : (meta?.guildId ?? null);
+      if (!isDM && !guildId) {
+        dbg('sweep:identity-unresolved', { channelId });
+        console.error(
+          `[discord-mcpl] Catch-up held back channel ${channelId}: neither its guild nor DM identity could be ` +
+            'resolved, so its missed messages were not delivered. It is tried again at the next start, unless a ' +
+            'message forwarded live in it before then moves its watermark past them.',
+        );
+        continue;
+      }
+
+      // The live ingress decision (guild, channel and thread parent, DM
+      // author), evaluated now, after the fetch, so a filter change made
+      // while it was pending applies. What the live path would refuse is
+      // never rendered here; a refused DM goes through the same notice rule.
+      const refusedDms: typeof msgs = [];
+      const withheld = new Map<string, number>();
+      msgs = msgs.filter((m) => {
+        const reason = this.discord.historyIngressReason(channelId, guildId, m.authorId);
+        if (reason === 'dm-user-not-allowed') refusedDms.push(m);
+        else if (reason) withheld.set(reason, (withheld.get(reason) ?? 0) + 1);
+        return reason === null;
+      });
+      // Refused DMs are decided alongside delivery, which doesn't wait for
+      // them; the watermark only moves past this batch once all of them are
+      // decided, or the wait for them runs out (advance). Their notices go
+      // out without holding up the sweep. Moving past a refusal means the
+      // sweep never sees it again, so one decided while the notice state
+      // can't be read or written gets no notice, now or later.
+      const refusalsDecided = refusedDms.map(
+        (m) => this.handleDmRefusal({ messageId: m.id, channelId, authorId: m.authorId, origin: 'sweep' }).decided,
+      );
+      const advance = async () => {
+        if (refusalsDecided.length) await this.awaitSweepDecisions(channelId, refusalsDecided);
+        // Only forward: the live path may have moved it past this batch
+        // while the sweep waited.
+        const current = this.forwardedWatermark.get(channelId);
+        if (!current || newestId.localeCompare(current, 'en-US-u-kn-true') > 0) {
+          this.forwardedWatermark.set(channelId, newestId);
+        }
+      };
+      for (const [reason, count] of withheld) {
+        if (reason === 'self-authored') continue;
+        console.error(
+          `[discord-mcpl] Catch-up withheld ${count} missed message(s) in channel ${channelId}: ${reason} ` +
+            '(the live filters refuse them)',
+        );
+      }
+      if (msgs.length === 0) {
+        // Everything was withheld: advance past it, as the live path never
+        // revisits what it refused.
+        await advance();
+        continue;
+      }
+
       // Delivery rule: DMs and subscribed channels get the full missed
       // backscroll; every other known channel gets each mention plus its
       // immediate vicinity (the ±VICINITY messages around each ping), so the
@@ -2554,20 +2718,11 @@ export class DiscordMcplServer {
       if (kept.length === 0) {
         // Nothing to deliver, but advance the anchor so we don't re-scan these
         // messages on the next reconnect.
-        this.forwardedWatermark.set(channelId, newestId);
+        await advance();
         continue;
       }
       const hadMention = isDM || mentionCount > 0;
 
-      // Cache-first, REST only as fallback; a failed lookup leaves a trace
-      // instead of silently shipping a name-less block (issue #28).
-      let meta = this.discord.getCachedChannelMeta(channelId);
-      if (!meta) {
-        meta = await this.discord.getChannelMeta(channelId).catch((err) => {
-          dbg('sweep:channel-meta-failed', { channelId, error: (err as Error).message });
-          return null;
-        });
-      }
       const attrs: string[] = [];
       if (meta?.name) attrs.push(`channel="#${meta.name}"`);
       // channelId is load-bearing: it's what fetch_around/fetch_history need to
@@ -2615,13 +2770,14 @@ export class DiscordMcplServer {
           } as Record<string, unknown>,
           payload: { content: [textContent(block)] },
         } satisfies PushEventParams);
-        // Advance past everything we scanned (not just what we delivered) so a
-        // mention-only channel doesn't re-surface its non-mention tail later.
-        this.forwardedWatermark.set(channelId, newestId);
-        delivered++;
       } catch (err) {
         dbg('sweep:send-failed', { channelId, error: (err as Error).message });
+        continue;
       }
+      // Advance past everything we scanned (not just what we delivered) so a
+      // mention-only channel doesn't re-surface its non-mention tail later.
+      await advance();
+      delivered++;
     }
 
     // Fill the downtime gap in any missed-ambient tallies (unsubscribed
@@ -2804,6 +2960,16 @@ export class DiscordMcplServer {
     const result: ChannelOpenResponse = { channel: desc };
     const requested = params.history?.limit ?? 0;
     if (requested > 0) {
+      // Backscroll is a deliberate read, so it respects the channel filters'
+      // inspection boundary as fetch_history does. A channel registered
+      // before the filters narrowed stays registered until restart, so the
+      // registry alone doesn't keep it out. A refusal fails the open before
+      // anything is read or subscribed.
+      const refusal = await this.discord.inspectionRefusal(parsed.channelId);
+      if (refusal) {
+        dbg('channel-open:inspection-refused', { channelId: desc.id });
+        throw new Error(refusal);
+      }
       const limit = this.capHistoryLimit(parsed.channelId, Math.min(500, Math.max(0, requested)));
       const messages = await this.discord.fetchHistory(parsed.channelId, {
         limit,
@@ -3094,6 +3260,139 @@ export class DiscordMcplServer {
         : {}),
     };
     this.conn.sendRequest(method.PUSH_EVENT, params as unknown as Record<string, unknown>).catch(() => {});
+  }
+
+  // ── DM refusal notices ──
+
+  /** Durable per-sender notice state (src/dm-notices.ts), opened once its
+   *  path is known: DISCORD_DM_NOTICES_FILE, or a per-bot default that needs
+   *  the bot user id. Until then notices are suspended. */
+  private readonly dmNotices = new DmNoticeState({
+    // Reported on every open, including a reopen after a repaired file.
+    onInterrupted: (i) =>
+      console.error(
+        `[discord-mcpl] DM notice to sender ${i.authorId} for message ${i.messageId} (reserved ` +
+          `${new Date(i.at).toISOString()}) was interrupted before its outcome was recorded; ` +
+          'outcome unknown, not retried',
+      ),
+  });
+  /** The notice state's opening, once its path was known. */
+  private dmNoticesOpening: Promise<void> | null = null;
+  /** How long the catch-up sweep waits for a channel's refused DMs to be
+   *  decided before moving past them (see awaitSweepDecisions). */
+  private sweepDecisionWaitMs = 30_000;
+
+  /** Start handling refused DMs, whether or not a host is connected:
+   *  index.ts calls this right after constructing the server, as it calls
+   *  setupSlashCommands. The adapter hands over the refusals it held since
+   *  Discord connected, so every refusal gets its notice decision and log
+   *  line. Resolves once the notice state is open; a refusal heard meanwhile
+   *  waits for it. */
+  async setupDmRefusals(): Promise<void> {
+    this.discord.onDmRefused((ev) => {
+      void this.handleDmRefusal(ev).settled;
+    });
+    this.dmNoticeState();
+    await this.dmNoticesOpening;
+  }
+
+  /** Wait for a channel's refused DMs to be decided, at most
+   *  sweepDecisionWaitMs. Each decision waits on the notice state's disk, and
+   *  one write that never answers would otherwise stop the whole catch-up.
+   *  A decision still pending is recorded when the disk answers, and its
+   *  notice, if one is due, can't go out before then; the worst case is a
+   *  notice never sent. */
+  private async awaitSweepDecisions(channelId: string, decided: Promise<unknown>[]): Promise<void> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const ranOut = new Promise<true>((resolve) => {
+      timer = setTimeout(() => resolve(true), this.sweepDecisionWaitMs);
+    });
+    const late = await Promise.race([Promise.allSettled(decided).then(() => false), ranOut]);
+    clearTimeout(timer);
+    if (late) {
+      console.error(
+        `[discord-mcpl] Catch-up moved past channel ${channelId} with refused DMs still being decided after ` +
+          `${this.sweepDecisionWaitMs / 1000}s: the notice state's disk hasn't answered. They're decided when it does.`,
+      );
+    }
+  }
+
+  private dmNoticeState(): DmNoticeState {
+    if (!this.dmNoticesOpening) {
+      const override = process.env.DISCORD_DM_NOTICES_FILE?.trim();
+      const botId = this.discord.botUserId;
+      if (override || botId) {
+        this.dmNoticesOpening = this.dmNotices.open(resolveDmNoticesPath(botId ?? '', process.env));
+      }
+    }
+    return this.dmNotices;
+  }
+
+  /**
+   * A DM the allowlist refused, live or swept. It is never forwarded; its
+   * sender is told at most once per 24 hours, and each refusal leaves one
+   * operator log line without the message body. The live path hears every
+   * refused DM while the bot is connected. The sweep only reaches DM
+   * channels the bot already knows, ones it forwarded a DM in, so a DM from
+   * a sender the bot has never seen, sent while it was offline, is never
+   * seen and gets no notice.
+   *
+   * `decided` resolves when the decision attempt has finished: a notice due
+   * is durably reserved by then, and a suspended decision has no
+   * confirmed-durable reservation, so nothing is sent. The sweep waits for
+   * it before moving its watermark past the message. `settled` resolves once
+   * the notice, if one was due, has been sent or has failed, and the log
+   * line is written. Nothing in the connector waits for it, so a slow
+   * Discord request holds up no other work.
+   */
+  private handleDmRefusal(ev: DmRefusal): { decided: Promise<DmNoticeDecision>; settled: Promise<void> } {
+    const state = this.dmNoticeState();
+    const decided = state.decide(ev.messageId, ev.authorId);
+    const settled = decided
+      .then(async (decision) => {
+        let outcome: string = decision;
+        if (decision === 'notify') {
+          let result: 'sent' | 'failed' | 'unknown' = 'sent';
+          let detail = '';
+          try {
+            // The nonce is the reservation's own identity: one notice per
+            // refused message, so the REST layer's retries can't duplicate it.
+            await this.discord.sendDmNotice(ev.channelId, DM_NOTICE_TEXT, `dmn${ev.messageId}`);
+          } catch (err) {
+            // Only a definite rejection counts as failed: the send never
+            // started, or Discord refused the request. A 4xx other than 429 is
+            // Discord evaluating it, and with the enforced nonce an earlier
+            // attempt that had posted would have been returned instead. A 429
+            // is refused before Discord evaluates the request, so it can't rule
+            // out an earlier attempt of it that posted, and it's unknown, like
+            // a 5xx, a timeout or a dropped connection, which may have posted
+            // it. Either way the reservation stands; no retry.
+            const e = err as { status?: unknown; notPosted?: unknown; message?: unknown };
+            const status = typeof e.status === 'number' ? e.status : null;
+            const rejected = e.notPosted === true || (status !== null && status >= 400 && status < 500 && status !== 429);
+            result = rejected ? 'failed' : 'unknown';
+            detail = `: ${String(e.message ?? err)}`;
+          }
+          const unsaved = await state.recordOutcome(ev.authorId, ev.messageId, result);
+          outcome = `${result}${detail}${unsaved ? `; its outcome was not saved durably (${unsaved})` : ''}`;
+        } else if (decision === 'suspended') {
+          // The state names why it isn't persisted. When it is again by now,
+          // the decision's reservation couldn't be made durable and its
+          // withdrawal then was (see DmNoticeState.decide).
+          outcome = `suspended (${state.status().error ?? 'its reservation could not be made durable, so it was withdrawn'})`;
+        }
+        console.error(
+          `[discord-mcpl] DM refused by the DM allowlist (${ev.origin}): sender ${ev.authorId}, ` +
+            `message ${ev.messageId}; notice ${outcome}`,
+        );
+      })
+      .catch((err) => {
+        console.error(
+          `[discord-mcpl] Handling the refused DM from sender ${ev.authorId} (message ${ev.messageId}) failed:`,
+          (err as Error).message,
+        );
+      });
+    return { decided, settled };
   }
 
   private setupDiscordForwarding(): void {
