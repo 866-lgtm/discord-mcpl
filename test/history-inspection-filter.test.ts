@@ -23,6 +23,7 @@ const OTHER_GUILD = '410000000000000007';
 const DM = '410000000000000008';
 const LOOKUP_FAILS = '410000000000000009'; // a channel whose lookup rejects
 const UNKNOWN = '410000000000000010'; // a channel whose lookup finds nothing
+const THREAD_UNDER_CATEGORY = '410000000000000011'; // a thread of a channel its category admits
 
 const channels: Record<string, Record<string, unknown>> = {
   [ALLOWED]: { guildId: G1, parentId: null },
@@ -30,6 +31,7 @@ const channels: Record<string, Record<string, unknown>> = {
   [UNDER_CATEGORY]: { guildId: G1, parentId: CATEGORY },
   [THREAD_OF_ALLOWED]: { guildId: G1, parentId: ALLOWED },
   [THREAD_OF_EXCLUDED]: { guildId: G1, parentId: EXCLUDED },
+  [THREAD_UNDER_CATEGORY]: { guildId: G1, parentId: UNDER_CATEGORY },
   [OTHER_GUILD]: { guildId: G2, parentId: null },
 };
 
@@ -37,6 +39,9 @@ function adapterWith(t: TestContext, config: Partial<DiscordAdapterConfig>) {
   const adapter = new DiscordAdapter({ token: 'unused', guildChannels: { [G1]: [ALLOWED, CATEGORY] }, ...config });
   const client = (adapter as unknown as { client: Client }).client;
   t.after(() => client.destroy());
+  // channelAllowed reads a thread's channel from the cache to find its
+  // category (#73), as the gateway leaves it there for a guild's channels.
+  client.channels.cache.set(UNDER_CATEGORY, { id: UNDER_CATEGORY, parentId: CATEGORY } as never);
   (client.channels as unknown as { fetch: unknown }).fetch = async (id: string) => {
     if (id === DM) return { id, isDMBased: () => true };
     // As discord.js's DiscordAPIError carries it: Discord's JSON code.
@@ -70,7 +75,7 @@ const REFUSAL = /is outside this residence's configured channel filters — filt
 describe('inspectionRefusal', () => {
   it('applies the guildChannels boundary, a parent admitting its channel', async (t) => {
     const { adapter } = adapterWith(t, {});
-    for (const id of [ALLOWED, UNDER_CATEGORY, THREAD_OF_ALLOWED, OTHER_GUILD, DM]) {
+    for (const id of [ALLOWED, UNDER_CATEGORY, THREAD_OF_ALLOWED, THREAD_UNDER_CATEGORY, OTHER_GUILD, DM]) {
       assert.equal(await adapter.inspectionRefusal(id), null, id);
     }
     for (const id of [EXCLUDED, THREAD_OF_EXCLUDED]) {
