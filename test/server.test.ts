@@ -9,6 +9,7 @@ import * as net from 'node:net';
 import { writeFileSync, unlinkSync, existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { PassThrough } from 'node:stream';
 
 import {
   McplConnection,
@@ -30,7 +31,7 @@ import type {
   ChannelsPublishResult,
 } from '@animalabs/mcpl-core';
 
-import { DiscordMcplServer } from '../src/server.js';
+import { DiscordMcplServer, serveStdio } from '../src/server.js';
 import { applyMentionCandidates } from '../src/discord-adapter.js';
 import { TOOL_CLASSES } from '../src/tool-classes.js';
 import type {
@@ -364,6 +365,18 @@ describe('DiscordMcplServer', () => {
     ]);
   }
 
+  /** The client's next message, or a failure once `ms` has passed, so a server
+   *  that never sends fails the test instead of hanging the suite. */
+  function nextWithin(client: McplConnection, ms = 10_000): ReturnType<McplConnection['nextMessage']> {
+    return Promise.race([
+      client.nextMessage(),
+      new Promise<never>((_, reject) => {
+        const t = setTimeout(() => reject(new Error(`the server sent nothing within ${ms} ms`)), ms);
+        (t as { unref?: () => void }).unref?.();
+      }),
+    ]);
+  }
+
   it('a notification whose handler throws leaves the server serving requests', async (t) => {
     const { client, serverConn, discord } = await createTestPair();
     const server = new DiscordMcplServer(discord as unknown as DiscordAdapter);
@@ -386,9 +399,10 @@ describe('DiscordMcplServer', () => {
 
     assert.equal(answered, true, 'tools/list was answered after the throwing notification');
     // The throw was logged once, naming the method, with the handler's own Error, stack and all.
-    assert.equal(errors.mock.callCount(), 1);
-    const logged = errors.mock.calls[0].arguments;
-    assert.match(String(logged[0]), /notification channels\/typing failed/);
+    // (The handshake's and the disconnect's own lines go to stderr too.)
+    const failures = errors!.mock.calls.filter((c) => /notification channels\/typing failed/.test(String(c.arguments[0])));
+    assert.equal(failures.length, 1, JSON.stringify(errors!.mock.calls.map((c) => String(c.arguments[0]))));
+    const logged = failures[0].arguments;
     assert.ok(logged[1] instanceof Error, 'the Error itself was logged, not only its message');
     assert.match(String((logged[1] as Error).stack), /handleNotification/, "the stack is the handler's, not one built in the catch");
   });
@@ -473,7 +487,7 @@ describe('DiscordMcplServer', () => {
   it('a client that leaves before initialize ends only its connection', async (t) => {
     const { client, serverConn, discord } = await createTestPair();
     const server = new DiscordMcplServer(discord as unknown as DiscordAdapter);
-    const log = t.mock.method(console, 'log', () => {});
+    const log = t.mock.method(console, 'error', () => {});
     const serverPromise = server.serve(serverConn);
     client.close();
     // serve() resolving is what lets the TCP transport accept the next client;
@@ -493,7 +507,7 @@ describe('DiscordMcplServer', () => {
   it('a request sent before notifications/initialized is answered, not dropped', async (t) => {
     const { client, serverConn, discord } = await createTestPair();
     const server = new DiscordMcplServer(discord as unknown as DiscordAdapter);
-    const log = t.mock.method(console, 'log', () => {});
+    const log = t.mock.method(console, 'error', () => {});
     const serverPromise = server.serve(serverConn);
     let early = false;
     let after = false;
@@ -523,7 +537,7 @@ describe('DiscordMcplServer', () => {
   it("an MCPL host's policy sent before notifications/initialized is answered, and still holds after it", async (t) => {
     const { client, serverConn, discord } = await createTestPair();
     const server = new DiscordMcplServer(discord as unknown as DiscordAdapter);
-    t.mock.method(console, 'log', () => {});
+    t.mock.method(console, 'error', () => {});
     const serverPromise = server.serve(serverConn);
     let receipt: { accepted?: boolean } | undefined;
     let history: { content: Array<{ text?: string }>; isError?: boolean } | undefined;
@@ -692,6 +706,186 @@ describe('DiscordMcplServer', () => {
     assert.ok(lines().includes('[discord-mcpl] Channel registration failed: undefined'), JSON.stringify(lines()));
     assert.ok(lines().includes('[discord-mcpl] Reconnect catch-up sweep failed: [an unprintable object]'), JSON.stringify(lines()));
     assert.deepEqual(unhandled, [], 'no rejection was left unhandled');
+  });
+
+  it("non-Error failures inside the start-up work are logged, and the sweep goes on to its next channel", async (t) => {
+    const wmPath = join(tmpdir(), `discord-mcpl-wm-${process.pid}-sweep-nonerror.json`);
+    writeFileSync(wmPath, JSON.stringify({ watermarks: { c1: '100', c2: '100' }, dmChannels: [] }));
+    process.env.DISCORD_WATERMARK_FILE = wmPath;
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => unhandled.push(reason);
+    process.on('unhandledRejection', onUnhandled);
+    t.after(() => process.off('unhandledRejection', onUnhandled));
+    try {
+      const { client, serverConn, discord } = await createTestPair();
+      const mention = { id: '102', authorId: 'u2', authorName: 'Bob', isBot: false, content: '<@bot_123> ping', cleanContent: '@bot ping', attachments: [], mentionsBot: true, timestamp: new Date(), reactions: [] };
+      // The sweep takes c1 first. Its fetch rejects with undefined, so its
+      // catch, and not a stub around the sweep, meets the value.
+      (discord as unknown as { fetchHistory: (channelId: string) => Promise<unknown> }).fetchHistory = (channelId) =>
+        channelId === 'c1' ? Promise.reject(undefined) : Promise.resolve([mention]);
+      // Registration's own request rejects with undefined too.
+      const send = serverConn.sendRequest.bind(serverConn);
+      serverConn.sendRequest = ((m: string, p?: unknown, timeout?: number) =>
+        m === method.CHANNELS_REGISTER ? Promise.reject(undefined) : send(m as never, p as never, timeout)) as typeof serverConn.sendRequest;
+      const errors = t.mock.method(console, 'error', () => {});
+      const lines = () => errors.mock.calls.map((c) => c.arguments.map(String).join(' '));
+      const server = new DiscordMcplServer(discord as unknown as DiscordAdapter);
+      const serverPromise = server.serve(serverConn);
+      let pushed: unknown;
+      try {
+        await mcplHandshake(client);
+        const missed = await nextWithin(client);
+        if (missed.type === 'request') {
+          pushed = (missed.request.params as PushEventParams).eventId;
+          client.sendResponse(missed.request.id, {});
+        }
+        // A turn more, for a rejection nothing handled to be reported.
+        await new Promise((r) => setTimeout(r, 50));
+      } finally {
+        client.close();
+        await serverPromise;
+      }
+
+      assert.equal(pushed, 'discord_missed_c2_102', "c2's missed mention is delivered after c1's fetch failed");
+      assert.ok(lines().includes('[discord-mcpl] Failed to register channels: undefined'), JSON.stringify(lines()));
+      assert.ok(!lines().some((l) => /failed:|TypeError/.test(l) && !/Failed to register channels/.test(l)), JSON.stringify(lines()));
+      assert.deepEqual(unhandled, [], 'no rejection was left unhandled');
+    } finally {
+      delete process.env.DISCORD_WATERMARK_FILE;
+      if (existsSync(wmPath)) unlinkSync(wmPath);
+    }
+  });
+
+  it('an error on the connection after serve() returns is logged, not thrown', async (t) => {
+    const { client, serverConn, discord } = await createTestPair();
+    const server = new DiscordMcplServer(discord as unknown as DiscordAdapter);
+    const errors = t.mock.method(console, 'error', () => {});
+    const serverPromise = server.serve(serverConn);
+    await mcpHandshake(client);
+    client.close();
+    await serverPromise;
+    // mcpl-core forwards its streams' errors to the connection for as long as
+    // the streams exist, after serve() has returned too. An 'error' nothing
+    // listens for is thrown, and from a stream's callback it ends the process.
+    assert.doesNotThrow(() => serverConn.emit('error', new Error('write EPIPE')));
+    const lines = errors.mock.calls.map((c) => c.arguments.map(String).join(' '));
+    assert.ok(lines.includes('[discord-mcpl] Connection error: write EPIPE'), JSON.stringify(lines));
+  });
+
+  it('a connection serve() ends unexpectedly is closed, not left open', async (t) => {
+    const { client, serverConn, discord } = await createTestPair();
+    // Whatever the assertions find, an open socket would keep the runner from exiting.
+    t.after(() => client.close());
+    const server = new DiscordMcplServer(discord as unknown as DiscordAdapter);
+    (server as unknown as { handleInitialize: () => Promise<void> }).handleInitialize = async () => {
+      throw new Error('a fault in the handshake');
+    };
+    t.mock.method(console, 'error', () => {});
+    const clientClosed = new Promise<boolean>((resolve) => {
+      client.once('close', () => resolve(true));
+      const timer = setTimeout(() => resolve(false), 5_000);
+      (timer as { unref?: () => void }).unref?.();
+    });
+    await server.serve(serverConn);
+
+    assert.equal(serverConn.isClosed, true, "serve() closed its connection");
+    assert.equal(await clientClosed, true, 'the client saw its connection end');
+  });
+
+  it('serveStdio exits 0 once the host closes stdin, mid-session', async (t) => {
+    // The host's side writes to the server's stdin and reads its stdout.
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    const serverConn = McplConnection.fromStreams(stdin, stdout);
+    const host = McplConnection.fromStreams(stdout, stdin);
+    const server = new DiscordMcplServer(new MockDiscordAdapter() as unknown as DiscordAdapter);
+    const errors = t.mock.method(console, 'error', () => {});
+    const exits: number[] = [];
+    const served = serveStdio(server, serverConn, (code) => exits.push(code));
+    try {
+      await mcpHandshake(host);
+      assert.equal(await answeredWithin(host.sendRequest('tools/list', {}), 5_000), true);
+      assert.deepEqual(exits, [], 'no exit while the host is there');
+      stdin.end(); // the host closes the server's stdin
+      const ended = await Promise.race([
+        served.then(() => true),
+        new Promise<boolean>((resolve) => {
+          const timer = setTimeout(() => resolve(false), 5_000);
+          (timer as { unref?: () => void }).unref?.();
+        }),
+      ]);
+      assert.equal(ended, true, 'serveStdio returned once stdin ended');
+    } finally {
+      host.close();
+    }
+
+    assert.deepEqual(exits, [0]);
+    const lines = errors.mock.calls.map((c) => c.arguments.map(String).join(' '));
+    assert.ok(lines.includes('[discord-mcpl] stdio connection ended; exiting'), JSON.stringify(lines));
+  });
+
+  it('before initialize, a ping is answered, another request is refused, a notification is dropped, and the session still starts', async (t) => {
+    const { client, serverConn, discord } = await createTestPair();
+    const server = new DiscordMcplServer(discord as unknown as DiscordAdapter);
+    let registered = false;
+    (server as unknown as { registerDiscordChannels: () => Promise<void> }).registerDiscordChannels = async () => {
+      registered = true;
+    };
+    const errors = t.mock.method(console, 'error', () => {});
+    const lines = () => errors.mock.calls.map((c) => c.arguments.map(String).join(' '));
+    const serverPromise = server.serve(serverConn);
+    let pong: unknown;
+    let refusal: unknown;
+    let registeredBeforeInitialize: boolean | undefined;
+    let pongAfter: unknown;
+    try {
+      client.sendNotification('notifications/cancelled', { requestId: 1 });
+      pong = await client.sendRequest('ping', {}, 5_000);
+      refusal = await client.sendRequest('tools/list', {}, 5_000).then(() => 'answered with a result', (err: unknown) => err);
+      registeredBeforeInitialize = registered;
+      // Its featureSets/update answers the policy, which releases the start-up work.
+      await mcplHandshake(client);
+      for (let i = 0; i < 100 && !registered; i++) await new Promise((r) => setTimeout(r, 20));
+      pongAfter = await client.sendRequest('ping', {}, 5_000);
+    } finally {
+      client.close();
+      await serverPromise;
+    }
+
+    assert.deepEqual(pong, {}, 'a ping before initialize gets an empty result');
+    const { code, message } = refusal as { code?: number; message?: string };
+    assert.equal(code, -32002, `a request before initialize is refused: ${String(message)}`);
+    assert.match(String(message), /send initialize before tools\/list/);
+    assert.equal(registeredBeforeInitialize, false, 'no start-up work before initialize');
+    assert.equal(registered, true, 'the start-up work ran once the session started');
+    assert.deepEqual(pongAfter, {}, 'a ping after initialize gets an empty result too');
+    assert.ok(lines().includes('[discord-mcpl] notifications/cancelled before initialize: dropped'), JSON.stringify(lines()));
+    assert.ok(lines().includes('[discord-mcpl] tools/list before initialize: refused'), JSON.stringify(lines()));
+  });
+
+  it("a handler that throws an Error with no message is answered with the Error's name", async (t) => {
+    const { client, serverConn, discord } = await createTestPair();
+    const server = new DiscordMcplServer(discord as unknown as DiscordAdapter);
+    (server as unknown as { handleChannelClose: () => never }).handleChannelClose = () => {
+      throw new Error('');
+    };
+    const serverPromise = server.serve(serverConn);
+    let refusal: unknown;
+    try {
+      await mcpHandshake(client);
+      t.mock.method(console, 'error', () => {});
+      refusal = await client
+        .sendRequest('channels/close', { channelId: 'discord:g1:c1' }, 5_000)
+        .then(() => 'answered with a result', (err: unknown) => err);
+    } finally {
+      client.close();
+      await serverPromise;
+    }
+
+    const { code, message } = refusal as { code?: number; message?: string };
+    assert.equal(code, -32603);
+    // mcpl-core's RpcError prefixes the code to the server's message.
+    assert.match(String(message), /-32603: Error$/, 'an empty message falls back to the value as text');
   });
 
   it('tools/list returns tool definitions', async () => {
@@ -1377,9 +1571,9 @@ describe('DiscordMcplServer', () => {
       const serverPromise = server.serve(serverConn);
       try {
         await mcplHandshake(client);
-        const reg = await client.nextMessage();
+        const reg = await nextWithin(client);
         if (reg.type === 'request') client.sendResponse(reg.request.id, {});
-        const missed = await client.nextMessage();
+        const missed = await nextWithin(client);
         assert.equal(missed.type === 'request' && missed.request.method, method.PUSH_EVENT);
         if (missed.type === 'request') client.sendResponse(missed.request.id, {});
         // The push is answered; the save follows it synchronously. Give the

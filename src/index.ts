@@ -45,7 +45,7 @@
 import * as net from 'node:net';
 import { McplConnection } from '@animalabs/mcpl-core';
 import { DiscordAdapter } from './discord-adapter.js';
-import { DiscordMcplServer } from './server.js';
+import { DiscordMcplServer, serveStdio } from './server.js';
 import {
   resolveStartupFilters,
   loadFiltersFile,
@@ -188,13 +188,8 @@ async function main(): Promise<void> {
     // Stdio transport — single client, MCP-compatible
     // Log to stderr (stdout is the protocol channel)
     console.error('[discord-mcpl] Starting on stdio');
-    const conn = McplConnection.fromStreams(process.stdin, process.stdout);
-    await server.serve(conn);
-    // The host closed stdin, or the connection otherwise ended. A stdio
-    // server can't be reached again, so it exits, as MCP's stdio shutdown
-    // expects, rather than stay logged in to Discord with no host.
-    console.error('[discord-mcpl] stdio connection ended; exiting');
-    process.exit(0);
+    // Exits once the host closes stdin or the connection otherwise ends.
+    await serveStdio(server, McplConnection.fromStreams(process.stdin, process.stdout));
   } else if (tcpPort) {
     // TCP transport — single client
     console.error(`[discord-mcpl] Listening on TCP port ${tcpPort}`);

@@ -92,11 +92,13 @@ interface ChannelAcknowledgeRequest {
 
 /** A thrown value's text. Anything can be thrown or rejected: a value that
  *  isn't an Error (undefined, a string) may have no message to read, and one
- *  with no prototype can't even be turned into a string. This never throws. */
+ *  with no prototype can't even be turned into a string. An empty message
+ *  says nothing, so the value itself is used then: an Error without one
+ *  reads "Error". This never throws. */
 function errorText(err: unknown): string {
   try {
     const carried = (err as { message?: unknown } | null | undefined)?.message;
-    return typeof carried === 'string' ? carried : String(err);
+    return typeof carried === 'string' && carried !== '' ? carried : String(err);
   } catch {
     return `[an unprintable ${typeof err}]`;
   }
@@ -949,9 +951,11 @@ export class DiscordMcplServer {
     // error on either stream. With no listener, EventEmitter throws it from
     // the stream's own callback, where nothing here can catch it, and the
     // process exits. Logged instead, so a bad line costs only itself and the
-    // loop reads on. (A read error also reaches mcpl-core's own readline
-    // interface, which listens for none, so a reset socket still ends the
-    // process. That is mcpl-core's to handle.)
+    // loop reads on. The listener stays for the connection's whole life,
+    // after serve() returns too: mcpl-core forwards its streams' errors to it
+    // for as long as they exist. (A read error, on a TCP socket or on stdin,
+    // also reaches mcpl-core's own readline interface, which listens for
+    // none, so it still ends the process. That is mcpl-core's to handle.)
     const onConnectionError = (err: unknown) => {
       console.error('[discord-mcpl] Connection error:', errorText(err));
       dbg('connection:error', { error: errorText(err) });
@@ -995,10 +999,11 @@ export class DiscordMcplServer {
     this.setupDiscordForwarding();
 
     try {
-      // Handshake. A client that leaves before initialize, or sends something
-      // else first, ends this connection and not the process: the TCP
-      // transport goes on to serve the next client.
-      if (!(await this.handleInitialize())) return;
+      // Handshake. A client that leaves before initialize ends this
+      // connection and not the process: the TCP transport goes on to serve
+      // the next client. The start-up work below starts only once initialize
+      // is answered.
+      await this.handleInitialize();
 
       // ORDERING (Mythos 0.5-canary find, two rounds): NOTHING may run between
       // initialize and the main loop. A 0.5 host sends its §5.3 initial policy
@@ -1078,32 +1083,47 @@ export class DiscordMcplServer {
         }
       }
     } catch (err) {
+      // stderr, like every log line here: on the stdio transport, stdout is
+      // the protocol channel, and a line there that isn't JSON is an error
+      // to the host.
       if ((err as { name?: unknown } | null | undefined)?.name === 'ConnectionClosedError') {
-        console.log('[discord-mcpl] Client disconnected');
+        console.error('[discord-mcpl] Client disconnected');
       } else {
         console.error('[discord-mcpl] Connection error:', err);
       }
     } finally {
-      conn.off('error', onConnectionError);
+      // serve() owns the connection, so whatever ended it, it ends the
+      // connection too: an unexpected throw releases the client rather than
+      // leave its socket open. Closing an already closed connection is a
+      // no-op.
       this.conn = null;
+      conn.close();
     }
   }
 
   // ── Initialize Handshake ──
 
-  /** Answer the initialize request, which must come first. Returns false,
-   *  having closed the connection, when something else came first. Nothing
-   *  after initialize is read here: notifications/initialized, and anything a
-   *  host sends before it, go through the main loop like every message. */
-  private async handleInitialize(): Promise<boolean> {
+  /** Answer the initialize request. Until it comes, nothing a client sends
+   *  ends the session: a ping is answered (MCP lets a client ping before
+   *  initialize), any other request is answered with an error, and a
+   *  notification is dropped with a log line. Rejects with
+   *  ConnectionClosedError when the client leaves first. Nothing after
+   *  initialize is read here: notifications/initialized, and anything a host
+   *  sends before it, go through the main loop like every message. */
+  private async handleInitialize(): Promise<void> {
     const conn = this.conn!;
 
-    // Wait for initialize request
-    const msg = await conn.nextMessage();
-    if (msg.type !== 'request' || msg.request.method !== 'initialize') {
-      console.error('[discord-mcpl] Expected initialize request, got:', msg);
-      conn.close();
-      return false;
+    let msg = await conn.nextMessage();
+    while (msg.type !== 'request' || msg.request.method !== 'initialize') {
+      if (msg.type === 'notification') {
+        console.error(`[discord-mcpl] ${msg.notification.method} before initialize: dropped`);
+      } else if (msg.request.method === 'ping') {
+        conn.sendResponse(msg.request.id, {});
+      } else {
+        console.error(`[discord-mcpl] ${msg.request.method} before initialize: refused`);
+        conn.sendError(msg.request.id, -32002, `Server not initialized: send initialize before ${msg.request.method}`);
+      }
+      msg = await conn.nextMessage();
     }
 
     const params = msg.request.params as McplInitializeParams | undefined;
@@ -1166,7 +1186,6 @@ export class DiscordMcplServer {
     }
 
     conn.sendResponse(msg.request.id, result);
-    return true;
   }
 
   // ── Request Dispatch ──
@@ -1177,6 +1196,12 @@ export class DiscordMcplServer {
 
     try {
       switch (req.method) {
+        case 'ping': {
+          // MCP: the receiver answers a ping promptly, with an empty result.
+          conn.sendResponse(req.id, {});
+          break;
+        }
+
         case 'tools/list': {
           // Each tool carries its MCPL RFC-008 classes in _meta["mcpl/class"].
           conn.sendResponse(req.id, { tools: toolDefinitions.map(withToolClasses) });
@@ -1397,7 +1422,7 @@ export class DiscordMcplServer {
       }
 
       case 'notifications/initialized':
-        console.log('[discord-mcpl] Client initialized' + (this.mcplEnabled ? ' (MCPL mode)' : ' (MCP mode)'));
+        console.error('[discord-mcpl] Client initialized' + (this.mcplEnabled ? ' (MCPL mode)' : ' (MCP mode)'));
         break;
 
       default:
@@ -2353,7 +2378,7 @@ export class DiscordMcplServer {
           after: watermark,
         });
       } catch (err) {
-        dbg('sweep:fetch-failed', { channelId, error: (err as Error).message });
+        dbg('sweep:fetch-failed', { channelId, error: errorText(err) });
         continue;
       }
       msgs.sort((a, b) => a.timestamp.getTime() - b.timestamp.getTime());
@@ -2400,7 +2425,7 @@ export class DiscordMcplServer {
       let meta = this.discord.getCachedChannelMeta(channelId);
       if (!meta) {
         meta = await this.discord.getChannelMeta(channelId).catch((err) => {
-          dbg('sweep:channel-meta-failed', { channelId, error: (err as Error).message });
+          dbg('sweep:channel-meta-failed', { channelId, error: errorText(err) });
           return null;
         });
       }
@@ -2460,7 +2485,7 @@ export class DiscordMcplServer {
         this.saveWatermark();
         delivered++;
       } catch (err) {
-        dbg('sweep:send-failed', { channelId, error: (err as Error).message });
+        dbg('sweep:send-failed', { channelId, error: errorText(err) });
       }
     }
 
@@ -2498,7 +2523,7 @@ export class DiscordMcplServer {
           after: tally.talliedThrough,
         });
       } catch (err) {
-        dbg('missed-backfill:fetch-failed', { channelId, error: (err as Error).message });
+        dbg('missed-backfill:fetch-failed', { channelId, error: errorText(err) });
         continue;
       }
       // Only ambient counts as "missed": mentions/DMs are (re)delivered by the
@@ -2565,8 +2590,8 @@ export class DiscordMcplServer {
       await conn.sendRequest(method.CHANNELS_REGISTER, regParams);
       dbg('registerDiscordChannels:sent', { count: descriptors.length });
     } catch (err) {
-      console.error('[discord-mcpl] Failed to register channels:', (err as Error).message);
-      dbg('registerDiscordChannels:send-failed', { error: (err as Error).message });
+      console.error('[discord-mcpl] Failed to register channels:', errorText(err));
+      dbg('registerDiscordChannels:send-failed', { error: errorText(err) });
     }
   }
 
@@ -3634,4 +3659,21 @@ export class DiscordMcplServer {
       }
     }
   }
+}
+
+/** Serve a stdio host until its connection ends, then exit. A stdio server
+ *  can't be reached again once its host has gone, so it exits, as MCP's
+ *  stdio shutdown expects (the client closes the server's stdin, then waits
+ *  for it to exit), rather than stay logged in to Discord with no host. The
+ *  status is 0 whatever ended the connection: a host that goes away, before
+ *  initialize or after, is a normal end. `exit` is process.exit, given here
+ *  so a test can watch it. */
+export async function serveStdio(
+  server: DiscordMcplServer,
+  conn: McplConnection,
+  exit: (code: number) => void = (code) => process.exit(code),
+): Promise<void> {
+  await server.serve(conn);
+  console.error('[discord-mcpl] stdio connection ended; exiting');
+  exit(0);
 }
