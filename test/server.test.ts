@@ -351,6 +351,99 @@ describe('DiscordMcplServer', () => {
     await serverPromise;
   });
 
+  /** Whether `request` is answered at all; the bound only ends a wait on a loop that stopped reading. */
+  function answeredWithin(request: Promise<unknown>, ms = 15_000): Promise<boolean> {
+    return Promise.race([
+      request.then(() => true),
+      new Promise<boolean>((resolve) => {
+        const t = setTimeout(() => resolve(false), ms);
+        (t as { unref?: () => void }).unref?.();
+      }),
+    ]);
+  }
+
+  it('a notification whose handler throws leaves the server serving requests', async (t) => {
+    const { client, serverConn, discord } = await createTestPair();
+    const server = new DiscordMcplServer(discord as unknown as DiscordAdapter);
+    const serverPromise = server.serve(serverConn);
+    let answered = false;
+    let errors: ReturnType<typeof t.mock.method>;
+    try {
+      await mcpHandshake(client);
+      errors = t.mock.method(console, 'error', () => {});
+      // A typing notification with no params, as a broken host could send:
+      // its handler throws reading the missing params, synchronously.
+      client.sendNotification('channels/typing');
+      answered = await answeredWithin(client.sendRequest('tools/list', {}));
+    } finally {
+      // Close whatever happened above: an open socket would keep the runner
+      // from ever exiting, even after it reported the failure.
+      client.close();
+      await serverPromise;
+    }
+
+    assert.equal(answered, true, 'tools/list was answered after the throwing notification');
+    // The throw was logged once, naming the method, with the handler's own Error, stack and all.
+    assert.equal(errors.mock.callCount(), 1);
+    const logged = errors.mock.calls[0].arguments;
+    assert.match(String(logged[0]), /notification channels\/typing failed/);
+    assert.ok(logged[1] instanceof Error, 'the Error itself was logged, not only its message');
+    assert.match(String((logged[1] as Error).stack), /handleNotification/, "the stack is the handler's, not one built in the catch");
+  });
+
+  it('a malformed featureSets/update notification changes no grant, and the server goes on serving', async (t) => {
+    const { client, serverConn, discord } = await createTestPair();
+    const server = new DiscordMcplServer(discord as unknown as DiscordAdapter);
+    const serverPromise = server.serve(serverConn);
+    let history: { content: Array<{ type: string; text?: string }>; isError?: boolean } | undefined;
+    let reaction: { content: Array<{ type: string; text?: string }>; isError?: boolean } | undefined;
+    let errors: ReturnType<typeof t.mock.method>;
+    try {
+      await mcplHandshake(client);
+      // Answer the server's own requests (channel registration) as they come.
+      void (async () => {
+        try {
+          for (;;) {
+            const m = await client.nextMessage();
+            if (m.type === 'request') client.sendResponse(m.request.id, {});
+          }
+        } catch { /* closed */ }
+      })();
+      const receipt = (await client.sendRequest('featureSets/update', { disabled: ['discord.history'] })) as { accepted: boolean };
+      assert.equal(receipt.accepted, true);
+
+      errors = t.mock.method(console, 'error', () => {});
+      // The Request form of the same malformed update is answered with an error.
+      await assert.rejects(
+        client.sendRequest('featureSets/update', { enabled: ['discord.history'], disabled: 'discord.messaging' }),
+        (err: { code?: number; message?: string }) =>
+          err.code === -32603 && /disabled must be a list of feature-set names/.test(String(err.message)),
+      );
+      // Its enable is well formed and its disable isn't: neither may apply, in either form.
+      client.sendNotification('featureSets/update', { enabled: ['discord.history'], disabled: 'discord.messaging' });
+      history = (await client.sendRequest('tools/call', {
+        name: 'fetch_history', arguments: { channelId: 'discord:g1:c1' },
+      })) as typeof history;
+      reaction = (await client.sendRequest('tools/call', {
+        name: 'add_reaction', arguments: { channelId: 'discord:g1:c1', messageId: 'm1', emoji: '👍' },
+      })) as typeof reaction;
+    } finally {
+      client.close();
+      await serverPromise;
+    }
+
+    // The enable didn't apply: history stays off, as the request before it left it.
+    assert.equal(history?.isError, true);
+    assert.match(history?.content[0]?.text ?? '', /Feature set 'discord\.history' is not enabled/);
+    // Nor did the disable: messaging still works.
+    assert.notEqual(reaction?.isError, true, `add_reaction was refused: ${reaction?.content[0]?.text}`);
+    assert.deepEqual(discord.reactions.at(-1), { channelId: 'discord:g1:c1', messageId: 'm1', emoji: '👍' });
+    // The malformed update was logged, naming what was wrong.
+    const failure = errors.mock.calls.find((c) => /notification featureSets\/update failed/.test(String(c.arguments[0])));
+    assert.ok(failure, 'the malformed update was logged');
+    assert.match(String((failure!.arguments[1] as Error).message), /disabled must be a list of feature-set names/);
+  });
+
   it('tools/list returns tool definitions', async () => {
     const { client, serverConn, discord } = await createTestPair();
     const server = new DiscordMcplServer(discord as unknown as DiscordAdapter);
