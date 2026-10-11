@@ -8,15 +8,18 @@ in the git log and PR descriptions.
 ### Upgrade notes
 
 - **`fetch_history` and `fetch_around` now refuse a channel id that the
-  configured channel list (`guildChannels`) excludes.** A resident that
-  reads such a channel by its numeric id today (following a pasted message
-  link, say) will get a refusal naming the channel filters, and nothing is
-  read. The refusal is deliberate: it is the boundary `list_channels` and
-  `list_channel_members` already apply (see the `fetch_history` entry under
-  Fixed). To let a residence read the channel, admit it in `guildChannels`,
-  directly or through its parent (a thread's channel, a channel's
-  category). The same list bounds delivery, so that admits it for delivery
-  too. Guilds without a `guildChannels` entry, and DMs, are unaffected.
+  configured channel list (`guildChannels`) excludes, and so does a host's
+  `channels/open` that asks for backscroll from such a channel.** An open
+  without backscroll still opens it, since it reads nothing. A resident
+  that reads such a channel by its numeric id today (following a pasted
+  message link, say) will get a refusal naming the channel filters, and
+  nothing is read. The refusal is deliberate: it is the boundary
+  `list_channels` and `list_channel_members` already apply (see the
+  `fetch_history` entry under Fixed). To let a residence read the channel,
+  admit it in `guildChannels`, directly or through its parent (a thread's
+  channel, a channel's category). The same list bounds delivery, so that
+  admits it for delivery too. Guilds without a `guildChannels` entry, and
+  DMs, are unaffected.
 
 ### Added
 

@@ -197,11 +197,20 @@ describe('channels/open backscroll', () => {
     const server = new DiscordMcplServer(adapter) as unknown as {
       channelManager: { register(d: unknown): void; isOpen(id: string): boolean };
       subscribedChannels: Set<string>;
+      reactionChannels: Set<string>;
+      missedTally: Map<string, unknown>;
+      forwardedWatermark: Map<string, string>;
+      subscriptionsLoaded: boolean;
+      reactionChannelsLoaded: boolean;
+      watermarkLoaded: boolean;
       handleChannelOpen(params: { channelId: string; type: string; history?: { limit: number } }): Promise<{
         history?: Array<{ content: Array<{ text: string }> }>;
       }>;
     };
-    const kinds = { [ALLOWED]: 'text', [EXCLUDED]: 'text', [THREAD_OF_EXCLUDED]: 'thread', [LOOKUP_FAILS]: 'text' } as const;
+    const kinds = {
+      [ALLOWED]: 'text', [EXCLUDED]: 'text', [THREAD_OF_EXCLUDED]: 'thread', [LOOKUP_FAILS]: 'text',
+      [UNDER_CATEGORY]: 'text', [THREAD_OF_ALLOWED]: 'thread',
+    } as const;
     for (const [id, type] of Object.entries(kinds)) {
       const name = `${type}-${id.slice(-1)}`;
       server.channelManager.register(toDescriptor(G1, 'Guild', { id, name, type, label: `#${name} (Guild)` }));
@@ -211,8 +220,15 @@ describe('channels/open backscroll', () => {
     return { server, reads, opened };
   }
 
-  it('refuses backscroll from an excluded channel, and a thread under one, before anything is read or opened', async (t) => {
+  it('refuses backscroll from an excluded channel, and a thread under one, before anything is read, opened or changed', async (t) => {
     const { server, reads, opened } = serverWith(t);
+    // What subscribing would change, set as an earlier session left it.
+    server.subscriptionsLoaded = server.reactionChannelsLoaded = server.watermarkLoaded = true;
+    const tally = { anchorId: '1', talliedThrough: '1', messages: 2, characters: 30 };
+    for (const id of [EXCLUDED, THREAD_OF_EXCLUDED]) {
+      server.missedTally.set(id, tally);
+      server.forwardedWatermark.set(id, '1');
+    }
     for (const id of [EXCLUDED, THREAD_OF_EXCLUDED]) {
       await assert.rejects(
         server.handleChannelOpen({ channelId: mcplChannelId(G1, id), type: 'discord', history: { limit: 20 } }),
@@ -220,6 +236,9 @@ describe('channels/open backscroll', () => {
         id,
       );
       assert.equal(opened(id), false, `${id} is neither open nor subscribed`);
+      assert.equal(server.reactionChannels.has(id), false, `${id}: reaction visibility unchanged`);
+      assert.deepEqual(server.missedTally.get(id), tally, `${id}: the missed tally is kept`);
+      assert.equal(server.forwardedWatermark.get(id), '1', `${id}: the watermark is unchanged`);
     }
     assert.deepEqual(reads, [], 'no history was read');
   });
@@ -234,20 +253,26 @@ describe('channels/open backscroll', () => {
     assert.deepEqual(reads, [], 'no history was read');
   });
 
-  it('still returns backscroll from an allowed channel', async (t) => {
+  it('still returns backscroll from an allowed channel, and from one admitted through its parent', async (t) => {
     const { server, reads, opened } = serverWith(t);
-    const result = await server.handleChannelOpen({
-      channelId: mcplChannelId(G1, ALLOWED), type: 'discord', history: { limit: 20 },
-    });
-    assert.match(result.history?.[0]?.content[0]?.text ?? '', new RegExp(`body in ${ALLOWED}`));
-    assert.equal(opened(ALLOWED), true);
-    assert.deepEqual(reads, [`history:${ALLOWED}`]);
+    for (const id of [ALLOWED, UNDER_CATEGORY, THREAD_OF_ALLOWED]) {
+      const result = await server.handleChannelOpen({
+        channelId: mcplChannelId(G1, id), type: 'discord', history: { limit: 20 },
+      });
+      assert.match(result.history?.[0]?.content[0]?.text ?? '', new RegExp(`body in ${id}`), id);
+      assert.equal(opened(id), true, id);
+    }
+    assert.deepEqual(reads, [`history:${ALLOWED}`, `history:${UNDER_CATEGORY}`, `history:${THREAD_OF_ALLOWED}`]);
   });
 
-  it('leaves an open without backscroll as it was, since it reads nothing', async (t) => {
+  it("opens an excluded channel without backscroll, with a limit of 0 too, and reads nothing", async (t) => {
+    // Ingress, and the reconnect sweep once #61 lands, drop what it would
+    // deliver, so an open that reads nothing isn't refused.
     const { server, reads, opened } = serverWith(t);
     await server.handleChannelOpen({ channelId: mcplChannelId(G1, EXCLUDED), type: 'discord' });
+    await server.handleChannelOpen({ channelId: mcplChannelId(G1, THREAD_OF_EXCLUDED), type: 'discord', history: { limit: 0 } });
     assert.equal(opened(EXCLUDED), true);
+    assert.equal(opened(THREAD_OF_EXCLUDED), true);
     assert.deepEqual(reads, []);
   });
 });
