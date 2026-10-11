@@ -126,6 +126,8 @@ describe('the tool chokepoint', () => {
   it('a send addressed by name explains the name that was sent, not only the id it resolved to', async () => {
     const adapter = {
       resolveChannelRef: () => ({ ok: true as const, id: '777777777777777777', matched: undefined }),
+      // #63's send path reads the channel's cached metadata for its receipt.
+      getCachedChannelMeta: () => null,
       sendMessage: async () => { throw discordError('Unknown Channel', 10003, 404); },
     };
     const server = new DiscordMcplServer(adapter as unknown as DiscordAdapter) as unknown as {
@@ -133,7 +135,11 @@ describe('the tool chokepoint', () => {
     };
     const r = await server.handleToolCall('send_message', { channelId: '#general', content: 'hi' });
     assert.equal(r.isError, true);
-    assert.match(r.content[0].text ?? '', /^Unknown Channel\n\n#general resolved to channel 777777777777777777, which Discord doesn't know/);
+    // Discord's words, then the destination the send attempted (#63), then what they mean.
+    assert.match(
+      r.content[0].text ?? '',
+      /^Unknown Channel\n\nAttempted destination: Discord channel 777777777777777777\.\n\n#general resolved to channel 777777777777777777, which Discord doesn't know/,
+    );
   });
 
   it('create_text_channel with an unknown category explains the category', async () => {
@@ -150,6 +156,7 @@ describe('the tool chokepoint', () => {
 
   it('a send to an unknown channel id returns the explanation as the tool error', async () => {
     const adapter = {
+      getCachedChannelMeta: () => null,
       sendMessage: async () => { throw discordError('Unknown Channel', 10003, 404); },
     };
     const server = new DiscordMcplServer(adapter as unknown as DiscordAdapter) as unknown as {
@@ -157,6 +164,9 @@ describe('the tool chokepoint', () => {
     };
     const r = await server.handleToolCall('send_message', { channelId: '123456789012345678', content: 'hi' });
     assert.equal(r.isError, true);
-    assert.match(r.content[0].text ?? '', /^Unknown Channel\n\nNo channel 123456789012345678 is visible to this connection/);
+    assert.match(
+      r.content[0].text ?? '',
+      /^Unknown Channel\n\nAttempted destination: Discord channel 123456789012345678\.\n\nNo channel 123456789012345678 is visible to this connection/,
+    );
   });
 });

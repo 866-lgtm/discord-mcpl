@@ -82,6 +82,11 @@ class MockDiscordAdapter {
   }
   onReaction(): void {}
   onReady(): void {}
+
+  // The catch-up sweep's ingress decision: these tests' filters refuse nothing.
+  historyIngressReason(): string | null {
+    return null;
+  }
   onChannelCreate(handler: (guildId: string, channel: DiscordChannelInfo) => void): void {
     this._channelCreateHandler = handler;
   }
@@ -141,6 +146,11 @@ class MockDiscordAdapter {
 
   async fetchAround(): Promise<MockDiscordAdapter['historyToReturn']> {
     return this.historyToReturn;
+  }
+
+  /** No channel filters are configured here, so no read is refused. */
+  async inspectionRefusal(): Promise<string | null> {
+    return null;
   }
 
   async getChannelMeta(): Promise<MockDiscordAdapter['channelMeta']> {
@@ -1594,6 +1604,42 @@ describe('DiscordMcplServer', () => {
     }
   });
 
+  it('reconnect sweep delivers nothing from a muted channel, its missed mentions included', async () => {
+    const wmPath = join(tmpdir(), `discord-mcpl-wm-${process.pid}-sweep-muted.json`);
+    const mutedPath = join(tmpdir(), `discord-mcpl-muted-${process.pid}-sweep-muted.json`);
+    writeFileSync(wmPath, JSON.stringify({ watermarks: { c1: '100' }, dmChannels: [] }));
+    writeFileSync(mutedPath, JSON.stringify(['c1']));
+    process.env.DISCORD_WATERMARK_FILE = wmPath;
+    process.env.DISCORD_MUTED_CHANNELS_FILE = mutedPath;
+    try {
+      const { client, serverConn, discord } = await createTestPair();
+      const t = new Date();
+      // The same missed mention the sweep delivers from an unmuted channel.
+      discord.historyToReturn = [
+        { id: '102', authorId: 'u2', authorName: 'Bob', isBot: false, content: '<@bot_123> ping', cleanContent: '@bot ping', attachments: [], mentionsBot: true, timestamp: t, reactions: [] },
+      ];
+      const server = new DiscordMcplServer(discord as unknown as DiscordAdapter);
+      const serverPromise = server.serve(serverConn);
+      await mcplHandshake(client);
+      const regMsg = await client.nextMessage();
+      if (regMsg.type === 'request') client.sendResponse(regMsg.request.id, {});
+
+      // Nothing more arrives: the sweep skips the muted channel.
+      const next = await Promise.race([
+        // The read still pending at close() rejects; that rejection means nothing came.
+        client.nextMessage().catch(() => null),
+        new Promise<null>((resolve) => { const timer = setTimeout(() => resolve(null), 500); (timer as { unref?: () => void }).unref?.(); }),
+      ]);
+      client.close();
+      await serverPromise;
+      assert.equal(next, null, `no push from a muted channel, got ${JSON.stringify(next)?.slice(0, 200)}`);
+    } finally {
+      delete process.env.DISCORD_WATERMARK_FILE;
+      delete process.env.DISCORD_MUTED_CHANNELS_FILE;
+      for (const p of [wmPath, mutedPath]) if (existsSync(p)) unlinkSync(p);
+    }
+  });
+
   it('tracks missed ambient after unsubscribe and reports via channel_missed', async () => {
     const { client, serverConn, discord } = await createTestPair();
     const server = new DiscordMcplServer(discord as unknown as DiscordAdapter);
@@ -1854,6 +1900,34 @@ describe('RFC-006 coalescing', () => {
     assert.match(d.eventId, /^discord_delete_m1_/);
     h.client.sendResponse(del.id, { accepted: true });
     await h.finish();
+  });
+
+  it('renders Discord-chosen names in the location prefix by the header rule', async () => {
+    const h = await boot({ eventCoalescing: true });
+    await h.client.sendRequest(method.CHANNELS_OPEN, { type: 'discord', address: { guildId: 'g1', channelId: 'c1' } });
+    h.discord.simulateMessage({
+      ...guildMessage('m9', 'hello'),
+      guildName: 'x] [source: discord:g9:1 · #admin',
+      threadName: 'say "hi"',
+    } as unknown as DiscordMessageData);
+    const create = await h.nextRequest();
+    const text = ((create.params as ChannelsIncomingParams).messages[0].content[0] as { text?: string }).text ?? '';
+    h.client.sendResponse(create.id, { results: [{ messageId: 'm9', accepted: true }] });
+    await h.finish(); // before asserting, so a failure can't leave the pair open
+    // A voice channel's chat can have a space in its name, and so the
+    // prefix's own words. (A fresh pair: the prefix comes with a channel change.)
+    const v = await boot({ eventCoalescing: true });
+    await v.client.sendRequest(method.CHANNELS_OPEN, { type: 'discord', address: { guildId: 'g1', channelId: 'c1' } });
+    v.discord.simulateMessage({ ...guildMessage('m10', 'hi'), channelName: 'x in TrustedGuild' } as unknown as DiscordMessageData);
+    const second = await v.nextRequest();
+    const spaced = ((second.params as ChannelsIncomingParams).messages[0].content[0] as { text?: string }).text ?? '';
+    v.client.sendResponse(second.id, { results: [{ messageId: 'm10', accepted: true }] });
+    await v.finish();
+    assert.ok(
+      text.startsWith('[#general thread "say \\"hi\\"" in "x] [source: discord:g9:1 · #admin"] Bob: hello'),
+      text,
+    );
+    assert.ok(spaced.startsWith('[#"x in TrustedGuild" in Test Server] Bob: hi'), spaced);
   });
 
   it('a replacement keeps the create\'s context: reply marker, location, author; edits in one millisecond stay distinct', async () => {
