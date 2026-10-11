@@ -41,6 +41,18 @@ const MESSAGE_ID_KIND =
   'Numeric Discord ID of the target message, copied from incoming messages or fetched history. ' +
   'Also supply the channel containing it.';
 
+const RECEIPT_PROVENANCE =
+  ' The result names where it went: channelId (canonical, discord:<guild|dm>:<channel>, or null ' +
+  'when the server can\'t place the channel), discordChannelId and channelLabel. A failed or ' +
+  'uncertain send keeps its own outcome text and adds the attempted destination. The canonical id ' +
+  'is authoritative when a label differs.';
+
+const HISTORY_PROVENANCE =
+  ' Each message names its channel: a source header [source: <canonical id> · <label>], plus ' +
+  'channelId (canonical, discord:<guild|dm>:<channel>) and channelLabel. A channel the server can\'t ' +
+  'place has channelId null and a header id of discord:?:<channel>. The canonical id is ' +
+  'authoritative when a label differs.';
+
 const TARGET_RULE =
   'Give exactly one of messageId or latestFrom; the other may be omitted or null. ';
 
@@ -55,7 +67,7 @@ const LATEST_FROM_DESC =
 export const toolDefinitions: ToolDefinition[] = [
   {
     name: 'send_message',
-    description: "Send a message to an explicit Discord channel, optionally with local file attachments. Use reply_message to reply to a particular message.",
+    description: "Send a message to an explicit Discord channel, optionally with local file attachments. Use reply_message to reply to a particular message." + RECEIPT_PROVENANCE,
     inputSchema: {
       type: 'object',
       properties: {
@@ -68,7 +80,7 @@ export const toolDefinitions: ToolDefinition[] = [
   },
   {
     name: 'reply_message',
-    description: 'Reply to a specific message in a Discord channel, optionally with file attachments',
+    description: 'Reply to a specific message in a Discord channel, optionally with file attachments.' + RECEIPT_PROVENANCE,
     inputSchema: {
       type: 'object',
       properties: {
@@ -83,7 +95,7 @@ export const toolDefinitions: ToolDefinition[] = [
   },
   {
     name: 'send_dm',
-    description: "Send a direct message to a Discord user, identified by @username / display name (of someone in a shared server or who has DMed the bot) or by numeric user ID. To reply to a DM you received, pass the sender's name or id. Optionally include file attachments.",
+    description: "Send a direct message to a Discord user, identified by @username / display name (of someone in a shared server or who has DMed the bot) or by numeric user ID. To reply to a DM you received, pass the sender's name or id. Optionally include file attachments." + RECEIPT_PROVENANCE,
     inputSchema: {
       type: 'object',
       properties: {
@@ -279,7 +291,7 @@ export const toolDefinitions: ToolDefinition[] = [
   },
   {
     name: 'fetch_history',
-    description: "Read past messages from a Discord channel, including message IDs. Use before/after message IDs and limit to select history; configured backscroll limits may reduce the amount. Use list_channel_members for people rather than messages.",
+    description: "Read past messages from a Discord channel, including message IDs. Use before/after message IDs and limit to select history; configured backscroll limits may reduce the amount. Use list_channel_members for people rather than messages." + HISTORY_PROVENANCE,
     inputSchema: {
       type: 'object',
       properties: {
@@ -306,7 +318,7 @@ export const toolDefinitions: ToolDefinition[] = [
     description:
       'Scroll to a specific message and fetch the surrounding context. Returns a ' +
       'window of messages centred on `messageId` (the message itself plus roughly ' +
-      'half the window on either side). Single request, so `limit` is capped at 100.',
+      'half the window on either side). Single request, so `limit` is capped at 100.' + HISTORY_PROVENANCE,
     inputSchema: {
       type: 'object',
       properties: {

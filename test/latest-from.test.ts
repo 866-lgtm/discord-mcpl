@@ -363,6 +363,8 @@ describe('reply and reaction tools', () => {
         calls.push({ op: 'send', channelId, options });
         return { messageId: '300000000000000001' };
       },
+      // #63's send receipt reads the cached channel for its label; none is cached here.
+      getCachedChannelMeta: () => null,
       async addReaction(channelId: string, messageId: string) {
         if (gone) throw Object.assign(new Error('Unknown Message'), { status: 404, code: 10008 });
         calls.push({ op: 'react', channelId, messageId });

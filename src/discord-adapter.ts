@@ -45,6 +45,11 @@ import {
 /** Maximum attachments Discord accepts on a single message. */
 const MAX_DISCORD_ATTACHMENTS = 10;
 
+/** What a sendDM failure carries once its DM channel was resolved. */
+export interface DmSendFailure {
+  dmChannel?: { id: string; recipientName: string };
+}
+
 /** Cap on members returned by listChannelMembers — a large guild's #general
  *  is visible to thousands; the agent gets the first page plus the total. */
 const MEMBER_LIST_CAP = 200;
@@ -983,27 +988,50 @@ export class DiscordAdapter {
     userId: string,
     content: string,
     options?: { files?: OutgoingFile[] },
-  ): Promise<{ messageId: string; channelId: string }> {
+  ): Promise<{ messageId: string; channelId: string; recipientName: string }> {
     const resolvedId = await this.resolveRecipientId(userId);
     const user = await this.client.users.fetch(resolvedId);
     // For DMs, the only resolvable user is the recipient. We resolve against
     // the DM channel we're about to send to. Return the DM channel ID too so
     // the caller can update sticky-reply state.
     const dm = await user.createDM();
-    const resolved = await this.resolveOutgoingMentions(dm, content);
-    const attachments = buildAttachments(options?.files);
-    const chunks = this.splitForDiscord(resolved);
-    if (chunks.length === 0 && attachments.length > 0) chunks.push('');
-    let lastId = '';
-    for (let i = 0; i < chunks.length; i++) {
-      const isLast = i === chunks.length - 1;
-      const sent = await user.send({
-        content: chunks[i] || undefined,
-        files: isLast && attachments.length > 0 ? attachments : undefined,
-      });
-      lastId = sent.id;
+    // The username, as the registry's DM descriptor names the DM.
+    const recipientName = user.username;
+    try {
+      const resolved = await this.resolveOutgoingMentions(dm, content);
+      const attachments = buildAttachments(options?.files);
+      const chunks = this.splitForDiscord(resolved);
+      if (chunks.length === 0 && attachments.length > 0) chunks.push('');
+      let lastId = '';
+      for (let i = 0; i < chunks.length; i++) {
+        const isLast = i === chunks.length - 1;
+        const sent = await user.send({
+          content: chunks[i] || undefined,
+          files: isLast && attachments.length > 0 ? attachments : undefined,
+        });
+        lastId = sent.id;
+      }
+      return { messageId: lastId, channelId: dm.id, recipientName };
+    } catch (err) {
+      // The DM channel was resolved before this failure: carry it on the
+      // error (DmSendFailure) so the caller can name the attempted destination.
+      if (err && typeof err === 'object') Object.assign(err, { dmChannel: { id: dm.id, recipientName } });
+      throw err;
     }
-    return { messageId: lastId, channelId: dm.id };
+  }
+
+  /** The recipient's username for a cached DM channel, or null when the channel
+   *  isn't cached, isn't a DM, or its recipient can't be read. Labels a DM
+   *  the channel registry hasn't seen. */
+  getCachedDmRecipientName(channelId: string): string | null {
+    const channel = this.client.channels.cache.get(channelId);
+    if (!channel || channel.type !== ChannelType.DM) return null;
+    try {
+      const recipient = (channel as DMChannel).recipient;
+      return recipient ? recipient.username : null; // as the registry's DM descriptor names it
+    } catch {
+      return null; // reading the recipient needs the logged-in user
+    }
   }
 
   async editMessage(channelId: string, messageId: string, content: string): Promise<void> {

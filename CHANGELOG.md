@@ -23,6 +23,36 @@ in the git log and PR descriptions.
 
 ### Added
 
+- **Self-contained channel provenance on Discord's own renderings** (the
+  Discord side of the host's message-provenance work). `fetch_history` and
+  `fetch_around` items each carry `source` (`[source: <canonical id> ·
+  <label>]`, the host's inbound header grammar minus its host-only server
+  segment), `channelId` (canonical `discord:<guild|dm>:<channel>`) and
+  `channelLabel`, so any message names its channel when read alone. A
+  channel the server can't place has `channelId` null and a header id of
+  `discord:?:<channel>`. `channels/open` history items add `channelLabel`
+  (the label at fetch, raw) for the host's header, which the host quotes by
+  the same rule. `send_message`, `reply_message` and `send_dm` receipts add
+  the channel the send targeted, as fields rather than a header: canonical
+  `channelId`, `discordChannelId` and `channelLabel`; for `send_dm`, the DM
+  channel the send resolved. A failed or uncertain send keeps whatever text
+  its error carries and adds `Attempted destination: …`, including a DM
+  resolved before the failure. DMs are named from the registry, inbound DM
+  state or the channel cache, so a fresh outgoing DM has its canonical id
+  too, and a DM's label is `DM: <username>` on every path. An unknown label
+  is left out, and the canonical id is authoritative when a label differs.
+  A value that could read as header structure is quoted, as the host quotes
+  it: a label holding brackets, `·`, ` / `, quotes, backslashes, control or
+  line-separator characters, or anything invisible, or beginning with
+  `thread`, `reply to` or `unscoped`, becomes an escaped string literal, so a
+  guild, thread or display name can't forge a second attribution, and the
+  header stays one line. The same rule renders the attempted destination,
+  a `send_dm` target that didn't resolve, and the location prefix
+  (`[#channel thread "name" in Guild]`) before message bodies, where a
+  channel name with a space (a voice or stage channel's can have one) is
+  quoted too, so it can't carry the prefix's own words. `channelLabel`
+  keeps the raw label.
+
 - **`latestFrom` for replies and reactions.** `reply_message`, `add_reaction`
   and `remove_reaction` accept `latestFrom` (an @username, display name,
   numeric user ID, `<@id>` or `@id`, bots included) as the exclusive

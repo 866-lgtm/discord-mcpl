@@ -46,13 +46,14 @@ import type {
   ChannelsOutgoingCompleteParams,
 } from '@animalabs/mcpl-core';
 
-import type { DiscordAdapter, DiscordMessageData, DiscordAttachment, OutgoingFile, ReactionSummary, MessageEventInfo, DmRefusal } from './discord-adapter.js';
+import type { DiscordAdapter, DiscordMessageData, DiscordAttachment, OutgoingFile, ReactionSummary, MessageEventInfo, DmRefusal, DmSendFailure } from './discord-adapter.js';
 import { LATEST_FROM_WINDOW } from './discord-adapter.js';
 import { DM_NOTICE_TEXT, DmNoticeState, resolveDmNoticesPath, type DmNoticeDecision } from './dm-notices.js';
 
 /** How much of a latestFrom target's text its receipt echoes. */
 const LATEST_FROM_EXCERPT = 80;
 import type { ChatInputCommandInteraction } from 'discord.js';
+import { headerValue, labelValue, quotedValue, renderSourceHeader } from './source-header.js';
 import { MessageFlags } from 'discord.js';
 import { toolDefinitions } from './tools.js';
 import { withToolClasses } from './tool-classes.js';
@@ -60,6 +61,7 @@ import { featureSets, isEnabled, featureSetForTool } from './feature-sets.js';
 import { ChannelManager, mcplChannelId, parseMcplChannelId, toDescriptor, toDmDescriptor } from './channels.js';
 import {
   channelLabel,
+  formatChannelLabel,
   isSnowflake,
   looksLikeExplicitName,
   type AddressingPath,
@@ -1579,7 +1581,12 @@ export class DiscordMcplServer {
         const content = (args.content as string | undefined) ?? '';
         const files = args.files as OutgoingFile[] | undefined;
         requireContentOrFiles(content, files);
-        const result = await this.discord.sendMessage(channelId, content, { files });
+        let result: { messageId: string };
+        try {
+          result = await this.discord.sendMessage(channelId, content, { files });
+        } catch (err) {
+          throw this.withAttemptedDestination(err, channelId);
+        }
         this.stateTracker.recordSent(result.messageId, channelId, content);
         const shifted = this.markOutboundSend(channelId);
         return this.augmentSendResult(result.messageId, channelId, shifted);
@@ -1591,11 +1598,16 @@ export class DiscordMcplServer {
         const files = args.files as OutgoingFile[] | undefined;
         requireContentOrFiles(content, files);
         const { messageId: replyTo, target } = await this.resolveTargetMessage(channelId, args);
-        const result = await this.discord.sendMessage(
-          channelId,
-          content,
-          { replyTo, files, ...(target ? { requireReplyTarget: true } : {}) },
-        );
+        let result: { messageId: string };
+        try {
+          result = await this.discord.sendMessage(
+            channelId,
+            content,
+            { replyTo, files, ...(target ? { requireReplyTarget: true } : {}) },
+          );
+        } catch (err) {
+          throw this.withAttemptedDestination(err, channelId);
+        }
         this.stateTracker.recordSent(result.messageId, channelId, content);
         const shifted = this.markOutboundSend(channelId);
         const receipt = await this.augmentSendResult(result.messageId, channelId, shifted);
@@ -1606,13 +1618,23 @@ export class DiscordMcplServer {
         const content = (args.content as string | undefined) ?? '';
         const files = args.files as OutgoingFile[] | undefined;
         requireContentOrFiles(content, files);
-        const result = await this.discord.sendDM(
-          args.userId as string,
-          content,
-          { files },
-        );
+        let result: { messageId: string; channelId: string; recipientName: string };
+        try {
+          result = await this.discord.sendDM(
+            args.userId as string,
+            content,
+            { files },
+          );
+        } catch (err) {
+          const resolved = (err as DmSendFailure | null)?.dmChannel;
+          if (resolved) throw this.withAttemptedDestination(err, resolved.id, { recipientName: resolved.recipientName });
+          if (err instanceof Error) {
+            err.message += `\n\nAttempted destination: a DM with ${quotedValue(String(args.userId))}; no DM channel was resolved, so no message was sent.`;
+          }
+          throw err;
+        }
         const shifted = this.markOutboundSend(result.channelId);
-        return this.augmentSendResult(result.messageId, result.channelId, shifted);
+        return this.augmentSendResult(result.messageId, result.channelId, shifted, { recipientName: result.recipientName });
       }
 
       case 'add_reaction': {
@@ -1684,7 +1706,7 @@ export class DiscordMcplServer {
         return this.refreshChannels();
 
       case 'fetch_history':
-        return this.projectHistoryReactions(await this.discord.fetchHistory(
+        return this.withProvenance(args.channelId as string, this.projectHistoryReactions(await this.discord.fetchHistory(
           args.channelId as string,
           {
             // Per-channel backscroll cap (DISCORD_BACKSCROLL_CHANNELS) also
@@ -1693,14 +1715,14 @@ export class DiscordMcplServer {
             ...(args.before ? { before: args.before as string } : {}),
             ...(args.after ? { after: args.after as string } : {}),
           },
-        ));
+        )));
 
       case 'fetch_around':
-        return this.projectHistoryReactions(await this.discord.fetchAround(
+        return this.withProvenance(args.channelId as string, this.projectHistoryReactions(await this.discord.fetchAround(
           args.channelId as string,
           args.messageId as string,
           this.capHistoryLimit(args.channelId as string, (args.limit as number) ?? 50),
-        ));
+        )));
 
       case 'create_text_channel':
         return await this.discord.createTextChannel(
@@ -2093,19 +2115,89 @@ export class DiscordMcplServer {
 
   // ── Sticky-reply state mutators ──
 
-  /** Build the tool-result object for a successful send_*. Just the messageId
-   *  now — the old "sticky channel is now X / your text-only replies route
-   *  here" note was tied to the retired per-surface sticky and would be
-   *  misleading under host-owned routing (the host routes plain-text turns to
-   *  the conversational locus, i.e. the most recent *incoming* channel, not
-   *  the last channel this bot sent to). `_shifted` is kept in the signature
-   *  for call-site compatibility but no longer used. */
+  /** A send receipt names the destination actually sent to: the canonical
+   *  `discord:<guild|dm>:<channel>` id (what the host's registry uses), the
+   *  raw Discord id, and the channel's label. It says nothing about where
+   *  later plain speech will go; the host owns that routing. `_shifted` is
+   *  kept in the signature for call-site compatibility but no longer used. */
   private async augmentSendResult(
     messageId: string,
-    _channelId: string,
+    channelId: string,
     _shifted: boolean,
-  ): Promise<{ messageId: string }> {
-    return { messageId };
+    dm?: { recipientName: string },
+  ): Promise<{ messageId: string; channelId: string | null; discordChannelId: string; channelLabel: string | null }> {
+    const p = this.channelProvenance(channelId, dm);
+    return { messageId, channelId: p.channelId, discordChannelId: channelId, channelLabel: p.channelLabel };
+  }
+
+  /** A failed or uncertain send keeps whatever text its error carries
+   *  (Discord's rejection, a timeout) and gains the destination it was aimed
+   *  at, so an unknown outcome still says where. The label is rendered by the
+   *  header rule, as in a [source: …] header, so a Discord-chosen name can't
+   *  forge a second destination here either. */
+  private withAttemptedDestination(err: unknown, discordChannelId: string, dm?: { recipientName: string }): unknown {
+    if (!(err instanceof Error)) return err;
+    const p = this.channelProvenance(discordChannelId, dm);
+    const where = p.channelId
+      ? `${p.channelId}${p.channelLabel ? ` · ${labelValue(p.channelLabel)}` : ''} (Discord channel ${discordChannelId})`
+      : `Discord channel ${discordChannelId}`;
+    err.message = `${err.message}\n\nAttempted destination: ${where}.`;
+    return err;
+  }
+
+  /** Where a Discord channel sits, for self-contained renderings: its
+   *  canonical id, the registry's label (else one built from cached names),
+   *  and the visible header `[source: <canonical id> · <label>]`, the same
+   *  grammar the host stamps on inbound messages minus the host-only server
+   *  segment, with values that could read as structure quoted as the host
+   *  quotes them (source-header.ts). An unknown label is left out; the
+   *  canonical id is authoritative when a label differs. A channel the server
+   *  can't place has no canonical id (null) and the header says
+   *  discord:?:<channel>. channelLabel is the raw label, a field: a host that
+   *  renders it into its own header quotes it by the same rule
+   *  (agent-framework's labelValue), as channels/open's history items rely on. */
+  private channelProvenance(
+    discordChannelId: string,
+    dm?: { recipientName: string },
+  ): { channelId: string | null; channelLabel: string | null; source: string } {
+    let canonical: string | null;
+    let fallbackLabel: string | null = null;
+    const dmId = mcplChannelId('dm', discordChannelId);
+    // A DM is known from a send's own resolution, the registry, inbound DM
+    // state, or the channel cache: an outgoing DM is often only in the last.
+    const isDM = dm !== undefined
+      || this.channelManager.get(dmId) !== undefined
+      || this.dmChannelIds.has(discordChannelId)
+      || this.discord.getCachedChannelMeta?.(discordChannelId)?.isDM === true;
+    if (isDM) {
+      canonical = dmId;
+      const recipient = dm?.recipientName
+        ?? this.discord.getCachedDmRecipientName?.(discordChannelId)
+        ?? ((this.channelManager.get(dmId)?.metadata as { recipientName?: string } | undefined)?.recipientName ?? null);
+      if (recipient) fallbackLabel = `DM: ${recipient}`;
+    } else {
+      const meta = this.resolveChannelMeta(discordChannelId);
+      canonical = meta.mcplChannelId;
+      if (meta.guildId && meta.channelName && meta.guildName) {
+        fallbackLabel = formatChannelLabel(meta.channelName, meta.guildName);
+      }
+    }
+    const label = (canonical ? this.channelManager.get(canonical)?.label : undefined) ?? fallbackLabel;
+    const id = canonical ?? `discord:?:${discordChannelId}`;
+    return {
+      channelId: canonical,
+      channelLabel: label ?? null,
+      source: renderSourceHeader(id, label),
+    };
+  }
+
+  /** Stamp fetched history with its channel, item by item, so each message
+   *  identifies its channel when read alone. */
+  private withProvenance<T extends object>(discordChannelId: string, items: T[]): Array<
+    { source: string; channelId: string | null; channelLabel: string | null } & T
+  > {
+    const p = this.channelProvenance(discordChannelId);
+    return items.map((item) => ({ source: p.source, channelId: p.channelId, channelLabel: p.channelLabel, ...item }));
   }
 
 
@@ -2889,6 +2981,8 @@ export class DiscordMcplServer {
       messages.sort((a, b) => a.timestamp.getTime() - b.timestamp.getTime());
       result.history = this.projectHistoryReactions(messages).map((message) => ({
         channelId: desc!.id,
+        // The label at fetch, for the host's header when its registry lacks one.
+        channelLabel: desc!.label,
         messageId: message.id,
         author: { id: message.authorId, name: message.authorName },
         timestamp: message.timestamp.toISOString(),
@@ -3826,10 +3920,17 @@ export class DiscordMcplServer {
     const contextChanged = this.lastChannelId !== msg.channelId;
     let location = '';
     if (contextChanged) {
+      // Discord-chosen names, rendered by the header rule (source-header.ts),
+      // so one can't read as structure; a thread name is always quoted. A
+      // channel name with a space is quoted too, so one can't carry this
+      // prefix's own words (` in <guild>`): a text channel's name never has
+      // one, but a voice, stage or forum channel's can.
       const locationParts: string[] = [];
-      if (msg.channelName) locationParts.push(`#${msg.channelName}`);
-      if (msg.threadName) locationParts.push(`thread "${msg.threadName}"`);
-      if (msg.guildName) locationParts.push(`in ${msg.guildName}`);
+      if (msg.channelName) {
+        locationParts.push(`#${/\s/.test(msg.channelName) ? quotedValue(msg.channelName) : headerValue(msg.channelName)}`);
+      }
+      if (msg.threadName) locationParts.push(`thread ${quotedValue(msg.threadName)}`);
+      if (msg.guildName) locationParts.push(`in ${headerValue(msg.guildName)}`);
       else if (msg.guildId === null) locationParts.push('DM');
       if (locationParts.length > 0) location = `[${locationParts.join(' ')}] `;
     }
