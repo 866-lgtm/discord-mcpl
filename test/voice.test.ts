@@ -283,14 +283,20 @@ test('socket died while queued: flush reopens a fresh stream and resends the ban
   assert.deepEqual(provider.streams[1]!.sent, ['resent text']);
 });
 
-test('maxHold expiry: dropped unspoken with an expired receipt, zero billed', async () => {
+test('maxHold expiry: dropped unspoken with an expired receipt, zero billed', (t) => {
+  // The test drives the clock, so the hold timer and Date.now() move
+  // together. On the real clock the timer runs on the event loop's cached
+  // time, which can lag Date.now(), so the receipt could measure under 20.
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
   const provider = new FakeProvider();
   const sink = new FakeSink();
   const out = new VoiceOutput({ textChannels: null, maxHoldMs: 20 }, provider, VOICE, sink, () => {});
   const reports: UtteranceReport[] = [];
   out.onReport((r) => reports.push(r));
   out.handleChunk('inf1', 'discord:g:100', 'too late');
-  await new Promise((r) => setTimeout(r, 50));
+  t.mock.timers.tick(19);
+  assert.deepEqual(sink.cancelled, [], 'not expired before its max hold');
+  t.mock.timers.tick(1);
   assert.deepEqual(sink.cancelled, ['inf1']);
   assert.equal(reports.length, 1);
   const r = reports[0]!;
@@ -298,7 +304,7 @@ test('maxHold expiry: dropped unspoken with an expired receipt, zero billed', as
   assert.equal(r.billedChars, 0);
   assert.equal(r.playedMs, 0);
   assert.equal(r.unvoicedText, 'too late');
-  assert.ok(r.queuedMs >= 20);
+  assert.equal(r.queuedMs, 20);
   assert.deepEqual(provider.streams[0]!.sent, []);
   assert.equal(provider.streams[0]!.aborted, true);
   // The inference is dead: post-expiry chunks must not reopen anything.
