@@ -71,7 +71,7 @@ function fixture(opts: {
 describe('fetched history names its channel on every item', () => {
   it('stamps each message, consecutive ones included, with the registry label', async () => {
     const f = fixture({ cached: { '110000000000000001': { name: 'general', guildId: 'g1', guildName: 'Guild One', isDM: false } } });
-    f.server.channelManager.register(toDescriptor('g1', 'Guild One', { id: '110000000000000001', name: 'general', type: 'text', label: '#general (Guild One)' }));
+    f.server.channelManager.register(toDescriptor({ id: '110000000000000001', guildId: 'g1', guildName: 'Guild One', type: 'text', name: 'general' }));
     const items = await f.call('fetch_history', { channelId: '110000000000000001' });
     assert.equal(items.length, 2);
     for (const m of items) {
@@ -135,7 +135,7 @@ describe('a thread is named by its own name, in its guild', () => {
 describe('the registry label wins over one built from cached names', () => {
   it('labels a guild channel with its registered label when the two differ, as the host labels its inbound messages', async () => {
     const f = fixture({ cached: { '110000000000000001': { name: 'general-renamed', guildId: 'g1', guildName: 'Guild One', isDM: false } } });
-    f.server.channelManager.register(toDescriptor('g1', 'Guild One', { id: '110000000000000001', name: 'general', type: 'text', label: '#general (Guild One)' }));
+    f.server.channelManager.register(toDescriptor({ id: '110000000000000001', guildId: 'g1', guildName: 'Guild One', type: 'text', name: 'general' }));
     const items = await f.call('fetch_history', { channelId: '110000000000000001' });
     assert.equal(items[0].channelLabel, '#general (Guild One)');
     assert.equal(items[0].source, '[source: discord:g1:110000000000000001 · #general (Guild One)]');
@@ -390,7 +390,7 @@ describe('a failed or uncertain send still names where it was aimed', () => {
 describe('channels/open backscroll items carry their label for the host header', () => {
   it('adds channelLabel beside the canonical channelId, with no header text in the body', async () => {
     const f = fixture();
-    f.server.channelManager.register(toDescriptor('g1', 'Guild One', { id: '110000000000000001', name: 'general', type: 'text', label: '#general (Guild One)' }));
+    f.server.channelManager.register(toDescriptor({ id: '110000000000000001', guildId: 'g1', guildName: 'Guild One', type: 'text', name: 'general' }));
     const res = await f.server.handleChannelOpen({ channelId: 'discord:g1:110000000000000001', type: 'discord', history: { limit: 5 } });
     assert.equal(res.history?.[0].channelId, 'discord:g1:110000000000000001');
     assert.equal(res.history?.[0].channelLabel, '#general (Guild One)');

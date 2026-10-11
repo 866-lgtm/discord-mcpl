@@ -59,7 +59,7 @@ export interface ChannelCandidate {
   /** Needed for tie-breaking: a stock Discord server ships a VOICE channel
    *  named "General" beside text #general, and matching is case-insensitive,
    *  so a name collision across types is the DEFAULT state, not an edge case. */
-  type: 'text' | 'announcement' | 'voice' | 'forum' | 'unknown';
+  type: 'text' | 'announcement' | 'voice' | 'stage' | 'forum' | 'unknown';
 }
 
 /**
@@ -87,18 +87,19 @@ export function formatChannelLabel(name: string, guildName: string): string {
  * this module exists to prevent. Without a known parent: `› thread (GuildName)`.
  *
  * Pasted back, it must fail loudly, and its shape alone doesn't ensure that:
- * a voice channel's name may hold spaces and `›`, so a voice room named
- * `general › design-chat` would match the label as a name. So
- * `resolveChannelName` refuses a name in this shape before matching anything.
+ * a voice or stage channel's name may hold spaces and `›`, so a voice room
+ * named `general › design-chat` would match the label as a name. So
+ * `resolveChannelName` refuses a name in this shape before matching anything,
+ * and such a voice room is labelled by its id instead (channelLabelFor in
+ * channels.ts), since its `#name (Guild)` would be refused too.
  */
 export function formatThreadLabel(parentName: string | null | undefined, threadName: string, guildName: string): string {
   return `${parentName ? `#${parentName} ` : ''}› ${threadName} (${guildName})`;
 }
 
-/** Whether a parsed name has a thread label's shape: `parent › thread`, or
- *  `› thread` when the parent isn't known (formatThreadLabel, and the
- *  guild-less labels the server falls back to). */
-function isThreadLabelShape(name: string): boolean {
+/** Whether a name has a thread label's shape: `parent › thread`, or
+ *  `› thread` when the parent isn't known (formatThreadLabel). */
+export function isThreadLabelShape(name: string): boolean {
   return /(?:^|\s)›\s/.test(name);
 }
 
@@ -322,14 +323,16 @@ const TEXTLIKE: ReadonlySet<string> = new Set(['text', 'announcement']);
  *
  *  This is an ALLOWLIST OF NAMED KINDS, deliberately not "everything except the
  *  few we exclude". It used to admit `'unknown'`, which was wrong in one
- *  direction (stage/media are not sendable); excluding `'unknown'` wholesale was
- *  then wrong in the other, because GuildAnnouncement (5) also landed in that
- *  bucket and `#announcements` is about as common a channel name as exists. An
- *  overloaded catch-all cannot be right either way — so kinds are named, and a
- *  new Discord channel type defaults to id-only addressing until someone
- *  deliberately classifies it. Failing closed here costs a bounce; failing open
- *  costs a send to something that cannot receive it. */
-const SENDABLE: ReadonlySet<string> = new Set([...TEXTLIKE, 'voice']);
+ *  direction (a media channel holds its posts as threads, like a forum);
+ *  excluding `'unknown'` wholesale was then wrong in the other, because
+ *  GuildAnnouncement (5) also landed in that bucket and `#announcements` is
+ *  about as common a channel name as exists. An overloaded catch-all cannot be
+ *  right either way — so kinds are named, and a new Discord channel type
+ *  defaults to id-only addressing until someone deliberately classifies it.
+ *  Failing closed here costs a bounce; failing open costs a send to something
+ *  that cannot receive it. A stage channel has a text chat, as a voice channel
+ *  does, and is named like one. */
+const SENDABLE: ReadonlySet<string> = new Set([...TEXTLIKE, 'voice', 'stage']);
 
 /** Whether a channel kind can be addressed by NAME. Exported so the mapping
  *  from Discord's type numbers to addressability is testable end to end —

@@ -20,7 +20,7 @@ describe('explainDiscordError', () => {
     const text = explainDiscordError(discordError('Unknown Channel', 10003, 404), { channelId: '111111111111111111' });
     assert.match(text, /^Unknown Channel\n\n/, "Discord's own words come first");
     assert.match(text, /No channel 111111111111111111 is visible to this connection: the id may be mistyped or remembered rather than copied/);
-    assert.match(text, /For a text, announcement or voice channel, re-send with its name instead/,
+    assert.match(text, /For a text, announcement, voice or stage channel, re-send with its name instead/,
       'the name cure is offered only for the kinds the name route resolves');
     assert.match(text, /or take its id from list_channels/, 'a route to a real id');
     assert.match(text, /A thread or DM has no name route: its id has to be copied from where it was shown, not recalled\./,

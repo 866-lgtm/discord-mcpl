@@ -54,13 +54,13 @@ export function explainDiscordError(err: unknown, args: Record<string, unknown>,
           `No category ${given('categoryId')} is visible to this connection: ${recalled}, or the category deleted. ` +
           "list_channels shows a server's channels, categories included, with their ids, within the configured filters.";
       } else {
-        // The name route covers text, announcement and voice channels only
+        // The name route covers text, announcement, voice and stage channels only
         // (resolveChannelRef leaves out threads, forums, categories and DMs),
         // so a thread or DM isn't sent back to a name that could match
         // another channel.
         why =
           `${channel ? `No channel ${channel}` : 'No such channel'} is visible to this connection: ${recalled}, ` +
-          'or the channel deleted. For a text, announcement or voice channel, re-send with its name instead ' +
+          'or the channel deleted. For a text, announcement, voice or stage channel, re-send with its name instead ' +
           "(#name, or #name (Server)), or take its id from list_channels, which shows a server's channels. " +
           "A thread or DM has no name route: its id has to be copied from where it was shown, not recalled.";
       }

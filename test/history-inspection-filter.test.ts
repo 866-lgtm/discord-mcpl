@@ -213,7 +213,7 @@ describe('channels/open backscroll', () => {
     } as const;
     for (const [id, type] of Object.entries(kinds)) {
       const name = `${type}-${id.slice(-1)}`;
-      server.channelManager.register(toDescriptor(G1, 'Guild', { id, name, type, label: `#${name} (Guild)` }));
+      server.channelManager.register(toDescriptor({ id, guildId: G1, guildName: 'Guild', type, name }));
     }
     const opened = (id: string) =>
       server.channelManager.isOpen(mcplChannelId(G1, id)) || server.subscribedChannels.has(id);

@@ -3,8 +3,8 @@
  */
 
 import type { ChannelDescriptor } from '@animalabs/mcpl-core';
-import type { DiscordChannelInfo } from './discord-adapter.js';
-import { formatChannelLabel, formatThreadLabel } from './channel-names.js';
+import type { ChannelFacts } from './discord-adapter.js';
+import { formatChannelLabel, formatThreadLabel, isNameAddressableKind, isThreadLabelShape } from './channel-names.js';
 
 export type DiscordChannelDescriptor = ChannelDescriptor & {
   initiallyOpen?: boolean;
@@ -26,26 +26,52 @@ export function parseMcplChannelId(id: string): { guildId: string; channelId: st
   return { guildId: parts[1], channelId: parts[2] };
 }
 
-/** Convert a Discord channel to an MCPL ChannelDescriptor. */
+/**
+ * A guild channel's label, from what is known of it: the one rule for every
+ * path that registers a channel (boot, a channel's or guild's events, a
+ * message delivered from it, an edit or delete), so a label means the same
+ * whichever path made it.
+ * - A channel the resolver names (text, announcement, voice, stage): its
+ *   address, `#name (Guild)`, the string a tool's channelId accepts back.
+ * - A thread: `#parent › thread (Guild)`, display only (formatThreadLabel
+ *   says why). Threads are addressed by id.
+ * - Anything else: its composite id, `discord:<guild>:<channel>`, which
+ *   addresses exactly this channel. That is the label when the guild's or
+ *   the channel's name isn't known (a bare `#name` would resolve to a
+ *   same-named channel in whichever guild has one), for a kind the resolver
+ *   doesn't name, and for a voice or stage channel whose name has a thread
+ *   label's shape (`general › design`), which the resolver refuses as a name.
+ * The server re-derives a registered label when what it's made from changes.
+ */
+export function channelLabelFor(c: ChannelFacts): string {
+  if (c.guildName && c.name) {
+    if (c.type === 'thread') return formatThreadLabel(c.parentName, c.name, c.guildName);
+    if (isNameAddressableKind(c.type) && !isThreadLabelShape(c.name)) return formatChannelLabel(c.name, c.guildName);
+  }
+  return mcplChannelId(c.guildId, c.id);
+}
+
+/** A guild channel's MCPL descriptor, from what is known of it. Its metadata
+ *  carries the names its label was made from, so a reader never has to parse
+ *  them back out of a label. */
 export function toDescriptor(
-  guildId: string,
-  guildName: string,
-  channel: DiscordChannelInfo,
+  channel: ChannelFacts,
   initiallyOpen = false,
   maxHistory = 500,
 ): DiscordChannelDescriptor {
   return {
-    id: mcplChannelId(guildId, channel.id),
+    id: mcplChannelId(channel.guildId, channel.id),
     type: 'discord',
-    // Same formatter the resolver parses back, so a channel's label is by
-    // construction a valid channelId argument. A thread's is display only
-    // (formatThreadLabel says why): threads are addressed by id.
-    label: channel.type === 'thread'
-      ? formatThreadLabel(channel.parentName, channel.name, guildName)
-      : formatChannelLabel(channel.name, guildName),
+    label: channelLabelFor(channel),
     direction: 'bidirectional',
-    address: { guildId, channelId: channel.id },
-    metadata: { channelType: channel.type, parentId: channel.parentId },
+    address: { guildId: channel.guildId, channelId: channel.id },
+    metadata: {
+      channelType: channel.type,
+      ...(channel.parentId ? { parentId: channel.parentId } : {}),
+      ...(channel.name ? { channelName: channel.name } : {}),
+      ...(channel.guildName ? { guildName: channel.guildName } : {}),
+      ...(channel.type === 'thread' && channel.parentName ? { parentName: channel.parentName } : {}),
+    },
     initiallyOpen,
     capabilities: {
       history: { maxMessages: maxHistory, supportsBeforeMessage: true },

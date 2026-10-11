@@ -189,11 +189,6 @@ export interface DiscordMessageData extends ThreadPlace {
   guildId: string | null;
   /** Guild name (e.g. "My Server"). `null` for DMs. */
   guildName: string | null;
-  /** The kind of channel the message was posted in (a guild message only). */
-  channelType?: DiscordChannelInfo['type'];
-  /** That channel's own parent (a guild message only): a channel's category,
-   *  or, for a thread, the channel it hangs off. */
-  channelParentId?: string | null;
   replyToId?: string;
   /** User id of the author of the message this message is in reply to.
    *  Populated for reply messages regardless of whether the sender left
@@ -227,17 +222,33 @@ export interface DiscordGuildInfo {
 export interface DiscordChannelInfo {
   id: string;
   name: string;
-  type: 'text' | 'announcement' | 'voice' | 'category' | 'thread' | 'forum' | 'unknown';
+  type: 'text' | 'announcement' | 'voice' | 'stage' | 'category' | 'thread' | 'forum' | 'unknown';
   parentId?: string;
-  /** For a thread, the name of the channel it hangs off (for its label). */
-  parentName?: string;
-  /** Guild-qualified display label, `#name (GuildName)` — the same string
-   *  `toDescriptor` produces and the same string the channelId argument
-   *  accepts. Returned so listings hand back something PASTEABLE: the
-   *  not-found error tells agents to "use list_channels to see what is
-   *  addressable", which was only true once this field existed. Both forms are
-   *  present on purpose — label to compose a send now, id to store. */
+  /** Guild-qualified display label, `#name (GuildName)` — the form a
+   *  registered channel's label takes (channelLabelFor) and the same string
+   *  the channelId argument accepts. Returned so listings hand back something
+   *  PASTEABLE: the not-found error tells agents to "use list_channels to see
+   *  what is addressable", which was only true once this field existed. Both
+   *  forms are present on purpose — label to compose a send now, id to store. */
   label: string;
+}
+
+/** What registering a guild channel needs to know of it (toDescriptor),
+ *  as the client's cache has it. A name the cache doesn't have is null. */
+export interface ChannelFacts {
+  id: string;
+  guildId: string;
+  /** Null when the client doesn't have the guild cached. */
+  guildName: string | null;
+  type: DiscordChannelInfo['type'];
+  name: string | null;
+  /** A channel's category, or the channel a thread hangs off. */
+  parentId?: string | null;
+  /** For a thread, the name of the channel it hangs off, which its label
+   *  names. */
+  parentName?: string | null;
+  /** For a thread, whether it's archived. */
+  archived?: boolean;
 }
 
 /** One member of a channel, as the agent should see them. */
@@ -626,15 +637,13 @@ export class DiscordAdapter {
    *  connects before the server exists), handed over when it does. */
   private heldDmRefusals: DmRefusal[] = [];
   private readyHandler?: () => void;
-  private channelCreateHandler?: (guildId: string, channel: DiscordChannelInfo) => void;
+  private channelCreateHandler?: (channel: ChannelFacts) => void;
+  private channelUpdateHandler?: (channel: ChannelFacts) => void;
   private channelDeleteHandler?: (guildId: string, channelId: string) => void;
+  private threadUpdateHandler?: (thread: ChannelFacts) => void;
   private threadDeleteHandler?: (guildId: string, threadId: string) => void;
-  private guildCreateHandler?: (
-    guildId: string,
-    guildName: string,
-    channels: DiscordChannelInfo[],
-  ) => void;
-  private channelAvailableHandler?: (guildId: string, channel: DiscordChannelInfo) => void;
+  private guildCreateHandler?: (guildId: string, channels: ChannelFacts[]) => void;
+  private guildRenameHandler?: (guildId: string) => void;
 
   constructor(config: DiscordAdapterConfig) {
     this.token = config.token;
@@ -851,35 +860,49 @@ export class DiscordAdapter {
     return { addedGuilds, removedGuilds };
   }
 
-  onChannelCreate(handler: (guildId: string, channel: DiscordChannelInfo) => void): void {
+  /** Fired when a channel of a listed kind (isListedKind) is created in a
+   *  guild the filters admit. */
+  onChannelCreate(handler: (channel: ChannelFacts) => void): void {
     this.channelCreateHandler = handler;
+  }
+
+  /** Fired when a channel of a listed kind changes (its name, its category,
+   *  its permissions) and the bot can view it, in a guild and channel the
+   *  filters admit: a rename re-derives what's registered, and a channel the
+   *  bot has just been let into (a permission overwrite on a private channel;
+   *  channelCreate doesn't fire for one that already existed) is registered. */
+  onChannelUpdate(handler: (channel: ChannelFacts) => void): void {
+    this.channelUpdateHandler = handler;
   }
 
   onChannelDelete(handler: (guildId: string, channelId: string) => void): void {
     this.channelDeleteHandler = handler;
   }
 
+  /** Fired when a thread changes: renamed, archived or unarchived, locked. */
+  onThreadUpdate(handler: (thread: ChannelFacts) => void): void {
+    this.threadUpdateHandler = handler;
+  }
+
   /** Fired when a thread is deleted (discord.js `threadDelete`; threads never
-   *  reach `channelDelete`). */
+   *  reach `channelDelete`). discord.js reports it only for a thread it has
+   *  cached: with the default caches, a live thread the bot can see is, and
+   *  an archived one is swept from the cache four hours after archiving. */
   onThreadDelete(handler: (guildId: string, threadId: string) => void): void {
     this.threadDeleteHandler = handler;
   }
 
   /** Fired when the bot joins a new guild after startup. The handler receives
-   *  every text channel currently visible to the bot in that guild, so the
-   *  server can register them with the host the same way it does at boot. */
-  onGuildCreate(
-    handler: (guildId: string, guildName: string, channels: DiscordChannelInfo[]) => void,
-  ): void {
+   *  the guild's channels of a listed kind that the filters admit, so the
+   *  server can register them the same way it does at boot. */
+  onGuildCreate(handler: (guildId: string, channels: ChannelFacts[]) => void): void {
     this.guildCreateHandler = handler;
   }
 
-  /** Fired when the bot gains visibility into a *pre-existing* channel — e.g.
-   *  a permission overwrite grants View Channel on a private channel the bot
-   *  was just added to. (channelCreate doesn't fire for channels that already
-   *  existed; this fills that gap.) */
-  onChannelAvailable(handler: (guildId: string, channel: DiscordChannelInfo) => void): void {
-    this.channelAvailableHandler = handler;
+  /** Fired when a guild the filters admit is renamed: its name is in every
+   *  label of its channels. */
+  onGuildRename(handler: (guildId: string) => void): void {
+    this.guildRenameHandler = handler;
   }
 
   // ── Operations ──
@@ -1438,23 +1461,40 @@ export class DiscordAdapter {
     };
   }
 
-  /** A cached guild channel's kind and parent (a channel's category, or a
-   *  thread's channel, with its name), or null when it isn't cached.
-   *  getChannelMeta's REST fetch caches what it fetches, so after it this
-   *  answers for an uncached channel too. Used to register what the reconnect
-   *  sweep pushes: a thread is labelled `#parent › thread`. */
-  getCachedChannelPlacement(channelId: string): {
-    type: DiscordChannelInfo['type'];
-    parentId: string | null;
-    parentName: string | null;
-  } | null {
-    const c = this.client.channels.cache.get(channelId) as {
-      type?: number;
-      parentId?: string | null;
-      parent?: { name?: string } | null;
-    } | undefined;
-    if (!c) return null;
-    return { type: mapChannelType(c.type), parentId: c.parentId ?? null, parentName: c.parent?.name ?? null };
+  /** A guild channel's facts as the client's cache has them now, or null when
+   *  the cache doesn't hold it (or it's a DM). getChannelMeta's REST fetch
+   *  caches what it fetches, so after it this answers for an uncached channel
+   *  too. What the server registers a channel by, whichever path registers
+   *  it (toDescriptor). */
+  getCachedChannelFacts(channelId: string): ChannelFacts | null {
+    return this.channelFacts(this.client.channels.cache.get(channelId));
+  }
+
+  /** A guild channel's facts, read from the channel and the client's caches.
+   *  The guild and a thread's parent are looked up by id, as threadPlace
+   *  looks up a parent: discord.js's `ThreadChannel.parent` getter goes
+   *  through the thread's guild and throws when it has none. */
+  private channelFacts(channel: unknown): ChannelFacts | null {
+    const c = channel as {
+      id?: string; guildId?: string | null; type?: number; name?: string | null;
+      parentId?: string | null; archived?: boolean | null;
+    } | null | undefined;
+    if (!c?.id || !c.guildId) return null;
+    const type = mapChannelType(c.type);
+    const named = (v: unknown): string | null => (typeof v === 'string' && v.length > 0 ? v : null);
+    const parent = type === 'thread' && c.parentId
+      ? (this.client.channels.cache.get(c.parentId) as { name?: string } | undefined)
+      : undefined;
+    return {
+      id: c.id,
+      guildId: c.guildId,
+      guildName: named(this.client.guilds.cache.get(c.guildId)?.name),
+      type,
+      name: named(c.name),
+      parentId: c.parentId ?? null,
+      parentName: named(parent?.name),
+      archived: type === 'thread' && c.archived === true,
+    };
   }
 
   /** Compare two Discord snowflake IDs numerically without BigInt parsing.
@@ -2060,47 +2100,28 @@ export class DiscordAdapter {
     }
   }
 
-  /** Get all text channels across filtered guilds. */
-  getTextChannels(): Array<{ guildId: string; guildName: string; channel: DiscordChannelInfo }> {
-    const result: Array<{ guildId: string; guildName: string; channel: DiscordChannelInfo }> = [];
+  /** The channels registered by listing them (boot, refresh_channels): every
+   *  channel of a listed kind (isListedKind) in the guilds the guild filter
+   *  admits, that the channel filter admits. */
+  getPostingChannels(): ChannelFacts[] {
+    const result: ChannelFacts[] = [];
     for (const guild of this.client.guilds.cache.values()) {
-      if (this.guildIds && !this.guildIds.includes(guild.id)) continue;
-      for (const channel of guild.channels.cache.values()) {
-        if (channel.type === ChannelType.GuildText) {
-          if (!this.channelAllowed(guild.id, channel.id, channel.parentId)) continue;
-          result.push({
-            guildId: guild.id,
-            guildName: guild.name,
-            channel: {
-              id: channel.id,
-              name: channel.name,
-              type: 'text',
-              parentId: channel.parentId ?? undefined,
-              label: formatChannelLabel(channel.name, guild.name),
-            },
-          });
-        }
-      }
+      if (this.guildIds?.length && !this.guildIds.includes(guild.id)) continue;
+      result.push(...this.guildPostingChannels(guild));
     }
     return result;
   }
 
-  /** All text channels in a single guild, as DiscordChannelInfo. Reads the
-   *  channel cache (populated by the gateway), mirroring getTextChannels but
-   *  scoped to one guild — used when the bot joins a guild after startup. */
-  private guildTextChannels(guild: Guild): DiscordChannelInfo[] {
-    const result: DiscordChannelInfo[] = [];
+  /** One guild's channels of a listed kind that the channel filter admits,
+   *  from the channel cache (the gateway fills it): getPostingChannels for a
+   *  guild the bot joins after startup. */
+  private guildPostingChannels(guild: Guild): ChannelFacts[] {
+    const result: ChannelFacts[] = [];
     for (const channel of guild.channels.cache.values()) {
+      if (!isListedKind(mapChannelType(channel.type))) continue;
       if (!this.channelAllowed(guild.id, channel.id, channel.parentId)) continue;
-      if (channel.type === ChannelType.GuildText) {
-        result.push({
-          id: channel.id,
-          name: channel.name,
-          type: 'text',
-          parentId: channel.parentId ?? undefined,
-          label: formatChannelLabel(channel.name, guild.name),
-        });
-      }
+      const facts = this.channelFacts(channel);
+      if (facts) result.push(facts);
     }
     return result;
   }
@@ -2332,37 +2353,18 @@ export class DiscordAdapter {
     });
 
     this.client.on('channelCreate', (channel) => {
-      // Only channels a conversation's messages are posted in: text,
-      // announcement and voice (text-in-voice). A category or forum holds no
-      // messages itself, and stage and media channels aren't sendable here
-      // (mapChannelType). Threads never reach channelCreate; they, and any
-      // channel registration missed, are registered when a message arrives.
-      if (!isPostingChannel(mapChannelType(channel.type))) return;
-      if ('guildId' in channel && channel.guildId) {
-        // The guild filter too, as guildCreate, channelUpdate and boot's
-        // listing apply it: a channel in a guild it excludes would be listed
-        // to the host while every message from it is dropped.
-        if (this.guildIds?.length && !this.guildIds.includes(channel.guildId)) return;
-        const parentId = 'parentId' in channel ? (channel.parentId ?? null) : null;
-        if (!this.channelAllowed(channel.guildId, channel.id, parentId)) return;
-        // A label must be an ADDRESS. The previous fallback substituted the
-        // guild *id* for its name, producing `#foo (1234…)` — which parses as a
-        // guild-qualified ref, matches nothing (resolution compares against
-        // guild NAMES), and so can never resolve. On this path especially: it
-        // announces a brand-new channel, which is exactly when an agent is
-        // likeliest to paste the label straight back. Prefer the cache, and if
-        // the name is genuinely unavailable emit the bare `#name` form, which
-        // is a real (if possibly ambiguous) address rather than a broken one.
-        const guildName =
-          channel.guild?.name ?? this.client.guilds.cache.get(channel.guildId)?.name;
-        this.channelCreateHandler?.(channel.guildId, {
-          id: channel.id,
-          name: channel.name,
-          label: guildName ? formatChannelLabel(channel.name, guildName) : `#${channel.name}`,
-          type: mapChannelType(channel.type),
-          parentId: 'parentId' in channel ? (channel.parentId ?? undefined) : undefined,
-        });
-      }
+      // Only a listed kind (isListedKind): a category or forum holds no
+      // messages itself. Threads never reach channelCreate: they're
+      // registered by their messages. The guild filter applies too, as at
+      // boot: a channel in a guild it excludes would be listed to the host
+      // while every message from it is dropped. (The server labels it, by the
+      // one rule every registration uses: toDescriptor.)
+      if (!isListedKind(mapChannelType(channel.type))) return;
+      const facts = this.channelFacts(channel);
+      if (!facts) return;
+      if (this.guildIds?.length && !this.guildIds.includes(facts.guildId)) return;
+      if (!this.channelAllowed(facts.guildId, facts.id, facts.parentId)) return;
+      this.channelCreateHandler?.(facts);
     });
 
     this.client.on('channelDelete', (channel) => {
@@ -2371,8 +2373,19 @@ export class DiscordAdapter {
       }
     });
 
+    this.client.on('threadUpdate', (_oldThread, newThread) => {
+      const facts = this.channelFacts(newThread);
+      if (facts) this.threadUpdateHandler?.(facts);
+    });
+
     this.client.on('threadDelete', (thread) => {
       if (thread.guildId) this.threadDeleteHandler?.(thread.guildId, thread.id);
+    });
+
+    this.client.on('guildUpdate', (oldGuild, newGuild) => {
+      if (oldGuild.name === newGuild.name) return;
+      if (this.guildIds?.length && !this.guildIds.includes(newGuild.id)) return;
+      this.guildRenameHandler?.(newGuild.id);
     });
 
     this.client.on('ready', () => {
@@ -2389,10 +2402,11 @@ export class DiscordAdapter {
     });
 
     // Newly-joined guilds: warm their member cache too, and surface the
-    // guild's existing text channels so the host can register them. Without
-    // this, channels in a server the bot is added to *after* startup never
-    // appear in the host's channel list (channelCreate only fires for
-    // channels created later, not the ones that already existed on join).
+    // guild's existing channels of a listed kind so the host can register
+    // them. Without this, channels in a server the bot is added to *after*
+    // startup never appear in the host's channel list (channelCreate only
+    // fires for channels created later, not the ones that already existed on
+    // join).
     this.client.on('guildCreate', (guild) => {
       void this.warmGuildMemberCache(guild);
       if (this.guildIds?.length && !this.guildIds.includes(guild.id)) return;
@@ -2402,7 +2416,7 @@ export class DiscordAdapter {
           console.error(`[discord-mcpl] Failed to register commands in new guild ${guild.id}:`, err.message);
         });
       }
-      this.guildCreateHandler?.(guild.id, guild.name, this.guildTextChannels(guild));
+      this.guildCreateHandler?.(guild.id, this.guildPostingChannels(guild));
     });
 
     this.client.on('interactionCreate', (interaction) => {
@@ -2417,33 +2431,22 @@ export class DiscordAdapter {
       this.slashCommandHandler?.(interaction);
     });
 
-    // Permission overwrites changing on an existing channel: when they flip
-    // the bot from "can't see" to "can see" (i.e. the bot was added to a
-    // private channel), treat it like a newly-available channel. We compare
-    // the bot's View Channel permission before vs after so ordinary edits
-    // (topic, name, slowmode) don't spuriously re-register.
-    this.client.on('channelUpdate', (oldChannel, newChannel) => {
-      if (!('guild' in newChannel) || newChannel.type !== ChannelType.GuildText) return;
+    // A listed channel changed: renamed, moved, or its permission overwrites
+    // let the bot in (it was added to a private channel). The server
+    // re-derives what it registered (a rename changes the label, and its
+    // threads' labels) and registers a channel it hadn't; an update that
+    // changes neither (a topic, slowmode) announces nothing. A channel the
+    // bot can't view isn't reported.
+    this.client.on('channelUpdate', (_oldChannel, newChannel) => {
+      if (!('guild' in newChannel) || !isListedKind(mapChannelType(newChannel.type))) return;
       const guild = newChannel.guild;
       if (this.guildIds?.length && !this.guildIds.includes(guild.id)) return;
       const me = guild.members.me;
       if (!me) return;
       if (!this.channelAllowed(guild.id, newChannel.id, newChannel.parentId)) return;
-      const VIEW = PermissionsBitField.Flags.ViewChannel;
-      const canViewNow = newChannel.permissionsFor(me)?.has(VIEW) ?? false;
-      if (!canViewNow) return;
-      const couldViewBefore =
-        'permissionsFor' in oldChannel
-          ? (oldChannel.permissionsFor(me)?.has(VIEW) ?? false)
-          : false;
-      if (couldViewBefore) return; // no visibility transition — ignore
-      this.channelAvailableHandler?.(guild.id, {
-        id: newChannel.id,
-        name: newChannel.name,
-        label: formatChannelLabel(newChannel.name, guild.name),
-        type: 'text',
-        parentId: newChannel.parentId ?? undefined,
-      });
+      if (!(newChannel.permissionsFor(me)?.has(PermissionsBitField.Flags.ViewChannel) ?? false)) return;
+      const facts = this.channelFacts(newChannel);
+      if (facts) this.channelUpdateHandler?.(facts);
     });
 
     this.client.on('error', (err: Error) => {
@@ -2698,12 +2701,6 @@ export class DiscordAdapter {
       channelName,
       guildId: message.guildId ?? null,
       guildName,
-      ...(message.guildId
-        ? {
-          channelType: mapChannelType((message.channel as { type?: number } | null)?.type),
-          channelParentId: (message.channel as { parentId?: string | null } | null)?.parentId ?? null,
-        }
-        : {}),
       // A message posted IN a thread names that thread, which is its channel.
       // (`message.thread` is the thread a message STARTED, not where it was
       // posted, so it never stands in for this.)
@@ -2808,10 +2805,19 @@ export function mapAllAttachments(m: {
   return out;
 }
 
-/** Whether messages are posted in a channel of this kind (and so it is
- *  registered as a place to post). */
-export function isPostingChannel(type: DiscordChannelInfo['type']): boolean {
-  return type === 'text' || type === 'announcement' || type === 'voice' || type === 'thread';
+/** The kinds of guild channel registered by listing them (at boot, when one
+ *  is created, changed or the bot joins its guild, and by refresh_channels):
+ *  those messages are posted in, a voice or stage channel's text chat
+ *  included. A thread is posted in too, but is registered by its messages:
+ *  a guild's live threads come and go, and its archived ones are unbounded. */
+export function isListedKind(type: DiscordChannelInfo['type']): boolean {
+  return type === 'text' || type === 'announcement' || type === 'voice' || type === 'stage';
+}
+
+/** The kinds that hold no messages themselves: a category holds channels,
+ *  and a forum its posts, which are threads. */
+export function holdsNoMessages(type: DiscordChannelInfo['type']): boolean {
+  return type === 'category' || type === 'forum';
 }
 
 /**
@@ -2834,8 +2840,13 @@ export function mapChannelType(type: number | undefined): DiscordChannelInfo['ty
     case 10: // AnnouncementThread — a thread, whatever its parent is.
     case 11:
     case 12: return 'thread';
+    // 13 = GuildStageVoice. Its text chat takes messages, as a voice
+    // channel's does (discord.js's StageChannel can send).
+    case 13: return 'stage';
     case 15: return 'forum';
-    // 13 (stage) and 16 (media) land here on purpose: not sendable, id-only.
+    // 16 (media) lands here on purpose: like a forum, it holds its posts as
+    // threads, never a message of its own, so no name resolves to it and no
+    // listing registers it; its posts are threads like any other.
     default: return 'unknown';
   }
 }

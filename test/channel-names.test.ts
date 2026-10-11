@@ -213,7 +213,7 @@ describe('resolveChannelName', () => {
     for (const label of [
       formatThreadLabel('general', 'design-chat', 'Separatrix'),
       formatThreadLabel(null, 'design-chat', 'Separatrix'),
-      // The server's labels for a thread when it doesn't know the guild's name.
+      // The same shapes, typed without a guild.
       '#general › design-chat',
       '› design-chat',
     ]) {
@@ -228,11 +228,17 @@ describe('resolveChannelName', () => {
 
   it('matches a name that merely contains › as usual', () => {
     // Only the label's shape is refused: › at the start or after a space,
-    // with a space after it.
-    const c = ch('100000000000000011', 'news›daily', 'g1', 'Separatrix');
-    const r = resolveChannelName({ name: 'news›daily' }, [...CANDIDATES, c]);
-    assert.ok(r.ok);
-    assert.equal(r.id, c.id);
+    // with a space after it. Each side of that boundary is a name.
+    for (const [i, name] of ['news›daily', 'ops ›room', 'ops› room'].entries()) {
+      const c = ch(`10000000000000001${i}`, name, 'g1', 'Separatrix', 'voice');
+      const r = resolveChannelName({ name }, [...CANDIDATES, c]);
+      assert.ok(r.ok, `${name}: ${JSON.stringify(r)}`);
+      assert.equal(r.id, c.id, name);
+    }
+    for (const name of ['› room', 'ops › room']) {
+      const r = resolveChannelName({ name }, CANDIDATES);
+      assert.ok(!r.ok && r.reason === 'thread-label', name);
+    }
   });
 });
 
@@ -461,7 +467,7 @@ describe('channel type classification', () => {
     [10, 'thread',       false],  // AnnouncementThread — names not unique
     [11, 'thread',       false],  // PublicThread
     [12, 'thread',       false],  // PrivateThread
-    [13, 'unknown',      false],  // Stage — not sendable
+    [13, 'stage',        true],   // Stage — has text chat, as voice does
     [15, 'forum',        false],  // Forum root — a bare send 400s
     [16, 'unknown',      false],  // Media — forum-like
   ];
@@ -520,9 +526,8 @@ describe('display form == address form', () => {
     // The claim the whole feature rests on. These live in different modules
     // (channels.ts vs channel-names.ts) and previously built the string
     // independently, so nothing stopped them drifting apart.
-    const desc = toDescriptor('g1', 'Separatrix', {
-      id: '100000000000000001', name: 'kitchen-table', type: 'text',
-      label: formatChannelLabel('kitchen-table', 'Separatrix'),
+    const desc = toDescriptor({
+      id: '100000000000000001', guildId: 'g1', guildName: 'Separatrix', type: 'text', name: 'kitchen-table',
     });
     assert.deepEqual(parseChannelRef(desc.label!), {
       kind: 'name', name: 'kitchen-table', guild: 'Separatrix',

@@ -28,6 +28,15 @@ in the git log and PR descriptions.
   while a channel message that spawned a thread no longer does. The old
   matches were the wrong ones (see "Thread fields name the thread a message
   was posted in" under Fixed), but a rule tuned to them is worth checking.
+- **The host's channel list now follows Discord's.** Voice and stage
+  channels (their text chat), and each thread a message comes from, are
+  registered beside text and announcement channels. An archived thread
+  leaves the list until a message brings it back, and a renamed channel,
+  thread or server is announced as `updated`. A host rule keyed on the
+  list, or on a label's `#name (Guild)` shape, is worth checking: a channel
+  whose name doesn't resolve back to it is labelled by its id,
+  `discord:<guild>:<channel>` (see "Every channel messages are posted in is
+  registered" under Fixed).
 - **A message that started a thread no longer carries that thread's id as
   its MCPL `threadId`, and no message carries one now.** A host that keys
   conversations by channel and thread filed such a message under the thread
@@ -517,28 +526,51 @@ in the git log and PR descriptions.
   carries `chat:thread` and the thread's fields, and every sweep push, a
   DM's included, now carries the `mcplChannelId` a live push's origin
   carries.
-- **Every channel a message comes from is registered, threads included,
-  and the reconnect sweep registers what it pushes.** Boot and channel
-  events register guild text channels, never a thread (a Discord thread is
-  its own channel) and not an announcement channel or a voice channel's
+- **Every channel messages are posted in is registered, threads included,
+  by one rule, and the host is told of each change.** Boot and channel
+  events registered guild text channels only: never a thread (a Discord
+  thread is its own channel), an announcement channel or a voice channel's
   text chat. Such a channel couldn't be opened, and a host that routes
   speech by a channel's declaration (MCPL RFC-011) held a resident's
-  plain-speech replies in it as drafts. When a message arrives through the
-  filters from a channel that isn't registered, the channel is now
-  registered first, as a DM is, so the host knows it before that message
-  reaches it. Only channels with activity are registered. A thread is
-  forgotten when it, or the channel it hangs off, is deleted. A thread's
-  label is `#parent › thread (Guild)`, which is display-only, because
-  `#thread (Guild)` would paste back as a same-named channel. A tool
-  given a thread label as its channel refuses it, even where a voice
-  channel has that name. Other channels keep their `#name (Guild)`
-  address. The reconnect sweep also registers a missed DM, thread or
-  other unregistered channel before pushing it, so a freshly started host
-  can answer it.
-  `channelCreate` registers only channels messages are posted in (text,
-  announcement and voice), no longer a category or forum, which hold no
-  messages themselves, nor a channel in a guild the guild filter excludes,
-  whose messages are all dropped.
+  plain-speech replies in it as drafts.
+  - **Listing** (boot, a channel's creation or change, a server joined,
+    `refresh_channels`) registers the text, announcement, voice and stage
+    channels the filters admit; never a category or forum, which hold no
+    messages of their own. A stage channel, which had no kind of its own, is
+    now `stage`: its text chat takes messages, and a name resolves to it as
+    to a voice channel.
+  - **A thread is registered by its messages:** before its first message
+    reaches the host, live or caught up by the reconnect sweep, or before an
+    edit or deletion there does. An archived thread is forgotten, and the
+    message that unarchives it registers it again, so the host holds the
+    live threads. A deleted thread is forgotten, and so is a deleted channel
+    with its threads; only what was registered is announced as removed.
+  - **A label is made one way on every path.** A channel's is its address,
+    `#name (Guild)`. A thread's is `#parent › thread (Guild)`, display-only,
+    since `#thread (Guild)` would paste back as a same-named channel; a tool
+    given one refuses it, even where a voice channel has that name. Where a
+    name isn't known (a server the client hasn't cached), or wouldn't
+    resolve back to the channel (a voice channel named like a thread label,
+    a kind no name resolves to), the label is the channel's id,
+    `discord:<guild>:<channel>`, never a bare `#name` that another server's
+    channel could answer to. A rename of a channel, thread or server, or a
+    name learned since, re-derives the labels it's in, announced as
+    `updated`.
+  - **Every host connection is given the whole registry,** whatever was
+    registered while another host, or none, was connected, and is told of
+    the channels removed while no host was connected. A restart starts
+    afresh: threads and DMs come back as they're active, and a host that
+    keeps a server's channels across a reconnect keeps a thread deleted or
+    archived while the server was down.
+  - **A push names its channel (`mcplChannelId`) once it's registered,**
+    which is every channel a message is delivered from except a thread
+    archived since its missed messages (the sweep delivers them without
+    it) and one deleted while the message was on its way. A DM's edit or
+    deletion names its DM too, registered under its other party's name when
+    that's known.
+  - **A deleted channel's watermark and missed tally go,** and so do those
+    of a channel the reconnect sweep finds Discord no longer knows (deleted
+    while the server was down, say), so later starts stop fetching it.
 - **DM whitelist fails closed on edits.** With `DISCORD_DM_USERS` set, a DM
   edit whose author is unknown (uncached message) was forwarded because the
   check required an author; it is now dropped, like creates.
