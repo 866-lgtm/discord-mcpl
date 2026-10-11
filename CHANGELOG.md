@@ -177,9 +177,12 @@ in the git log and PR descriptions.
   billed. An item the player accepts but doesn't start within 10 s, or
   doesn't finish within 300 s, fails too, naming which wait ran out. It used
   to be reported as spoken in full though nothing was heard, as when the TTS
-  provider is unavailable at clearance. An item whose stream the player
-  reports an error for fails with that error, where it was reported as
-  finished. A barge-in still reports `interrupted`. Any other throw in
+  provider is unavailable at clearance, or ends the stream after clearance
+  before sending any audio. Such a reply now fails, and the rest of it isn't
+  voiced, where a later part used to be voiced as a new utterance. An item
+  whose stream the player reports an error for fails with that error, where
+  it was reported as finished. A barge-in still reports `interrupted`. Any
+  other throw in
   playback settles the playing and queued items the same way, and nothing a
   `failed` listener queues meanwhile waits for the next `play()`.
   `VoiceOutput` ends a failed utterance as it does an interrupted one: it
