@@ -74,6 +74,10 @@ const packageJson: typeof import('../package.json') = JSON.parse(
   readFileSync(new URL('../package.json', import.meta.url), 'utf8'),
 );
 
+/** Tools that read a channel's messages by channelId, held to the channel
+ *  filters' inspection boundary (DiscordAdapter.inspectionRefusal). */
+const INSPECTION_TOOLS: ReadonlySet<string> = new Set(['fetch_history', 'fetch_around']);
+
 type ChannelOpenRequest = ChannelsOpenParams & {
   channelId?: string;
   history?: { limit: number; beforeMessageId?: string; sinceLastSeen?: boolean };
@@ -1507,6 +1511,32 @@ export class DiscordMcplServer {
       }
     }
 
+    // Deliberate reads respect the channel filters' inspection boundary
+    // before any message is read. Names above resolve only among allowed
+    // channels; this holds a numeric id to the same rule. Tool arguments
+    // aren't checked against their schema, so a channelId that isn't a
+    // string is refused here, rather than let past the check to be
+    // stringified into Discord's route.
+    if (INSPECTION_TOOLS.has(name)) {
+      if (typeof args.channelId !== 'string' || args.channelId.trim().length === 0) {
+        return {
+          content: [textContent(`${name} needs channelId as a channel id string, such as "123456789012345678". Nothing was read.`)],
+          isError: true,
+        };
+      }
+      let refusal: string | null;
+      try {
+        refusal = await this.discord.inspectionRefusal(args.channelId);
+      } catch (err) {
+        // A lookup Discord refuses is explained as any tool's error is below.
+        return { content: [textContent(explainDiscordError(err, args, explain))], isError: true };
+      }
+      if (refusal) {
+        dbg('channel:inspection-refused', { tool: name, channelId: args.channelId });
+        return { content: [textContent(refusal)], isError: true };
+      }
+    }
+
     try {
       const result = await this.executeToolCall(name, args);
 
@@ -2784,6 +2814,16 @@ export class DiscordMcplServer {
     const result: ChannelOpenResponse = { channel: desc };
     const requested = params.history?.limit ?? 0;
     if (requested > 0) {
+      // Backscroll is a deliberate read, so it respects the channel filters'
+      // inspection boundary as fetch_history does. A channel registered
+      // before the filters narrowed stays registered until restart, so the
+      // registry alone doesn't keep it out. A refusal fails the open before
+      // anything is read or subscribed.
+      const refusal = await this.discord.inspectionRefusal(parsed.channelId);
+      if (refusal) {
+        dbg('channel-open:inspection-refused', { channelId: desc.id });
+        throw new Error(refusal);
+      }
       const limit = this.capHistoryLimit(parsed.channelId, Math.min(500, Math.max(0, requested)));
       const messages = await this.discord.fetchHistory(parsed.channelId, {
         limit,

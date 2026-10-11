@@ -196,7 +196,9 @@ export const toolDefinitions: ToolDefinition[] = [
       '(guild whitelist, optional per-guild channel whitelist) and which users may DM you. ' +
       'null means unrestricted. dmNotice says whether senders of refused DMs get an automatic ' +
       'delivery notice (off until you turn it on), and whether its state is `persisted` (notices are ' +
-      'suspended while it is not). Filters gate delivery only — the bot must also be a ' +
+      'suspended while it is not). Filters gate delivery, and the per-guild channel list also ' +
+      'bounds list_channels, list_channel_members, fetch_history and fetch_around, which refuse ' +
+      'a channel outside it. The bot must also be a ' +
       'member of a guild to see it at all. Reports the config plane\'s desired-vs-effective ' +
       'state (live / stale / unavailable — whitelists and suppression share one lifecycle, so ' +
       'a broken filters file makes ALL of them stale together) and reaction-suppression state ' +
