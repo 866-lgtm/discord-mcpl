@@ -22,6 +22,7 @@ const THREAD_OF_EXCLUDED = '410000000000000006';
 const OTHER_GUILD = '410000000000000007';
 const DM = '410000000000000008';
 const LOOKUP_FAILS = '410000000000000009'; // a channel whose lookup rejects
+const UNKNOWN = '410000000000000010'; // a channel whose lookup finds nothing
 
 const channels: Record<string, Record<string, unknown>> = {
   [ALLOWED]: { guildId: G1, parentId: null },
@@ -55,7 +56,12 @@ function adapterWith(t: TestContext, config: Partial<DiscordAdapterConfig>) {
     reads.push(`around:${channelId}`);
     return [];
   };
-  return { adapter, reads };
+  const sends: string[] = [];
+  a.sendMessage = async (channelId: string) => {
+    sends.push(channelId);
+    return { messageId: '430000000000000001', channelId };
+  };
+  return { adapter, reads, sends };
 }
 
 const REFUSAL = /is outside this residence's configured channel filters — filters bound inspection as well as delivery\. Nothing was read\.$/;
@@ -80,11 +86,11 @@ describe('inspectionRefusal', () => {
 
 describe('fetch_history and fetch_around by numeric id', () => {
   function serverWith(t: TestContext) {
-    const { adapter, reads } = adapterWith(t, {});
+    const { adapter, reads, sends } = adapterWith(t, {});
     const server = new DiscordMcplServer(adapter) as unknown as {
       handleToolCall(name: string, args: Record<string, unknown>): Promise<{ content: Array<{ text: string }>; isError?: boolean }>;
     };
-    return { server, reads };
+    return { server, reads, sends };
   }
 
   it('refuses an excluded channel, and a thread under one, before any message is read', async (t) => {
@@ -112,6 +118,38 @@ describe('fetch_history and fetch_around by numeric id', () => {
       assert.equal(res.content[0].text, 'Unknown Channel', tool);
     }
     assert.deepEqual(reads, [], 'no history was read');
+  });
+
+  it("refuses a channel whose lookup finds nothing, before any message is read", async (t) => {
+    const { server, reads } = serverWith(t);
+    for (const [tool, args] of [
+      ['fetch_history', { channelId: UNKNOWN }],
+      ['fetch_around', { channelId: UNKNOWN, messageId: '420000000000000001' }],
+    ] as const) {
+      const res = await server.handleToolCall(tool, args);
+      assert.equal(res.isError, true, tool);
+      assert.equal(res.content[0].text, `Channel ${UNKNOWN} not found`, tool);
+    }
+    assert.deepEqual(reads, [], 'no history was read');
+  });
+
+  it("refuses a channelId that isn't a string, rather than let it past the check", async (t) => {
+    const { server, reads } = serverWith(t);
+    for (const channelId of [[EXCLUDED], Number(EXCLUDED), undefined, '']) {
+      for (const tool of ['fetch_history', 'fetch_around']) {
+        const res = await server.handleToolCall(tool, { channelId, messageId: '420000000000000001' });
+        assert.equal(res.isError, true, `${tool} ${JSON.stringify(channelId)}`);
+        assert.match(res.content[0].text, /needs channelId as a channel id string.*Nothing was read\.$/);
+      }
+    }
+    assert.deepEqual(reads, [], 'no history was read');
+  });
+
+  it("doesn't hold a send to the read boundary", async (t) => {
+    const { server, sends } = serverWith(t);
+    const res = await server.handleToolCall('send_message', { channelId: EXCLUDED, content: 'hello' });
+    assert.ok(!res.isError, res.content[0]?.text);
+    assert.deepEqual(sends, [EXCLUDED]);
   });
 
   it('still reads allowed channels, threads under them, other guilds and DMs', async (t) => {

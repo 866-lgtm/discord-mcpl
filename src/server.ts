@@ -1512,8 +1512,17 @@ export class DiscordMcplServer {
 
     // Deliberate reads respect the channel filters' inspection boundary
     // before any message is read. Names above resolve only among allowed
-    // channels; this holds a numeric id to the same rule.
-    if (INSPECTION_TOOLS.has(name) && typeof args.channelId === 'string') {
+    // channels; this holds a numeric id to the same rule. Tool arguments
+    // aren't checked against their schema, so a channelId that isn't a
+    // string is refused here, rather than let past the check to be
+    // stringified into Discord's route.
+    if (INSPECTION_TOOLS.has(name)) {
+      if (typeof args.channelId !== 'string' || args.channelId.length === 0) {
+        return {
+          content: [textContent(`${name} needs channelId as a channel id string, such as "123456789012345678". Nothing was read.`)],
+          isError: true,
+        };
+      }
       let refusal: string | null;
       try {
         refusal = await this.discord.inspectionRefusal(args.channelId);

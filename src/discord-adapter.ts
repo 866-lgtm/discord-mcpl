@@ -95,9 +95,11 @@ export interface DiscordAdapterConfig {
   /** Per-guild channel whitelist. When a guild id has an entry here, only
    *  the listed channel ids (and threads under them) are visible/handled in
    *  that guild. It also bounds deliberate inspection: list_channels leaves
-   *  channels outside it out of its listing, and list_channel_members,
-   *  fetch_history and fetch_around refuse them (see inspectionRefusal).
-   *  Guilds without an entry are unrestricted. */
+   *  channels outside it out of its listing, list_channel_members refuses
+   *  them with its own check, and fetch_history and fetch_around refuse them
+   *  through inspectionRefusal. Guilds without an entry are unrestricted. An
+   *  entry applies only to a guild that guildIds lists too (normalizeFilters
+   *  drops the rest). */
   guildChannels?: Record<string, string[]>;
   /** DM user whitelist. When set, incoming DMs are only handled from these
    *  user ids; DMs from anyone else are dropped. Unset = all DMs allowed.
@@ -2072,7 +2074,11 @@ export class DiscordAdapter {
    *  bound delivery, not reads. */
   async inspectionRefusal(channelId: string): Promise<string | null> {
     const channel = await this.client.channels.fetch(channelId);
-    if (!channel || channel.isDMBased()) return null;
+    // A lookup that finds nothing can't be placed, so it fails closed, with
+    // the not-found error the read itself would give.
+    if (!channel) throw new Error(`Channel ${channelId} not found`);
+    // A DM passes: the DM list filters incoming DMs only.
+    if (channel.isDMBased()) return null;
     const guildId = 'guildId' in channel ? channel.guildId : null;
     const parentId = 'parentId' in channel ? channel.parentId : null;
     if (this.channelAllowed(guildId, channelId, parentId)) return null;

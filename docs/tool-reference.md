@@ -29,6 +29,6 @@ Deployments can expose this document through their resident's file-reading tool.
 
 ## Channel filters and deliberate reads
 
-Deliberate reads respect the residence's configured channel filters. `list_channels` leaves a channel outside them out of its listing; `list_channel_members`, `fetch_history` and `fetch_around` refuse such a channel whether it's named or given by numeric ID. A thread follows its parent channel.
+The per-guild channel list bounds these reads as well as delivery. `list_channels` leaves a channel outside it out of its listing, and `list_channel_members`, `fetch_history` and `fetch_around` refuse such a channel given by numeric ID. Channel names resolve only among the channels it admits, so an excluded channel isn't found by name either. A thread follows its parent channel. Other tools that take a channel aren't bounded by it; sends aren't.
 
 The other two filters don't restrict deliberate reads. The guild filter decides which guilds' channels are registered, resolvable by name, and delivered. The DM contact list filters incoming DMs.

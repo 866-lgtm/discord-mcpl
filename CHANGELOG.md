@@ -334,7 +334,9 @@ in the git log and PR descriptions.
   channel the configured channel list (`guildChannels`) excludes. Both now
   refuse such a channel before any message is read, by the rule
   `list_channels` and `list_channel_members` already apply (a thread or a
-  categorized channel admitted by its parent). The guild filter
+  categorized channel admitted by its parent). A `channelId` that isn't a
+  string, and a channel the lookup can't find, are refused before any read
+  too. The guild filter
   (registration, name resolution, delivery) and the DM contact list
   (incoming DMs) keep their meaning and don't restrict deliberate reads; the
   config docs now say what each filter bounds.
