@@ -3423,9 +3423,14 @@ export class DiscordMcplServer {
     let location = '';
     if (contextChanged) {
       // Discord-chosen names, rendered by the header rule (source-header.ts),
-      // so one can't read as structure; a thread name is always quoted.
+      // so one can't read as structure; a thread name is always quoted. A
+      // channel name with a space is quoted too, so one can't carry this
+      // prefix's own words (` in <guild>`): a text channel's name never has
+      // one, but a voice, stage or forum channel's can.
       const locationParts: string[] = [];
-      if (msg.channelName) locationParts.push(`#${headerValue(msg.channelName)}`);
+      if (msg.channelName) {
+        locationParts.push(`#${/\s/.test(msg.channelName) ? quotedValue(msg.channelName) : headerValue(msg.channelName)}`);
+      }
       if (msg.threadName) locationParts.push(`thread ${quotedValue(msg.threadName)}`);
       if (msg.guildName) locationParts.push(`in ${headerValue(msg.guildName)}`);
       else if (msg.guildId === null) locationParts.push('DM');

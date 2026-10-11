@@ -32,8 +32,10 @@ in the git log and PR descriptions.
   guild, thread or display name can't forge a second attribution, and the
   header stays one line. The same rule renders the attempted destination,
   a `send_dm` target that didn't resolve, and the location prefix
-  (`[#channel thread "name" in Guild]`) before message bodies.
-  `channelLabel` keeps the raw label.
+  (`[#channel thread "name" in Guild]`) before message bodies, where a
+  channel name with a space (a voice or stage channel's can have one) is
+  quoted too, so it can't carry the prefix's own words. `channelLabel`
+  keeps the raw label.
 
 - **RFC-006 event coalescing** (agent-framework #197, mcpl #5). When the host
   advertises `eventCoalescing`, a message create carries its stable subject

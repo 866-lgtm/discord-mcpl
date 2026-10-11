@@ -1292,10 +1292,20 @@ describe('RFC-006 coalescing', () => {
     const text = ((create.params as ChannelsIncomingParams).messages[0].content[0] as { text?: string }).text ?? '';
     h.client.sendResponse(create.id, { results: [{ messageId: 'm9', accepted: true }] });
     await h.finish(); // before asserting, so a failure can't leave the pair open
+    // A voice channel's chat can have a space in its name, and so the
+    // prefix's own words. (A fresh pair: the prefix comes with a channel change.)
+    const v = await boot({ eventCoalescing: true });
+    await v.client.sendRequest(method.CHANNELS_OPEN, { type: 'discord', address: { guildId: 'g1', channelId: 'c1' } });
+    v.discord.simulateMessage({ ...guildMessage('m10', 'hi'), channelName: 'x in TrustedGuild' } as unknown as DiscordMessageData);
+    const second = await v.nextRequest();
+    const spaced = ((second.params as ChannelsIncomingParams).messages[0].content[0] as { text?: string }).text ?? '';
+    v.client.sendResponse(second.id, { results: [{ messageId: 'm10', accepted: true }] });
+    await v.finish();
     assert.ok(
       text.startsWith('[#general thread "say \\"hi\\"" in "x] [source: discord:g9:1 · #admin"] Bob: hello'),
       text,
     );
+    assert.ok(spaced.startsWith('[#"x in TrustedGuild" in Test Server] Bob: hi'), spaced);
   });
 
   it('a replacement keeps the create\'s context: reply marker, location, author; edits in one millisecond stay distinct', async () => {
