@@ -13,6 +13,17 @@
  *                       (whitelist those channels + their threads only)
  *   DISCORD_DM_USERS  - Optional: Comma-separated user ID whitelist for DMs.
  *                       Nonempty = only listed users; empty/unset = anyone.
+ *                       A refused DM is never forwarded. The agent can turn
+ *                       on an automatic delivery notice to its sender (off
+ *                       by default; filters_update setDmNotice), sent at
+ *                       most once per 24 hours per sender and 10 an hour
+ *                       across all senders.
+ *   DISCORD_DM_NOTICES_FILE - Optional: where that notice's durable state
+ *                       lives (per-sender limits and the on/off setting; no
+ *                       message bodies). Default:
+ *                       $XDG_STATE_HOME/discord-mcpl/<bot user id>/dm-notices.json
+ *                       (~/.local/state when XDG_STATE_HOME is unset). If it
+ *                       can't be read or written, notices are suspended.
  *   DISCORD_ADMIN_USERS - Optional: Comma-separated user IDs allowed to use
  *                       admin slash commands (/undo). Unset = nobody.
  *   DISCORD_FILTERS_FILE - Optional: path to a JSON file holding the guild/
@@ -45,7 +56,7 @@
 import * as net from 'node:net';
 import { McplConnection } from '@animalabs/mcpl-core';
 import { DiscordAdapter } from './discord-adapter.js';
-import { DiscordMcplServer } from './server.js';
+import { DiscordMcplServer, serveStdio } from './server.js';
 import {
   resolveStartupFilters,
   loadFiltersFile,
@@ -116,6 +127,14 @@ async function main(): Promise<void> {
   }
 
   const server = new DiscordMcplServer(discord, voice);
+  // Refused DMs are handled from here on, whether or not a host is connected
+  // (TCP mode waits for its first client): each gets its notice decision and
+  // operator log line. Discord connected earlier, so the adapter has held
+  // the refusals it heard since then, and hands them over here. A new notice
+  // state's floor is the moment the state is created, here once the bot
+  // user id is known, so a held refusal from before it gets no notice, only
+  // its log line.
+  await server.setupDmRefusals();
 
   // The filters plane state (whitelists + reaction suppression share one
   // desired/effective/status lifecycle): hand it the startup filters, or
@@ -188,8 +207,8 @@ async function main(): Promise<void> {
     // Stdio transport — single client, MCP-compatible
     // Log to stderr (stdout is the protocol channel)
     console.error('[discord-mcpl] Starting on stdio');
-    const conn = McplConnection.fromStreams(process.stdin, process.stdout);
-    await server.serve(conn);
+    // Exits once the host closes stdin or the connection otherwise ends.
+    await serveStdio(server, McplConnection.fromStreams(process.stdin, process.stdout));
   } else if (tcpPort) {
     // TCP transport — single client
     console.error(`[discord-mcpl] Listening on TCP port ${tcpPort}`);

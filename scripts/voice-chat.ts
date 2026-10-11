@@ -12,13 +12,15 @@
  *  - The bot's own speech gets the same treatment: message posted when it
  *    starts speaking, edited at the end to reflect what was ACTUALLY heard —
  *    an interrupted utterance shows the voiced prefix, the unvoiced tail
- *    struck through. Other models read this channel and know exactly what
- *    was said, by whom, in what order.
+ *    struck through, and so does one the player couldn't play, with why.
+ *    Other models read this channel and know exactly what was said, by whom,
+ *    in what order.
  *
  * Conversation loop: utterance ends → (debounce for follow-ons) → history →
  * Claude streaming → deltas feed TTS (physics gates playback; barge-in
- * aborts both playback AND the model stream) → interruption reports edit
- * the message and annotate history so the model knows what the room heard.
+ * aborts both playback AND the model stream, and so does a reply the player
+ * can't play) → interruption and failure reports edit the message and
+ * annotate history so the model knows what the room heard.
  *
  * Usage (from discord-mcpl/):
  *   env $(grep -v '^#' .env.voice-test | xargs) ./node_modules/.bin/tsx \
@@ -66,7 +68,9 @@ playful and to have opinions.
 Turn-taking physics you live under: you never talk over a human; if someone speaks while you \
 are speaking, you are cut off mid-word and a report tells you exactly which of your words were \
 voiced and which were lost. User turns may note "[interrupted you after: ...]" — that means the \
-rest of that sentence was never heard; don't refer to unvoiced content as if it was said.`;
+rest of that sentence was never heard; don't refer to unvoiced content as if it was said. A note \
+that playback of your last reply failed, or that it couldn't be played, means the same: the room \
+heard your reply up to where the note's quote ends, or nothing.`;
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates] });
 const anthropic = new Anthropic(); // ANTHROPIC_API_KEY from env
@@ -110,11 +114,21 @@ client.once('ready', async () => {
   // ── Conversation state ──────────────────────────────────────────────────
   const history: Anthropic.MessageParam[] = [];
   let pendingUserLines: string[] = [];
+  // Notes for the model's next turn that don't start one: a turn prompted by
+  // "your reply couldn't be played" would likely fail the same way, and the
+  // harness would loop on model calls.
+  let pendingNotes: string[] = [];
   let turnTimer: ReturnType<typeof setTimeout> | null = null;
   let respNum = 0;
   let activeStream: { abort: () => void; id: string } | null = null;
   // Bot utterance accounting: id → { editor, fullText }
   const botMsgs = new Map<string, { editor: ReturnType<typeof makeEditor>; fullText: string }>();
+  // History keeps what the room heard. A reply that ends short (interrupted,
+  // or couldn't be played) while the model is still generating it leaves
+  // the heard part here, for respond() to write instead of the whole reply;
+  // one that ends short after its turn is written rewrites that turn.
+  const heardOnly = new Map<string, string>();
+  const turns = new Map<string, Anthropic.MessageParam>();
 
   // ── Listening leg: per-speaker Scribe sessions, transmission-bounded ────
   interface Listener {
@@ -190,12 +204,14 @@ client.once('ready', async () => {
   async function respond(): Promise<void> {
     if (pendingUserLines.length === 0) return;
     if (activeStream) return; // still talking; new speech will barge in and re-schedule
-    const userText = pendingUserLines.join('\n');
+    const userText = [...pendingNotes, ...pendingUserLines].join('\n');
+    pendingNotes = [];
     pendingUserLines = [];
     history.push({ role: 'user', content: userText });
 
     const id = `resp${++respNum}`;
     let full = '';
+    let completed = false;
     const stream = anthropic.messages.stream({
       model: MODEL,
       max_tokens: 1024,
@@ -217,17 +233,26 @@ client.once('ready', async () => {
 
     try {
       const final = await stream.finalMessage();
+      completed = true;
       if (final.stop_reason === 'refusal') console.log('[chat] model refused');
-      history.push({ role: 'assistant', content: full || '…' });
       console.log(`[said→queue] ${full.slice(0, 100)}…`);
     } catch (err) {
-      // Aborted (barge-in) or API error. History gets what was actually voiced
-      // via the utterance report below; if nothing was, drop the turn.
+      // Aborted (barge-in, or a reply that couldn't be played) or API error.
       if (!(err as Error).message?.includes('abort')) console.error('[chat] stream error:', (err as Error).message);
-      if (full && history[history.length - 1]?.role !== 'assistant') {
-        history.push({ role: 'assistant', content: full });
-      }
     } finally {
+      // History gets what the room heard: the heard part if the utterance
+      // has already ended short, else the whole reply, which the utterance
+      // report below rewrites if it ends short later. A stream that failed
+      // before any text leaves no turn.
+      const heard = heardOnly.get(id);
+      heardOnly.delete(id);
+      if (heard !== undefined) {
+        history.push({ role: 'assistant', content: heard || '…' });
+      } else if (full || completed) {
+        const turn: Anthropic.MessageParam = { role: 'assistant', content: full || '…' };
+        history.push(turn);
+        if (full) turns.set(id, turn);
+      }
       out.handleComplete(id);
       activeStream = null;
       // Anything said while we were generating gets answered now.
@@ -235,30 +260,42 @@ client.once('ready', async () => {
     }
   }
 
-  // ── Interruption accounting → chat message + history truth ─────────────
+  // ── Utterance accounting → chat message + history truth ────────────────
   out.onReport((r) => {
     const entry = botMsgs.get(r.inferenceId);
-    if (r.status === 'interrupted') {
-      // Abort the model stream if it's still generating this utterance.
-      if (activeStream?.id === r.inferenceId) activeStream.abort();
-      const who = r.interruptedBy?.username ?? 'someone';
-      if (entry) {
-        const cut = r.unvoicedText ? ` ~~${r.unvoicedText.slice(0, 500)}~~` : '';
-        entry.editor.final(`🔊 **${VOICE_NAME}**: ${r.voicedText}${cut}\n-# ✂️ interrupted by ${who}${r.estimated ? ' (approx.)' : ''}`);
-      }
-      // Rewrite history so the model knows what the room actually heard.
-      for (let i = history.length - 1; i >= 0; i--) {
-        if (history[i]!.role === 'assistant') {
-          history[i] = { role: 'assistant', content: r.voicedText || '…' };
-          break;
-        }
-      }
-      pendingUserLines.push(`[you were interrupted by ${who} after: "${r.voicedText.slice(-120)}"]`);
-      console.log(`[report] interrupted by ${who}; voiced ${r.voicedText.length}/${r.voicedText.length + r.unvoicedText.length} chars`);
-    } else if (entry) {
-      entry.editor.final(`🔊 **${VOICE_NAME}**: ${entry.fullText}`);
-    }
     botMsgs.delete(r.inferenceId);
+    const turn = turns.get(r.inferenceId);
+    turns.delete(r.inferenceId);
+    if (r.status === 'spoken') {
+      if (entry) entry.editor.final(`🔊 **${VOICE_NAME}**: ${entry.fullText}`);
+      return;
+    }
+    // Interrupted, or the player couldn't play it ('expired' needs a
+    // maxHoldMs, which this harness doesn't set): the room heard only
+    // r.voicedText. Rewrite history so the model knows that.
+    if (activeStream?.id === r.inferenceId) {
+      // Still generating: stop the model; respond() writes what was heard.
+      heardOnly.set(r.inferenceId, r.voicedText);
+      activeStream.abort();
+    } else if (turn) {
+      turn.content = r.voicedText || '…';
+    }
+    const who = r.interruptedBy?.username ?? 'someone';
+    const reason = r.failure ?? 'playback failed';
+    const why = r.status === 'interrupted' ? `interrupted by ${who}` : `couldn't be played: ${reason}`;
+    if (entry) {
+      const cut = r.unvoicedText ? ` ~~${r.unvoicedText.slice(0, 500)}~~` : '';
+      const mark = r.status === 'interrupted' ? '✂️' : '⚠️';
+      entry.editor.final(`🔊 **${VOICE_NAME}**: ${r.voicedText}${cut}\n-# ${mark} ${why}${r.estimated && r.playedMs > 0 ? ' (approx.)' : ''}`);
+    }
+    if (r.status === 'interrupted') {
+      pendingUserLines.push(`[you were interrupted by ${who} after: "${r.voicedText.slice(-120)}"]`);
+    } else {
+      pendingNotes.push(r.voicedText
+        ? `[playback of your last reply failed (${reason}) after: "${r.voicedText.slice(-120)}"]`
+        : `[your last reply couldn't be played (${reason}); nobody heard it]`);
+    }
+    console.log(`[report] ${why}; voiced ${r.voicedText.length}/${r.voicedText.length + r.unvoicedText.length} chars`);
   });
 
   console.log('[chat] live — speak in the channel');
