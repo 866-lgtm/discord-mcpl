@@ -420,6 +420,43 @@ in the git log and PR descriptions.
   is checked whole before it changes anything, so a malformed one leaves the
   grants as they were, where before it could apply its enables and skip its
   disables.
+- **The rest of what ended the serve loop or the process.** None of these
+  ends either now:
+  - **A line on the connection that isn't JSON.** The connection emitted an
+    error that nothing listened for, which ends a Node process. It's now
+    logged, and the loop reads on. The listener stays on the connection
+    after `serve()` returns, so a late stream error is logged too.
+  - **A client that leaves before `initialize`.** The handshake read sat
+    outside the loop's catch, so `serve()` rejected and the process exited.
+    Over TCP, the server now goes on to its next client.
+  - **Anything else a client sends before `initialize`.** It ended the
+    session. Now a `ping` is answered, any other request is answered with
+    an error (-32002), a notification is dropped with a log line, and the
+    handshake waits on for `initialize`. A `ping` after it is answered too,
+    where it got -32601.
+  - **A request handler that throws something other than an Error**, such
+    as `undefined`. The error answer read `.stack` off the value and threw
+    itself, which ended the loop with the request unanswered. The request is
+    now answered -32603 with the value as text, and the loop reads on. (A
+    value with no prototype can't be made text, so it's answered with a
+    placeholder; an Error with an empty message, with its name.) A request
+    the server still fails to answer no longer ends the loop either.
+  - **The same kind of value in the start-up work** (channel registration
+    and the reconnect sweep). It escaped their catches as an unhandled
+    rejection, which ends the process. It's now logged, and the sweep goes
+    on to its next channel.
+
+  The handshake no longer reads past `initialize`. A request a host sends
+  before `notifications/initialized` used to be read there and dropped. Now
+  it's answered. The "Client initialized" and "Client disconnected" lines go
+  to stderr, where they went to stdout, the stdio transport's protocol
+  channel. `serve()` closes its connection when it returns, whatever ended
+  it. The stdio transport exits with status 0 when its connection ends, as
+  MCP's stdio shutdown expects, rather than stay logged in to Discord with
+  no host. A host that leaves before `initialize` ends it that way too,
+  where it exited 1 with "Fatal error". A read error on a TCP socket or on
+  stdin still ends the process: it also reaches mcpl-core's readline
+  interface, which listens for none.
 - **Edits and deletes carry their author and location.** The push-event
   origin now includes `guildId`, the composite `mcplChannelId`, `messageId`
   and (when known) `authorId`/`authorName`, and an edit reads
