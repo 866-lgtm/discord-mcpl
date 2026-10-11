@@ -998,9 +998,11 @@ export class DiscordMcplServer {
         if (msg.type === 'request') {
           await this.handleRequest(msg.request);
         } else {
-          // A notification has no reply to carry an error, and one that
-          // throws must not end this loop: every later request would go
-          // unread, and the host would wait each one out as unconfirmed.
+          // A notification has no reply to carry an error, and one whose
+          // handler throws synchronously must not end this loop: every later
+          // request would go unread, and the host would wait each one out as
+          // unconfirmed. This catches synchronous throws only: a promise a
+          // handler starts has to settle its own errors.
           try {
             this.handleNotification(msg.notification);
           } catch (err) {
@@ -1008,6 +1010,11 @@ export class DiscordMcplServer {
               `[discord-mcpl] notification ${msg.notification.method} failed:`,
               err,
             );
+            dbg('handleNotification:error', {
+              method: msg.notification.method,
+              error: err instanceof Error ? err.message : String(err),
+              stack: err instanceof Error ? err.stack?.split('\n').slice(0, 8).join('\n') : undefined,
+            });
           }
         }
       }
@@ -1241,14 +1248,26 @@ export class DiscordMcplServer {
   }
 
   /** Shared body of featureSets/update, both forms (§6.7). Also resolves
-   *  the policy gate that releases the reconnect sweep (see serve()). */
+   *  the policy gate that releases the reconnect sweep (see serve()).
+   *  An update applies whole or not at all: its lists are checked before
+   *  anything changes, so a malformed one throws and leaves the grants as
+   *  they were (the notification form has no reply to say it failed). */
   private applyFeatureSetsUpdate(p: FeatureSetsUpdateParams): void {
-    if (p.enabled) {
-      for (const name of p.enabled) this.enabledFeatureSets.add(name);
+    if (typeof p !== 'object' || p === null) {
+      throw new Error('featureSets/update: params must be an object');
     }
-    if (p.disabled) {
-      for (const name of p.disabled) this.enabledFeatureSets.delete(name);
-    }
+    const names = (field: 'enabled' | 'disabled'): string[] => {
+      const list: unknown = p[field];
+      if (list === undefined || list === null) return [];
+      if (!Array.isArray(list) || !list.every((name) => typeof name === 'string')) {
+        throw new Error(`featureSets/update: ${field} must be a list of feature-set names`);
+      }
+      return list;
+    };
+    const enabled = names('enabled');
+    const disabled = names('disabled');
+    for (const name of enabled) this.enabledFeatureSets.add(name);
+    for (const name of disabled) this.enabledFeatureSets.delete(name);
     this.resolvePolicyAnswered();
   }
 
@@ -1257,9 +1276,11 @@ export class DiscordMcplServer {
   private handleNotification(notif: JsonRpcNotification): void {
     switch (notif.method) {
       case method.FEATURE_SETS_UPDATE: {
-        // §6.7 Notification form: descriptive metadata only. Grant-bearing
-        // updates (including the §5.3 initial policy) arrive as a Request —
-        // see the handleRequest case.
+        // §6.7 Notification form. A 0.5 host sends grant-bearing updates
+        // (including the §5.3 initial policy) as a Request (see the
+        // handleRequest case), but hosts before 0.5 send every update this
+        // way, so it gets the same body and changes the grants too: whole, or
+        // not at all when it's malformed.
         this.applyFeatureSetsUpdate(notif.params as FeatureSetsUpdateParams);
         break;
       }

@@ -163,12 +163,15 @@ in the git log and PR descriptions.
   reply, which Discord refuses with "Unknown interaction" once its
   3-second window has passed, took the whole server down. The dispatch now
   catches and logs a handler's failure.
-- **A notification whose handler throws no longer stops the server.** The
-  main loop read each message and dispatched notifications without a guard,
-  so a synchronous throw in one (a malformed `featureSets/update`, a typing
-  or voice handler failing) ended the loop. The server then read nothing
-  more, and every later request went unanswered until the host timed it
-  out. The throw is now logged and the loop goes on.
+- **A notification whose handler throws synchronously no longer stops the
+  server.** The main loop read each message and dispatched notifications
+  without a guard, so a synchronous throw in one, such as a notification
+  whose params are missing or malformed, ended the loop. The server then read
+  nothing more, and every later request went unanswered until the host timed
+  it out. The throw is now logged and the loop goes on. A `featureSets/update`
+  is checked whole before it changes anything, so a malformed one leaves the
+  grants as they were, where before it could apply its enables and skip its
+  disables.
 - **Edits and deletes carry their author and location.** The push-event
   origin now includes `guildId`, the composite `mcplChannelId`, `messageId`
   and (when known) `authorId`/`authorName`, and an edit reads
