@@ -47,7 +47,11 @@ import type {
 } from '@animalabs/mcpl-core';
 
 import type { DiscordAdapter, DiscordMessageData, DiscordAttachment, OutgoingFile, ReactionSummary, MessageEventInfo, DmRefusal } from './discord-adapter.js';
+import { LATEST_FROM_WINDOW } from './discord-adapter.js';
 import { DM_NOTICE_TEXT, DmNoticeState, resolveDmNoticesPath, type DmNoticeDecision } from './dm-notices.js';
+
+/** How much of a latestFrom target's text its receipt echoes. */
+const LATEST_FROM_EXCERPT = 80;
 import type { ChatInputCommandInteraction } from 'discord.js';
 import { MessageFlags } from 'discord.js';
 import { toolDefinitions } from './tools.js';
@@ -1586,14 +1590,16 @@ export class DiscordMcplServer {
         const content = (args.content as string | undefined) ?? '';
         const files = args.files as OutgoingFile[] | undefined;
         requireContentOrFiles(content, files);
+        const { messageId: replyTo, target } = await this.resolveTargetMessage(channelId, args);
         const result = await this.discord.sendMessage(
           channelId,
           content,
-          { replyTo: args.messageId as string, files },
+          { replyTo, files, ...(target ? { requireReplyTarget: true } : {}) },
         );
         this.stateTracker.recordSent(result.messageId, channelId, content);
         const shifted = this.markOutboundSend(channelId);
-        return this.augmentSendResult(result.messageId, channelId, shifted);
+        const receipt = await this.augmentSendResult(result.messageId, channelId, shifted);
+        return target ? { ...receipt, target } : receipt;
       }
 
       case 'send_dm': {
@@ -1609,21 +1615,19 @@ export class DiscordMcplServer {
         return this.augmentSendResult(result.messageId, result.channelId, shifted);
       }
 
-      case 'add_reaction':
-        await this.discord.addReaction(
-          args.channelId as string,
-          args.messageId as string,
-          args.emoji as string,
-        );
-        return 'Reaction added';
+      case 'add_reaction': {
+        const channelId = args.channelId as string;
+        const { messageId, target } = await this.resolveTargetMessage(channelId, args);
+        await this.discord.addReaction(channelId, messageId, args.emoji as string);
+        return target ? { result: 'Reaction added', target } : 'Reaction added';
+      }
 
-      case 'remove_reaction':
-        await this.discord.removeReaction(
-          args.channelId as string,
-          args.messageId as string,
-          args.emoji as string,
-        );
-        return 'Reaction removed';
+      case 'remove_reaction': {
+        const channelId = args.channelId as string;
+        const { messageId, target } = await this.resolveTargetMessage(channelId, args);
+        await this.discord.removeReaction(channelId, messageId, args.emoji as string);
+        return target ? { result: 'Reaction removed', target } : 'Reaction removed';
+      }
 
       case 'edit_message':
         await this.discord.editMessage(
@@ -1878,6 +1882,56 @@ export class DiscordMcplServer {
       default:
         throw new Error(`Unknown tool: ${name}`);
     }
+  }
+
+  /** The target of a reply or reaction: exactly one of messageId or
+   *  latestFrom, each a string or null. Only omission and null mean absent:
+   *  a string, blank included, is a selector given, so a blank one beside
+   *  another is two, and a blank one alone names nothing. A latestFrom
+   *  selection is resolved once, its message id frozen for the action, and
+   *  echoed back so the resident can recognize what was chosen. */
+  private async resolveTargetMessage(
+    channelId: string,
+    args: Record<string, unknown>,
+  ): Promise<{ messageId: string; target?: Record<string, unknown> }> {
+    const selector = (value: unknown, name: string): string | undefined => {
+      if (value === undefined || value === null) return undefined;
+      if (typeof value !== 'string') throw new Error(`${name} must be a string or null; nothing was done.`);
+      return value;
+    };
+    const messageId = selector(args.messageId, 'messageId');
+    const latestFrom = selector(args.latestFrom, 'latestFrom');
+    if (messageId !== undefined && latestFrom !== undefined) {
+      throw new Error('Give messageId or latestFrom, not both; nothing was done.');
+    }
+    if (messageId === undefined && latestFrom === undefined) {
+      throw new Error('Give exactly one of messageId or latestFrom; nothing was done.');
+    }
+    if (messageId !== undefined) {
+      if (!messageId.trim()) throw new Error('messageId is blank, so it names no message; nothing was done.');
+      return { messageId: messageId.trim() };
+    }
+    if (!latestFrom!.trim()) throw new Error('latestFrom is blank, so it names no one; nothing was done.');
+    const r = await this.discord.resolveLatestFrom(channelId, latestFrom!);
+    if (!r.ok) throw new Error(r.message);
+    // Cut by code points, never inside a surrogate pair: at most
+    // LATEST_FROM_EXCERPT characters, its ellipsis included.
+    const text = Array.from(r.message.cleanContent.replace(/\s+/g, ' ').trim());
+    return {
+      messageId: r.message.id,
+      target: {
+        messageId: r.message.id,
+        author: { id: r.authorId, name: r.authorLabel },
+        // The raw Discord id, named as such: in receipts `channelId` is the
+        // canonical discord:<guild|dm>:<channel> form.
+        discordChannelId: channelId,
+        timestamp: r.message.timestamp.toISOString(),
+        excerpt: text.length > LATEST_FROM_EXCERPT ? `${text.slice(0, LATEST_FROM_EXCERPT - 1).join('')}…` : text.join(''),
+        selectedBy:
+          `latestFrom "${latestFrom}": their newest message among the ${LATEST_FROM_WINDOW} most recent ` +
+          'in this channel when this call ran (not a claim about what you have seen)',
+      },
+    };
   }
 
   /** Hot-apply a whitelist change: mutate the filters file (source of truth),

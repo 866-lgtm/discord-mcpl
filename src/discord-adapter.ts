@@ -36,6 +36,7 @@ import { dbg } from './debug-log.js';
 import {
   buildCandidates,
   formatChannelLabel,
+  isSnowflake,
   parseChannelRef,
   resolveChannelName,
   type ResolveResult,
@@ -213,6 +214,19 @@ export interface DiscordMemberInfo {
   isBot: boolean;
 }
 
+/** How far latestFrom looks: the newest messages fetched at invocation. */
+export const LATEST_FROM_WINDOW = 100;
+/** How long latestFrom remembers a guild whose member-cache warm-up failed,
+ *  refusing names there at once rather than waiting out another download. */
+const LATEST_FROM_WARMUP_RETRY_MS = 10 * 60_000;
+/** One page of List Thread Members, should Discord page a listing without
+ *  with_member (see listChannelMembers). */
+const THREAD_MEMBER_PAGE = 100;
+
+export type LatestFromResult =
+  | { ok: true; message: HistoryMessage; authorId: string; authorLabel: string }
+  | { ok: false; message: string };
+
 export interface DiscordChannelMembers {
   channelId: string;
   channelName: string | null;
@@ -230,13 +244,27 @@ export interface DiscordChannelMembers {
   truncated: boolean;
   /** Scope caveat the agent should see (set for threads). */
   note?: string;
+  /** Members listed by id only because their names couldn't be resolved
+   *  (thread members after a failed member-cache warm-up); absent when 0. */
+  unresolved?: number;
+  /** Set when Discord returned exactly one page of a thread's joined members,
+   *  so there may be more than listed. */
+  possiblyIncomplete?: true;
 }
 
 export interface HistoryMessage {
   id: string;
   authorId: string;
+  /** The author's username. */
   authorName: string;
+  /** The author's display name: their server nickname or global display
+   *  name as discord.js resolves it (the member's, else the account's global
+   *  name), else the username. */
+  authorDisplayName?: string;
   isBot: boolean;
+  /** Set on a system notice (a pin, a join, a thread start…): a message
+   *  discord.js counts as system, which nobody wrote as a message. */
+  system?: true;
   /** Raw content (mentions encoded as `<@id>`). */
   content: string;
   /** Content with mentions resolved (@username, #channel, @role). Falls back
@@ -537,6 +565,9 @@ export class DiscordAdapter {
   private guildIds?: string[];
   private guildChannels?: Map<string, Set<string>>;
   private dmUsers?: Set<string>;
+  /** Guilds whose member-cache warm-up failed during a latestFrom name lookup,
+   *  with when: names there are refused at once for LATEST_FROM_WARMUP_RETRY_MS. */
+  private latestFromWarmupFailures = new Map<string, number>();
   /** In-flight mutation deliveries, ordered per Discord message. */
   private messageEventDeliveries = new Map<string, Promise<void>>();
   /** Creates waiting for their thread to be fetched, per channel, so later
@@ -856,7 +887,7 @@ export class DiscordAdapter {
   async sendMessage(
     channelId: string,
     content: string,
-    options?: { replyTo?: string; files?: OutgoingFile[] },
+    options?: { replyTo?: string; files?: OutgoingFile[]; requireReplyTarget?: boolean },
   ): Promise<{ messageId: string }> {
     const channel = await this.client.channels.fetch(channelId);
     if (!channel || !('send' in channel)) {
@@ -873,7 +904,15 @@ export class DiscordAdapter {
       const isLast = i === chunks.length - 1;
       const sent = await (channel as TextChannel | DMChannel).send({
         content: chunks[i] || undefined,
-        reply: i === 0 && options?.replyTo ? { messageReference: options.replyTo } : undefined,
+        // A reply to a message that's gone fails rather than posting
+        // unthreaded: discord.js sends fail_if_not_exists from the client's
+        // failIfNotExists option, true by default. requireReplyTarget states
+        // it for a reply whose target the server chose (a latestFrom
+        // selection), so that one keeps failing whatever the default for
+        // other replies becomes (#58 makes them post unthreaded instead).
+        reply: i === 0 && options?.replyTo
+          ? { messageReference: options.replyTo, ...(options.requireReplyTarget ? { failIfNotExists: true } : {}) }
+          : undefined,
         files: isLast && attachments.length > 0 ? attachments : undefined,
       });
       lastId = sent.id;
@@ -1206,7 +1245,9 @@ export class DiscordAdapter {
           id: m.id,
           authorId: m.author.id,
           authorName: m.author.username,
+          authorDisplayName: m.member?.displayName ?? m.author.displayName,
           isBot: m.author.bot,
+          ...(m.system ? { system: true as const } : {}),
           content: cleanContent,
           cleanContent,
           attachments: mapAllAttachments(m),
@@ -1256,7 +1297,9 @@ export class DiscordAdapter {
         id: m.id,
         authorId: m.author.id,
         authorName: m.author.username,
+        authorDisplayName: m.member?.displayName ?? m.author.displayName,
         isBot: m.author.bot,
+        ...(m.system ? { system: true as const } : {}),
         content: cleanContent,
         cleanContent,
         attachments: mapAllAttachments(m),
@@ -1385,6 +1428,8 @@ export class DiscordAdapter {
    *  correctness depends on a FULL cache (permission-computed member lists)
    *  must check it — a partial cache silently narrows their answer. */
   private async warmGuildMemberCache(guild: Guild): Promise<boolean> {
+    // The cache already holds every member: nothing to download.
+    if (guild.memberCount > 0 && guild.members.cache.size >= guild.memberCount) return true;
     const TIMEOUT_MS = this.memberFetchTimeoutMs;
     const fetchP = guild.members.fetch();
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -1539,10 +1584,27 @@ export class DiscordAdapter {
    *  Configured channel filters bound what a residence may INSPECT, not just
    *  what gets delivered: a channel outside them throws, matching
    *  listChannels' enforcement. Threads count as their parent channel, same
-   *  as event routing. */
-  async listChannelMembers(channelId: string): Promise<DiscordChannelMembers> {
+   *  as event routing.
+   *
+   *  `cap: false` returns every member (for author resolution); the listing
+   *  tool keeps the MEMBER_LIST_CAP cut. `warmups` lets one operation that
+   *  lists twice in a guild (a thread, then its parent) warm the member cache
+   *  once: each guild's first outcome is recorded there and reused, so a
+   *  success isn't downloaded again and a failure isn't waited out again. */
+  async listChannelMembers(
+    channelId: string,
+    opts: { cap?: boolean; withPermission?: bigint; warmups?: Map<string, boolean> } = {},
+  ): Promise<DiscordChannelMembers> {
     const channel = await this.client.channels.fetch(channelId);
     if (!channel) throw new Error(`Channel ${channelId} not found`);
+    const warm = async (guild: Guild): Promise<boolean> => {
+      let warmed = opts.warmups?.get(guild.id);
+      if (warmed === undefined) {
+        warmed = await this.warmGuildMemberCache(guild);
+        opts.warmups?.set(guild.id, warmed);
+      }
+      return warmed;
+    };
 
     const toInfo = (m: GuildMember): DiscordMemberInfo => ({
       id: m.id,
@@ -1568,8 +1630,8 @@ export class DiscordAdapter {
         channelName,
         scope,
         total: members.length,
-        members: members.slice(0, MEMBER_LIST_CAP),
-        truncated: members.length > MEMBER_LIST_CAP,
+        members: opts.cap === false ? members : members.slice(0, MEMBER_LIST_CAP),
+        truncated: opts.cap !== false && members.length > MEMBER_LIST_CAP,
         ...(note ? { note } : {}),
       };
     };
@@ -1596,22 +1658,35 @@ export class DiscordAdapter {
       if (!this.channelAllowed(guild?.id ?? channel.guildId, channelId, channel.parentId)) {
         throw filterDenied();
       }
+      // Discord documents List Thread Members as paged only with with_member,
+      // which this call doesn't pass, so it should return every joined
+      // member. Its limit has a default of 100 all the same, and nothing here
+      // shows which holds, so a listing of exactly one page may be cut short.
       const threadMembers = await channel.members.fetch();
+      const pageFull = threadMembers.size === THREAD_MEMBER_PAGE;
       // Bulk resolution: one guarded cache warm, then cache reads — never a
       // serial per-member REST fetch. Warm failure only degrades DISPLAY here
       // (the membership list itself comes from the thread, not the guild
       // cache), so unknown members fall back to id-only rather than aborting.
-      await this.warmGuildMemberCache(guild);
+      await warm(guild);
+      let unresolved = 0;
       const members = [...threadMembers.values()].map((tm) => {
         const gm = guild.members.cache.get(tm.id);
+        if (!gm) unresolved++;
         return gm ? toInfo(gm) : { id: tm.id, username: tm.id, displayName: tm.id, isBot: false };
       });
-      return finish(
+      const listed = finish(
         channel.name,
         'thread-joined',
         members,
-        'Joined members only. Users with access to the parent channel may be able to read a public thread without joining it.',
+        'Joined members only. Users with access to the parent channel may be able to read a public thread without joining it.' +
+          (pageFull ? ` Discord returned exactly one page (${THREAD_MEMBER_PAGE}) of joined members, so there may be more.` : ''),
       );
+      return {
+        ...listed,
+        ...(unresolved > 0 ? { unresolved } : {}),
+        ...(pageFull ? { possiblyIncomplete: true as const } : {}),
+      };
     }
 
     if ('members' in channel && 'guild' in channel) {
@@ -1624,7 +1699,7 @@ export class DiscordAdapter {
       // warm it first (timeout-guarded) so the answer covers everyone, not
       // just recent speakers. A failed warm-up must throw: a list computed
       // over a partial cache would be silently incomplete.
-      const warmed = await this.warmGuildMemberCache(guildChannel.guild);
+      const warmed = await warm(guildChannel.guild);
       if (!warmed) {
         throw new Error(
           'Guild member cache warm-up failed or timed out — a member list computed now ' +
@@ -1632,11 +1707,202 @@ export class DiscordAdapter {
           '(Developer Portal → Bot → Privileged Gateway Intents).',
         );
       }
-      const members = [...guildChannel.members.values()].map(toInfo);
+      // withPermission narrows a guild channel's viewers to those holding a
+      // permission there (computed per member: overwrites, roles, admin).
+      const members = [...guildChannel.members.values()]
+        .filter((m) => opts.withPermission === undefined
+          || (guildChannel as GuildBasedChannel & { permissionsFor(m: GuildMember): Readonly<PermissionsBitField> | null })
+            .permissionsFor(m)?.has(opts.withPermission) === true)
+        .map(toInfo);
       return finish(guildChannel.name, 'guild-channel', members);
     }
 
     throw new Error(`Channel ${channelId} has no queryable membership (type ${channel.type})`);
+  }
+
+  /**
+   * Resolve a reply/reaction target by its author: the newest message from
+   * that author among the LATEST_FROM_WINDOW most recent messages in the
+   * channel, fetched now. Only a message someone wrote counts: a system
+   * notice (a pin, a join, a thread start) is never their latest message. A
+   * numeric id (or <@id>, or @id) names the author directly. A name resolves
+   * within the channel's identity context (everyone who can read it, bots
+   * included: a guild channel's viewers, a public thread's joined members
+   * plus its parent's viewers, a private thread's members plus the parent's
+   * viewers who can manage threads, a DM's two parties; plus the authors in
+   * that window), by username or display name, and must match one person: a
+   * collision is refused with choices, never guessed. When that context
+   * can't be read whole (the member list fails, lists members it couldn't
+   * name, or may be cut short), a name can't be checked for collisions and
+   * is refused; a numeric id still works. No match in the window is refused;
+   * nothing older or by anyone else is ever chosen. A channel outside the
+   * configured filters (guildIds, guildChannels with a thread by its parent,
+   * and for a DM the other party against dmUsers) is refused before its
+   * history or members are read, and again after them, since those filters
+   * bound inspection as well as delivery, as in listChannels and
+   * listChannelMembers.
+   */
+  async resolveLatestFrom(channelId: string, ref: string): Promise<LatestFromResult> {
+    const raw = ref.trim();
+    // '@' (or '@' and spaces) names no one: refused before anything is read.
+    const bare = raw.replace(/^@/, '').trim();
+    if (!bare) return { ok: false, message: 'latestFrom names no one; nothing was done.' };
+    const channel = await this.client.channels.fetch(channelId);
+    if (!channel) throw new Error(`Channel ${channelId} not found`);
+    const refused = await this.latestFromFilterRefusal(channel, channelId);
+    if (refused) return { ok: false, message: refused };
+    const guildId = 'guildId' in channel && channel.guildId ? channel.guildId : null;
+    const window = await this.fetchHistory(channelId, { limit: LATEST_FROM_WINDOW });
+    if (window.length === 0) {
+      return { ok: false, message: 'This channel has no messages, so latestFrom has nothing to choose from; nothing was done.' };
+    }
+    const newestFirst = [...window].sort((a, b) => (BigInt(b.id) > BigInt(a.id) ? 1 : BigInt(b.id) < BigInt(a.id) ? -1 : 0));
+    const span = `the ${newestFirst.length} most recent messages here (${newestFirst[newestFirst.length - 1].timestamp.toISOString()} to ${newestFirst[0].timestamp.toISOString()})`;
+    const displayOf = (m: HistoryMessage): string => m.authorDisplayName ?? m.authorName;
+    const mention = /^<@!?(\d{17,20})>$/.exec(raw);
+    let authorId: string;
+    let authorLabel: string;
+    if (mention || isSnowflake(bare)) {
+      authorId = mention ? mention[1] : bare;
+      const seen = newestFirst.find((m) => m.authorId === authorId);
+      authorLabel = seen ? displayOf(seen) : authorId;
+    } else {
+      const name = bare.toLowerCase();
+      const matches = new Map<string, { label: string; username?: string; isBot: boolean }>();
+      let identities: DiscordMemberInfo[];
+      let unresolved = 0;
+      let incomplete = false;
+      // Both listings below share one guild member-cache warm-up. A guild
+      // whose warm-up failed lately is taken as failed again, at once.
+      const warmups = new Map<string, boolean>();
+      const failedAt = guildId ? this.latestFromWarmupFailures.get(guildId) : undefined;
+      const rememberedFailure = failedAt !== undefined && Date.now() - failedAt < LATEST_FROM_WARMUP_RETRY_MS;
+      if (guildId && rememberedFailure) warmups.set(guildId, false);
+      try {
+        const lists = [await this.listChannelMembers(channelId, { cap: false, warmups })];
+        if (lists[0].scope === 'thread-joined') {
+          // A thread is readable beyond its joined members, so a name must be
+          // unique among those readers as well: for a public thread, everyone
+          // who can view its parent; for a private one, the parent's viewers
+          // who can manage threads there (administrators included).
+          if (!channel.isThread()) throw new Error(`channel ${channelId} was listed as a thread but isn't one`);
+          if (!channel.parentId) throw new Error(`thread ${channelId} has no parent channel`);
+          lists.push(await this.listChannelMembers(channel.parentId, {
+            cap: false,
+            warmups,
+            ...(channel.type === ChannelType.PrivateThread
+              ? { withPermission: PermissionsBitField.Flags.ManageThreads }
+              : {}),
+          }));
+        }
+        identities = lists.flatMap((l) => l.members);
+        // A member a list couldn't name appears id-only (username and display
+        // name both the id); count those too, whether or not the list says so.
+        for (const l of lists) {
+          unresolved += Math.max(
+            l.unresolved ?? 0,
+            l.members.filter((m) => m.username === m.id && m.displayName === m.id).length,
+          );
+          if (l.possiblyIncomplete) incomplete = true;
+        }
+      } catch (err) {
+        return {
+          ok: false,
+          message: `"${raw}" can't be checked for people sharing that name: this channel's member list is unavailable (${(err as Error).message}). Use their numeric user id; nothing was done.`,
+        };
+      } finally {
+        // Remember a warm-up that ran and failed; forget one that succeeded.
+        const outcome = guildId ? warmups.get(guildId) : undefined;
+        if (guildId && outcome === true) this.latestFromWarmupFailures.delete(guildId);
+        else if (guildId && outcome === false && !rememberedFailure) this.latestFromWarmupFailures.set(guildId, Date.now());
+      }
+      if (unresolved > 0) {
+        return {
+          ok: false,
+          message: `"${raw}" can't be checked for people sharing that name: ${unresolved} member(s) here couldn't be resolved to names. Use their numeric user id; nothing was done.`,
+        };
+      }
+      if (incomplete) {
+        return {
+          ok: false,
+          message: `"${raw}" can't be checked for people sharing that name: Discord returned exactly one page (${THREAD_MEMBER_PAGE}) of this thread's members, so there may be more. Use their numeric user id; nothing was done.`,
+        };
+      }
+      for (const m of identities) {
+        if (m.username.toLowerCase() === name || m.displayName.toLowerCase() === name) {
+          matches.set(m.id, { label: m.displayName, username: m.username, isBot: m.isBot });
+        }
+      }
+      // The window's authors, by username or display name, as members are
+      // matched: someone no longer in the channel can still have written here.
+      for (const m of newestFirst) {
+        if (matches.has(m.authorId)) continue;
+        if (m.authorName.toLowerCase() === name || displayOf(m).toLowerCase() === name) {
+          matches.set(m.authorId, { label: displayOf(m), username: m.authorName, isBot: m.isBot });
+        }
+      }
+      if (matches.size === 0) {
+        return { ok: false, message: `No one named "${raw}" is in this channel or among ${span}. Use their numeric user id; nothing was done.` };
+      }
+      if (matches.size > 1) {
+        const choices = [...matches].slice(0, 10)
+          .map(([id, m]) => `${m.label}${m.username ? ` (@${m.username})` : ''}${m.isBot ? ' [bot]' : ''} = ${id}`)
+          .join('; ');
+        return { ok: false, message: `"${raw}" matches ${matches.size} people here: ${choices}. Use the numeric user id; nothing was done.` };
+      }
+      const [[id, only]] = [...matches];
+      authorId = id;
+      authorLabel = only.label;
+    }
+    // A system notice is nobody's message: never their latest.
+    const target = newestFirst.find((m) => m.authorId === authorId && !m.system);
+    if (!target) {
+      return {
+        ok: false,
+        message: `No message from ${authorLabel} among ${span}; nothing was done. latestFrom never reaches further back or picks another author.`,
+      };
+    }
+    // The filters may have changed during the reads (a slow member download):
+    // the action is refused if they no longer admit this channel.
+    const refusedNow = await this.latestFromFilterRefusal(channel, channelId);
+    if (refusedNow) return { ok: false, message: refusedNow };
+    return { ok: true, message: target, authorId, authorLabel };
+  }
+
+  /**
+   * Why latestFrom may not read this channel, or null: every configured
+   * filter that bounds inspection. guildIds and guildChannels (a thread by its
+   * parent) for a guild channel; for a DM, the other party against dmUsers.
+   * The cache can't always name a DM's other party (dmOtherParty), so then
+   * Discord is asked once, past the cache; the fetch patches the cached
+   * channel, so a later check finds the party there. A party still unknown
+   * is refused (fail closed).
+   */
+  private async latestFromFilterRefusal(channel: Channel, channelId: string): Promise<string | null> {
+    const guildId = 'guildId' in channel && channel.guildId ? channel.guildId : null;
+    if (guildId && this.guildIds?.length && !this.guildIds.includes(guildId)) {
+      return `Channel ${channelId} is in a server outside this residence's configured guild filter, which bounds reading as well as delivery, so latestFrom can't choose a message there; nothing was done.`;
+    }
+    if (!this.channelAllowed(guildId, channelId, 'parentId' in channel ? channel.parentId : null)) {
+      return `Channel ${channelId} is outside this residence's configured channel filters, which bound reading as well as delivery, so latestFrom can't choose a message there; nothing was done.`;
+    }
+    if (channel.type === ChannelType.DM && this.dmUsers) {
+      let other = this.dmOtherParty(channel);
+      if (!other) {
+        const unconfirmed = (why: string) =>
+          `This DM's other party couldn't be confirmed (${why}), so latestFrom can't check it against this residence's configured DM users and can't choose a message there; nothing was done.`;
+        try {
+          other = this.dmOtherParty(await this.client.channels.fetch(channelId, { force: true }));
+        } catch (err) {
+          return unconfirmed(`looking up its DM channel failed: ${(err as Error).message}`);
+        }
+        if (!other) return unconfirmed('Discord names no recipient for its DM channel');
+      }
+      if (!this.dmUsers.has(other)) {
+        return `This DM is with someone outside this residence's configured DM users, which bound reading as well as delivery, so latestFrom can't choose a message there; nothing was done.`;
+      }
+    }
+    return null;
   }
 
   /** List the custom (server) emojis the bot can see — the shared palette for
