@@ -394,6 +394,13 @@ export interface MessageEventInfo {
   /** Guild id, or null for a DM. */
   guildId: string | null;
   authorId?: string;
+  /** For a DM delete: the conversation's other party, its author unless the
+   *  message is the bot's own, else the channel's recipient. A delete may
+   *  name no author, so the DM allowlist judges it by this. */
+  dmRecipientId?: string;
+  /** For a DM delete whose other party couldn't be confirmed: why, for the
+   *  operator log line that withholding it leaves. */
+  dmPartyUnknown?: string;
   /** Discord username — the same handle the create path renders. */
   authorName?: string;
   /** Edit time (ISO) when Discord supplies it: distinguishes one edit of a
@@ -409,16 +416,15 @@ export type EditForwardDecision =
   | 'no-content'
   | 'self'
   | 'not-an-edit'
-  | 'unchanged'
-  | 'dm-not-allowed';
+  | 'unchanged';
 
 /**
  * Decide whether a discord.js `messageUpdate` is a real content edit worth
  * forwarding. Discord emits MESSAGE_UPDATE for more than edits: link-preview /
  * embed refreshes re-send old messages with `edited_timestamp` still null, and
  * forwarding those surfaced weeks-old, never-edited messages to the agent as
- * fresh "[message edited]" events. A DM whose author can't be identified is
- * dropped when a DM whitelist is set — fail closed, as creates already are.
+ * fresh "[message edited]" events. The DM allowlist is applied where the
+ * edit is forwarded, by the adapter's one rule for it (dmUserRefused).
  */
 export function editForwardDecision(
   oldMsg: { partial?: boolean; content?: string | null } | null | undefined,
@@ -428,7 +434,7 @@ export function editForwardDecision(
     guildId?: string | null;
     author?: { id: string } | null;
   },
-  opts: { selfId?: string | null; dmUsers?: ReadonlySet<string> },
+  opts: { selfId?: string | null },
 ): EditForwardDecision {
   if (!newMsg.content) return 'no-content';
   // Our own edits (e.g. deferred slash-command replies arrive as edits).
@@ -436,9 +442,6 @@ export function editForwardDecision(
   if (!newMsg.editedTimestamp) return 'not-an-edit';
   if (oldMsg && !oldMsg.partial && typeof oldMsg.content === 'string' && oldMsg.content === newMsg.content) {
     return 'unchanged';
-  }
-  if (!newMsg.guildId && opts.dmUsers && (!newMsg.author || !opts.dmUsers.has(newMsg.author.id))) {
-    return 'dm-not-allowed';
   }
   return 'forward';
 }
@@ -1752,8 +1755,13 @@ export class DiscordAdapter {
    *  A missing guild id is not evidence of a DM: uncached guild messages can
    *  lack it too. Fetch the channel (never the deleted message) only when the
    *  message and cache cannot establish its location or a parent needed by
-   *  the channel allowlist. */
-  private async messageEventInfo(message: Message | PartialMessage): Promise<MessageEventInfo | null> {
+   *  the channel allowlist. With `dmParty`, also resolve a DM's other party
+   *  (dmRecipientId), fetching the channel if need be. Only a delete asks: an
+   *  edit is judged by its author. */
+  private async messageEventInfo(
+    message: Message | PartialMessage,
+    opts: { dmParty?: boolean } = {},
+  ): Promise<MessageEventInfo | null> {
     const authorId = message.author?.id;
     const authorName = message.author?.username;
     let channel: Channel | null | undefined = message.channel ?? this.client.channels.cache.get(message.channelId);
@@ -1779,11 +1787,48 @@ export class DiscordAdapter {
     if (guildId && this.guildIds?.length && !this.guildIds.includes(guildId)) return null;
     const parentId = channel && 'parentId' in channel ? channel.parentId : null;
     if (!this.channelAllowed(guildId, message.channelId, parentId)) return null;
+    // A DM's other party, for the allowlist (dmUserRefused): the author,
+    // unless the message is the bot's own, else the channel's recipient that
+    // isn't the bot (dmOtherParty). The cache can't always say: a deletion
+    // of an uncached message names no author, a channel known only by its id
+    // carries no recipient, and discord.js counts a cached DM channel as
+    // complete once it has seen a message there, whatever recipients it has
+    // recorded, which may be only the bot. So then this lookup asks Discord
+    // (force: true, past the cache), once, and only when a list needs it.
+    // (The location lookup above is separate.) When this lookup fails, or
+    // names no one, the party stays unknown and the delete is withheld
+    // (fail closed, as a create from an unknown user is), with the reason
+    // for the operator log.
+    let dmRecipientId: string | undefined;
+    let dmPartyUnknown: string | undefined;
+    if (opts.dmParty && !guildId && channel?.isDMBased()) {
+      dmRecipientId = authorId && authorId !== this.client.user?.id ? authorId : this.dmOtherParty(channel);
+      if (!dmRecipientId && this.dmUsers) {
+        try {
+          const fetched = await this.client.channels.fetch(message.channelId, { force: true });
+          dmRecipientId = this.dmOtherParty(fetched);
+          if (!dmRecipientId) dmPartyUnknown = 'Discord names no recipient for its DM channel';
+        } catch (err) {
+          dmPartyUnknown = `looking up its DM channel failed (${(err as Error).message})`;
+        }
+      }
+    }
     return {
       guildId: guildId ?? null,
       authorId,
       authorName,
+      ...(dmRecipientId ? { dmRecipientId } : {}),
+      ...(dmPartyUnknown ? { dmPartyUnknown } : {}),
     };
+  }
+
+  /** A DM channel's recipient other than the bot, read from discord.js's
+   *  `recipientIds`. Its `recipientId` getter won't do here: it throws when
+   *  no recipient was ever recorded, and returns the bot's own id when the
+   *  bot is the only one recorded. */
+  private dmOtherParty(channel: unknown): string | undefined {
+    const ids = (channel as { recipientIds?: Array<string | undefined> } | null)?.recipientIds;
+    return ids?.find((id) => !!id && id !== this.client.user?.id);
   }
 
   /** Resolve locations concurrently, but let earlier mutations finish before
@@ -1792,13 +1837,14 @@ export class DiscordAdapter {
   private forwardMessageEvent(
     message: Message | PartialMessage,
     forward: (info: MessageEventInfo) => void,
+    opts: { dmParty?: boolean } = {},
   ): Promise<void> {
     const messageId = message.id;
     const previous = this.messageEventDeliveries.get(messageId) ?? Promise.resolve();
     // A create still waiting for its thread's lookup goes first, so an edit
     // or delete never overtakes the message it changes.
     const created = this.threadLookups.get(message.channelId);
-    const pending = Promise.allSettled([previous, created, this.messageEventInfo(message)]).then(([, , result]) => {
+    const pending = Promise.allSettled([previous, created, this.messageEventInfo(message, opts)]).then(([, , result]) => {
       if (result.status === 'rejected') throw result.reason;
       if (result.value) forward(result.value);
     });
@@ -1830,8 +1876,8 @@ export class DiscordAdapter {
     const editedAt = newMsg.editedTimestamp ? new Date(newMsg.editedTimestamp).toISOString() : undefined;
     const cleanContent = newMsg.cleanContent ?? undefined;
     await this.forwardMessageEvent(newMsg, (info) => {
-      if (!info.guildId && this.dmUsers && (!info.authorId || !this.dmUsers.has(info.authorId))) {
-        dbg('messageUpdate:drop', { msgId: messageId, channelId, reason: 'dm-not-allowed' });
+      if (!info.guildId && this.dmUserRefused(info.authorId)) {
+        dbg('messageUpdate:drop', { msgId: messageId, channelId, reason: info.authorId ? 'dm-not-allowed' : 'dm-party-unknown' });
         return;
       }
       this.editHandler?.(channelId, messageId, content, !info.guildId, { ...info, editedAt, cleanContent });
@@ -1845,8 +1891,22 @@ export class DiscordAdapter {
     }
     const { channelId, id: messageId } = message;
     await this.forwardMessageEvent(message, (info) => {
+      if (!info.guildId && this.dmUserRefused(info.dmRecipientId)) {
+        if (info.dmRecipientId) {
+          dbg('messageDelete:drop', { msgId: messageId, channelId, reason: 'dm-not-allowed' });
+          return;
+        }
+        // A party that couldn't be confirmed is refused too. That can withhold
+        // an allowed user's deletion, so the operator log says so.
+        dbg('messageDelete:drop', { msgId: messageId, channelId, reason: 'dm-party-unknown' });
+        console.error(
+          `[discord-mcpl] Withheld the deletion of message ${messageId} in DM channel ${channelId}: ` +
+            `${info.dmPartyUnknown ?? 'its other party is unknown'}, and the DM allowlist refuses what it can't attribute.`,
+        );
+        return;
+      }
       this.deleteHandler?.(channelId, messageId, !info.guildId, info);
-    });
+    }, { dmParty: true });
   }
 
   private setupEvents(): void {
@@ -1882,13 +1942,19 @@ export class DiscordAdapter {
 
     this.client.on('messageUpdate', (oldMsg, newMsg) => {
       void this.handleMessageUpdate(oldMsg, newMsg).catch((err) => {
-        console.error('[discord-mcpl] Failed to forward message edit:', (err as Error).message);
+        console.error(
+          `[discord-mcpl] Failed to forward the edit of message ${newMsg.id} in channel ${newMsg.channelId}:`,
+          (err as Error).message,
+        );
       });
     });
 
     const forwardDelete = (message: Message | PartialMessage): void => {
       void this.handleMessageDelete(message).catch((err) => {
-        console.error('[discord-mcpl] Failed to forward message deletion:', (err as Error).message);
+        console.error(
+          `[discord-mcpl] Failed to forward the deletion of message ${message.id} in channel ${message.channelId}:`,
+          (err as Error).message,
+        );
       });
     };
     this.client.on('messageDelete', forwardDelete);
@@ -2197,13 +2263,30 @@ export class DiscordAdapter {
       return 'guild-not-allowed';
     }
     // DMs: when a DM user whitelist is configured, drop DMs from anyone else.
-    if (!m.guildId && this.dmUsers && !this.dmUsers.has(m.authorId)) {
+    if (!m.guildId && this.dmUserRefused(m.authorId)) {
       return 'dm-user-not-allowed';
     }
     if (m.guildId && !this.channelAllowed(m.guildId, m.channelId, m.parentId)) {
       return 'channel-not-allowed';
     }
     return null;
+  }
+
+  /**
+   * The DM allowlist's one rule, for every DM event delivered to the agent
+   * (creates, live and swept, edits and deletes): with a list configured, a
+   * DM counts only from a listed user, and one whose user isn't known is
+   * refused (fail closed). The agent's own reads, such as fetch_history, are
+   * outside it, as they always were. Creates and edits are judged by their
+   * author: a create always names one, an edit normally does, and an edit
+   * that doesn't is refused. A delete is judged by the DM's other party
+   * (messageEventInfo's dmRecipientId): its author unless the message is the
+   * bot's own, else the channel's recipient, since an uncached delete names
+   * no author. A sender removed from the list is out for every one of these,
+   * deletes of messages delivered before the removal included.
+   */
+  private dmUserRefused(userId: string | undefined): boolean {
+    return !!this.dmUsers && (!userId || !this.dmUsers.has(userId));
   }
 
   /** Ingress decision for a message fetched from history (the catch-up

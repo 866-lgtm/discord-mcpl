@@ -50,19 +50,6 @@ describe('editForwardDecision', () => {
     assert.equal(editForwardDecision(null, guildMsg({ author: { id: 'bot' } }), { selfId: 'bot' }), 'self');
   });
 
-  it('applies the DM whitelist and fails closed when the author is unknown', () => {
-    const dmUsers = new Set(['ok-user']);
-    const dm = (author: { id: string } | null) => guildMsg({ guildId: null, author });
-    assert.equal(editForwardDecision(null, dm({ id: 'ok-user' }), { dmUsers }), 'forward');
-    assert.equal(editForwardDecision(null, dm({ id: 'stranger' }), { dmUsers }), 'dm-not-allowed');
-    assert.equal(editForwardDecision(null, dm(null), { dmUsers }), 'dm-not-allowed');
-    // No whitelist configured: DMs from anyone, as before.
-    assert.equal(editForwardDecision(null, dm(null), {}), 'forward');
-  });
-
-  it('does not apply the DM whitelist to guild channels', () => {
-    assert.equal(editForwardDecision(null, guildMsg({ author: null }), { dmUsers: new Set(['ok-user']) }), 'forward');
-  });
 });
 
 describe('edit/delete push events', () => {

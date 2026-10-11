@@ -225,6 +225,25 @@ in the git log and PR descriptions.
 
 ### Fixed
 
+- **A refused DM's deletion no longer reaches the agent.** With a DM
+  allowlist set, a refused sender's DM was never forwarded, but its deletion
+  was: discord.js caches every DM it receives, so the tombstone carried the
+  sender's id and username ("[message deleted] <id> by @name"). A host
+  without event coalescing showed it. Deletes now apply the allowlist too.
+  Creates and edits are judged by their author; a delete, which may name no
+  author, by the DM's other party: the author unless the message is the
+  bot's own, else the DM channel's recipient other than the bot, asked of
+  Discord once if the cache can't name it. If Discord can't confirm the
+  party (the lookup fails, or names no one), the deletion is withheld, as a
+  create from an unknown user is, and the operator log says so with its
+  channel and message. An allowed user's deletion of a message no longer
+  cached still arrives while discord.js holds the DM channel; a deletion in
+  a DM channel it doesn't hold (say, just after a restart) never reaches the
+  adapter, as before. The list as it is when the deletion arrives decides,
+  as for edits, so a sender removed from it is out for the deletion of a
+  message delivered before the removal too. A refused user's DM channel now
+  sends the agent no events: the deletion of the bot's own message there
+  (one sent with `send_dm`) no longer arrives either.
 - **The reconnect catch-up sweep bypassed the ingress filters** (issue #60).
   It delivered every missed message in a known DM channel, including DMs from a
   sender since removed from the DM whitelist, and kept sweeping channels of
