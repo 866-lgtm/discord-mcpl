@@ -1517,7 +1517,7 @@ export class DiscordMcplServer {
     // string is refused here, rather than let past the check to be
     // stringified into Discord's route.
     if (INSPECTION_TOOLS.has(name)) {
-      if (typeof args.channelId !== 'string' || args.channelId.length === 0) {
+      if (typeof args.channelId !== 'string' || args.channelId.trim().length === 0) {
         return {
           content: [textContent(`${name} needs channelId as a channel id string, such as "123456789012345678". Nothing was read.`)],
           isError: true,

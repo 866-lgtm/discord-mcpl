@@ -135,7 +135,7 @@ describe('fetch_history and fetch_around by numeric id', () => {
 
   it("refuses a channelId that isn't a string, rather than let it past the check", async (t) => {
     const { server, reads } = serverWith(t);
-    for (const channelId of [[EXCLUDED], Number(EXCLUDED), undefined, '']) {
+    for (const channelId of [[EXCLUDED], Number(EXCLUDED), undefined, '', '   ']) {
       for (const tool of ['fetch_history', 'fetch_around']) {
         const res = await server.handleToolCall(tool, { channelId, messageId: '420000000000000001' });
         assert.equal(res.isError, true, `${tool} ${JSON.stringify(channelId)}`);
