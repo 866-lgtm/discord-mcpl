@@ -171,8 +171,12 @@ in the git log and PR descriptions.
   edits, deletes, reactions) and refused by `list_channel_members`, and a
   forum admitted through its category lost every post. A thread now counts
   as its channel wherever that channel's admission comes from: the check
-  reads the channel's own category from the channel cache. A thread whose
-  channel isn't cached stays excluded, as before.
+  reads the channel's own category from the channel cache. A thread the
+  client knows only partly, without its channel, is now fetched before the
+  filters decide, for every event, and new messages in it wait for that
+  fetch and arrive in order. Before, such a thread was dropped even under a
+  listed channel. A thread whose channel isn't cached stays excluded, as
+  before.
 - **DM whitelist fails closed on edits.** With `DISCORD_DM_USERS` set, a DM
   edit whose author is unknown (uncached message) was forwarded because the
   check required an author; it is now dropped, like creates.
