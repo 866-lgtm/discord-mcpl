@@ -304,7 +304,15 @@ test('VoiceOutput ends a failed utterance, stops its synthesis and reports it as
   assert.equal(sink.played.length, 1);
 });
 
-test('an item refused before clearance bills nothing and reports how long it was queued', async () => {
+test('an item refused before clearance bills nothing and reports how long it was queued', (t) => {
+  // The test drives Date, so the queued time is exact rather than a real
+  // wait read back on the wall clock. node:test mocks Date from Node 20.11.
+  try {
+    t.mock.timers.enable({ apis: ['Date'], now: 1_700_000_000_000 });
+  } catch {
+    t.skip("node:test's mock timers can't mock Date before Node 20.11");
+    return;
+  }
   const provider = new FakeProvider();
   const sink = new FakeSink();
   const out = new VoiceOutput({ textChannels: null }, provider, { voiceId: 'v1' }, sink, () => {});
@@ -312,7 +320,7 @@ test('an item refused before clearance bills nothing and reports how long it was
   out.onReport((r) => reports.push(r));
 
   out.handleChunk('inf1', 'discord:g:100', 'Hello there.');
-  await new Promise((r) => setTimeout(r, 25));
+  t.mock.timers.tick(25);
   sink.emit({ type: 'failed', id: 'inf1', playedMs: 0, reason: 'refused' });
 
   assert.deepEqual(provider.streams[0]!.sent, [], 'no text went to the provider');
@@ -321,7 +329,7 @@ test('an item refused before clearance bills nothing and reports how long it was
   assert.equal(reports[0]!.status, 'failed');
   assert.equal(reports[0]!.billedChars, 0);
   assert.equal(reports[0]!.unvoicedText, 'Hello there.');
-  assert.ok(reports[0]!.queuedMs >= 15, `queued until it failed (${reports[0]!.queuedMs} ms)`);
+  assert.equal(reports[0]!.queuedMs, 25, 'queued until it failed');
 });
 
 test('a finished utterance that never had audio is not counted as fully played, and nothing heard is exact', () => {
