@@ -2029,15 +2029,24 @@ export class DiscordAdapter {
   }
 
   /** Fetch a thread so the cache holds its channel (threadChannelUnknown).
-   *  Forced, since discord.js would otherwise return the cached partial. If
-   *  the fetch fails, the thread stays as it was, and the filters decide on
-   *  what's known: a thread whose channel is unknown is admitted only if
-   *  it's listed itself. */
+   *  Forced, since discord.js would otherwise return the cached partial. The
+   *  REST client's own timeout and retries bound the wait (15 s a try, three
+   *  retries, by default), so creates waiting behind it are held at most
+   *  that long. If the fetch fails, the thread stays as it was, and the
+   *  filters decide on what's known: a thread whose channel is unknown is
+   *  admitted only if it's listed itself. That failure is logged, since the
+   *  thread's messages may then be filtered out though its channel is
+   *  admitted. */
   private async lookUpThread(channelId: string): Promise<void> {
     try {
       await this.client.channels.fetch(channelId, { force: true });
     } catch (err) {
-      dbg('gateway:thread-lookup-failed', { channelId, error: (err as Error).message });
+      const error = (err as Error).message;
+      dbg('gateway:thread-lookup-failed', { channelId, error });
+      console.error(
+        `[discord-mcpl] Couldn't look up thread ${channelId} to find its channel (${error}). ` +
+          'Its events are filtered without it, so they pass only if the thread is listed itself.',
+      );
     }
   }
 
