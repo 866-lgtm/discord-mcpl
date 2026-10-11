@@ -194,7 +194,9 @@ export const toolDefinitions: ToolDefinition[] = [
     description:
       'Show the active event filters: which guilds/channels can deliver events to you ' +
       '(guild whitelist, optional per-guild channel whitelist) and which users may DM you. ' +
-      'null means unrestricted. Filters gate delivery, and the per-guild channel list also ' +
+      'null means unrestricted. dmNotice says whether senders of refused DMs get an automatic ' +
+      'delivery notice (off until you turn it on), and whether its state is `persisted` (notices are ' +
+      'suspended while it is not). Filters gate delivery, and the per-guild channel list also ' +
       'bounds list_channels, list_channel_members, fetch_history and fetch_around, which refuse ' +
       'a channel outside it. The bot must also be a ' +
       'member of a guild to see it at all. Reports the config plane\'s desired-vs-effective ' +
@@ -214,8 +216,9 @@ export const toolDefinitions: ToolDefinition[] = [
   {
     name: 'filters_update',
     description:
-      'Hot-adjust the event filters — takes effect immediately, no restart. Requires ' +
-      'DISCORD_FILTERS_FILE to be configured (filters_get tells you). If the guild filter ' +
+      'Hot-adjust the event filters — takes effect immediately, no restart. Guild and DM ' +
+      'whitelist changes require DISCORD_FILTERS_FILE to be configured (filters_get tells you); ' +
+      'setDmNotice does not. If the guild filter ' +
       'is currently unrestricted, the first add/remove materializes it as the list of all ' +
       'current guilds first, so nothing silently drops. Newly-allowed guilds have their ' +
       'channels registered right away. Reaction-suppression entries are operator-owned and ' +
@@ -246,6 +249,16 @@ export const toolDefinitions: ToolDefinition[] = [
           description:
             'Replace the DM-user whitelist with these user ids. CAREFUL: an empty array ' +
             'means UNRESTRICTED (DMs from anyone), matching the env-unset semantics. Omit to leave DMs unchanged.',
+        },
+        setDmNotice: {
+          type: 'boolean',
+          description:
+            'Whether a sender whose DM the whitelist refuses gets an automatic delivery notice from this ' +
+            'connection (at most once per 24 hours per sender, and at most 10 an hour across all senders; ' +
+            'it never quotes or forwards their message). Off by default, so refused DMs are dropped without ' +
+            'any notice until you set it true. Setting it false stops every notice not yet reserved; one already ' +
+            'being sent still goes out. Saved with the notice state, so it ' +
+            'works and survives restarts even when DISCORD_FILTERS_FILE is not configured. Omit to leave it unchanged.',
         },
       },
     },

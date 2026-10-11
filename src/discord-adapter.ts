@@ -108,6 +108,18 @@ export interface DiscordAdapterConfig {
   dmUsers?: string[];
 }
 
+/** How many refusals the adapter holds while no handler is registered. */
+export const DM_REFUSALS_HELD = 100;
+
+/** A DM the DM allowlist refused: its identity only, never its body. */
+export interface DmRefusal {
+  messageId: string;
+  channelId: string;
+  authorId: string;
+  /** Which door refused it: the live gateway or the reconnect catch-up. */
+  origin: 'live' | 'sweep';
+}
+
 /** A file attached to a Discord message (image, text file, etc.). */
 export interface DiscordAttachment {
   id: string;
@@ -538,6 +550,10 @@ export class DiscordAdapter {
   private editAccept?: (channelId: string) => boolean;
   private deleteAccept?: (channelId: string) => boolean;
   private reactionHandler?: (ev: ReactionEvent) => void;
+  private dmRefusedHandler?: (ev: DmRefusal) => void;
+  /** Refusals heard before onDmRefused registered a handler (Discord
+   *  connects before the server exists), handed over when it does. */
+  private heldDmRefusals: DmRefusal[] = [];
   private readyHandler?: () => void;
   private channelCreateHandler?: (guildId: string, channel: DiscordChannelInfo) => void;
   private channelDeleteHandler?: (guildId: string, channelId: string) => void;
@@ -645,6 +661,31 @@ export class DiscordAdapter {
    *  decides per-channel whether to surface these; the adapter always emits. */
   onReaction(handler: (ev: ReactionEvent) => void): void {
     this.reactionHandler = handler;
+  }
+
+  /** Register a handler for DMs the DM allowlist refused at the gateway.
+   *  It receives the refusal's identity only, never the message body. The
+   *  refusals heard before it was registered are handed to it first, in
+   *  order (see refuseDm). */
+  onDmRefused(handler: (ev: DmRefusal) => void): void {
+    this.dmRefusedHandler = handler;
+    for (const ev of this.heldDmRefusals.splice(0)) handler(ev);
+  }
+
+  /** Hand a refusal to the handler, or hold it until one is registered, up
+   *  to DM_REFUSALS_HELD. Past that, a refusal still leaves its operator log
+   *  line, without a notice decision. */
+  private refuseDm(ev: DmRefusal): void {
+    if (this.dmRefusedHandler) {
+      this.dmRefusedHandler(ev);
+    } else if (this.heldDmRefusals.length < DM_REFUSALS_HELD) {
+      this.heldDmRefusals.push(ev);
+    } else {
+      console.error(
+        `[discord-mcpl] DM refused by the DM allowlist (${ev.origin}) before refusals were handled, past the ` +
+          `${DM_REFUSALS_HELD} held until then: sender ${ev.authorId}, message ${ev.messageId}; no notice`,
+      );
+    }
   }
 
   onReady(handler: () => void): void {
@@ -782,6 +823,31 @@ export class DiscordAdapter {
     }
     if (rest) chunks.push(rest);
     return chunks;
+  }
+
+  /** Post the automatic delivery notice in a DM channel: plain text, no
+   *  mention resolution, and no mentions allowed to ping. `nonce` is
+   *  enforced, so the REST layer's own retries after a lost response can't
+   *  post a second copy (Discord returns the first instead). An error that
+   *  carries `notPosted: true` was raised before anything was sent: the
+   *  channel lookup failed or found no text channel. */
+  async sendDmNotice(channelId: string, content: string, nonce: string): Promise<{ messageId: string }> {
+    const channel = await this.client.channels.fetch(channelId).catch((err: unknown) => {
+      throw Object.assign(
+        new Error(`could not look up channel ${channelId}: ${err instanceof Error ? err.message : String(err)}`),
+        { notPosted: true },
+      );
+    });
+    if (!channel || !('send' in channel)) {
+      throw Object.assign(new Error(`Channel ${channelId} not found or not a text channel`), { notPosted: true });
+    }
+    const sent = await (channel as DMChannel).send({
+      content,
+      allowedMentions: { parse: [] },
+      nonce,
+      enforceNonce: true,
+    });
+    return { messageId: sent.id };
   }
 
   async sendMessage(
@@ -1203,12 +1269,13 @@ export class DiscordAdapter {
 
   /** Resolve display metadata for a channel by ID — used by the reconnect
    *  catch-up sweep to label `<missed>` blocks. Returns nulls for an
-   *  unresolvable channel rather than throwing. */
+   *  unresolvable channel rather than throwing; `isDM` is null when the
+   *  channel's kind isn't known. */
   async getChannelMeta(channelId: string): Promise<{
     name: string | null;
     guildId: string | null;
     guildName: string | null;
-    isDM: boolean;
+    isDM: boolean | null;
   }> {
     const channel = await this.client.channels.fetch(channelId);
     return this.extractChannelMeta(channel);
@@ -1221,7 +1288,7 @@ export class DiscordAdapter {
     name: string | null;
     guildId: string | null;
     guildName: string | null;
-    isDM: boolean;
+    isDM: boolean | null;
   } | null {
     const channel = this.client.channels.cache.get(channelId);
     if (!channel) return null;
@@ -1232,20 +1299,25 @@ export class DiscordAdapter {
     name: string | null;
     guildId: string | null;
     guildName: string | null;
-    isDM: boolean;
+    isDM: boolean | null;
   } {
-    if (!channel) return { name: null, guildId: null, guildName: null, isDM: true };
+    if (!channel) return { name: null, guildId: null, guildName: null, isDM: null };
     const c = channel as {
       name?: string;
       guildId?: string | null;
       guild?: { name?: string };
+      isDMBased?: () => boolean;
     };
     const guildId = c.guildId ?? null;
+    // DM-ness comes from the channel's own kind, never from a missing guild
+    // id: a sparse or partial object leaves it unknown, so no caller can
+    // mistake an unresolved channel for a DM.
+    const isDM = typeof c.isDMBased === 'function' ? c.isDMBased() : guildId ? false : null;
     return {
       name: typeof c.name === 'string' && c.name.length > 0 ? c.name : null,
       guildId,
       guildName: c.guild?.name ?? null,
-      isDM: !guildId,
+      isDM,
     };
   }
 
@@ -2034,6 +2106,15 @@ export class DiscordAdapter {
     const dropReason = this.messageFilterReason(message);
     if (dropReason) {
       dbg('gateway:message-create-drop', { ...base, reason: dropReason });
+      if (dropReason === 'dm-user-not-allowed') {
+        // The body stays here; only the refusal's identity leaves.
+        this.refuseDm({
+          messageId: message.id,
+          channelId: message.channelId,
+          authorId: message.author.id,
+          origin: 'live',
+        });
+      }
       return;
     }
     try {
@@ -2090,24 +2171,46 @@ export class DiscordAdapter {
   }
 
   private messageFilterReason(message: Message): string | null {
-    if (message.author.id === this.client.user?.id) return 'self-authored';
-    if (this.guildIds?.length && message.guildId && !this.guildIds.includes(message.guildId)) {
+    const parentId =
+      message.channel && 'parentId' in message.channel
+        ? ((message.channel as { parentId?: string | null }).parentId ?? null)
+        : null;
+    return this.ingressReason({
+      authorId: message.author.id,
+      guildId: message.guildId,
+      channelId: message.channelId,
+      parentId,
+    });
+  }
+
+  /** The one ingress decision, shared by live delivery and the reconnect
+   *  catch-up sweep, so a message the live path refuses is never delivered
+   *  by the other door. */
+  private ingressReason(m: {
+    authorId: string;
+    guildId: string | null | undefined;
+    channelId: string;
+    parentId?: string | null;
+  }): string | null {
+    if (m.authorId === this.client.user?.id) return 'self-authored';
+    if (this.guildIds?.length && m.guildId && !this.guildIds.includes(m.guildId)) {
       return 'guild-not-allowed';
     }
     // DMs: when a DM user whitelist is configured, drop DMs from anyone else.
-    if (!message.guildId && this.dmUsers && !this.dmUsers.has(message.author.id)) {
+    if (!m.guildId && this.dmUsers && !this.dmUsers.has(m.authorId)) {
       return 'dm-user-not-allowed';
     }
-    if (message.guildId) {
-      const parentId =
-        message.channel && 'parentId' in message.channel
-          ? ((message.channel as { parentId?: string | null }).parentId ?? null)
-          : null;
-      if (!this.channelAllowed(message.guildId, message.channelId, parentId)) {
-        return 'channel-not-allowed';
-      }
+    if (m.guildId && !this.channelAllowed(m.guildId, m.channelId, m.parentId)) {
+      return 'channel-not-allowed';
     }
     return null;
+  }
+
+  /** Ingress decision for a message fetched from history (the catch-up
+   *  sweep), resolving a thread's parent from the channel cache. */
+  historyIngressReason(channelId: string, guildId: string | null, authorId: string): string | null {
+    const channel = this.client.channels.cache.get(channelId) as { parentId?: string | null } | undefined;
+    return this.ingressReason({ authorId, guildId, channelId, parentId: channel?.parentId ?? null });
   }
 
   private convertMessage(message: Message): DiscordMessageData {

@@ -81,6 +81,11 @@ class MockDiscordAdapter {
   }
   onReaction(): void {}
   onReady(): void {}
+
+  // The catch-up sweep's ingress decision: these tests' filters refuse nothing.
+  historyIngressReason(): string | null {
+    return null;
+  }
   onChannelCreate(handler: (guildId: string, channel: DiscordChannelInfo) => void): void {
     this._channelCreateHandler = handler;
   }
