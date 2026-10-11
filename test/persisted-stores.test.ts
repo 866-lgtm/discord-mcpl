@@ -251,6 +251,13 @@ describe('a store whose file is left in place', () => {
     assert.equal(readFileSync(join(dir, asides('muted.json')[0]), 'utf-8'), 'not json', 'and a copy is kept');
     assert.ok(logged(log).some((line) => line.includes("couldn't empty the file")));
     assert.match(readFileSync(join(dir, 'debug.log'), 'utf-8'), /persisted-json:empty-failed /);
+    // A restart while the emptying still fails reads the same content again,
+    // and keeps the one copy it already has.
+    await withFs(t, 'writeFileSync', (real) => ((p: fs.PathOrFileDescriptor, ...rest: unknown[]) => {
+      if (String(p).endsWith('.tmp')) throw refuse('ENOSPC', 'no space');
+      return (real as (...a: unknown[]) => void)(p, ...rest);
+    }) as typeof fs.writeFileSync, () => server(t).ensureMutedLoaded());
+    assert.equal(asides('muted.json').length, 1, 'one copy of the same content');
   });
 
   it("leaves a file it can't read where it is, refuses to save over it, and reads it again in a new store", { skip: asRoot }, async (t) => {

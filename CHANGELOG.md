@@ -164,9 +164,9 @@ in the git log and PR descriptions.
   `mute_channel`, one `set_reaction_visibility`, or the next forwarded
   message for watermarks) overwrote it with only the new entry. Now:
   - A file that isn't JSON, or isn't the shape its store writes, down to
-    each entry, keeps its place: a copy goes to `<file>.unreadable-<time>`,
-    the file itself is emptied, and the store starts empty. The error log
-    names the copy. The file keeps its permissions, owner, group and links.
+    each entry, keeps its place: a copy goes to `<file>.unreadable-<hash>`,
+    named by its content so the same content is kept once, the file itself
+    is emptied, and the store starts empty. The error log names the copy. The file keeps its permissions, owner, group and links.
     To restore the copy, stop the server first, since a running server
     saves over its file. A leading byte-order mark is no longer a reason.
   - A file that can't be read at all, say for its permissions, stays as it

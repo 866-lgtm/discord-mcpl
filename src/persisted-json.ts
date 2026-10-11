@@ -7,10 +7,12 @@
  * - No file means a store with nothing in it yet.
  * - A file whose content can't be used, because it isn't JSON or isn't the
  *   shape its store expects, keeps its place: a copy goes aside to
- *   `<file>.unreadable-<time>`, and the file itself is emptied by an ordinary
- *   save, so its permissions, owner, group and links stay. The store starts
- *   empty. To restore the copy, an operator stops the server first, since a
- *   running server saves over its file.
+ *   `<file>.unreadable-<hash>`, named by its content so that reading the same
+ *   content again (say, while the emptying keeps failing) keeps one copy, and
+ *   the file itself is emptied by an ordinary save, so its permissions, owner,
+ *   group and links stay. The store starts empty. To restore the copy, an
+ *   operator stops the server first, since a running server saves over its
+ *   file.
  * - A file that can't be read at all (EACCES, EIO, EMFILE…) says nothing
  *   about its content, so it stays as it is, and nothing saves over it until
  *   it's read again: at a restart, or by a new store. The same holds when
@@ -47,6 +49,7 @@ import {
   writeFileSync,
   type Stats,
 } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { dirname } from 'node:path';
 import { dbg } from './debug-log.js';
 
@@ -121,9 +124,9 @@ export function readJsonFile<T>(
   empty: T,
 ): T | undefined {
   unsaveable.delete(path); // each read decides afresh
-  let text: string;
+  let bytes: Buffer;
   try {
-    text = readFileSync(path, 'utf-8');
+    bytes = readFileSync(path);
   } catch (err) {
     if (errorCode(err) === 'ENOENT') return undefined;
     unsaveable.add(path);
@@ -137,23 +140,28 @@ export function readJsonFile<T>(
   let problem: string;
   try {
     // An editor's byte-order mark isn't part of the JSON.
-    const parsed: unknown = JSON.parse(text.replace(/^\uFEFF/, ''));
+    const parsed: unknown = JSON.parse(bytes.toString('utf-8').replace(/^\uFEFF/, ''));
     if (isShape(parsed)) return parsed;
     problem = 'not the shape this store expects';
   } catch {
     problem = 'not valid JSON'; // JSON.parse's own message quotes the file's text
   }
-  const aside = `${path}.unreadable-${new Date().toISOString().replace(/[:.]/g, '-')}`;
+  // Named by content: a copy already kept under this name holds these bytes.
+  const aside = `${path}.unreadable-${createHash('sha256').update(bytes).digest('hex').slice(0, 12)}`;
   try {
     copyFileSync(path, aside, constants.COPYFILE_EXCL);
   } catch (err) {
-    unsaveable.add(path);
-    console.error(
-      `[discord-mcpl] Couldn't load ${what} from ${path} (${problem}), or copy it aside (${(err as Error).message}). ` +
-        "Starting with none, and nothing is saved over that file until it's read again.",
-    );
-    dbg('persisted-json:copy-failed', { what, path, problem, error: (err as Error).message });
-    return undefined;
+    // EEXIST: an earlier read kept this very content, as when the emptying
+    // keeps failing across restarts. One copy is enough.
+    if (errorCode(err) !== 'EEXIST') {
+      unsaveable.add(path);
+      console.error(
+        `[discord-mcpl] Couldn't load ${what} from ${path} (${problem}), or copy it aside (${(err as Error).message}). ` +
+          "Starting with none, and nothing is saved over that file until it's read again.",
+      );
+      dbg('persisted-json:copy-failed', { what, path, problem, error: (err as Error).message });
+      return undefined;
+    }
   }
   try {
     writeJsonFile(path, empty);
