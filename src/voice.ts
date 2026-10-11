@@ -118,7 +118,30 @@ export type SinkEvent =
   | { type: 'cleared'; id: string }
   | { type: 'started'; id: string }
   | { type: 'finished'; id: string; playedMs: number }
-  | { type: 'interrupted'; id: string; playedMs: number; by: SpeakerInfo };
+  | { type: 'interrupted'; id: string; playedMs: number; by: SpeakerInfo }
+  /** The item couldn't be played to its end. Terminal, like the two above:
+   *  the utterance is over, with `playedMs` of it heard. The causes, each
+   *  with its `reason` (PlaybackFailure, words the model reads; the raw error
+   *  goes to the log only):
+   *  - the player, or making its audio resource, refused the item: never
+   *    'cleared', so it bills nothing;
+   *  - the player reported an error for the playing stream;
+   *  - no audio reached the player within the wait for Playing;
+   *  - playback went on past the limit on one item (300 s), which stops it;
+   *  - playback stopped on an unexpected throw, which settles every queued
+   *    item the same way. */
+  | { type: 'failed'; id: string; playedMs: number; reason: string };
+
+/** Why an item couldn't be played, in the words the model is told. A fixed
+ *  set: the raw error can carry library text or paths, so it goes to the log
+ *  only. The two waits name their limits. */
+export const PlaybackFailure = {
+  refused: 'the player refused it',
+  streamFailed: 'its audio stream failed',
+  noAudio: (ms: number) => `no audio reached the player within ${ms / 1000}s`,
+  tooLong: (ms: number) => `it reached the ${ms / 1000}s limit on one reply`,
+  stopped: 'playback stopped unexpectedly',
+} as const;
 
 /** Audio sink: queues utterances, plays them one at a time under the physics
  *  rules, reports what actually happened to each. */
@@ -234,11 +257,12 @@ export interface UtteranceReport {
   channelId: string;
   /** 'expired' = dropped unspoken after maxHoldMs in the queue: nothing was
    *  billed, nothing was heard, and the model decides whether to re-say. */
-  status: 'spoken' | 'interrupted' | 'expired';
+  status: 'spoken' | 'interrupted' | 'expired' | 'failed';
   /** Audio actually played into the channel, ms. */
   playedMs: number;
   /** Time spent queued behind the carrier before clearance (or before
-   *  expiry, for status 'expired'). Staleness signal for the model. */
+   *  expiry, for status 'expired', or before the failure, for a 'failed'
+   *  item that was never cleared). Staleness signal for the model. */
   queuedMs: number;
   /** Characters actually sent to the TTS provider — the zero-cost-loser
    *  receipt: 0 for anything dropped before clearance. */
@@ -252,6 +276,11 @@ export interface UtteranceReport {
   estimated: boolean;
   /** Who cut us off (status 'interrupted' only). */
   interruptedBy?: SpeakerInfo;
+  /** Why playback failed (status 'failed' only), from PlaybackFailure. */
+  failure?: string;
+  /** Status 'interrupted' or 'failed' only: the inference was still
+   *  streaming, and what it goes on to say isn't voiced either. */
+  restUnvoiced?: true;
 }
 
 interface ActiveUtterance {
@@ -369,8 +398,8 @@ export class VoiceOutput {
     // handleCleared retries once before going text-only.
     if (this.active.size < PRE_OPEN_MAX) this.openProviderStream(utt);
     // Queue for playback immediately. The sink's 'cleared' event — after
-    // carrier-clear + hold-off, right before play — is what flushes banked
-    // text into synthesis.
+    // carrier-clear + hold-off, once the player has accepted the item — is
+    // what flushes banked text into synthesis.
     this.sink.play({ id: inferenceId, stream: out });
     const maxHold = this.cfg.maxHoldMs;
     if (maxHold != null && maxHold > 0) {
@@ -404,7 +433,10 @@ export class VoiceOutput {
       utt.aDurMs.push(...a.durationMs);
     });
     tts.onAudio((pcm) => {
-      if (utt.tts !== tts) return;
+      // A chunk that arrives after the stream ended (synthesis aborted, or
+      // the utterance settled) is dropped: written after end, it would make
+      // the playing resource's stream fail.
+      if (utt.tts !== tts || utt.out.writableEnded) return;
       utt.audioMs += pcm.length / 2 / (rate / 1000); // PCM16 mono
       utt.out.write(monoTo48kStereo(pcm, rate));
     });
@@ -441,8 +473,10 @@ export class VoiceOutput {
     if (utt.holdTimer) { clearTimeout(utt.holdTimer); utt.holdTimer = null; }
     if ((!utt.tts || utt.ttsDead) && !this.openProviderStream(utt)) {
       // No provider stream and the reopen failed: the line stays text-only.
-      // Ending the (empty) audio stream lets the sink finish it at 0 ms and
-      // the report goes up as a truncation with billedChars 0.
+      // The (empty) audio stream is ended, so the player starts and ends it at
+      // once, with nothing played. It's reported spoken, nothing heard, with
+      // billedChars 0, and the server tells the model it was cut short by a
+      // synthesis error, which is the cause.
       this.log('TTS unavailable at clearance — line stays text-only');
       utt.out.end();
       return;
@@ -480,28 +514,39 @@ export class VoiceOutput {
     if (!utt) return;
     this.active.delete(ev.id);
     if (utt.holdTimer) { clearTimeout(utt.holdTimer); utt.holdTimer = null; }
-    const queuedMs = Math.max(0, (utt.clearedAt ?? utt.queuedAt) - utt.queuedAt);
+    // An item that fails before clearance was queued until now.
+    const queuedMs = Math.max(0, (utt.clearedAt ?? Date.now()) - utt.queuedAt);
 
-    if (ev.type === 'interrupted') {
+    // Fully-played completed utterances snap to the full text so alignment
+    // jitter can't manufacture phantom unvoiced tails. With no audio at all
+    // nothing was played, whatever the clock says.
+    const fullyPlayed = utt.done && utt.audioMs > 0 && ev.playedMs + FULLY_PLAYED_SLACK_MS >= utt.audioMs;
+
+    if (ev.type === 'interrupted' || ev.type === 'failed') {
       // Kill synthesis and drop any not-yet-arrived prose for this inference:
       // the utterance is dead, resuming mid-thought as audio would be worse
-      // than the model re-deciding what (and whether) to say.
+      // than the model re-deciding what (and whether) to say. A playback
+      // failure ends it the same way, and stops billing for audio no one
+      // will hear. The report says when there was more to come, so the
+      // model re-decides that part too.
       utt.tts?.abort();
       utt.out.end();
       if (!utt.done) this.skipped.add(ev.id);
-      const split = this.split(utt, ev.playedMs);
+      const split = ev.type === 'failed' && fullyPlayed
+        ? { voicedText: utt.sentText, unvoicedText: '', estimated: false }
+        : this.split(utt, ev.playedMs);
       this.report({
-        inferenceId: ev.id, channelId: utt.channelId, status: 'interrupted',
+        inferenceId: ev.id, channelId: utt.channelId, status: ev.type,
         playedMs: ev.playedMs, queuedMs, billedChars: utt.billedChars,
-        ...split, interruptedBy: ev.by,
+        ...split,
+        ...(ev.type === 'interrupted' ? { interruptedBy: ev.by } : { failure: ev.reason }),
+        ...(utt.done ? {} : { restUnvoiced: true as const }),
       });
       return;
     }
 
     // 'finished' — natural end, or truncation (TTS error ended the stream
-    // early). Fully-played completed utterances snap to the full text so
-    // alignment jitter can't manufacture phantom unvoiced tails.
-    const fullyPlayed = utt.done && ev.playedMs + FULLY_PLAYED_SLACK_MS >= utt.audioMs;
+    // early).
     const split = fullyPlayed
       ? { voicedText: utt.sentText, unvoicedText: '', estimated: false }
       : this.split(utt, ev.playedMs);
@@ -519,6 +564,8 @@ export class VoiceOutput {
    *  construction. */
   private split(utt: ActiveUtterance, playedMs: number):
     { voicedText: string; unvoicedText: string; estimated: boolean } {
+    // Nothing played is an exact boundary, as an expired item's is.
+    if (playedMs <= 0) return { voicedText: '', unvoicedText: utt.sentText, estimated: false };
     if (utt.aChars.length > 0) {
       let n = 0;
       for (let i = 0; i < utt.aChars.length; i++) {
@@ -572,7 +619,12 @@ export class DiscordVoiceSink implements PcmSink {
     resource: import('@discordjs/voice').AudioResource;
     startedAt: number;
     interruptedBy: SpeakerInfo | null;
+    /** Fired by a yield (maybeYield), so the item's waits end at once. */
+    yielded: AbortController;
   } | null = null;
+  /** How long a cleared item may take to start playing, and then to finish. */
+  private playingTimeoutMs = 10_000;
+  private idleTimeoutMs = 300_000;
   /** Per-speaker VAD pipelines (userId → cleanup). */
   private pipelines = new Map<string, () => void>();
   /** Speakers on packet-presence semantics (their pipeline failed). */
@@ -708,7 +760,17 @@ export class DiscordVoiceSink implements PcmSink {
 
   play(item: SinkItem): void {
     this.queue.push(item);
-    void this.pump();
+    this.kick();
+  }
+
+  /** Start pump() unless it is already running. pump() settles every
+   *  failure it can name as a 'failed' item, and no path rejects it today.
+   *  The catch is there so a future one can't end the whole process, as an
+   *  unhandled rejection would (Node >= 15). */
+  private kick(): void {
+    void this.pump().catch((err) => {
+      console.error('[discord-mcpl voice] playback pump:', err);
+    });
   }
 
   cancel(id: string): boolean {
@@ -733,7 +795,26 @@ export class DiscordVoiceSink implements PcmSink {
       compareSnowflakes(this.selfId, s.userId) > 0;
     if (!human && !collision) return;
     cur.interruptedBy = s;
-    this.player?.stop(true); // → Idle; pump() emits 'interrupted' with playedMs
+    // The stop takes a playing item to Idle, which ends the wait for Idle.
+    // An item still waiting for Playing never gets there once stopped, so
+    // the abort ends that wait too, and pump() emits 'interrupted' at once.
+    cur.yielded.abort();
+    this.player?.stop(true);
+  }
+
+  /** A signal that fires after `ms`, or when `yielded` does, whichever is
+   *  first. (AbortSignal.any would say this, but it arrived in Node 20.3, and
+   *  the engines floor is 20.0.) Call `done` once the wait is over. */
+  private static waitSignal(ms: number, yielded: AbortSignal): { signal: AbortSignal; done: () => void } {
+    const deadline = new AbortController();
+    const onYield = () => deadline.abort();
+    const timer = setTimeout(onYield, ms);
+    if (yielded.aborted) deadline.abort();
+    else yielded.addEventListener('abort', onYield, { once: true });
+    return {
+      signal: deadline.signal,
+      done: () => { clearTimeout(timer); yielded.removeEventListener('abort', onYield); },
+    };
   }
 
   private async pump(): Promise<void> {
@@ -750,29 +831,96 @@ export class DiscordVoiceSink implements PcmSink {
         // whole child down (#28 review, blocker 2).
         const item = this.queue.shift();
         if (!item) break;
-        // Billing gate: VoiceOutput flushes banked text into synthesis on
-        // this event — audio starts flowing into item.stream from here.
-        this.emit({ type: 'cleared', id: item.id });
-        const resource = createAudioResource(item.stream, { inputType: StreamType.Raw });
-        this.current = { id: item.id, resource, startedAt: Date.now(), interruptedBy: null };
-        this.player.play(resource);
+        let resource: import('@discordjs/voice').AudioResource;
         try {
-          await entersState(this.player, AudioPlayerStatus.Playing, 10_000);
-          this.emit({ type: 'started', id: item.id });
-          await entersState(this.player, AudioPlayerStatus.Idle, 300_000);
+          resource = createAudioResource(item.stream, { inputType: StreamType.Raw });
+          this.current = {
+            id: item.id, resource, startedAt: Date.now(), interruptedBy: null, yielded: new AbortController(),
+          };
+          // AudioPlayer.play throws for a resource that has already ended or
+          // that another player is playing (@discordjs/voice).
+          this.player.play(resource);
         } catch (err) {
-          console.error(`[discord-mcpl voice] playback: ${(err as Error).message}`);
-          this.player.stop(true);
+          // This item can't be played: release its resource, settle it, and
+          // go on to the next. It was never cleared, so nothing was billed.
+          const refused = this.current;
+          this.current = null;
+          try { refused?.resource.playStream.destroy(); } catch { /* already gone */ }
+          console.error(`[discord-mcpl voice] playback refused: ${(err as Error)?.message ?? String(err)}`);
+          this.emit({ type: 'failed', id: item.id, playedMs: 0, reason: PlaybackFailure.refused });
+          continue;
         }
+        // Billing gate: VoiceOutput flushes banked text into synthesis on
+        // this event — audio starts flowing into item.stream from here. It
+        // comes only once the player has accepted the item (until audio
+        // arrives the player just buffers), so a refused item bills nothing.
+        this.emit({ type: 'cleared', id: item.id });
+        // An item the player doesn't start, or doesn't finish, in time is one
+        // that couldn't be played to its end: it fails, naming which limit it
+        // reached, unless someone barged in. A barge-in (maybeYield) stops the
+        // player, which ends the wait for Idle, and aborts the item's waits,
+        // which ends the wait for Playing that the stop alone wouldn't.
+        // entersState rejects with an AbortError when its signal fires, and
+        // with the player's own error when the playing stream fails meanwhile
+        // (its once() listener is what hears that 'error').
+        const yielded = this.current.yielded.signal;
+        const wait = async (status: import('@discordjs/voice').AudioPlayerStatus, ms: number, limit: string): Promise<string | null> => {
+          const { signal, done } = DiscordVoiceSink.waitSignal(ms, yielded);
+          try {
+            await entersState(this.player!, status, signal);
+            return null;
+          } catch (err) {
+            if ((err as Error)?.name === 'AbortError') return limit;
+            console.error(`[discord-mcpl voice] playback stream: ${(err as Error)?.message ?? String(err)}`);
+            return PlaybackFailure.streamFailed;
+          } finally {
+            done();
+          }
+        };
+        let failure = await wait(AudioPlayerStatus.Playing, this.playingTimeoutMs, PlaybackFailure.noAudio(this.playingTimeoutMs));
+        if (!failure) {
+          this.emit({ type: 'started', id: item.id });
+          failure = await wait(AudioPlayerStatus.Idle, this.idleTimeoutMs, PlaybackFailure.tooLong(this.idleTimeoutMs));
+        }
+        // Unguarded: if the stop itself throws, the outer catch settles this
+        // item, which is still current.
+        if (failure) this.player.stop(true);
         const cur = this.current;
         this.current = null;
         const playedMs = Math.round(resource.playbackDuration);
+        if (failure && !cur?.interruptedBy) console.error(`[discord-mcpl voice] playback failed: ${failure}`);
         this.emit(cur?.interruptedBy
           ? { type: 'interrupted', id: item.id, playedMs, by: cur.interruptedBy }
-          : { type: 'finished', id: item.id, playedMs });
+          : failure
+            ? { type: 'failed', id: item.id, playedMs, reason: failure }
+            : { type: 'finished', id: item.id, playedMs });
       }
+    } catch (err) {
+      // A throw outside the per-item guard: none is known today, but if one
+      // comes, settle the item that was playing, if any, and every queued
+      // item as failed, so none waits for an outcome that will never come.
+      // Unexpected, so the whole error is logged. The queue is taken first,
+      // so an item a listener queues while these settle stays queued, and
+      // the restart below plays it.
+      const reason = PlaybackFailure.stopped;
+      console.error('[discord-mcpl voice] playback stopped:', err);
+      const queued = this.queue.splice(0);
+      const cur = this.current;
+      this.current = null;
+      if (cur) {
+        try { this.player?.stop(true); } catch { /* nothing to stop */ }
+        const playedMs = Math.round(cur.resource.playbackDuration);
+        this.emit(cur.interruptedBy
+          ? { type: 'interrupted', id: cur.id, playedMs, by: cur.interruptedBy }
+          : { type: 'failed', id: cur.id, playedMs, reason });
+      }
+      for (const item of queued) this.emit({ type: 'failed', id: item.id, playedMs: 0, reason });
     } finally {
       this.playing = false;
+      // A 'failed' listener can queue an item while the drain above runs.
+      // Its play() found the pump still marked as playing, so start the
+      // pump for it here; otherwise it would wait for the next play().
+      if (this.queue.length) this.kick();
     }
   }
 
