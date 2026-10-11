@@ -154,15 +154,29 @@ in the git log and PR descriptions.
 - **`channels/open` opens exactly the channel it was asked for.** A stale or
   unknown `channelId` used to fall through to the first registered channel of
   the same type, so a host could open, subscribe to, and receive history from
-  a different channel than it named. Now every supplied selector (`channelId`,
-  `address`) must name the same registered channel, and a missing, malformed,
-  or contradictory one is refused before any history is fetched or anything
-  is opened. Only a request with no selector at all may pick a channel by
-  type, and only when exactly one fits; otherwise the refusal lists bounded
-  choices. `type`, which MCPL requires, must be a non-empty string on every
-  request and must match the channel opened: a missing or invalid `type` is
-  refused, even beside an exact `channelId` or `address`, rather than read as
-  any type.
+  a different channel than it named. Now the request is read by MCPL's
+  precedence. A `channelId` alone selects, and an `address` beside it isn't
+  read; without a `channelId`, an `address` naming a guildId and a channelId
+  selects. Either names exactly one channel or is refused: an id the registry
+  doesn't hold is looked up in Discord, and opened (and registered) when it's
+  a text or announcement channel, or a DM, that the filters admit, so a DM
+  after a restart still opens; any other id is refused, whatever an address
+  beside it says. Threads aren't looked up yet: one opens once something
+  registers it. A request with no selector (`channelId` absent or null, and
+  `address` absent, null or `{}`) opens the one registered channel of its
+  type, DMs and threads counted, and is refused when there are none or
+  several; a refusal over several lists the first ten and points to
+  `channels/list` for the rest. `type`, which MCPL requires, must be a
+  non-empty string on every request and must match the channel opened, so a
+  registered `channelId` with a different `type` is refused too. Unlike
+  `main`, an empty-string `channelId` is refused rather than read as absent,
+  and address ids must be strings. Refusals carry MCPL's codes: unknown
+  channel (`-32023`), invalid params (`-32602`), or open failed (`-32024`,
+  when the history fetch fails, or a `channels/close` or `mute_channel` for
+  the channel arrives while it runs, which then stands). No history is
+  fetched, and nothing is opened or subscribed, before a request names its
+  channel, and a channel unregistered during the fetch isn't opened. `sinceLastSeen` reads the
+  persisted watermark even when it's the first thing to.
 
 - **Ghost "[message edited]" events.** Discord emits `messageUpdate` for more
   than content edits: link-preview / embed refreshes re-send old messages with

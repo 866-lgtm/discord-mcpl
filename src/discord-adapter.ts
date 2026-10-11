@@ -1175,6 +1175,60 @@ export class DiscordAdapter {
     return collected;
   }
 
+  /**
+   * The channel an exact channels/open selector names, when this server
+   * serves it, for one the registry doesn't hold yet (a DM after a restart,
+   * say). `guildSegment` is the MCPL id's middle part: a guild id, or `dm`.
+   *
+   * Served means what the registry's own paths would register: a guild text
+   * or announcement channel in that guild, which the guild filter and the
+   * channel list admit, or a DM whose recipient the DM list admits. Anything
+   * else is null: another kind, another guild, a channel the filters refuse,
+   * and a lookup that fails or finds nothing. Threads are left to the
+   * registry's own arrival paths, which build their descriptors. The cache is
+   * read first, then Discord.
+   */
+  async lookUpServedChannel(guildSegment: string, channelId: string): Promise<
+    | { kind: 'guild'; guildId: string; guildName: string; channel: DiscordChannelInfo }
+    | { kind: 'dm'; recipientId: string; recipientName: string }
+    | null
+  > {
+    let channel: Channel | null | undefined;
+    try {
+      channel = this.client.channels.cache.get(channelId) ?? (await this.client.channels.fetch(channelId));
+    } catch (err) {
+      dbg('lookUpServedChannel:failed', { channelId, error: (err as Error).message });
+      return null;
+    }
+    if (!channel) return null;
+    if (guildSegment === 'dm') {
+      if (channel.type !== ChannelType.DM) return null;
+      const recipientId = (channel as DMChannel).recipientId;
+      if (!recipientId || (this.dmUsers && !this.dmUsers.has(recipientId))) return null;
+      // The username, as an inbound DM's descriptor is labelled.
+      const recipient = (channel as DMChannel).recipient ?? (await this.client.users.fetch(recipientId).catch(() => null));
+      return { kind: 'dm', recipientId, recipientName: recipient?.username ?? recipientId };
+    }
+    if (channel.type !== ChannelType.GuildText && channel.type !== ChannelType.GuildAnnouncement) return null;
+    const c = channel as TextChannel;
+    if (c.guildId !== guildSegment) return null;
+    if (this.guildIds && !this.guildIds.includes(c.guildId)) return null;
+    if (!this.channelAllowed(c.guildId, c.id, c.parentId)) return null;
+    const guildName = c.guild?.name ?? c.guildId;
+    return {
+      kind: 'guild',
+      guildId: c.guildId,
+      guildName,
+      channel: {
+        id: c.id,
+        name: c.name,
+        type: mapChannelType(c.type),
+        parentId: c.parentId ?? undefined,
+        label: formatChannelLabel(c.name, guildName),
+      },
+    };
+  }
+
   /** Resolve display metadata for a channel by ID — used by the reconnect
    *  catch-up sweep to label `<missed>` blocks. Returns nulls for an
    *  unresolvable channel rather than throwing. */

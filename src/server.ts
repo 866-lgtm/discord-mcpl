@@ -14,6 +14,7 @@ import {
   ERR_FEATURE_SET_NOT_ENABLED,
   ERR_UNKNOWN_FEATURE_SET,
   ERR_UNKNOWN_CHANNEL,
+  ERR_CHANNEL_OPEN_FAILED,
   ERR_CHECKPOINT_NOT_FOUND,
 } from '@animalabs/mcpl-core';
 import { formatAgentDateTime, resolveAgentTimeZone, resolveTimestampStyle } from './timezone.js';
@@ -52,7 +53,17 @@ import { MessageFlags } from 'discord.js';
 import { toolDefinitions } from './tools.js';
 import { withToolClasses } from './tool-classes.js';
 import { featureSets, isEnabled, featureSetForTool } from './feature-sets.js';
-import { ChannelManager, mcplChannelId, parseMcplChannelId, resolveOpenTarget, toDescriptor, toDmDescriptor } from './channels.js';
+import {
+  ChannelManager,
+  INVALID_PARAMS,
+  RequestRefusal,
+  typeName,
+  mcplChannelId,
+  parseMcplChannelId,
+  resolveOpenTarget,
+  toDescriptor,
+  toDmDescriptor,
+} from './channels.js';
 import {
   channelLabel,
   isSnowflake,
@@ -1180,6 +1191,13 @@ export class DiscordMcplServer {
           conn.sendError(req.id, -32601, `Method not found: ${req.method}`);
       }
     } catch (err) {
+      if (err instanceof RequestRefusal) {
+        // An answer to the request, not a fault: its own code, one log line.
+        console.error(`[discord-mcpl] ${req.method} refused (${err.code}): ${err.message}`);
+        dbg('handleRequest:refused', { method: req.method, code: err.code, error: err.message });
+        conn.sendError(req.id, err.code, err.message);
+        return;
+      }
       // Capture the full error before reporting it. The previous version
       // dropped stack + tool/input context, which made transient failures
       // (Discord 5xx, rate-limit, missing permissions, etc.) untraceable
@@ -1544,6 +1562,7 @@ export class DiscordMcplServer {
         const wasNew = !this.mutedChannels.has(channelId);
         this.mutedChannels.add(channelId);
         if (wasNew) this.saveMuted();
+        this.bumpLifecycle(channelId); // an open awaiting history doesn't undo this mute
         // Muting implies leaving: drop any ambient subscription so the channel
         // stops delivering; it also won't auto-subscribe back in while muted.
         this.ensureSubscriptionsLoaded();
@@ -2504,25 +2523,36 @@ export class DiscordMcplServer {
   }
 
   private async handleChannelOpen(params: ChannelOpenRequest): Promise<ChannelOpenResponse> {
-    // Every supplied selector must name the same registered channel; nothing
-    // is fetched, opened or subscribed unless they do (see resolveOpenTarget).
+    // One channel this server serves, by MCPL's precedence, or a refusal with
+    // its code; nothing is fetched, opened or subscribed before this.
     const target = resolveOpenTarget(params, this.channelManager.getAll());
-    if (!target.ok) throw new Error(target.reason);
-    const desc = target.channel;
-
-    const parsed = parseMcplChannelId(desc.id);
-    if (!parsed) throw new Error(`Invalid Discord channel ID: ${desc.id}`);
+    if (target.kind === 'refused') throw new RequestRefusal(target.code, target.reason);
+    const parsed = parseMcplChannelId(target.kind === 'registered' ? target.channel.id : target.id);
+    if (!parsed) throw new Error(`Invalid Discord channel ID: ${target.kind === 'registered' ? target.channel.id : target.id}`);
+    // A close or mute of this channel from here on, during the lookup or the
+    // history fetch, stands over this open.
+    const lifecycle = this.lifecycleEpoch(parsed.channelId);
+    const desc = target.kind === 'registered' ? target.channel : await this.registerServedChannel(target, params.type);
     const result: ChannelOpenResponse = { channel: desc };
     const requested = params.history?.limit ?? 0;
     if (requested > 0) {
       const limit = this.capHistoryLimit(parsed.channelId, Math.min(500, Math.max(0, requested)));
-      const messages = await this.discord.fetchHistory(parsed.channelId, {
-        limit,
-        ...(params.history?.beforeMessageId ? { before: params.history.beforeMessageId } : {}),
-        ...(params.history?.sinceLastSeen
-          ? { after: this.forwardedWatermark.get(parsed.channelId) }
-          : {}),
-      });
+      if (params.history?.sinceLastSeen) this.ensureWatermarkLoaded();
+      let messages: Awaited<ReturnType<typeof this.discord.fetchHistory>>;
+      try {
+        messages = await this.discord.fetchHistory(parsed.channelId, {
+          limit,
+          ...(params.history?.beforeMessageId ? { before: params.history.beforeMessageId } : {}),
+          ...(params.history?.sinceLastSeen
+            ? { after: this.forwardedWatermark.get(parsed.channelId) }
+            : {}),
+        });
+      } catch (err) {
+        throw new RequestRefusal(
+          ERR_CHANNEL_OPEN_FAILED,
+          `${desc.id}'s history couldn't be fetched, so nothing was opened: ${(err as Error).message}`,
+        );
+      }
       messages.sort((a, b) => a.timestamp.getTime() - b.timestamp.getTime());
       result.history = this.projectHistoryReactions(messages).map((message) => ({
         channelId: desc.id,
@@ -2541,19 +2571,80 @@ export class DiscordMcplServer {
       result.historyTruncated = requested > limit;
     }
 
-    // Commit actual lifecycle only after any requested history fetch succeeds,
-    // so a failed open cannot leave Discord subscribed while the host records
-    // the operation as failed.
-    this.channelManager.open(desc.id);
+    // Commit the lifecycle only now, after any history fetch, and only if
+    // nothing that arrived meanwhile overrides this open: a close or mute of
+    // the channel stands, and a channel unregistered meanwhile isn't opened.
+    // So a failed or overtaken open leaves nothing subscribed.
+    if (this.lifecycleEpoch(parsed.channelId) !== lifecycle) {
+      throw new RequestRefusal(
+        ERR_CHANNEL_OPEN_FAILED,
+        `A channels/close or mute_channel for ${desc.id} arrived while its history was fetched, and it stands. Nothing was opened.`,
+      );
+    }
+    const opened = this.channelManager.open(desc.id);
+    if (!opened) {
+      throw new RequestRefusal(
+        ERR_UNKNOWN_CHANNEL,
+        `${desc.id} was unregistered while its history was fetched (deleted, or no longer admitted by the filters). Nothing was opened.`,
+      );
+    }
+    result.channel = opened;
     this.subscribeRawChannel(parsed.channelId);
     return result;
+  }
+
+  /** An exact id or address the registry doesn't hold (resolveOpenTarget's
+   *  `unregistered`), looked up in Discord. A channel this server serves is
+   *  registered, and announced, now, so a DM or channel no traffic has
+   *  registered since a restart still opens; anything else is refused as
+   *  unknown, and a channel of another type as bad params. */
+  private async registerServedChannel(target: { id: string; via: string }, type: unknown): Promise<ChannelDescriptor> {
+    const parsed = parseMcplChannelId(target.id)!; // resolveOpenTarget hands back only ids that parse
+    const found = await this.discord.lookUpServedChannel(parsed.guildId, parsed.channelId);
+    if (!found) {
+      throw new RequestRefusal(
+        ERR_UNKNOWN_CHANNEL,
+        `No channel this server serves matches ${target.via}: Discord doesn't know it, or it isn't a text channel ` +
+          'or DM the filters admit. Nothing was opened.',
+      );
+    }
+    const desc = found.kind === 'dm'
+      ? toDmDescriptor(parsed.channelId, found.recipientName, false, this.backscrollLimitFor(parsed.channelId), found.recipientId)
+      : toDescriptor(
+        found.guildId,
+        found.guildName,
+        found.channel,
+        this.isChannelSubscribed(found.channel.id),
+        this.backscrollLimitFor(found.channel.id),
+      );
+    if (desc.type !== type) {
+      throw new RequestRefusal(INVALID_PARAMS, `${target.via} is a ${desc.type} channel, not ${typeName(String(type))}. Nothing was opened.`);
+    }
+    this.registerAndNotifyNew([desc]);
+    return desc;
+  }
+
+  /** How many closes and mutes a Discord channel has had in this process
+   *  (bumpLifecycle), so an open that awaited history can tell whether one
+   *  arrived meanwhile. */
+  private lifecycleEpochs = new Map<string, number>();
+
+  private lifecycleEpoch(channelId: string): number {
+    return this.lifecycleEpochs.get(channelId) ?? 0;
+  }
+
+  private bumpLifecycle(channelId: string): void {
+    this.lifecycleEpochs.set(channelId, this.lifecycleEpoch(channelId) + 1);
   }
 
   private handleChannelClose(params: ChannelsCloseParams): ChannelsCloseResult {
     const desc = this.channelManager.get(params.channelId);
     const parsed = parseMcplChannelId(params.channelId);
     const wasOpen = this.channelManager.close(params.channelId);
-    if (parsed) this.unsubscribeRawChannel(parsed.channelId);
+    if (parsed) {
+      this.bumpLifecycle(parsed.channelId); // an open awaiting history doesn't overtake this close
+      this.unsubscribeRawChannel(parsed.channelId);
+    }
     return { closed: wasOpen || desc !== undefined };
   }
 

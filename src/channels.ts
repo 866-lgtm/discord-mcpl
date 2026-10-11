@@ -2,7 +2,7 @@
  * MCPL channel management — maps Discord channels to MCPL ChannelDescriptors.
  */
 
-import type { ChannelDescriptor } from '@animalabs/mcpl-core';
+import { ERR_UNKNOWN_CHANNEL, type ChannelDescriptor } from '@animalabs/mcpl-core';
 import type { DiscordChannelInfo } from './discord-adapter.js';
 import { formatChannelLabel } from './channel-names.js';
 
@@ -85,87 +85,132 @@ export function toDmDescriptor(
 }
 
 /** How many candidates an ambiguity refusal lists before summarizing. */
-const OPEN_CHOICES_SHOWN = 10;
+export const OPEN_CHOICES_SHOWN = 10;
+
+/** JSON-RPC's code for invalid params (MCPL's own codes are mcpl-core's ERR_*). */
+export const INVALID_PARAMS = -32602;
+
+/** A request refused with the JSON-RPC error code its answer carries, so a
+ *  host can tell a stale selector (unknown channel) from bad params, an open
+ *  that couldn't go ahead, or a fault. Not a fault itself: the server logs it
+ *  as one line, without a stack. */
+export class RequestRefusal extends Error {
+  constructor(readonly code: number, message: string) {
+    super(message);
+    this.name = 'RequestRefusal';
+  }
+}
+
+/** A caller's value in a refusal: quoted, and cut short past 100 characters,
+ *  so an outsized value can't flood the error or the operator log. */
+export function echo(value: string): string {
+  return JSON.stringify(value.length > 100 ? `${value.slice(0, 100)}…` : value);
+}
+
+/** A caller's type in a refusal: as is when it's a plain word, such as
+ *  `discord`, else echoed. */
+export function typeName(type: string): string {
+  return /^[a-z][\w.-]{0,39}$/i.test(type) ? type : echo(type);
+}
+
+/** What a channels/open request names, read against the registry. */
+export type OpenTarget =
+  | { kind: 'registered'; channel: ChannelDescriptor }
+  /** An exact selector naming a well-formed id the registry doesn't hold:
+   *  the server looks it up in Discord (see DiscordMcplServer.openTarget). */
+  | { kind: 'unregistered'; id: string; via: string }
+  /** Refused, with the JSON-RPC error code the answer carries. */
+  | { kind: 'refused'; code: number; reason: string };
 
 /**
- * Resolve a channels/open request to exactly one registered channel, or say
- * why it can't. Every selector the caller supplied must name the same
- * channel: an explicit channelId or address that is unknown, malformed, or
- * contradicts another selector is refused, never replaced by a looser match.
- * Only a request with no selector at all (a legacy host) may pick a channel
- * by type, and only when exactly one of that type is registered.
+ * Resolve a channels/open request against the registered channels, by MCPL's
+ * precedence. Nothing here opens anything.
  *
- * type is required in MCPL, so every request must carry it as a non-empty
- * string, and the channel opened must be of that type. A missing or invalid
- * type is refused, never read as "any type".
+ * type is required in MCPL, and every host we know sends it (agent-framework's
+ * ChannelsOpenParams makes it a required field, so its exact thread opens
+ * carry it too). So it must be a non-empty string, and the channel opened must
+ * be of that type; a missing or invalid type is refused, never read as "any".
  *
- * "No selector" is narrow. channelId is optional in MCPL, so it is absent
- * only when omitted; an empty or non-string channelId is an invalid selector.
- * address is a required field, so a selector-free host sends it as null or
- * an empty object; anything else must be an object naming both guildId and
- * channelId (an array, say, is refused).
+ * channelId, when given, is the exact selector, and it alone selects: an
+ * address beside it isn't read, whatever it says (MCPL prefers channelId, and
+ * hosts code against that). Absent or null means no channelId. An empty string
+ * or a non-string is refused, since it names nothing.
+ *
+ * Without a channelId, an address naming a guildId and a channelId (both
+ * non-empty strings) is the exact selector. An address that is absent, null or
+ * {} names nothing, and anything else is refused.
+ *
+ * An exact selector that names a registered channel opens it. One that is
+ * well-formed but not registered is handed back as `unregistered`, for the
+ * server to look up in Discord: it may be a channel this server serves that
+ * no traffic has registered yet (a DM after a restart, say). An exact
+ * selector never falls back to another channel. With no selector at all, a
+ * request opens the one channel of its type, every registered kind counted
+ * (DMs among them), and is refused when there are none or several.
  */
 export function resolveOpenTarget(
   params: { channelId?: unknown; type?: unknown; address?: unknown },
   channels: readonly ChannelDescriptor[],
-): { ok: true; channel: ChannelDescriptor } | { ok: false; reason: string } {
+): OpenTarget {
+  const refuse = (code: number, reason: string): OpenTarget => ({ kind: 'refused', code, reason });
   const { type } = params;
   if (typeof type !== 'string' || type === '') {
-    return { ok: false, reason: 'type must be a non-empty string naming a channel type, such as "discord". Nothing was opened.' };
+    return refuse(INVALID_PARAMS, 'type must be a non-empty string naming a channel type, such as "discord". Nothing was opened.');
   }
   const byId = new Map(channels.map((c) => [c.id, c]));
-  const named: Array<{ via: string; id: string }> = [];
-
-  if (params.channelId !== undefined) {
-    if (typeof params.channelId !== 'string' || params.channelId === '') {
-      return {
-        ok: false,
-        reason: 'channelId must be a registered channel id; an empty or non-string channelId names no channel (omit it to open by type). Nothing was opened.',
-      };
+  const exact = (id: string, via: string): OpenTarget => {
+    const channel = byId.get(id);
+    if (!channel) {
+      return parseMcplChannelId(id)
+        ? { kind: 'unregistered', id, via }
+        : refuse(ERR_UNKNOWN_CHANNEL, `${via} names no channel: a Discord channel id has the form discord:<guildId>:<channelId> (discord:dm:<channelId> for a DM). Nothing was opened.`);
     }
-    named.push({ via: `channelId "${params.channelId}"`, id: params.channelId });
+    if (channel.type !== type) {
+      return refuse(INVALID_PARAMS, `${via} is a ${channel.type} channel, not ${typeName(type)}. Nothing was opened.`);
+    }
+    return { kind: 'registered', channel };
+  };
+
+  const { channelId } = params;
+  if (channelId !== undefined && channelId !== null) {
+    if (typeof channelId !== 'string') {
+      return refuse(INVALID_PARAMS, 'channelId must be a string, such as "discord:<guildId>:<channelId>" (send null or omit it for no selector). Nothing was opened.');
+    }
+    if (channelId === '') {
+      return refuse(INVALID_PARAMS, 'channelId is empty: send null or omit it for no selector, or name the channel as discord:<guildId>:<channelId>. Nothing was opened.');
+    }
+    return exact(channelId, `channelId ${echo(channelId)}`);
   }
+
   const addr = params.address;
   const isObject = typeof addr === 'object' && addr !== null && !Array.isArray(addr);
   if (addr !== undefined && addr !== null && !(isObject && Object.keys(addr).length === 0)) {
+    if (!isObject) {
+      return refuse(INVALID_PARAMS, 'address must be absent, null, {}, or an object naming a guildId and a channelId. Nothing was opened.');
+    }
     const a = addr as { guildId?: unknown; channelId?: unknown };
-    if (!isObject || typeof a.guildId !== 'string' || !a.guildId
-      || typeof a.channelId !== 'string' || !a.channelId) {
-      return { ok: false, reason: 'address must be an object naming both a guildId and a channelId. Nothing was opened.' };
+    if ((a.guildId !== undefined && typeof a.guildId !== 'string') || (a.channelId !== undefined && typeof a.channelId !== 'string')) {
+      return refuse(INVALID_PARAMS, 'address guildId and channelId are strings (a Discord id as a JSON number loses precision). Nothing was opened.');
     }
-    named.push({ via: `address ${a.guildId}/${a.channelId}`, id: mcplChannelId(a.guildId, a.channelId) });
-  }
-
-  if (named.length > 0) {
-    for (const n of named) {
-      if (!byId.has(n.id)) {
-        return { ok: false, reason: `No registered channel matches ${n.via}; nothing was opened.` };
-      }
+    if (!a.guildId || !a.channelId) {
+      return refuse(INVALID_PARAMS, 'address must name both a guildId and a channelId, or be absent, null or {} for no selector. Nothing was opened.');
     }
-    if (named.some((n) => n.id !== named[0].id)) {
-      return {
-        ok: false,
-        reason: `The selectors name different channels (${named.map((n) => `${n.via} → ${n.id}`).join('; ')}); nothing was opened.`,
-      };
-    }
-    const channel = byId.get(named[0].id)!;
-    if (channel.type !== type) {
-      return { ok: false, reason: `${named[0].via} is a ${channel.type} channel, not ${type}; nothing was opened.` };
-    }
-    return { ok: true, channel };
+    return exact(mcplChannelId(a.guildId as string, a.channelId as string), `address ${echo(a.guildId as string)}/${echo(a.channelId as string)}`);
   }
 
   const candidates = channels.filter((c) => c.type === type);
-  if (candidates.length === 1) return { ok: true, channel: candidates[0] };
+  if (candidates.length === 1) return { kind: 'registered', channel: candidates[0] };
   if (candidates.length === 0) {
-    return { ok: false, reason: `No ${type} channel is registered; nothing was opened.` };
+    return refuse(ERR_UNKNOWN_CHANNEL, `No ${typeName(type)} channel is registered, so there is none to open without a selector. Nothing was opened.`);
   }
   const shown = candidates.slice(0, OPEN_CHOICES_SHOWN).map((c) => `${c.id} (${c.label})`).join(', ');
-  const more = candidates.length > OPEN_CHOICES_SHOWN ? `, and ${candidates.length - OPEN_CHOICES_SHOWN} more` : '';
-  return {
-    ok: false,
-    reason: `${candidates.length} ${type} channels are registered; name one with channelId. Choices: ${shown}${more}. Nothing was opened.`,
-  };
+  const more = candidates.length > OPEN_CHOICES_SHOWN
+    ? `, and ${candidates.length - OPEN_CHOICES_SHOWN} more, which channels/list returns`
+    : '';
+  return refuse(
+    INVALID_PARAMS,
+    `${candidates.length} ${typeName(type)} channels are registered; name one with channelId. Choices: ${shown}${more}. Nothing was opened.`,
+  );
 }
 
 /**
