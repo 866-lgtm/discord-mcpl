@@ -39,7 +39,8 @@ function adapterWith(t: TestContext, config: Partial<DiscordAdapterConfig>) {
   t.after(() => client.destroy());
   (client.channels as unknown as { fetch: unknown }).fetch = async (id: string) => {
     if (id === DM) return { id, isDMBased: () => true };
-    if (id === LOOKUP_FAILS) throw new Error('Unknown Channel');
+    // As discord.js's DiscordAPIError carries it: Discord's JSON code.
+    if (id === LOOKUP_FAILS) throw Object.assign(new Error('Unknown Channel'), { code: 10003, status: 404 });
     const c = channels[id];
     return c ? { id, isDMBased: () => false, ...c } : null;
   };
@@ -107,7 +108,7 @@ describe('fetch_history and fetch_around by numeric id', () => {
     assert.deepEqual(reads, [], 'no history was read');
   });
 
-  it('returns a failed channel lookup as its error, before any message is read', async (t) => {
+  it('returns a failed channel lookup as its error, explained, before any message is read', async (t) => {
     const { server, reads } = serverWith(t);
     for (const [tool, args] of [
       ['fetch_history', { channelId: LOOKUP_FAILS }],
@@ -115,8 +116,20 @@ describe('fetch_history and fetch_around by numeric id', () => {
     ] as const) {
       const res = await server.handleToolCall(tool, args);
       assert.equal(res.isError, true, tool);
-      assert.equal(res.content[0].text, 'Unknown Channel', tool);
+      assert.match(res.content[0].text, /^Unknown Channel\n\n/, `${tool}: Discord's own words come first`);
+      assert.match(res.content[0].text, new RegExp(`No channel ${LOOKUP_FAILS} is visible to this connection`), tool);
     }
+    assert.deepEqual(reads, [], 'no history was read');
+  });
+
+  it('explains a failed lookup against the name the model sent', async (t) => {
+    const { server, reads } = serverWith(t);
+    // The name route resolved '#gone' to an id whose lookup Discord refuses.
+    const discord = (server as unknown as { discord: Record<string, unknown> }).discord;
+    discord.resolveChannelRef = () => ({ ok: true, id: LOOKUP_FAILS });
+    const res = await server.handleToolCall('fetch_history', { channelId: '#gone' });
+    assert.equal(res.isError, true);
+    assert.match(res.content[0].text, new RegExp(`#gone resolved to channel ${LOOKUP_FAILS}, which Discord doesn't know`));
     assert.deepEqual(reads, [], 'no history was read');
   });
 

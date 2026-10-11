@@ -1527,7 +1527,8 @@ export class DiscordMcplServer {
       try {
         refusal = await this.discord.inspectionRefusal(args.channelId);
       } catch (err) {
-        return { content: [textContent((err as Error).message)], isError: true };
+        // A lookup Discord refuses is explained as any tool's error is below.
+        return { content: [textContent(explainDiscordError(err, args, explain))], isError: true };
       }
       if (refusal) {
         dbg('channel:inspection-refused', { tool: name, channelId: args.channelId });
