@@ -60,10 +60,11 @@ import {
   looksLikeExplicitName,
   type AddressingPath,
 } from './channel-names.js';
+import { explainDiscordError, type ExplainContext } from './discord-errors.js';
 import { saveFiltersFile, loadFiltersFile, DiscordFiltersState, type DiscordFilters } from './filters.js';
 import { StateTracker } from './state.js';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { existsSync, readFileSync } from 'node:fs';
+import { isId, isJsonObject, readJsonFile, usableIds, writeJsonFile, type Usable } from './persisted-json.js';
 import sharp from 'sharp';
 import { dbg } from './debug-log.js';
 
@@ -89,6 +90,76 @@ interface ChannelAcknowledgeRequest {
   intent: string;
   value?: string;
 }
+
+interface SavedTally {
+  anchorId: string;
+  talliedThrough?: string;
+  messages: number;
+  characters: number;
+}
+
+interface SavedWatermarks {
+  watermarks?: Record<string, string>;
+  dmChannels?: string[];
+  missed?: Record<string, SavedTally>;
+}
+
+/** What the watermark store can use of its file. saveWatermark writes an
+ *  object with three keys, any of which a file from an earlier version may
+ *  lack: `watermarks`, channel ids to message ids; `dmChannels`, a list of
+ *  ids; and `missed`, channel ids to tallies. A tally has a string anchorId,
+ *  finite messages and characters, and talliedThrough a string or absent, as
+ *  every version since the tally began (9884f70) has written it. Anything
+ *  else can't be used, so readJsonFile keeps it in the copy it makes, and
+ *  loads the rest. */
+function usableWatermarks(value: unknown): Usable<SavedWatermarks> {
+  if (!isJsonObject(value)) return { value: null, unusable: 'not an object' };
+  let others = 0;
+  const out: SavedWatermarks = {};
+  for (const [key, entries] of Object.entries(value)) {
+    if (key === 'watermarks' && isJsonObject(entries)) {
+      out.watermarks = {};
+      for (const [channel, id] of Object.entries(entries)) {
+        if (isId(channel) && isId(id)) out.watermarks[channel] = id;
+        else others++;
+      }
+    } else if (key === 'dmChannels' && Array.isArray(entries)) {
+      out.dmChannels = entries.filter(isId);
+      others += entries.length - out.dmChannels.length;
+    } else if (key === 'missed' && isJsonObject(entries)) {
+      out.missed = {};
+      for (const [channel, tally] of Object.entries(entries)) {
+        if (
+          isId(channel) &&
+          isJsonObject(tally) &&
+          typeof tally.anchorId === 'string' &&
+          (tally.talliedThrough === undefined || typeof tally.talliedThrough === 'string') &&
+          Number.isFinite(tally.messages) &&
+          Number.isFinite(tally.characters)
+        ) {
+          const { anchorId, talliedThrough, messages, characters, ...extra } = tally;
+          out.missed[channel] = {
+            anchorId,
+            ...(talliedThrough === undefined ? {} : { talliedThrough }),
+            messages,
+            characters,
+          } as SavedTally;
+          others += Object.keys(extra).length;
+        } else {
+          others++;
+        }
+      }
+    } else {
+      others++;
+    }
+  }
+  return { value: out, unusable: others ? `${others} ${others === 1 ? 'entry' : 'entries'} the store doesn't write` : null };
+}
+
+/** What a tool's reply adds when its store's configured file couldn't be
+ *  saved. True whatever the failure: the store as it is now isn't on disk. */
+const unsavedNote = (store: string, failure: string | null): string =>
+  failure ? ` The ${store} couldn't be saved (${failure}), so as it stands now it wouldn't survive a restart.` : '';
 
 /** A Discord message must carry text and/or attachments — reject empty sends. */
 function requireContentOrFiles(content: string, files: OutgoingFile[] | undefined): void {
@@ -269,6 +340,9 @@ export class DiscordMcplServer {
    *  subscriptions file. */
   private reactionChannels = new Set<string>();
   private reactionChannelsLoaded = false;
+  /** The file may not hold reactionChannels as it is now: a change wasn't
+   *  saved, or the file couldn't be read, copied aside or rewritten. */
+  private reactionChannelsUnsaved = false;
 
   /** Resolved when the host's first featureSets/update (either form) has
    *  been processed — the signal that §5.3 policy is settled and pushes
@@ -292,6 +366,8 @@ export class DiscordMcplServer {
    *  (…​.muted.json), or DISCORD_MUTED_CHANNELS_FILE if set. */
   private mutedChannels = new Set<string>();
   private mutedLoaded = false;
+  /** The file may not hold mutedChannels as it is now, as reactionChannelsUnsaved. */
+  private mutedUnsaved = false;
 
   /** Per-channel watermark of the highest Discord message id forwarded to
    *  the host. Used by the auto-subscribe-on-mention flow to fetch only
@@ -322,6 +398,9 @@ export class DiscordMcplServer {
     { anchorId: string; talliedThrough: string; messages: number; characters: number }
   >();
   private watermarkLoaded = false;
+  /** Why the last watermark save failed, or null when it succeeded, so a
+   *  failure is logged when it starts or changes rather than per message. */
+  private watermarkSaveFailure: string | null = null;
   /** Set once the reconnect catch-up sweep has run for the current process,
    *  so it doesn't re-run if a host reconnects mid-session. */
   private sweepDone = false;
@@ -487,6 +566,7 @@ export class DiscordMcplServer {
     if (r.status === 'spoken' && r.unvoicedText.length === 0) return;
     const interrupted = r.status === 'interrupted';
     const expired = r.status === 'expired';
+    const failed = r.status === 'failed';
     const secs = (r.playedMs / 1000).toFixed(1);
     const who = r.interruptedBy
       ? `@${r.interruptedBy.username ?? r.interruptedBy.userId}${r.interruptedBy.bot ? ' (bot)' : ''}`
@@ -496,12 +576,26 @@ export class DiscordMcplServer {
     const tail = r.voicedText.length > 120 ? `…${r.voicedText.slice(-120)}` : r.voicedText;
     const head = r.unvoicedText.length > 400 ? `${r.unvoicedText.slice(0, 400)}…` : r.unvoicedText;
     const approx = r.estimated ? ' (boundary approximate)' : '';
+    // A reply still streaming when its utterance ended short isn't voiced
+    // past that point either: say so, so the model re-decides all of it.
+    const rest = r.restUnvoiced ? '\nWhat you went on to say in that reply wasn\'t voiced either.' : '';
     const line = expired
       ? `[voice] Your spoken message waited ${(r.queuedMs / 1000).toFixed(0)}s for the channel to clear and was dropped UNSPOKEN — nothing was heard (and nothing was billed).\n` +
         `Not said: "${head}"\n(The text was still delivered in the text channel as usual. Say it again — possibly shorter — only if it still needs saying.)`
       : interrupted
         ? `[voice] Your spoken message was interrupted by ${who} after ${secs}s${approx}.\n` +
-          `Heard up to: "${tail}"\nNOT heard: "${head}"`
+          `Heard up to: "${tail}"\nNOT heard: "${head}"` + rest
+        : failed
+          ? // Part of it played: it was stopped, for the reason given (the
+            // limit on one reply, say). Nothing played: it couldn't be.
+            (r.playedMs > 0
+              ? `[voice] Your spoken message was stopped after ${secs}s${approx} (${r.failure ?? 'playback failed'}).\n`
+              : `[voice] Your spoken message couldn't be played (${r.failure ?? 'playback failed'}) — nothing was heard.\n`) +
+            // A line whose text is empty is left out rather than quoted empty.
+            (r.playedMs > 0 && tail ? `Heard up to: "${tail}"\n` : '') +
+            (head ? `NOT heard: "${head}"\n` : '') +
+            (rest ? `${rest.slice(1)}\n` : '') +
+            '(The text was still delivered in the text channel as usual.)'
         : `[voice] Your spoken message was cut short by a synthesis error after ${secs}s${approx}.\n` +
           `Heard up to: "${tail}"\nNOT heard: "${head}"\n(The text was still delivered in the text channel as usual.)`;
     this.conn.sendRequest(method.PUSH_EVENT, {
@@ -530,7 +624,12 @@ export class DiscordMcplServer {
       // is context: the text landed in the text channel, nothing to decide.
       // Third-party speech while recently-engaged (the engagement-window
       // rule) is the floor/gate layer's job, not this transport's.
-      tags: [expired ? 'voice:expired' : interrupted ? 'voice:interrupted' : 'voice:truncated'],
+      // 'voice:failed' is context too, like 'voice:truncated': the text
+      // landed in the text channel. The model sees it on its next turn (the
+      // next person to speak wakes it), and can say the line again then if it
+      // still needs saying. Some causes pass (a slow start, the limit on one
+      // reply), so it isn't an operator's fault to fix each time.
+      tags: [expired ? 'voice:expired' : interrupted ? 'voice:interrupted' : failed ? 'voice:failed' : 'voice:truncated'],
       payload: { content: [textContent(line)] },
     } satisfies PushEventParams).catch(() => {});
   }
@@ -549,7 +648,17 @@ export class DiscordMcplServer {
    */
   async setupSlashCommands(): Promise<void> {
     this.discord.onSlashCommand((interaction) => {
-      void this.handleSlashCommand(interaction);
+      // Dispatched without awaiting, so a handler's rejection would be
+      // unhandled — and on Node ≥ 15 an unhandled rejection ends the
+      // process. Discord rejects a late reply ("Unknown interaction" once
+      // its 3-second acknowledgment window has passed), so this must never
+      // take the server down with it.
+      void this.handleSlashCommand(interaction).catch((err) => {
+        console.error(
+          `[discord-mcpl] /${interaction.commandName} failed:`,
+          err instanceof Error ? err.message : err,
+        );
+      });
     });
     await this.discord.registerGuildCommands([
       {
@@ -989,7 +1098,24 @@ export class DiscordMcplServer {
         if (msg.type === 'request') {
           await this.handleRequest(msg.request);
         } else {
-          this.handleNotification(msg.notification);
+          // A notification has no reply to carry an error, and one whose
+          // handler throws synchronously must not end this loop: every later
+          // request would go unread, and the host would wait each one out as
+          // unconfirmed. This catches synchronous throws only: a promise a
+          // handler starts has to settle its own errors.
+          try {
+            this.handleNotification(msg.notification);
+          } catch (err) {
+            console.error(
+              `[discord-mcpl] notification ${msg.notification.method} failed:`,
+              err,
+            );
+            dbg('handleNotification:error', {
+              method: msg.notification.method,
+              error: err instanceof Error ? err.message : String(err),
+              stack: err instanceof Error ? err.stack?.split('\n').slice(0, 8).join('\n') : undefined,
+            });
+          }
         }
       }
     } catch (err) {
@@ -1222,14 +1348,26 @@ export class DiscordMcplServer {
   }
 
   /** Shared body of featureSets/update, both forms (§6.7). Also resolves
-   *  the policy gate that releases the reconnect sweep (see serve()). */
+   *  the policy gate that releases the reconnect sweep (see serve()).
+   *  An update applies whole or not at all: its lists are checked before
+   *  anything changes, so a malformed one throws and leaves the grants as
+   *  they were (the notification form has no reply to say it failed). */
   private applyFeatureSetsUpdate(p: FeatureSetsUpdateParams): void {
-    if (p.enabled) {
-      for (const name of p.enabled) this.enabledFeatureSets.add(name);
+    if (typeof p !== 'object' || p === null) {
+      throw new Error('featureSets/update: params must be an object');
     }
-    if (p.disabled) {
-      for (const name of p.disabled) this.enabledFeatureSets.delete(name);
-    }
+    const names = (field: 'enabled' | 'disabled'): string[] => {
+      const list: unknown = p[field];
+      if (list === undefined || list === null) return [];
+      if (!Array.isArray(list) || !list.every((name) => typeof name === 'string')) {
+        throw new Error(`featureSets/update: ${field} must be a list of feature-set names`);
+      }
+      return list;
+    };
+    const enabled = names('enabled');
+    const disabled = names('disabled');
+    for (const name of enabled) this.enabledFeatureSets.add(name);
+    for (const name of disabled) this.enabledFeatureSets.delete(name);
     this.resolvePolicyAnswered();
   }
 
@@ -1238,9 +1376,11 @@ export class DiscordMcplServer {
   private handleNotification(notif: JsonRpcNotification): void {
     switch (notif.method) {
       case method.FEATURE_SETS_UPDATE: {
-        // §6.7 Notification form: descriptive metadata only. Grant-bearing
-        // updates (including the §5.3 initial policy) arrive as a Request —
-        // see the handleRequest case.
+        // §6.7 Notification form. A 0.5 host sends grant-bearing updates
+        // (including the §5.3 initial policy) as a Request (see the
+        // handleRequest case), but hosts before 0.5 send every update this
+        // way, so it gets the same body and changes the grants too: whole, or
+        // not at all when it's malformed.
         this.applyFeatureSetsUpdate(notif.params as FeatureSetsUpdateParams);
         break;
       }
@@ -1318,10 +1458,12 @@ export class DiscordMcplServer {
     // of the dozen-odd tools that take a channelId — one chokepoint means no
     // tool can be added later that silently misses it.
     //
-    // Snowflakes and the `discord:<guild>:<channel>` composite pass through
-    // untouched, so this is backwards compatible. A name resolves against the
-    // live channel cache; ambiguity is a hard error listing qualified labels
-    // rather than a silent pick. See channel-names.ts.
+    // A snowflake passes through untouched, so this is backwards compatible.
+    // A name, or the `discord:<guild>:<channel>` composite, is resolved to the
+    // bare channel id: a name against the live channel cache (see
+    // channel-names.ts for how it answers several matches), the composite by
+    // the id it carries.
+    let explain: ExplainContext = {};
     if (typeof args.channelId === 'string' && args.channelId.trim()) {
       const given = args.channelId;
       const path: AddressingPath = isSnowflake(given.trim()) ? 'explicit-id' : 'name-resolved';
@@ -1358,6 +1500,8 @@ export class DiscordMcplServer {
           label: resolved.matched ? channelLabel(resolved.matched) : undefined,
         });
         args = { ...args, channelId: resolved.id };
+        // An error is explained against what the model sent, not this id.
+        explain = { channelGiven: given };
       } else {
         dbg('channel:addressing', { tool: name, path, channelId: given });
       }
@@ -1380,7 +1524,7 @@ export class DiscordMcplServer {
       };
     } catch (err) {
       return {
-        content: [textContent((err as Error).message)],
+        content: [textContent(explainDiscordError(err, args, explain))],
         isError: true,
       };
     }
@@ -1479,16 +1623,27 @@ export class DiscordMcplServer {
         return await this.discord.listEmojis(args.guildId as string | undefined);
 
       case 'set_reaction_visibility': {
-        this.ensureReactionChannelsLoaded();
         const channelId = args.channelId as string;
+        if (typeof channelId !== 'string' || channelId.length === 0) {
+          throw new Error('channelId is required');
+        }
+        this.ensureReactionChannelsLoaded();
         const visible = args.visible as boolean;
-        const had = this.reactionChannels.has(channelId);
+        const changed = visible !== this.reactionChannels.has(channelId);
         if (visible) this.reactionChannels.add(channelId);
         else this.reactionChannels.delete(channelId);
-        if (visible !== had) this.saveReactionChannels();
-        return visible
-          ? `Reaction visibility ON for channel ${channelId}. Reactions there now appear in your context as they happen (they never wake you).`
-          : `Reaction visibility OFF for channel ${channelId}.`;
+        // Saved when the call changes the list or the file may not hold it,
+        // so the reply says whenever a configured file doesn't hold the list
+        // as it stands.
+        const unsaved = changed || this.reactionChannelsUnsaved ? this.saveReactionChannels() : null;
+        const note = unsavedNote('reaction channel list', unsaved);
+        if (!visible) return `Reaction visibility OFF for channel ${channelId}.` + note;
+        // A muted channel delivers nothing: the opt-in is kept, and takes effect once the mute is lifted.
+        return (
+          (this.isChannelMuted(channelId)
+            ? `Reaction visibility ON for channel ${channelId}, but the channel is muted: its reactions reach you once unmute_channel lifts the mute (they never wake you).`
+            : `Reaction visibility ON for channel ${channelId}. Reactions there now appear in your context as they happen (they never wake you).`) + note
+        );
       }
 
       case 'refresh_channels':
@@ -1544,17 +1699,29 @@ export class DiscordMcplServer {
         this.ensureMutedLoaded();
         const wasNew = !this.mutedChannels.has(channelId);
         this.mutedChannels.add(channelId);
-        if (wasNew) this.saveMuted();
+        // Saved as in set_reaction_visibility: when the call changes the list
+        // or the file may not hold it.
+        const unsaved = wasNew || this.mutedUnsaved ? this.saveMuted() : null;
         // Muting implies leaving: drop any ambient subscription so the channel
         // stops delivering; it also won't auto-subscribe back in while muted.
+        // Its reaction visibility goes too, as a close drops it
+        // (unsubscribeRawChannel), saved so a restart can't bring it back:
+        // unmuting leaves reactions off until channel_open turns them back on
+        // with the rest of ambient traffic, or set_reaction_visibility does.
         this.ensureSubscriptionsLoaded();
         this.subscribedChannels.delete(channelId);
+        this.ensureReactionChannelsLoaded();
+        const reactionsUnsaved = this.reactionChannels.delete(channelId) ? this.saveReactionChannels() : null;
         for (const channel of this.channelManager.getOpen()) {
           if (parseMcplChannelId(channel.id)?.channelId === channelId) this.channelManager.close(channel.id);
         }
-        return wasNew
-          ? `Muted channel ${channelId}: no ambient, no wake on mention/reply, and it will not auto-subscribe you back in. Reverse with unmute_channel("${channelId}").`
-          : `Channel ${channelId} was already muted.`;
+        return (
+          (wasNew
+            ? `Muted channel ${channelId}: no ambient, no wake on mention/reply, and it will not auto-subscribe you back in. Reverse with unmute_channel("${channelId}").`
+            : `Channel ${channelId} was already muted.`) +
+          unsavedNote('muted channel list', unsaved) +
+          unsavedNote('reaction channel list', reactionsUnsaved)
+        );
       }
 
       case 'unmute_channel': {
@@ -1564,13 +1731,15 @@ export class DiscordMcplServer {
         }
         this.ensureMutedLoaded();
         const removed = this.mutedChannels.delete(channelId);
-        if (removed) this.saveMuted();
+        const unsaved = removed || this.mutedUnsaved ? this.saveMuted() : null; // as in mute_channel
         const compositeId = this.channelManager.getAll()
           .find((channel) => parseMcplChannelId(channel.id)?.channelId === channelId)?.id;
         const target = compositeId ? `channelId "${compositeId}"` : 'its MCPL channel id';
-        return removed
-          ? `Unmuted channel ${channelId}. Direct addresses will reach you again. Ordinary traffic requires channel_open with ${target}. If the host still shows it as open, use channel_close then channel_open with the same id to reconcile.`
-          : `Channel ${channelId} was not muted.`;
+        return (
+          (removed
+            ? `Unmuted channel ${channelId}. Direct addresses will reach you again. Ordinary traffic requires channel_open with ${target}. If the host still shows it as open, use channel_close then channel_open with the same id to reconcile.`
+            : `Channel ${channelId} was not muted.`) + unsavedNote('muted channel list', unsaved)
+        );
       }
 
       case 'list_subscriptions': {
@@ -1941,30 +2110,27 @@ export class DiscordMcplServer {
     if (this.reactionChannelsLoaded) return;
     this.reactionChannelsLoaded = true;
     const path = this.reactionChannelsFile();
-    if (!path || !existsSync(path)) return;
-    try {
-      const parsed = JSON.parse(readFileSync(path, 'utf-8'));
-      if (Array.isArray(parsed)) {
-        for (const id of parsed) {
-          if (typeof id === 'string' && id.length > 0) this.reactionChannels.add(id);
-        }
-      }
-      dbg('reaction-channels:loaded', { count: this.reactionChannels.size, path });
-    } catch (err) {
-      console.error('[discord-mcpl] Failed to load reaction channels:', (err as Error).message);
-      dbg('reaction-channels:load-failed', { error: (err as Error).message, path });
-    }
+    if (!path) return;
+    const read = readJsonFile(path, 'reaction channels', usableIds, []);
+    for (const id of read.value) this.reactionChannels.add(id);
+    this.reactionChannelsUnsaved = !read.held;
+    dbg('reaction-channels:loaded', { count: this.reactionChannels.size, path });
   }
 
-  private saveReactionChannels(): void {
+  /** Save the reaction channels. Returns why the save failed, or null, as
+   *  with no file configured, when the list is in memory by choice. */
+  private saveReactionChannels(): string | null {
     const path = this.reactionChannelsFile();
-    if (!path) return; // in-memory mode
+    if (!path) return null; // in-memory mode
     try {
-      mkdirSync(dirname(path), { recursive: true });
-      writeFileSync(path, JSON.stringify([...this.reactionChannels].sort(), null, 2) + '\n');
+      writeJsonFile(path, [...this.reactionChannels].sort());
+      this.reactionChannelsUnsaved = false;
+      return null;
     } catch (err) {
+      this.reactionChannelsUnsaved = true;
       console.error('[discord-mcpl] Failed to save reaction channels:', (err as Error).message);
       dbg('reaction-channels:save-failed', { error: (err as Error).message, path });
+      return (err as Error).message;
     }
   }
 
@@ -2006,26 +2172,27 @@ export class DiscordMcplServer {
     if (this.mutedLoaded) return;
     this.mutedLoaded = true;
     const path = this.mutedFile();
-    if (!path || !existsSync(path)) return;
-    try {
-      const parsed = JSON.parse(readFileSync(path, 'utf-8'));
-      if (Array.isArray(parsed)) {
-        for (const id of parsed) if (typeof id === 'string' && id.length > 0) this.mutedChannels.add(id);
-      }
-      dbg('muted:loaded', { count: this.mutedChannels.size, path });
-    } catch (err) {
-      console.error('[discord-mcpl] Failed to load muted channels:', (err as Error).message);
-    }
+    if (!path) return;
+    const read = readJsonFile(path, 'muted channels', usableIds, []);
+    for (const id of read.value) this.mutedChannels.add(id);
+    this.mutedUnsaved = !read.held;
+    dbg('muted:loaded', { count: this.mutedChannels.size, path });
   }
 
-  private saveMuted(): void {
+  /** Save the muted channels. Returns why the save failed, or null, as
+   *  saveReactionChannels. */
+  private saveMuted(): string | null {
     const path = this.mutedFile();
-    if (!path) return;
+    if (!path) return null;
     try {
-      mkdirSync(dirname(path), { recursive: true });
-      writeFileSync(path, JSON.stringify([...this.mutedChannels].sort(), null, 2) + '\n');
+      writeJsonFile(path, [...this.mutedChannels].sort());
+      this.mutedUnsaved = false;
+      return null;
     } catch (err) {
+      this.mutedUnsaved = true;
       console.error('[discord-mcpl] Failed to save muted channels:', (err as Error).message);
+      dbg('muted:save-failed', { error: (err as Error).message, path });
+      return (err as Error).message;
     }
   }
 
@@ -2049,52 +2216,24 @@ export class DiscordMcplServer {
     if (this.watermarkLoaded) return;
     this.watermarkLoaded = true;
     const path = this.watermarkFile();
-    if (!path || !existsSync(path)) return;
-    try {
-      const parsed = JSON.parse(readFileSync(path, 'utf-8'));
-      const marks = parsed?.watermarks;
-      if (marks && typeof marks === 'object') {
-        for (const [chan, id] of Object.entries(marks)) {
-          if (typeof chan === 'string' && typeof id === 'string' && id.length > 0) {
-            this.forwardedWatermark.set(chan, id);
-          }
-        }
-      }
-      if (Array.isArray(parsed?.dmChannels)) {
-        for (const id of parsed.dmChannels) {
-          if (typeof id === 'string' && id.length > 0) this.dmChannelIds.add(id);
-        }
-      }
-      const missed = parsed?.missed;
-      if (missed && typeof missed === 'object') {
-        for (const [chan, v] of Object.entries(missed as Record<string, unknown>)) {
-          const e = v as Partial<{
-            anchorId: string;
-            talliedThrough: string;
-            messages: number;
-            characters: number;
-          }>;
-          if (typeof chan === 'string' && chan.length > 0) {
-            this.missedTally.set(chan, {
-              anchorId: typeof e.anchorId === 'string' ? e.anchorId : '',
-              talliedThrough:
-                typeof e.talliedThrough === 'string' ? e.talliedThrough : e.anchorId ?? '',
-              messages: Number.isFinite(e.messages) ? (e.messages as number) : 0,
-              characters: Number.isFinite(e.characters) ? (e.characters as number) : 0,
-            });
-          }
-        }
-      }
-      dbg('watermark:loaded', {
-        channels: this.forwardedWatermark.size,
-        dms: this.dmChannelIds.size,
-        missed: this.missedTally.size,
-        path,
+    if (!path) return;
+    const { value: saved } = readJsonFile(path, 'watermarks', usableWatermarks, {});
+    for (const [chan, id] of Object.entries(saved.watermarks ?? {})) this.forwardedWatermark.set(chan, id);
+    for (const id of saved.dmChannels ?? []) this.dmChannelIds.add(id);
+    for (const [chan, tally] of Object.entries(saved.missed ?? {})) {
+      this.missedTally.set(chan, {
+        anchorId: tally.anchorId,
+        talliedThrough: tally.talliedThrough ?? tally.anchorId,
+        messages: tally.messages,
+        characters: tally.characters,
       });
-    } catch (err) {
-      console.error('[discord-mcpl] Failed to load watermarks:', (err as Error).message);
-      dbg('watermark:load-failed', { error: (err as Error).message, path });
     }
+    dbg('watermark:loaded', {
+      channels: this.forwardedWatermark.size,
+      dms: this.dmChannelIds.size,
+      missed: this.missedTally.size,
+      path,
+    });
   }
 
   /** Persist the watermark map + DM channel set. Best-effort; called after
@@ -2103,7 +2242,6 @@ export class DiscordMcplServer {
     const path = this.watermarkFile();
     if (!path) return; // in-memory mode
     try {
-      mkdirSync(dirname(path), { recursive: true });
       const out = {
         watermarks: Object.fromEntries(
           [...this.forwardedWatermark.entries()].sort((a, b) => a[0].localeCompare(b[0])),
@@ -2113,10 +2251,22 @@ export class DiscordMcplServer {
           [...this.missedTally.entries()].sort((a, b) => a[0].localeCompare(b[0])),
         ),
       };
-      writeFileSync(path, JSON.stringify(out, null, 2) + '\n');
+      writeJsonFile(path, out);
+      if (this.watermarkSaveFailure !== null) console.error('[discord-mcpl] Saved watermarks again.');
+      this.watermarkSaveFailure = null;
     } catch (err) {
-      console.error('[discord-mcpl] Failed to save watermarks:', (err as Error).message);
-      dbg('watermark:save-failed', { error: (err as Error).message, path });
+      const failure = (err as Error).message;
+      // Saved after every forward, so a lasting failure is logged when it
+      // starts or its reason changes, not once per message.
+      if (failure !== this.watermarkSaveFailure) {
+        console.error(
+          '[discord-mcpl] Failed to save watermarks:',
+          failure,
+          '(logged again only if the reason changes; a later success is logged too)',
+        );
+      }
+      this.watermarkSaveFailure = failure;
+      dbg('watermark:save-failed', { error: failure, path });
     }
   }
 
@@ -2266,6 +2416,11 @@ export class DiscordMcplServer {
 
     let delivered = 0;
     for (const channelId of candidates) {
+      // A muted channel delivers nothing, its missed mentions included.
+      if (this.isChannelMuted(channelId)) {
+        dbg('sweep:skip', { channelId, reason: 'muted' });
+        continue;
+      }
       const watermark = this.forwardedWatermark.get(channelId);
       if (!watermark) continue;
       const isSubscribed = this.subscribedChannels.has(channelId);
@@ -2697,6 +2852,8 @@ export class DiscordMcplServer {
     this.ensureReactionChannelsLoaded();
     if (!this.reactionChannels.has(channelId)) {
       this.reactionChannels.add(channelId);
+      // Not saved here, so the next set_reaction_visibility saves it.
+      this.reactionChannelsUnsaved = true;
     }
     this.ensureWatermarkLoaded();
     if (this.missedTally.delete(channelId)) this.saveWatermark();
@@ -2708,7 +2865,10 @@ export class DiscordMcplServer {
     this.ensureSubscriptionsLoaded();
     const removed = this.subscribedChannels.delete(channelId);
     this.ensureReactionChannelsLoaded();
-    this.reactionChannels.delete(channelId);
+    // Saved, so a restart doesn't bring back the reactions a close turned
+    // off. A failed save sets reactionChannelsUnsaved, so the next
+    // set_reaction_visibility saves again and says so if it fails.
+    if (this.reactionChannels.delete(channelId)) this.saveReactionChannels();
     if (removed) {
       this.ensureWatermarkLoaded();
       const anchor = this.forwardedWatermark.get(channelId) ?? '';
@@ -3080,6 +3240,15 @@ export class DiscordMcplServer {
       // match on. Issue #14.
       this.ensureReactionChannelsLoaded();
       if (!this.reactionChannels.has(ev.channelId)) return;
+      // A muted channel delivers nothing, its reactions included, as its
+      // creates, edits and deletes already don't (shouldEnterContext).
+      // mute_channel drops the channel's visibility, but visibility can come
+      // back while it's muted: set_reaction_visibility, or a persisted
+      // opt-in read after a restart. Muting takes precedence.
+      if (this.isChannelMuted(ev.channelId)) {
+        dbg('reaction:drop', { channelId: ev.channelId, messageId: ev.messageId, action: ev.action, reason: 'muted' });
+        return;
+      }
       // Reaction-suppression projection (issue #21): decided before ANY
       // model-visible text or the event id exists, so a suppressed reaction
       // leaves no glyph, name, or token anywhere — the eventId below embeds
