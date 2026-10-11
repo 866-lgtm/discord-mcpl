@@ -149,6 +149,24 @@ in the git log and PR descriptions.
   Images are unaffected: they inline as native image blocks under their own
   ceilings. (issue #30, PR #12)
 
+- **A tool given an id Discord doesn't know says what that means.** Discord
+  answers an unknown or unreachable id with two words ("Unknown Channel",
+  "Unknown Guild", "Unknown Message", "Unknown User", "Missing Access"). The
+  tool error now keeps them and adds what they mean for what the model sent,
+  and the cure. For an id, it says the id may be mistyped or remembered
+  rather than copied, or the thing deleted or out of the bot's reach, and
+  where real ids show (`list_channels`, `list_guilds`, `fetch_history`, a
+  message's author, `list_channel_members`). A text, announcement or voice
+  channel can be re-sent by `#name` instead, and a user by `@username` if
+  they share a server with the bot or have DMed it. A thread or DM has no
+  name route, so its id has to be copied from where it was shown. A `#name`
+  that resolved to an id Discord doesn't know is explained as a channel gone
+  since it was seen, not with advice to send the name again. A
+  `create_text_channel` category is explained as a category. `list_emojis`
+  with a `guildId` now lets the guild lookup's own error through, Discord's or
+  not, as `list_channels` does, where every failure there used to read "Guild
+  <id> not found". Other errors pass through unchanged.
+
 ### Fixed
 
 - **Ghost "[message edited]" events.** Discord emits `messageUpdate` for more
@@ -157,6 +175,17 @@ in the git log and PR descriptions.
   weeks-old, never-edited messages. Updates are now forwarded only when
   `editedTimestamp` is set and the content actually changed (when the old
   message is cached). Real edits are unaffected.
+- **A muted channel's reactions no longer reach the agent.** `mute_channel`
+  promises "no ambient", and closes the channel, but the reaction
+  visibility that opening it turned on outlived the mute, so reactions there
+  kept landing in context. A mute now drops that visibility, as a close
+  does, and both now save the drop, so a restart can't bring it back. After
+  `unmute_channel`, reactions return with `channel_open`, along with the rest
+  of ambient traffic, as the tools' descriptions now say. While a channel is
+  muted, no reaction gets through, even where visibility is turned on again;
+  `set_reaction_visibility` says so, and that opt-in takes effect once the
+  mute is lifted. The reconnect catch-up sweep now skips a muted channel
+  too, where it used to push its missed mentions after a restart.
 - **An unreadable state file no longer loses everything in it at the next
   save.** The muted channels, the reaction channels and the watermarks are
   each read once and rewritten whole after every change. When a file
@@ -178,14 +207,16 @@ in the git log and PR descriptions.
   - The server owns these files while it runs, and every save writes the
     whole store over the file, so to edit one or restore a copy, stop the
     server first.
-  - `mute_channel`, `unmute_channel` and `set_reaction_visibility` save
-    when the call changes their store, or when its file may not hold it
-    (an earlier save failed, or the file couldn't be read). When that save
-    fails, the reply says so, and that as it stands the store wouldn't
-    survive a restart. `set_reaction_visibility` now refuses a missing
-    `channelId`, as the other two do. A watermark save that keeps failing
-    is logged when it starts, when its reason changes and when it succeeds
-    again, rather than for every forwarded message.
+  - `mute_channel`, `unmute_channel` and `set_reaction_visibility` save when
+    the call changes their store, or when its file may not hold it (an earlier
+    save failed, or the file couldn't be read). When that save fails, the
+    reply says so, and that as it stands the store wouldn't survive a restart.
+    `mute_channel` also saves the reaction list when it drops the channel's
+    visibility, and its reply says so when that save fails.
+    `set_reaction_visibility` now refuses a missing `channelId`, as the other
+    two do. A watermark save that keeps failing is logged when it starts, when
+    its reason changes and when it succeeds again, rather than for every
+    forwarded message.
   - A save replaces a plain file the server owns by renaming a temp file
     over it, given the file's mode and group before any content goes in,
     so a process crash partway through can't leave a torn file. Extended
@@ -207,6 +238,15 @@ in the git log and PR descriptions.
   reply, which Discord refuses with "Unknown interaction" once its
   3-second window has passed, took the whole server down. The dispatch now
   catches and logs a handler's failure.
+- **A notification whose handler throws synchronously no longer stops the
+  server.** The main loop read each message and dispatched notifications
+  without a guard, so a synchronous throw in one, such as a notification
+  whose params are missing or malformed, ended the loop. The server then read
+  nothing more, and every later request went unanswered until the host timed
+  it out. The throw is now logged and the loop goes on. A `featureSets/update`
+  is checked whole before it changes anything, so a malformed one leaves the
+  grants as they were, where before it could apply its enables and skip its
+  disables.
 - **Edits and deletes carry their author and location.** The push-event
   origin now includes `guildId`, the composite `mcplChannelId`, `messageId`
   and (when known) `authorId`/`authorName`, and an edit reads
@@ -216,3 +256,48 @@ in the git log and PR descriptions.
 - **DM whitelist fails closed on edits.** With `DISCORD_DM_USERS` set, a DM
   edit whose author is unknown (uncached message) was forwarded because the
   check required an author; it is now dropped, like creates.
+- **A voice item that can't be played no longer ends the process.** The
+  playback sink's fire-and-forget `pump()` had no `catch`: if
+  `createAudioResource` or `AudioPlayer.play` threw (it throws for a resource
+  that has already ended, or one another player is playing), the rejection
+  went unhandled, which ends a Node process. It also left the item marked as
+  playing and its utterance waiting for an outcome. Such an item is now
+  settled with a new terminal sink event, `failed`, and the sink goes on to
+  the next one. A refused item is never `cleared`, so its text is never
+  billed.
+  - **Playback that stalls or runs on fails too.** An item the player accepts
+    fails when no audio reaches it within 10 s, or when it plays past 300 s,
+    and the reason names the limit. Before, both were reported as spoken, and
+    the model was told the message was "cut short by a synthesis error", with
+    what wasn't heard. A 10 s stall on a reply already complete even counted
+    as spoken in full, so the model wasn't told at all. Such a reply now fails, synthesis stops, and the rest of it isn't voiced, where
+    a later part used to be voiced as a new utterance. When the TTS provider
+    is unavailable at clearance, or ends the stream before any audio, the
+    stream ends empty and the player starts and ends it at once: that is
+    still reported as spoken, nothing heard, cut short by a synthesis error.
+  - **A stream error fails the item,** where it was reported as finished.
+  - **A barge-in, or a bot's yield, still reports `interrupted`,** and now at
+    once even before the item starts playing, where it waited out the 10 s.
+  - **Any other throw in playback** settles the playing and queued items the
+    same way, and nothing a `failed` listener queues meanwhile waits for the
+    next `play()`.
+- **What the model is told.** `VoiceOutput` ends a failed utterance as it
+  does an interrupted one: it stops synthesis and drops the rest of that
+  inference. It reports status `failed` with a reason from a fixed set
+  (`PlaybackFailure`); the raw error, which can carry library text, goes to
+  the log only. The model is told the message couldn't be played, when
+  nothing was heard, or was stopped after so many seconds, with what was
+  heard. When the reply was still streaming, the report says so
+  (`restUnvoiced`), and the model is told that what it went on to say wasn't
+  voiced either, after an interruption too. The note is tagged
+  `voice:failed`. Like `voice:truncated`, that tag is context, not a wake:
+  the text landed in the text channel, and the model sees the note on its
+  next turn and can say the line again then if it still needs saying.
+- **The voice-chat harness** (`scripts/voice-chat.ts`) treats `failed` like
+  an interruption. It stops the model's stream, and its history keeps only
+  what was heard, while its transcript shows the rest struck through. The
+  model is told on its next turn, without one being started for it. An
+  interruption that came while the model was still generating used to
+  overwrite the previous turn's history and then keep everything generated so
+  far, heard or not; it now keeps only what was heard. Raised in #69's
+  review, the same class as #70's slash-command fix.

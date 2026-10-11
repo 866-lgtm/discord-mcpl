@@ -59,6 +59,7 @@ import {
   looksLikeExplicitName,
   type AddressingPath,
 } from './channel-names.js';
+import { explainDiscordError, type ExplainContext } from './discord-errors.js';
 import { saveFiltersFile, loadFiltersFile, DiscordFiltersState, type DiscordFilters } from './filters.js';
 import { StateTracker } from './state.js';
 import { existsSync, readFileSync } from 'node:fs';
@@ -564,6 +565,7 @@ export class DiscordMcplServer {
     if (r.status === 'spoken' && r.unvoicedText.length === 0) return;
     const interrupted = r.status === 'interrupted';
     const expired = r.status === 'expired';
+    const failed = r.status === 'failed';
     const secs = (r.playedMs / 1000).toFixed(1);
     const who = r.interruptedBy
       ? `@${r.interruptedBy.username ?? r.interruptedBy.userId}${r.interruptedBy.bot ? ' (bot)' : ''}`
@@ -573,12 +575,26 @@ export class DiscordMcplServer {
     const tail = r.voicedText.length > 120 ? `…${r.voicedText.slice(-120)}` : r.voicedText;
     const head = r.unvoicedText.length > 400 ? `${r.unvoicedText.slice(0, 400)}…` : r.unvoicedText;
     const approx = r.estimated ? ' (boundary approximate)' : '';
+    // A reply still streaming when its utterance ended short isn't voiced
+    // past that point either: say so, so the model re-decides all of it.
+    const rest = r.restUnvoiced ? '\nWhat you went on to say in that reply wasn\'t voiced either.' : '';
     const line = expired
       ? `[voice] Your spoken message waited ${(r.queuedMs / 1000).toFixed(0)}s for the channel to clear and was dropped UNSPOKEN — nothing was heard (and nothing was billed).\n` +
         `Not said: "${head}"\n(The text was still delivered in the text channel as usual. Say it again — possibly shorter — only if it still needs saying.)`
       : interrupted
         ? `[voice] Your spoken message was interrupted by ${who} after ${secs}s${approx}.\n` +
-          `Heard up to: "${tail}"\nNOT heard: "${head}"`
+          `Heard up to: "${tail}"\nNOT heard: "${head}"` + rest
+        : failed
+          ? // Part of it played: it was stopped, for the reason given (the
+            // limit on one reply, say). Nothing played: it couldn't be.
+            (r.playedMs > 0
+              ? `[voice] Your spoken message was stopped after ${secs}s${approx} (${r.failure ?? 'playback failed'}).\n`
+              : `[voice] Your spoken message couldn't be played (${r.failure ?? 'playback failed'}) — nothing was heard.\n`) +
+            // A line whose text is empty is left out rather than quoted empty.
+            (r.playedMs > 0 && tail ? `Heard up to: "${tail}"\n` : '') +
+            (head ? `NOT heard: "${head}"\n` : '') +
+            (rest ? `${rest.slice(1)}\n` : '') +
+            '(The text was still delivered in the text channel as usual.)'
         : `[voice] Your spoken message was cut short by a synthesis error after ${secs}s${approx}.\n` +
           `Heard up to: "${tail}"\nNOT heard: "${head}"\n(The text was still delivered in the text channel as usual.)`;
     this.conn.sendRequest(method.PUSH_EVENT, {
@@ -607,7 +623,12 @@ export class DiscordMcplServer {
       // is context: the text landed in the text channel, nothing to decide.
       // Third-party speech while recently-engaged (the engagement-window
       // rule) is the floor/gate layer's job, not this transport's.
-      tags: [expired ? 'voice:expired' : interrupted ? 'voice:interrupted' : 'voice:truncated'],
+      // 'voice:failed' is context too, like 'voice:truncated': the text
+      // landed in the text channel. The model sees it on its next turn (the
+      // next person to speak wakes it), and can say the line again then if it
+      // still needs saying. Some causes pass (a slow start, the limit on one
+      // reply), so it isn't an operator's fault to fix each time.
+      tags: [expired ? 'voice:expired' : interrupted ? 'voice:interrupted' : failed ? 'voice:failed' : 'voice:truncated'],
       payload: { content: [textContent(line)] },
     } satisfies PushEventParams).catch(() => {});
   }
@@ -1076,7 +1097,24 @@ export class DiscordMcplServer {
         if (msg.type === 'request') {
           await this.handleRequest(msg.request);
         } else {
-          this.handleNotification(msg.notification);
+          // A notification has no reply to carry an error, and one whose
+          // handler throws synchronously must not end this loop: every later
+          // request would go unread, and the host would wait each one out as
+          // unconfirmed. This catches synchronous throws only: a promise a
+          // handler starts has to settle its own errors.
+          try {
+            this.handleNotification(msg.notification);
+          } catch (err) {
+            console.error(
+              `[discord-mcpl] notification ${msg.notification.method} failed:`,
+              err,
+            );
+            dbg('handleNotification:error', {
+              method: msg.notification.method,
+              error: err instanceof Error ? err.message : String(err),
+              stack: err instanceof Error ? err.stack?.split('\n').slice(0, 8).join('\n') : undefined,
+            });
+          }
         }
       }
     } catch (err) {
@@ -1309,14 +1347,26 @@ export class DiscordMcplServer {
   }
 
   /** Shared body of featureSets/update, both forms (§6.7). Also resolves
-   *  the policy gate that releases the reconnect sweep (see serve()). */
+   *  the policy gate that releases the reconnect sweep (see serve()).
+   *  An update applies whole or not at all: its lists are checked before
+   *  anything changes, so a malformed one throws and leaves the grants as
+   *  they were (the notification form has no reply to say it failed). */
   private applyFeatureSetsUpdate(p: FeatureSetsUpdateParams): void {
-    if (p.enabled) {
-      for (const name of p.enabled) this.enabledFeatureSets.add(name);
+    if (typeof p !== 'object' || p === null) {
+      throw new Error('featureSets/update: params must be an object');
     }
-    if (p.disabled) {
-      for (const name of p.disabled) this.enabledFeatureSets.delete(name);
-    }
+    const names = (field: 'enabled' | 'disabled'): string[] => {
+      const list: unknown = p[field];
+      if (list === undefined || list === null) return [];
+      if (!Array.isArray(list) || !list.every((name) => typeof name === 'string')) {
+        throw new Error(`featureSets/update: ${field} must be a list of feature-set names`);
+      }
+      return list;
+    };
+    const enabled = names('enabled');
+    const disabled = names('disabled');
+    for (const name of enabled) this.enabledFeatureSets.add(name);
+    for (const name of disabled) this.enabledFeatureSets.delete(name);
     this.resolvePolicyAnswered();
   }
 
@@ -1325,9 +1375,11 @@ export class DiscordMcplServer {
   private handleNotification(notif: JsonRpcNotification): void {
     switch (notif.method) {
       case method.FEATURE_SETS_UPDATE: {
-        // §6.7 Notification form: descriptive metadata only. Grant-bearing
-        // updates (including the §5.3 initial policy) arrive as a Request —
-        // see the handleRequest case.
+        // §6.7 Notification form. A 0.5 host sends grant-bearing updates
+        // (including the §5.3 initial policy) as a Request (see the
+        // handleRequest case), but hosts before 0.5 send every update this
+        // way, so it gets the same body and changes the grants too: whole, or
+        // not at all when it's malformed.
         this.applyFeatureSetsUpdate(notif.params as FeatureSetsUpdateParams);
         break;
       }
@@ -1405,10 +1457,12 @@ export class DiscordMcplServer {
     // of the dozen-odd tools that take a channelId — one chokepoint means no
     // tool can be added later that silently misses it.
     //
-    // Snowflakes and the `discord:<guild>:<channel>` composite pass through
-    // untouched, so this is backwards compatible. A name resolves against the
-    // live channel cache; ambiguity is a hard error listing qualified labels
-    // rather than a silent pick. See channel-names.ts.
+    // A snowflake passes through untouched, so this is backwards compatible.
+    // A name, or the `discord:<guild>:<channel>` composite, is resolved to the
+    // bare channel id: a name against the live channel cache (see
+    // channel-names.ts for how it answers several matches), the composite by
+    // the id it carries.
+    let explain: ExplainContext = {};
     if (typeof args.channelId === 'string' && args.channelId.trim()) {
       const given = args.channelId;
       const path: AddressingPath = isSnowflake(given.trim()) ? 'explicit-id' : 'name-resolved';
@@ -1445,6 +1499,8 @@ export class DiscordMcplServer {
           label: resolved.matched ? channelLabel(resolved.matched) : undefined,
         });
         args = { ...args, channelId: resolved.id };
+        // An error is explained against what the model sent, not this id.
+        explain = { channelGiven: given };
       } else {
         dbg('channel:addressing', { tool: name, path, channelId: given });
       }
@@ -1467,7 +1523,7 @@ export class DiscordMcplServer {
       };
     } catch (err) {
       return {
-        content: [textContent((err as Error).message)],
+        content: [textContent(explainDiscordError(err, args, explain))],
         isError: true,
       };
     }
@@ -1579,10 +1635,13 @@ export class DiscordMcplServer {
         // so the reply says whenever a configured file doesn't hold the list
         // as it stands.
         const unsaved = changed || this.reactionChannelsUnsaved ? this.saveReactionChannels() : null;
+        const note = unsavedNote('reaction channel list', unsaved);
+        if (!visible) return `Reaction visibility OFF for channel ${channelId}.` + note;
+        // A muted channel delivers nothing: the opt-in is kept, and takes effect once the mute is lifted.
         return (
-          (visible
-            ? `Reaction visibility ON for channel ${channelId}. Reactions there now appear in your context as they happen (they never wake you).`
-            : `Reaction visibility OFF for channel ${channelId}.`) + unsavedNote('reaction channel list', unsaved)
+          (this.isChannelMuted(channelId)
+            ? `Reaction visibility ON for channel ${channelId}, but the channel is muted: its reactions reach you once unmute_channel lifts the mute (they never wake you).`
+            : `Reaction visibility ON for channel ${channelId}. Reactions there now appear in your context as they happen (they never wake you).`) + note
         );
       }
 
@@ -1644,15 +1703,23 @@ export class DiscordMcplServer {
         const unsaved = wasNew || this.mutedUnsaved ? this.saveMuted() : null;
         // Muting implies leaving: drop any ambient subscription so the channel
         // stops delivering; it also won't auto-subscribe back in while muted.
+        // Its reaction visibility goes too, as a close drops it
+        // (unsubscribeRawChannel), saved so a restart can't bring it back:
+        // unmuting leaves reactions off until channel_open turns them back on
+        // with the rest of ambient traffic, or set_reaction_visibility does.
         this.ensureSubscriptionsLoaded();
         this.subscribedChannels.delete(channelId);
+        this.ensureReactionChannelsLoaded();
+        const reactionsUnsaved = this.reactionChannels.delete(channelId) ? this.saveReactionChannels() : null;
         for (const channel of this.channelManager.getOpen()) {
           if (parseMcplChannelId(channel.id)?.channelId === channelId) this.channelManager.close(channel.id);
         }
         return (
           (wasNew
             ? `Muted channel ${channelId}: no ambient, no wake on mention/reply, and it will not auto-subscribe you back in. Reverse with unmute_channel("${channelId}").`
-            : `Channel ${channelId} was already muted.`) + unsavedNote('muted channel list', unsaved)
+            : `Channel ${channelId} was already muted.`) +
+          unsavedNote('muted channel list', unsaved) +
+          unsavedNote('reaction channel list', reactionsUnsaved)
         );
       }
 
@@ -2312,6 +2379,11 @@ export class DiscordMcplServer {
 
     let delivered = 0;
     for (const channelId of candidates) {
+      // A muted channel delivers nothing, its missed mentions included.
+      if (this.isChannelMuted(channelId)) {
+        dbg('sweep:skip', { channelId, reason: 'muted' });
+        continue;
+      }
       const watermark = this.forwardedWatermark.get(channelId);
       if (!watermark) continue;
       const isDM = this.dmChannelIds.has(channelId);
@@ -2691,7 +2763,10 @@ export class DiscordMcplServer {
     this.ensureSubscriptionsLoaded();
     const removed = this.subscribedChannels.delete(channelId);
     this.ensureReactionChannelsLoaded();
-    if (this.reactionChannels.delete(channelId)) this.reactionChannelsUnsaved = true; // as in subscribeRawChannel
+    // Saved, so a restart doesn't bring back the reactions a close turned
+    // off. A failed save sets reactionChannelsUnsaved, so the next
+    // set_reaction_visibility saves again and says so if it fails.
+    if (this.reactionChannels.delete(channelId)) this.saveReactionChannels();
     if (removed) {
       this.ensureWatermarkLoaded();
       const anchor = this.forwardedWatermark.get(channelId) ?? '';
@@ -2930,6 +3005,15 @@ export class DiscordMcplServer {
       // match on. Issue #14.
       this.ensureReactionChannelsLoaded();
       if (!this.reactionChannels.has(ev.channelId)) return;
+      // A muted channel delivers nothing, its reactions included, as its
+      // creates, edits and deletes already don't (shouldEnterContext).
+      // mute_channel drops the channel's visibility, but visibility can come
+      // back while it's muted: set_reaction_visibility, or a persisted
+      // opt-in read after a restart. Muting takes precedence.
+      if (this.isChannelMuted(ev.channelId)) {
+        dbg('reaction:drop', { channelId: ev.channelId, messageId: ev.messageId, action: ev.action, reason: 'muted' });
+        return;
+      }
       // Reaction-suppression projection (issue #21): decided before ANY
       // model-visible text or the event id exists, so a suppressed reaction
       // leaves no glyph, name, or token anywhere — the eventId below embeds

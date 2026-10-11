@@ -62,6 +62,7 @@ function server(t: TestContext) {
     ensureReactionChannelsLoaded(): void;
     saveWatermark(): void;
     subscribeRawChannel(channelId: string): void;
+    unsubscribeRawChannel(channelId: string): void;
     forwardedWatermark: Map<string, string>;
     dmChannelIds: Set<string>;
     missedTally: Map<string, { anchorId: string; talliedThrough: string; messages: number; characters: number }>;
@@ -476,6 +477,40 @@ describe('the watermark store and the tools', () => {
     assert.deepEqual(json('reactions.json'), ['chan-r']);
     await call('chan-open');
     assert.deepEqual(json('reactions.json'), ['chan-open', 'chan-r'], 'the next call saves the opt-in');
+  });
+
+  it("saves the reaction list when a mute drops the channel's visibility, and says so when that save fails", async (t) => {
+    errors(t);
+    const s = server(t);
+    const call = async (tool: string, args: Record<string, unknown>) => String(await s.executeToolCall(tool, args));
+    for (const channelId of ['chan-r', 'chan-s']) await call('set_reaction_visibility', { channelId, visible: true });
+    assert.doesNotMatch(await call('mute_channel', { channelId: 'chan-r' }), /couldn't be saved/);
+    assert.deepEqual(json('reactions.json'), ['chan-s'], "the mute's drop is saved");
+    await openFailing(t, 'ENOSPC', (p) => p.endsWith('reactions.json.tmp'), async () => {
+      const reply = await call('mute_channel', { channelId: 'chan-s' });
+      assert.match(reply, /^Muted channel chan-s: .*\)\. The reaction channel list couldn't be saved \(.*ENOSPC.*\), so as it stands now it wouldn't survive a restart\.$/);
+      assert.doesNotMatch(reply, /muted channel list couldn't be saved/, 'the muted list was saved');
+      assert.match(
+        await call('set_reaction_visibility', { channelId: 'chan-r', visible: true }),
+        /^Reaction visibility ON for channel chan-r, but the channel is muted: .* The reaction channel list couldn't be saved/,
+        "a muted channel's opt-in says so too",
+      );
+    });
+    assert.deepEqual(json('muted.json'), ['chan-r', 'chan-s']);
+    assert.deepEqual(json('reactions.json'), ['chan-s'], 'the file keeps what was last saved');
+    assert.doesNotMatch(await call('mute_channel', { channelId: 'chan-t' }), /couldn't be saved/);
+    assert.deepEqual(json('reactions.json'), ['chan-s'], 'a mute that drops no visibility leaves the reaction list alone');
+    await call('set_reaction_visibility', { channelId: 'chan-s', visible: false });
+    assert.deepEqual(json('reactions.json'), ['chan-r'], 'the next reaction call saves the list as it stands');
+  });
+
+  it("saves the reaction list when a close drops the channel's visibility", async (t) => {
+    errors(t);
+    const s = server(t);
+    await s.executeToolCall('set_reaction_visibility', { channelId: 'chan-c', visible: true });
+    s.subscribeRawChannel('chan-open'); // an open opts in without saving
+    s.unsubscribeRawChannel('chan-c');
+    assert.deepEqual(json('reactions.json'), ['chan-open'], "the close's drop is saved at the close, with the list as it stands");
   });
 });
 
