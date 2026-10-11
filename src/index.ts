@@ -190,6 +190,11 @@ async function main(): Promise<void> {
     console.error('[discord-mcpl] Starting on stdio');
     const conn = McplConnection.fromStreams(process.stdin, process.stdout);
     await server.serve(conn);
+    // The host closed stdin, or the connection otherwise ended. A stdio
+    // server can't be reached again, so it exits, as MCP's stdio shutdown
+    // expects, rather than stay logged in to Discord with no host.
+    console.error('[discord-mcpl] stdio connection ended; exiting');
+    process.exit(0);
   } else if (tcpPort) {
     // TCP transport — single client
     console.error(`[discord-mcpl] Listening on TCP port ${tcpPort}`);

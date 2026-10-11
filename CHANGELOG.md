@@ -190,6 +190,30 @@ in the git log and PR descriptions.
   is checked whole before it changes anything, so a malformed one leaves the
   grants as they were, where before it could apply its enables and skip its
   disables.
+- **The rest of what ended the serve loop or the process.** Each is now
+  logged instead:
+  - **A line on the connection that isn't JSON.** The connection emitted an
+    error that nothing listened for, which ends a Node process. The loop now
+    reads on.
+  - **A client that leaves before `initialize`.** The handshake read sat
+    outside the loop's catch, so `serve()` rejected and the process exited.
+    Over TCP, the server now goes on to its next client.
+  - **A request handler that throws something other than an Error**, such
+    as `undefined`. The error answer read `.stack` off the value and threw
+    itself, which ended the loop with the request unanswered. The request is
+    now answered with the value as text, and the loop reads on. A request
+    the server still fails to answer no longer ends the loop either.
+  - **The same kind of value from the start-up work** (channel registration
+    and the reconnect sweep). It escaped their catches as an unhandled
+    rejection, which ends the process.
+
+  The handshake no longer reads past `initialize`. A request a host sends
+  before `notifications/initialized` used to be read there and dropped. Now
+  it's answered. The stdio transport exits when its connection ends, as MCP's
+  stdio shutdown expects, rather than stay logged in to Discord with no
+  host. A read error on a TCP socket, such as a reset, still ends the
+  process: it also reaches mcpl-core's readline interface, which listens
+  for none.
 - **Edits and deletes carry their author and location.** The push-event
   origin now includes `guildId`, the composite `mcplChannelId`, `messageId`
   and (when known) `authorId`/`authorName`, and an edit reads
