@@ -2550,7 +2550,7 @@ export class DiscordMcplServer {
       } catch (err) {
         throw new RequestRefusal(
           ERR_CHANNEL_OPEN_FAILED,
-          `${desc.id}'s history couldn't be fetched, so nothing was opened: ${(err as Error).message}`,
+          `${desc.id}'s history couldn't be fetched, so nothing was opened: ${err instanceof Error ? err.message : String(err)}`,
         );
       }
       messages.sort((a, b) => a.timestamp.getTime() - b.timestamp.getTime());
@@ -2571,21 +2571,21 @@ export class DiscordMcplServer {
       result.historyTruncated = requested > limit;
     }
 
-    // Commit the lifecycle only now, after any history fetch, and only if
-    // nothing that arrived meanwhile overrides this open: a close or mute of
-    // the channel stands, and a channel unregistered meanwhile isn't opened.
-    // So a failed or overtaken open leaves nothing subscribed.
+    // Commit the lifecycle only now, after the lookup and any history fetch,
+    // and only if nothing that arrived meanwhile overrides this open: a close
+    // or mute of the channel stands, and a channel unregistered meanwhile
+    // isn't opened. So a failed or overtaken open leaves nothing subscribed.
     if (this.lifecycleEpoch(parsed.channelId) !== lifecycle) {
       throw new RequestRefusal(
         ERR_CHANNEL_OPEN_FAILED,
-        `A channels/close or mute_channel for ${desc.id} arrived while its history was fetched, and it stands. Nothing was opened.`,
+        `A channels/close or mute_channel for ${desc.id} arrived while this open was in progress, and it stands. Nothing was opened.`,
       );
     }
     const opened = this.channelManager.open(desc.id);
     if (!opened) {
       throw new RequestRefusal(
         ERR_UNKNOWN_CHANNEL,
-        `${desc.id} was unregistered while its history was fetched (deleted, or no longer admitted by the filters). Nothing was opened.`,
+        `${desc.id} was unregistered while this open was in progress (deleted, or no longer admitted by the filters). Nothing was opened.`,
       );
     }
     result.channel = opened;

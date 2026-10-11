@@ -1197,7 +1197,7 @@ export class DiscordAdapter {
     try {
       channel = this.client.channels.cache.get(channelId) ?? (await this.client.channels.fetch(channelId));
     } catch (err) {
-      dbg('lookUpServedChannel:failed', { channelId, error: (err as Error).message });
+      dbg('lookUpServedChannel:failed', { channelId, error: err instanceof Error ? err.message : String(err) });
       return null;
     }
     if (!channel) return null;

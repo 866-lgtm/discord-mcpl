@@ -203,17 +203,26 @@ describe('channels/open: what selects', () => {
     }
   });
 
-  it('refuses a string type the channel does not have, on every path, a registered channelId included', async () => {
+  it('refuses a string type the channel does not have, on every path, a registered channelId and a looked-up one included', async () => {
+    // c7 isn't registered, but the lookup finds it served: its type is checked
+    // there, and it isn't registered for a request of another type.
+    const served = (guild: string, channel: string): Served | null =>
+      (guild === 'g1' && channel === 'c7'
+        ? { kind: 'guild', guildId: 'g1', guildName: 'Guild', channel: { id: 'c7', name: 'new', type: 'text', label: '#new (Guild)' } }
+        : null);
     const cases: Array<[Record<string, unknown>, number, RegExp]> = [
       [{ address: null }, UNKNOWN_CHANNEL, /^No slack channel is registered, so there is none to open without a selector\. Nothing was opened\.$/],
       [{ address: {} }, UNKNOWN_CHANNEL, /^No slack channel is registered/],
       [{ channelId: 'discord:g1:c1' }, INVALID_PARAMS, /^channelId "discord:g1:c1" is a discord channel, not slack\. Nothing was opened\.$/],
       [{ address: { guildId: 'g1', channelId: 'c1' } }, INVALID_PARAMS, /^address "g1"\/"c1" is a discord channel, not slack\. Nothing was opened\.$/],
+      [{ channelId: 'discord:g1:c7' }, INVALID_PARAMS, /^channelId "discord:g1:c7" is a discord channel, not slack\. Nothing was opened\.$/],
+      [{ address: { guildId: 'g1', channelId: 'c7' } }, INVALID_PARAMS, /^address "g1"\/"c7" is a discord channel, not slack\. Nothing was opened\.$/],
     ];
     for (const [selector, code, reason] of cases) {
-      const f = fixture([general]);
+      const f = fixture([general], { served });
       await f.refused({ ...selector, type: 'slack', history: { limit: 10 } }, code, reason);
       f.nothingOpened();
+      assert.equal(f.server.channelManager.get('discord:g1:c7'), undefined, `${JSON.stringify(selector)}: nothing registered`);
     }
   });
 
@@ -321,7 +330,7 @@ describe('channels/open: what arrives during the history fetch stands', () => {
     f.server.channelManager.unregister('discord:g1:c1');
     held.release();
     await assert.rejects(open, (err: Error & { code?: number }) =>
-      err.code === UNKNOWN_CHANNEL && /^discord:g1:c1 was unregistered while its history was fetched/.test(err.message));
+      err.code === UNKNOWN_CHANNEL && /^discord:g1:c1 was unregistered while this open was in progress/.test(err.message));
     assert.deepEqual(f.subscribed(), []);
   });
 
@@ -333,7 +342,7 @@ describe('channels/open: what arrives during the history fetch stands', () => {
     await f.server.executeToolCall('mute_channel', { channelId: 'c1' });
     held.release();
     await assert.rejects(open, (err: Error & { code?: number }) =>
-      err.code === OPEN_FAILED && /^A channels\/close or mute_channel for discord:g1:c1 arrived while its history was fetched, and it stands\./.test(err.message));
+      err.code === OPEN_FAILED && /^A channels\/close or mute_channel for discord:g1:c1 arrived while this open was in progress, and it stands\./.test(err.message));
     assert.equal(f.server.channelManager.isOpen('discord:g1:c1'), false);
     assert.deepEqual(f.subscribed(), []);
     assert.equal(f.server.mutedChannels.has('c1'), true, 'still muted');
@@ -368,6 +377,13 @@ describe('channels/open: what arrives during the history fetch stands', () => {
     );
     assert.equal(f.server.channelManager.isOpen('discord:g1:c1'), false);
     assert.deepEqual(f.subscribed(), []);
+    // A rejection that isn't an Error is still this refusal, not a fault.
+    const g = fixture([general], { history: async () => { throw 'rate limited'; } });
+    await assert.rejects(
+      g.server.handleChannelOpen({ channelId: 'discord:g1:c1', type: 'discord', history: { limit: 5 } }),
+      (err: Error & { code?: number }) =>
+        err.code === OPEN_FAILED && err.message === "discord:g1:c1's history couldn't be fetched, so nothing was opened: rate limited",
+    );
   });
 
   it('reads a persisted watermark for sinceLastSeen on the first open', async (t: TestContext) => {

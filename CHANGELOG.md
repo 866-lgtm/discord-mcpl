@@ -173,10 +173,11 @@ in the git log and PR descriptions.
   and address ids must be strings. Refusals carry MCPL's codes: unknown
   channel (`-32023`), invalid params (`-32602`), or open failed (`-32024`,
   when the history fetch fails, or a `channels/close` or `mute_channel` for
-  the channel arrives while it runs, which then stands). No history is
-  fetched, and nothing is opened or subscribed, before a request names its
-  channel, and a channel unregistered during the fetch isn't opened. `sinceLastSeen` reads the
-  persisted watermark even when it's the first thing to.
+  the channel arrives while the open is in progress, which then stands). No
+  history is fetched, and nothing is opened or subscribed, before a request
+  names its channel, and a channel unregistered while the open is in
+  progress isn't opened. `sinceLastSeen` reads the persisted watermark even
+  when it's the first thing to.
 
 - **Ghost "[message edited]" events.** Discord emits `messageUpdate` for more
   than content edits: link-preview / embed refreshes re-send old messages with
