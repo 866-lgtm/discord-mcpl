@@ -7,6 +7,7 @@
  * Follows the pattern from zero-k/game-manager/src/mcpl_server.rs.
  */
 
+import type * as net from 'node:net';
 import {
   McplConnection,
   textContent,
@@ -4210,4 +4211,26 @@ export async function serveStdio(
   await server.serve(conn);
   console.error('[discord-mcpl] stdio connection ended; exiting');
   exit(0);
+}
+
+/** Accept MCPL connections on a listening TCP server and serve them one at a
+ *  time, for as long as the process runs. An 'error' the server emits while
+ *  a client is being served (an accept that fails for the next client, say)
+ *  is logged, and serving goes on. Without this listener, what became of it
+ *  would depend on mcpl-core: up to 0.3.0, `acceptTcp` leaves an 'error'
+ *  listener behind for each connection it accepts, which swallows it unseen,
+ *  and once mcpl-core-ts#12 stops that leak nothing would hear it, and an
+ *  'error' nobody hears ends the process. An 'error' while an accept is
+ *  pending still rejects `acceptTcp`, which ends the loop, as before. Call
+ *  it once the server is listening: before that, this listener would also
+ *  catch a failure to listen (a port already taken), and the caller would
+ *  wait for a 'listening' that never comes. */
+export async function serveTcp(server: DiscordMcplServer, tcpServer: net.Server): Promise<never> {
+  tcpServer.on('error', (err) => console.error('[discord-mcpl] TCP server error:', err));
+  while (true) {
+    const conn = await McplConnection.acceptTcp(tcpServer);
+    console.error('[discord-mcpl] Client connected');
+    await server.serve(conn);
+    console.error('[discord-mcpl] Client disconnected, waiting for next...');
+  }
 }

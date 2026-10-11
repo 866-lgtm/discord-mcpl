@@ -31,7 +31,7 @@ import type {
   ChannelsPublishResult,
 } from '@animalabs/mcpl-core';
 
-import { DiscordMcplServer, serveStdio } from '../src/server.js';
+import { DiscordMcplServer, serveStdio, serveTcp } from '../src/server.js';
 import { applyMentionCandidates } from '../src/discord-adapter.js';
 import { TOOL_CLASSES } from '../src/tool-classes.js';
 import type {
@@ -832,6 +832,47 @@ describe('DiscordMcplServer', () => {
     assert.deepEqual(exits, [0]);
     const lines = errors.mock.calls.map((c) => c.arguments.map(String).join(' '));
     assert.ok(lines.includes('[discord-mcpl] stdio connection ended; exiting'), JSON.stringify(lines));
+  });
+
+  it("serveTcp logs the server's error while a client is served, and serves the next client", async (t) => {
+    const tcpServer = net.createServer();
+    await new Promise<void>((resolve) => tcpServer.listen(0, '127.0.0.1', resolve));
+    const { port } = tcpServer.address() as net.AddressInfo;
+    const accepted: net.Socket[] = [];
+    tcpServer.on('connection', (socket) => accepted.push(socket));
+    const server = new DiscordMcplServer(new MockDiscordAdapter() as unknown as DiscordAdapter);
+    const errors = t.mock.method(console, 'error', () => {});
+    const logged = () => errors.mock.calls.map((c) => c.arguments as unknown[]);
+    const connected = () => logged().filter((args) => args[0] === '[discord-mcpl] Client connected').length;
+    const until = async (done: () => boolean, what: string) => {
+      for (let waited = 0; !done(); waited += 5) {
+        if (waited > 5_000) assert.fail(`timed out waiting for ${what}`);
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+    };
+    void serveTcp(server, tcpServer);
+    const clients: net.Socket[] = [];
+    try {
+      clients.push(net.connect(port, '127.0.0.1'));
+      await until(() => connected() === 1, 'the first client to be served');
+
+      // What an accept that fails for a second client emits meanwhile. Were
+      // nothing listening, emit would throw: in the server, the process ends.
+      const err = Object.assign(new Error('accept EMFILE'), { code: 'EMFILE', syscall: 'accept' });
+      tcpServer.emit('error', err);
+      assert.ok(logged().some((args) => args.includes(err)), 'the error is logged');
+
+      clients[0]!.destroy(); // the first client goes; serve() returns
+      // A client that connects while one is served isn't accepted, so the
+      // next one waits until the loop does.
+      const waiting = () => logged().some((args) => args[0] === '[discord-mcpl] Client disconnected, waiting for next...');
+      await until(waiting, 'the loop to wait for the next client');
+      clients.push(net.connect(port, '127.0.0.1'));
+      await until(() => connected() === 2, 'the next client to be served');
+    } finally {
+      for (const socket of [...clients, ...accepted]) socket.destroy();
+      await new Promise<void>((resolve) => tcpServer.close(() => resolve()));
+    }
   });
 
   it('before initialize, a ping is answered, another request is refused, a notification is dropped, and the session still starts', async (t) => {
