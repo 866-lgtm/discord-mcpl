@@ -236,4 +236,36 @@ describe('a thread the client knows only partly is fetched before the filters de
     assert.deepEqual(reacted, [THREAD_IN_CATEGORY, PARTLY_KNOWN_THREAD]);
     assert.deepEqual(fetches.map((f) => f.id), [PARTLY_KNOWN_THREAD, PARTLY_KNOWN_UNLISTED]);
   });
+
+  it("delivers a delete or a reaction after its message's create, when the create waits on the lookup", async (t) => {
+    const f = fixture(t);
+    const order: string[] = [];
+    f.adapter.onMessage((m) => order.push(`create ${(m as unknown as { id: string }).id}`));
+    f.adapter.onMessageDelete((_channelId, messageId) => order.push(`delete ${messageId}`));
+    f.adapter.onReaction((ev) => order.push(`reaction ${ev.messageId}`));
+    // Hold the create's lookup open until the delete and the reaction have
+    // done their own lookups and are only waiting to be delivered.
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    const fetch = (f.internals.client.channels as unknown as { fetch: (id: string, o?: object) => Promise<unknown> }).fetch;
+    let calls = 0;
+    (f.internals.client.channels as unknown as { fetch: unknown }).fetch = async (id: string, o?: object) => {
+      if (calls++ === 0) await held;
+      return fetch(id, o);
+    };
+    f.emit(f.message(PARTLY_KNOWN_THREAD, 'm1'));
+    f.internals.client.emit('messageDelete', f.message(PARTLY_KNOWN_THREAD, 'm1') as never);
+    const reacted = f.internals.handleReactionEvent(
+      'add',
+      { partial: false, emoji: { id: null, name: '👍', animated: false }, message: f.message(PARTLY_KNOWN_THREAD, 'm1') },
+      { id: '620000000000000001', partial: false, username: 'someone' },
+    );
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.deepEqual(order, [], 'nothing overtakes the waiting create');
+    release();
+    await reacted;
+    await f.settle();
+    assert.deepEqual(order.slice(0, 1), ['create m1']);
+    assert.deepEqual(order.slice(1).sort(), ['delete m1', 'reaction m1']);
+  });
 });

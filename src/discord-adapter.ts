@@ -1041,6 +1041,9 @@ export class DiscordAdapter {
       const full = reaction.partial ? await reaction.fetch() : reaction;
       const msg = full.message;
       const guildId = msg.guildId ?? null;
+      // A create still waiting for its thread's lookup goes first, so a
+      // reaction never arrives before the message it's on.
+      await this.threadLookups.get(msg.channelId);
       if (guildId && threadChannelUnknown(msg.channel)) await this.lookUpThread(msg.channelId);
       const parentId =
         msg.channel && 'parentId' in msg.channel
@@ -1709,7 +1712,10 @@ export class DiscordAdapter {
   ): Promise<void> {
     const messageId = message.id;
     const previous = this.messageEventDeliveries.get(messageId) ?? Promise.resolve();
-    const pending = Promise.allSettled([previous, this.messageEventInfo(message)]).then(([, result]) => {
+    // A create still waiting for its thread's lookup goes first, so an edit
+    // or delete never overtakes the message it changes.
+    const created = this.threadLookups.get(message.channelId);
+    const pending = Promise.allSettled([previous, created, this.messageEventInfo(message)]).then(([, , result]) => {
       if (result.status === 'rejected') throw result.reason;
       if (result.value) forward(result.value);
     });
