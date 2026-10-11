@@ -19,7 +19,9 @@ in the git log and PR descriptions.
     `list_channels` and `list_channel_members`, it reads only what the
     configured filters admit: a channel in a guild `guildIds` lists, admitted
     by `guildChannels` (a thread by its parent's entry), and for a DM, one
-    whose other party `dmUsers` lists. Anything else is refused, by ID or by
+    whose other party `dmUsers` lists. When the cache can't name a DM's other
+    party (a channel known only from the bot's own message), Discord is asked
+    once, and a party it still can't name is refused. Anything else is refused, by ID or by
     name, before its history or members are read, and the filters are
     checked again after the reads, so a change made meanwhile refuses the
     action.

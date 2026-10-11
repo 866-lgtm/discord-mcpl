@@ -1643,7 +1643,7 @@ export class DiscordAdapter {
     if (!bare) return { ok: false, message: 'latestFrom names no one; nothing was done.' };
     const channel = await this.client.channels.fetch(channelId);
     if (!channel) throw new Error(`Channel ${channelId} not found`);
-    const refused = this.latestFromFilterRefusal(channel, channelId);
+    const refused = await this.latestFromFilterRefusal(channel, channelId);
     if (refused) return { ok: false, message: refused };
     const guildId = 'guildId' in channel && channel.guildId ? channel.guildId : null;
     const window = await this.fetchHistory(channelId, { limit: LATEST_FROM_WINDOW });
@@ -1758,7 +1758,7 @@ export class DiscordAdapter {
     }
     // The filters may have changed during the reads (a slow member download):
     // the action is refused if they no longer admit this channel.
-    const refusedNow = this.latestFromFilterRefusal(channel, channelId);
+    const refusedNow = await this.latestFromFilterRefusal(channel, channelId);
     if (refusedNow) return { ok: false, message: refusedNow };
     return { ok: true, message: target, authorId, authorLabel };
   }
@@ -1767,8 +1767,12 @@ export class DiscordAdapter {
    * Why latestFrom may not read this channel, or null: every configured
    * filter that bounds inspection. guildIds and guildChannels (a thread by its
    * parent) for a guild channel; for a DM, the other party against dmUsers.
+   * The cache can't always name a DM's other party (dmOtherParty), so then
+   * Discord is asked once, past the cache; the fetch patches the cached
+   * channel, so a later check finds the party there. A party still unknown
+   * is refused (fail closed).
    */
-  private latestFromFilterRefusal(channel: Channel, channelId: string): string | null {
+  private async latestFromFilterRefusal(channel: Channel, channelId: string): Promise<string | null> {
     const guildId = 'guildId' in channel && channel.guildId ? channel.guildId : null;
     if (guildId && this.guildIds?.length && !this.guildIds.includes(guildId)) {
       return `Channel ${channelId} is in a server outside this residence's configured guild filter, which bounds reading as well as delivery, so latestFrom can't choose a message there; nothing was done.`;
@@ -1777,12 +1781,35 @@ export class DiscordAdapter {
       return `Channel ${channelId} is outside this residence's configured channel filters, which bound reading as well as delivery, so latestFrom can't choose a message there; nothing was done.`;
     }
     if (channel.type === ChannelType.DM && this.dmUsers) {
-      const other = (channel as DMChannel).recipientId;
-      if (!other || !this.dmUsers.has(other)) {
+      let other = this.dmOtherParty(channel);
+      if (!other) {
+        const unconfirmed = (why: string) =>
+          `This DM's other party couldn't be confirmed (${why}), so latestFrom can't check it against this residence's configured DM users and can't choose a message there; nothing was done.`;
+        try {
+          other = this.dmOtherParty(await this.client.channels.fetch(channelId, { force: true }));
+        } catch (err) {
+          return unconfirmed(`looking up its DM channel failed: ${(err as Error).message}`);
+        }
+        if (!other) return unconfirmed('Discord names no recipient for its DM channel');
+      }
+      if (!this.dmUsers.has(other)) {
         return `This DM is with someone outside this residence's configured DM users, which bound reading as well as delivery, so latestFrom can't choose a message there; nothing was done.`;
       }
     }
     return null;
+  }
+
+  /**
+   * A DM channel's recipient other than the bot, from the recipients
+   * discord.js recorded, or undefined when it recorded none but the bot.
+   * DMChannel.recipientId isn't used: it falls back to the first recorded id,
+   * which is the bot's own when the cached channel was built from the bot's
+   * own message, and it throws when none is recorded. (#76 reads a DM's other
+   * party the same way, with a helper of the same name.)
+   */
+  private dmOtherParty(channel: unknown): string | undefined {
+    const ids = (channel as { recipientIds?: Array<string | undefined> } | null)?.recipientIds;
+    return ids?.find((id) => !!id && id !== this.client.user?.id);
   }
 
   /** List the custom (server) emojis the bot can see — the shared palette for

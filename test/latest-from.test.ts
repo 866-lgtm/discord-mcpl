@@ -511,6 +511,7 @@ function wireMessage(o: {
     type: o.system ? 6 : 0,
     content: o.text, cleanContent: o.text, messageSnapshots: null,
     attachments: new Map(), reactions: { cache: new Map() }, createdAt: at(o.s),
+    mentions: { users: new Map(), repliedUser: null, roles: { some: () => false } },
   };
 }
 
@@ -629,7 +630,7 @@ describe('latestFrom after the second review', () => {
     const listedGuild = realFixture(t, wire, members, { guildIds: ['g1'] });
     assert.ok((await listedGuild.adapter.resolveLatestFrom('c1', 'Ra')).ok, 'a listed guild resolves');
 
-    const dm = { id: 'd1', type: ChannelType.DM, recipientId: RA, isThread: () => false };
+    const dm = { id: 'd1', type: ChannelType.DM, recipientIds: [RA], isThread: () => false };
     const stranger = realFixture(t, wire, members, { dmUsers: [LINN] }, dm);
     for (const ref of [RA, 'Ra']) {
       const r = await stranger.adapter.resolveLatestFrom('d1', ref);
@@ -638,6 +639,41 @@ describe('latestFrom after the second review', () => {
     assert.deepEqual([stranger.historyOptions, stranger.listings], [[], []], 'nothing read in a DM outside the filter');
     const allowed = realFixture(t, wire, members, { dmUsers: [RA] }, dm);
     assert.ok((await allowed.adapter.resolveLatestFrom('d1', RA)).ok, 'an allowed DM resolves');
+  });
+
+  it('asks Discord once for a DM\'s other party when the cache records only the bot, and fails closed when it can\'t say (I6)', async (t) => {
+    const BOT = '100000000000000099';
+    const wire = [wireMessage({ id: '200000000000000030', authorId: RA, username: 'ra', displayName: 'Ra', text: 'hi', s: 3 })];
+    const run = async (forced: 'names Ra' | 'names no one' | 'fails') => {
+      // A cached DM channel built from the bot's own message: only the bot is recorded.
+      const dm: Record<string, unknown> = { id: 'd1', type: ChannelType.DM, recipientIds: [BOT], isThread: () => false };
+      const f = realFixture(t, wire, members, { dmUsers: [RA] }, dm);
+      (f.client as unknown as { user: unknown }).user = { id: BOT };
+      const withMessages = await (f.client.channels.fetch as unknown as (id: string) => Promise<Record<string, unknown>>)('d1');
+      f.fetched.length = 0;
+      const forcedCalls: unknown[] = [];
+      (f.client.channels as unknown as { fetch: unknown }).fetch = async (id: string, options?: { force?: boolean }) => {
+        f.fetched.push(id);
+        if (!options?.force) return withMessages;
+        forcedCalls.push(options);
+        if (forced === 'fails') throw new Error('Missing Access');
+        // As discord.js patches the cached channel with the recipients Discord gives.
+        if (forced === 'names Ra') withMessages.recipientIds = [BOT, RA];
+        return withMessages;
+      };
+      return { r: await f.adapter.resolveLatestFrom('d1', RA), forcedCalls, f };
+    };
+    const named = await run('names Ra');
+    assert.ok(named.r.ok && named.r.message.id === '200000000000000030', JSON.stringify(named.r));
+    assert.equal(named.forcedCalls.length, 1, 'asked once; the re-check after the reads finds the party in the patched cache');
+    for (const [forced, why] of [
+      ['names no one', 'Discord names no recipient for its DM channel'],
+      ['fails', 'looking up its DM channel failed: Missing Access'],
+    ] as const) {
+      const { r, f } = await run(forced);
+      assert.ok(!r.ok && r.message === `This DM's other party couldn't be confirmed (${why}), so latestFrom can't check it against this residence's configured DM users and can't choose a message there; nothing was done.`, JSON.stringify(r));
+      assert.deepEqual(f.historyOptions, [], `${forced}: nothing read`);
+    }
   });
 
   it('checks the filters again after its reads, refusing if they changed meanwhile (I10)', async (t) => {
