@@ -1419,7 +1419,7 @@ export class DiscordMcplServer {
         const result = await this.discord.sendMessage(
           channelId,
           content,
-          { replyTo, files, ...(target ? { requireReplyTarget: true } : {}) },
+          { replyTo, files },
         );
         this.stateTracker.recordSent(result.messageId, channelId, content);
         const shifted = this.markOutboundSend(channelId);
@@ -1680,30 +1680,38 @@ export class DiscordMcplServer {
   }
 
   /** The target of a reply or reaction: exactly one of messageId or
-   *  latestFrom, each a string or null (null and omission mean absent). A
-   *  latestFrom selection is resolved once, its message id frozen for the
-   *  action, and echoed back so the resident can recognize what was chosen. */
+   *  latestFrom, each a string or null. Only omission and null mean absent:
+   *  a string, blank included, is a selector given, so a blank one beside
+   *  another is two, and a blank one alone names nothing. A latestFrom
+   *  selection is resolved once, its message id frozen for the action, and
+   *  echoed back so the resident can recognize what was chosen. */
   private async resolveTargetMessage(
     channelId: string,
     args: Record<string, unknown>,
   ): Promise<{ messageId: string; target?: Record<string, unknown> }> {
-    const selector = (value: unknown, name: string): string | null => {
-      if (value === undefined || value === null) return null;
+    const selector = (value: unknown, name: string): string | undefined => {
+      if (value === undefined || value === null) return undefined;
       if (typeof value !== 'string') throw new Error(`${name} must be a string or null; nothing was done.`);
-      return value.trim() ? value.trim() : null;
+      return value;
     };
     const messageId = selector(args.messageId, 'messageId');
     const latestFrom = selector(args.latestFrom, 'latestFrom');
-    if (messageId && latestFrom) {
+    if (messageId !== undefined && latestFrom !== undefined) {
       throw new Error('Give messageId or latestFrom, not both; nothing was done.');
     }
-    if (!messageId && !latestFrom) {
+    if (messageId === undefined && latestFrom === undefined) {
       throw new Error('Give exactly one of messageId or latestFrom; nothing was done.');
     }
-    if (messageId) return { messageId };
+    if (messageId !== undefined) {
+      if (!messageId.trim()) throw new Error('messageId is blank, so it names no message; nothing was done.');
+      return { messageId: messageId.trim() };
+    }
+    if (!latestFrom!.trim()) throw new Error('latestFrom is blank, so it names no one; nothing was done.');
     const r = await this.discord.resolveLatestFrom(channelId, latestFrom!);
     if (!r.ok) throw new Error(r.message);
-    const text = r.message.cleanContent.replace(/\s+/g, ' ').trim();
+    // Cut by code points, never inside a surrogate pair: at most
+    // LATEST_FROM_EXCERPT characters, its ellipsis included.
+    const text = Array.from(r.message.cleanContent.replace(/\s+/g, ' ').trim());
     return {
       messageId: r.message.id,
       target: {
@@ -1713,7 +1721,7 @@ export class DiscordMcplServer {
         // canonical discord:<guild|dm>:<channel> form.
         discordChannelId: channelId,
         timestamp: r.message.timestamp.toISOString(),
-        excerpt: text.length > LATEST_FROM_EXCERPT ? `${text.slice(0, LATEST_FROM_EXCERPT)}…` : text,
+        excerpt: text.length > LATEST_FROM_EXCERPT ? `${text.slice(0, LATEST_FROM_EXCERPT - 1).join('')}…` : text.join(''),
         selectedBy:
           `latestFrom "${latestFrom}": their newest message among the ${LATEST_FROM_WINDOW} most recent ` +
           'in this channel when this call ran (not a claim about what you have seen)',

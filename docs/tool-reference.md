@@ -17,7 +17,7 @@ Discord tools accept Discord channel names/IDs as described above. Framework cha
 
 For Discord message operations, copy the numeric messageId from incoming messages or fetched history and supply its channelId too. Do not guess message IDs.
 
-To reply or react to someone's latest message without copying its ID, reply_message, add_reaction and remove_reaction accept `latestFrom` instead of `messageId`: the author's @username, display name, or numeric user ID (bots included). It targets their newest message among the 100 most recent in that channel, resolved once when the call runs. An ambiguous name returns choices, a name that can't be checked against the channel's members is refused (use the numeric ID), no match in that window is refused, and the result echoes the chosen message (ID, author, time, excerpt). Give exactly one of the two; the other may be omitted or null.
+To reply or react to someone's latest message without copying its ID, reply_message, add_reaction and remove_reaction accept `latestFrom` instead of `messageId`: the author's @username, display name, or numeric user ID (bots included). It targets their newest message (never a system notice such as a pin) among the 100 most recent in that channel, resolved once when the call runs. An ambiguous name returns choices, a name that can't be checked against the channel's members is refused (use the numeric ID), no match in that window is refused, and the result echoes the chosen message (ID, author, time, excerpt). Give exactly one of the two; the other may be omitted or null.
 
 ## Attachments
 

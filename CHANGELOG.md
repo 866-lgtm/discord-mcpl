@@ -8,26 +8,54 @@ in the git log and PR descriptions.
 ### Added
 
 - **`latestFrom` for replies and reactions.** `reply_message`, `add_reaction`
-  and `remove_reaction` accept `latestFrom` (an @username, display name, or
-  numeric user ID, bots included) as the exclusive alternative to
-  `messageId`. It targets that author's newest message among the 100 most
-  recent in the channel, resolved once when the call runs and frozen for the
-  action. Like `list_channels` and `list_channel_members`, it reads only
-  channels the configured channel filters admit (a thread by its parent's
-  entry); a channel outside them is refused, by ID or by name, before its
-  history or members are read. A name
-  must match one identity among everyone who can read the
-  channel (for a public thread, its parent's viewers as well as its joined
-  members; for a private thread, its members and the parent's viewers who
-  can manage threads) plus the window's authors; a collision returns
-  choices, a name that can't be
-  checked against the channel's members (the member list fails, or lists
-  members it couldn't name) is refused in favor of the numeric id, and no
-  match in the window is refused rather than guessed. The result echoes the chosen
-  message's ID, author, channel, time and an excerpt. A latestFrom reply
-  whose target disappears fails instead of posting unthreaded. Both
-  selectors are nullable and neither is required, so sparse calls and
-  all-properties calls with the unused one null both work.
+  and `remove_reaction` accept `latestFrom` (an @username, display name,
+  numeric user ID, `<@id>` or `@id`, bots included) as the exclusive
+  alternative to `messageId`. It targets that author's newest message among
+  the 100 most recent in the channel, resolved once when the call runs and
+  frozen for the action. Only a message someone wrote counts: a system
+  notice (a pin, a join, a thread start) is never their latest message,
+  though a bot's reply to a slash command is the bot's.
+  - **The filters bound it, before and after its reads.** Like
+    `list_channels` and `list_channel_members`, it reads only what the
+    configured filters admit: a channel in a guild `guildIds` lists, admitted
+    by `guildChannels` (a thread by its parent's entry), and for a DM, one
+    whose other party `dmUsers` lists. Anything else is refused, by ID or by
+    name, before its history or members are read, and the filters are
+    checked again after the reads, so a change made meanwhile refuses the
+    action.
+  - **A name must match one identity.** That is among everyone who can read
+    the channel (for a public thread, its parent's viewers as well as its
+    joined members; for a private thread, its members and the parent's
+    viewers who can manage threads) plus the window's authors, by username or
+    display name: a member's server nickname or global display name, and for
+    an author no longer there, the account's. A collision returns choices,
+    and no match in the window is refused rather than guessed. A name that
+    can't be checked against the channel's members is refused in favor of
+    the numeric ID: when the member list fails, lists members it couldn't
+    name, or is a thread's listing of exactly one page (100), which may be
+    cut short. A guild whose member-cache warm-up failed is remembered for 10
+    minutes, so names there are refused at once rather than each waiting out
+    another download, and a warm-up is skipped when the cache already holds
+    every member. A `latestFrom` of `@` alone names no one and is refused
+    before anything is read, and an empty channel is refused as having
+    nothing to choose from.
+  - **The result echoes the chosen message:** its ID, author (by display
+    name), channel, time, and an excerpt of at most 80 characters, cut by
+    code points so no emoji is split. `add_reaction` and `remove_reaction`
+    return `{ result, target }` for a `latestFrom` selection.
+  - **A reply to a message that's gone fails** instead of posting
+    unthreaded, by discord.js's default (`fail_if_not_exists`), for a
+    `latestFrom` selection as for an exact ID.
+  - **Selectors:** both are nullable and neither is required, so sparse
+    calls and all-properties calls with the unused one null both work. Only
+    omission and null mean absent: a string is a selector given, blank
+    included, so two given are refused, and a blank one alone names nothing.
+    Each of the three tools now refuses a call with no `messageId` or
+    `latestFrom`, or with a non-string one; a `reply_message` without
+    `messageId` used to post unthreaded.
+  - **`list_channel_members`** reports, for a thread, `unresolved` (members
+    listed by ID only, whose names couldn't be read) and
+    `possiblyIncomplete` (Discord returned exactly one page of members).
 
 - **RFC-006 event coalescing** (agent-framework #197, mcpl #5). When the host
   advertises `eventCoalescing`, a message create carries its stable subject

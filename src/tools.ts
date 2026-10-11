@@ -46,7 +46,7 @@ const TARGET_RULE =
 
 const LATEST_FROM_DESC =
   'Instead of messageId: the author whose newest message to target, as @username, display name, ' +
-  'or numeric user id (people and bots alike). Picks their newest message among the 100 most ' +
+  'or numeric user id (people and bots alike). Picks their newest message (never a system notice) among the 100 most ' +
   'recent in the channel, resolved once when the call runs; an ambiguous name returns choices, ' +
   'a name that can\'t be checked against the channel\'s members is refused (use the numeric id), ' +
   'and no match in that window is refused rather than guessed. The result echoes the chosen ' +
@@ -168,7 +168,7 @@ export const toolDefinitions: ToolDefinition[] = [
   },
   {
     name: 'list_channel_members',
-    description: "List people associated with a Discord channel, with IDs and display names. For a guild channel: members who can view it; for a thread: joined members; for a DM: participants. Check scope, note and truncated. This does not report who is online or reading now. Use fetch_history for messages.",
+    description: "List people associated with a Discord channel, with IDs and display names. For a guild channel: members who can view it; for a thread: joined members; for a DM: participants. Check scope, note and truncated, and for a thread unresolved (members listed by id only, whose names couldn't be read) and possiblyIncomplete (Discord returned one full page, so there may be more). This does not report who is online or reading now. Use fetch_history for messages.",
     inputSchema: {
       type: 'object',
       properties: {
