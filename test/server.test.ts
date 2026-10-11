@@ -520,6 +520,47 @@ describe('DiscordMcplServer', () => {
     );
   });
 
+  it("an MCPL host's policy sent before notifications/initialized is answered, and still holds after it", async (t) => {
+    const { client, serverConn, discord } = await createTestPair();
+    const server = new DiscordMcplServer(discord as unknown as DiscordAdapter);
+    t.mock.method(console, 'log', () => {});
+    const serverPromise = server.serve(serverConn);
+    let receipt: { accepted?: boolean } | undefined;
+    let history: { content: Array<{ text?: string }>; isError?: boolean } | undefined;
+    try {
+      await client.sendRequest('initialize', {
+        protocolVersion: '2024-11-05',
+        capabilities: { experimental: { mcpl: { version: '0.4', pushEvents: true, channels: true, rollback: true } } },
+        clientInfo: { name: 'test-early-policy', version: '0.1.0' },
+      });
+      // The policy comes before notifications/initialized: the handshake used
+      // to read it in that slot and drop it.
+      receipt = (await client.sendRequest('featureSets/update', { disabled: ['discord.history'] }, 5_000)) as typeof receipt;
+      client.sendNotification('notifications/initialized');
+      // Answer the server's own requests (channel registration) as they come.
+      void (async () => {
+        try {
+          for (;;) {
+            const m = await client.nextMessage();
+            if (m.type === 'request') client.sendResponse(m.request.id, {});
+          }
+        } catch { /* closed */ }
+      })();
+      history = (await client.sendRequest(
+        'tools/call',
+        { name: 'fetch_history', arguments: { channelId: 'discord:g1:c1' } },
+        5_000,
+      )) as typeof history;
+    } finally {
+      client.close();
+      await serverPromise;
+    }
+
+    assert.equal(receipt?.accepted, true, 'the early policy was answered');
+    assert.equal(history?.isError, true, "the policy's disable held past notifications/initialized");
+    assert.match(history?.content[0]?.text ?? '', /Feature set 'discord\.history' is not enabled/);
+  });
+
   it("a request whose handler throws something that isn't an Error is answered, and serving goes on", async (t) => {
     const { client, serverConn, discord } = await createTestPair();
     const server = new DiscordMcplServer(discord as unknown as DiscordAdapter);
@@ -1314,6 +1355,45 @@ describe('DiscordMcplServer', () => {
 
       client.close();
       await serverPromise;
+    } finally {
+      delete process.env.DISCORD_WATERMARK_FILE;
+      if (existsSync(wmPath)) unlinkSync(wmPath);
+    }
+  });
+
+  it("the reconnect sweep saves each channel's watermark as its block is accepted, so an exit mid-sweep can't replay it", async () => {
+    const wmPath = join(tmpdir(), `discord-mcpl-wm-${process.pid}-sweep-progress.json`);
+    writeFileSync(wmPath, JSON.stringify({ watermarks: { c1: '100', c2: '100' }, dmChannels: [] }));
+    process.env.DISCORD_WATERMARK_FILE = wmPath;
+    try {
+      const { client, serverConn, discord } = await createTestPair();
+      const t = new Date();
+      const mention = { id: '102', authorId: 'u2', authorName: 'Bob', isBot: false, content: '<@bot_123> ping', cleanContent: '@bot ping', attachments: [], mentionsBot: true, timestamp: t, reactions: [] };
+      // c1 has a missed mention; c2's fetch never finishes, as if the process
+      // ended (the host closing stdio) while the sweep was still running.
+      (discord as unknown as { fetchHistory: (channelId: string) => Promise<unknown> }).fetchHistory = (channelId) =>
+        channelId === 'c2' ? new Promise(() => {}) : Promise.resolve([mention]);
+      const server = new DiscordMcplServer(discord as unknown as DiscordAdapter);
+      const serverPromise = server.serve(serverConn);
+      try {
+        await mcplHandshake(client);
+        const reg = await client.nextMessage();
+        if (reg.type === 'request') client.sendResponse(reg.request.id, {});
+        const missed = await client.nextMessage();
+        assert.equal(missed.type === 'request' && missed.request.method, method.PUSH_EVENT);
+        if (missed.type === 'request') client.sendResponse(missed.request.id, {});
+        // The push is answered; the save follows it synchronously. Give the
+        // server a turn to read the answer.
+        for (let i = 0; i < 50 && JSON.parse(readFileSync(wmPath, 'utf8')).watermarks.c1 !== '102'; i++) {
+          await new Promise((r) => setTimeout(r, 20));
+        }
+      } finally {
+        client.close();
+        await serverPromise;
+      }
+      const saved = JSON.parse(readFileSync(wmPath, 'utf8'));
+      assert.equal(saved.watermarks.c1, '102', 'c1 is saved past its delivered block while the sweep is still on c2');
+      assert.equal(saved.watermarks.c2, '100', 'c2 is untouched');
     } finally {
       delete process.env.DISCORD_WATERMARK_FILE;
       if (existsSync(wmPath)) unlinkSync(wmPath);

@@ -2390,6 +2390,7 @@ export class DiscordMcplServer {
         // Nothing to deliver, but advance the anchor so we don't re-scan these
         // messages on the next reconnect.
         this.forwardedWatermark.set(channelId, newestId);
+        this.saveWatermark();
         continue;
       }
       const hadMention = isDM || mentionCount > 0;
@@ -2452,7 +2453,11 @@ export class DiscordMcplServer {
         } satisfies PushEventParams);
         // Advance past everything we scanned (not just what we delivered) so a
         // mention-only channel doesn't re-surface its non-mention tail later.
+        // Saved at once, as live forwarding saves each message: the process
+        // can end before the sweep does (the stdio transport exits when its
+        // host goes), and a later start would deliver this block again.
         this.forwardedWatermark.set(channelId, newestId);
+        this.saveWatermark();
         delivered++;
       } catch (err) {
         dbg('sweep:send-failed', { channelId, error: (err as Error).message });
