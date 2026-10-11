@@ -118,7 +118,8 @@ export function parseFiltersFromEnv(env: NodeJS.ProcessEnv = process.env): Disco
  *  present-but-not-string[] key therefore invalidates the whole load. */
 export function loadFiltersFile(path: string): DiscordFilters | null {
   try {
-    const raw: unknown = JSON.parse(readFileSync(path, 'utf-8'));
+    // An editor's byte-order mark isn't part of the JSON.
+    const raw: unknown = JSON.parse(readFileSync(path, 'utf-8').replace(/^\uFEFF/, ''));
     if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return null;
     const r = raw as Record<string, unknown>;
     const out: DiscordFilters = {};
