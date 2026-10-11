@@ -87,10 +87,12 @@ describe('explainDiscordError: what was sent, and the id-less branches', () => {
     assert.match(e('Unknown Channel', 10003, 404, { channelId: 111 }), /No such channel is visible/);
   });
 
-  it('a user name the adapter resolved is not sent back to the name route', () => {
+  it('a user name the adapter resolved is not sent back to the name route, and an @id is read as the id', () => {
     const text = explainDiscordError(discordError('Unknown User', 10013, 404), { userId: '@someone' });
     assert.match(text, /@someone matched an account Discord no longer knows/);
     assert.doesNotMatch(text, /a name works/);
+    const id = explainDiscordError(discordError('Unknown User', 10013, 404), { userId: '@123456789012345678' });
+    assert.match(id, /No user 123456789012345678 is known to Discord: the id may be mistyped/);
   });
 
   it('missing access on a channel does not assume a server, and points at list_channels with its limits', () => {

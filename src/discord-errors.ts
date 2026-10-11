@@ -52,7 +52,7 @@ export function explainDiscordError(err: unknown, args: Record<string, unknown>,
       } else if (!channel && given('categoryId')) {
         why =
           `No category ${given('categoryId')} is visible to this connection: ${recalled}, or the category deleted. ` +
-          "list_channels shows a server's channels, categories included, with their ids.";
+          "list_channels shows a server's channels, categories included, with their ids, within the configured filters.";
       } else {
         // The name route covers text, announcement and voice channels only
         // (resolveChannelRef leaves out threads, forums, categories and DMs),
@@ -78,10 +78,11 @@ export function explainDiscordError(err: unknown, args: Record<string, unknown>,
         'message as it arrived, with the channel it arrived in.';
       break;
     case UNKNOWN_USER:
+      // Read as the adapter's resolver reads it: an id may come with one leading @.
       why = !user
         ? 'A user this call needed is gone from Discord.'
-        : isSnowflake(user)
-          ? `No user ${user} is known to Discord: ${recalled}. A message's author and list_channel_members ` +
+        : isSnowflake(user.replace(/^@/, ''))
+          ? `No user ${user.replace(/^@/, '')} is known to Discord: ${recalled}. A message's author and list_channel_members ` +
             'show real ids, and a name works for someone who shares a server with this bot or has DMed it ' +
             '(@username or display name).'
           // A name the adapter resolved: sending it again would reach the same account.
