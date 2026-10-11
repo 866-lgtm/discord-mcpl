@@ -952,10 +952,12 @@ export class DiscordMcplServer {
     // the stream's own callback, where nothing here can catch it, and the
     // process exits. Logged instead, so a bad line costs only itself and the
     // loop reads on. The listener stays for the connection's whole life,
-    // after serve() returns too: mcpl-core forwards its streams' errors to it
-    // for as long as they exist. (A read error, on a TCP socket or on stdin,
-    // also reaches mcpl-core's own readline interface, which listens for
-    // none, so it still ends the process. That is mcpl-core's to handle.)
+    // after serve() returns too: mcpl-core 0.2 and 0.3 forward its streams'
+    // errors to it for as long as they exist. (mcpl-core-ts #11 stops at the
+    // close, so there the late listener costs nothing.) A read error, on a
+    // TCP socket or on stdin, also reaches mcpl-core's own readline
+    // interface, which listens for none, so it still ends the process. That
+    // is mcpl-core's to handle.
     const onConnectionError = (err: unknown) => {
       console.error('[discord-mcpl] Connection error:', errorText(err));
       dbg('connection:error', { error: errorText(err) });
