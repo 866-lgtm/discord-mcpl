@@ -88,13 +88,22 @@ function buildAttachments(files?: OutgoingFile[]): AttachmentBuilder[] {
 
 export interface DiscordAdapterConfig {
   token: string;
+  /** Guild filter: only these guilds' channels are registered with the host,
+   *  resolvable by name, and delivered. It doesn't restrict a deliberate read
+   *  by channel id; reads follow guildChannels. */
   guildIds?: string[];
   /** Per-guild channel whitelist. When a guild id has an entry here, only
    *  the listed channel ids (and threads under them) are visible/handled in
-   *  that guild. Guilds without an entry are unrestricted. */
+   *  that guild. It also bounds deliberate inspection: list_channels leaves
+   *  channels outside it out of its listing, list_channel_members refuses
+   *  them with its own check, and fetch_history and fetch_around refuse them
+   *  through inspectionRefusal. Guilds without an entry are unrestricted. An
+   *  entry applies only to a guild that guildIds lists too (normalizeFilters
+   *  drops the rest). */
   guildChannels?: Record<string, string[]>;
   /** DM user whitelist. When set, incoming DMs are only handled from these
-   *  user ids; DMs from anyone else are dropped. Unset = all DMs allowed. */
+   *  user ids; DMs from anyone else are dropped. Unset = all DMs allowed.
+   *  It filters incoming DMs only; it doesn't restrict reads or sends. */
   dmUsers?: string[];
 }
 
@@ -2055,6 +2064,28 @@ export class DiscordAdapter {
           'Its events are filtered without it, so they pass only if the thread is listed itself.',
       );
     }
+  }
+
+  /** Why a deliberate read of this channel is refused by the channel filters,
+   *  or null when it isn't. It is the boundary list_channels and
+   *  list_channel_members already apply: guildChannels, with a channel's
+   *  parent (a thread's channel, a channel's category) admitting it too.
+   *  DMs and guilds without a guildChannels entry pass; guildIds and dmUsers
+   *  bound delivery, not reads. */
+  async inspectionRefusal(channelId: string): Promise<string | null> {
+    const channel = await this.client.channels.fetch(channelId);
+    // A lookup that finds nothing can't be placed, so it fails closed, with
+    // the not-found error the read itself would give.
+    if (!channel) throw new Error(`Channel ${channelId} not found`);
+    // A DM passes: the DM list filters incoming DMs only.
+    if (channel.isDMBased()) return null;
+    const guildId = 'guildId' in channel ? channel.guildId : null;
+    const parentId = 'parentId' in channel ? channel.parentId : null;
+    if (this.channelAllowed(guildId, channelId, parentId)) return null;
+    return (
+      `Channel ${channelId} is outside this residence's configured channel filters — ` +
+      'filters bound inspection as well as delivery. Nothing was read.'
+    );
   }
 
   private messageFilterReason(message: Message): string | null {

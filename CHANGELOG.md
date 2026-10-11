@@ -5,6 +5,19 @@ in the git log and PR descriptions.
 
 ## Unreleased
 
+### Upgrade notes
+
+- **`fetch_history` and `fetch_around` now refuse a channel id that the
+  configured channel list (`guildChannels`) excludes.** A resident that
+  reads such a channel by its numeric id today (following a pasted message
+  link, say) will get a refusal naming the channel filters, and nothing is
+  read. The refusal is deliberate: it is the boundary `list_channels` and
+  `list_channel_members` already apply (see the `fetch_history` entry under
+  Fixed). To let a residence read the channel, admit it in `guildChannels`,
+  directly or through its parent (a thread's channel, a channel's
+  category). The same list bounds delivery, so that admits it for delivery
+  too. Guilds without a `guildChannels` entry, and DMs, are unaffected.
+
 ### Added
 
 - **RFC-006 event coalescing** (agent-framework #197, mcpl #5). When the host
@@ -315,3 +328,15 @@ in the git log and PR descriptions.
   overwrite the previous turn's history and then keep everything generated so
   far, heard or not; it now keeps only what was heard. Raised in #69's
   review, the same class as #70's slash-command fix.
+- **`fetch_history` and `fetch_around` respect the channel filters for
+  numeric ids.** Names already resolved only among allowed channels, but a
+  numeric channel id went straight to Discord, so either tool could read a
+  channel the configured channel list (`guildChannels`) excludes. Both now
+  refuse such a channel before any message is read, by the rule
+  `list_channels` and `list_channel_members` already apply (a thread or a
+  categorized channel admitted by its parent). A `channelId` that isn't a
+  string, and a channel the lookup can't find, are refused before any read
+  too. The guild filter
+  (registration, name resolution, delivery) and the DM contact list
+  (incoming DMs) keep their meaning and don't restrict deliberate reads; the
+  config docs now say what each filter bounds.

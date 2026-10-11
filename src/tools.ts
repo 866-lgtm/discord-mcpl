@@ -194,7 +194,9 @@ export const toolDefinitions: ToolDefinition[] = [
     description:
       'Show the active event filters: which guilds/channels can deliver events to you ' +
       '(guild whitelist, optional per-guild channel whitelist) and which users may DM you. ' +
-      'null means unrestricted. Filters gate delivery only — the bot must also be a ' +
+      'null means unrestricted. Filters gate delivery, and the per-guild channel list also ' +
+      'bounds list_channels, list_channel_members, fetch_history and fetch_around, which refuse ' +
+      'a channel outside it. The bot must also be a ' +
       'member of a guild to see it at all. Reports the config plane\'s desired-vs-effective ' +
       'state (live / stale / unavailable — whitelists and suppression share one lifecycle, so ' +
       'a broken filters file makes ALL of them stale together) and reaction-suppression state ' +
