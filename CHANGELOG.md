@@ -38,7 +38,9 @@ in the git log and PR descriptions.
   writes nothing, and turning them on starts from that moment, so nothing
   refused while they were off is notified later. If it can't be read or
   written, notices are suspended, and a refusal decided meanwhile gets no
-  notice; nothing retries it. The agent turns notices on and off with
+  notice; nothing retries it, though a later sight of the same message
+  (a duplicate event, or the next start's catch-up in a DM channel the bot
+  knows) decides it afresh. The agent turns notices on and off with
   `filters_update {setDmNotice}`, which works with or without a filters
   file; turning them off stops every notice not yet reserved, while one
   already being sent still goes out. `filters_get` shows the setting and
