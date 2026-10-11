@@ -161,10 +161,13 @@ in the git log and PR descriptions.
   promises "no ambient", and closes the channel, but the reaction
   visibility that opening it turned on outlived the mute, so reactions there
   kept landing in context. A mute now drops that visibility, as a close
-  does, so after `unmute_channel` reactions return with `channel_open`,
-  along with the rest of ambient traffic, as both tools' descriptions say.
-  While a channel is muted, no reaction gets through, even where visibility
-  is turned on again.
+  does, and both now save the drop, so a restart can't bring it back. After
+  `unmute_channel`, reactions return with `channel_open`, along with the rest
+  of ambient traffic, as the tools' descriptions now say. While a channel is
+  muted, no reaction gets through, even where visibility is turned on again;
+  `set_reaction_visibility` says so, and that opt-in takes effect once the
+  mute is lifted. The reconnect catch-up sweep now skips a muted channel
+  too, where it used to push its missed mentions after a restart.
 - **A slash command that fails no longer ends the process.** Slash handlers
   run without being awaited, and their rejections were unhandled. On Node
   15 and later, an unhandled rejection exits the process, so a single late

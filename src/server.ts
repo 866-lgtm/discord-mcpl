@@ -1495,9 +1495,11 @@ export class DiscordMcplServer {
         if (visible) this.reactionChannels.add(channelId);
         else this.reactionChannels.delete(channelId);
         if (visible !== had) this.saveReactionChannels();
-        return visible
-          ? `Reaction visibility ON for channel ${channelId}. Reactions there now appear in your context as they happen (they never wake you).`
-          : `Reaction visibility OFF for channel ${channelId}.`;
+        if (!visible) return `Reaction visibility OFF for channel ${channelId}.`;
+        // A muted channel delivers nothing: the opt-in is kept, and takes effect once the mute is lifted.
+        return this.isChannelMuted(channelId)
+          ? `Reaction visibility ON for channel ${channelId}, but the channel is muted: its reactions reach you once unmute_channel lifts the mute (they never wake you).`
+          : `Reaction visibility ON for channel ${channelId}. Reactions there now appear in your context as they happen (they never wake you).`;
       }
 
       case 'refresh_channels':
@@ -1557,12 +1559,13 @@ export class DiscordMcplServer {
         // Muting implies leaving: drop any ambient subscription so the channel
         // stops delivering; it also won't auto-subscribe back in while muted.
         // Its reaction visibility goes too, as a close drops it
-        // (unsubscribeRawChannel), so unmuting leaves reactions off until
-        // channel_open turns them back on with the rest of ambient traffic.
+        // (unsubscribeRawChannel), saved so a restart can't bring it back:
+        // unmuting leaves reactions off until channel_open turns them back on
+        // with the rest of ambient traffic, or set_reaction_visibility does.
         this.ensureSubscriptionsLoaded();
         this.subscribedChannels.delete(channelId);
         this.ensureReactionChannelsLoaded();
-        this.reactionChannels.delete(channelId);
+        if (this.reactionChannels.delete(channelId)) this.saveReactionChannels();
         for (const channel of this.channelManager.getOpen()) {
           if (parseMcplChannelId(channel.id)?.channelId === channelId) this.channelManager.close(channel.id);
         }
@@ -2244,6 +2247,11 @@ export class DiscordMcplServer {
 
     let delivered = 0;
     for (const channelId of candidates) {
+      // A muted channel delivers nothing, its missed mentions included.
+      if (this.isChannelMuted(channelId)) {
+        dbg('sweep:skip', { channelId, reason: 'muted' });
+        continue;
+      }
       const watermark = this.forwardedWatermark.get(channelId);
       if (!watermark) continue;
       const isDM = this.dmChannelIds.has(channelId);
@@ -2621,7 +2629,8 @@ export class DiscordMcplServer {
     this.ensureSubscriptionsLoaded();
     const removed = this.subscribedChannels.delete(channelId);
     this.ensureReactionChannelsLoaded();
-    this.reactionChannels.delete(channelId);
+    // Saved, so a restart doesn't bring back the reactions a close turned off.
+    if (this.reactionChannels.delete(channelId)) this.saveReactionChannels();
     if (removed) {
       this.ensureWatermarkLoaded();
       const anchor = this.forwardedWatermark.get(channelId) ?? '';

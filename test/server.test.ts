@@ -1018,6 +1018,42 @@ describe('DiscordMcplServer', () => {
     }
   });
 
+  it('reconnect sweep delivers nothing from a muted channel, its missed mentions included', async () => {
+    const wmPath = join(tmpdir(), `discord-mcpl-wm-${process.pid}-sweep-muted.json`);
+    const mutedPath = join(tmpdir(), `discord-mcpl-muted-${process.pid}-sweep-muted.json`);
+    writeFileSync(wmPath, JSON.stringify({ watermarks: { c1: '100' }, dmChannels: [] }));
+    writeFileSync(mutedPath, JSON.stringify(['c1']));
+    process.env.DISCORD_WATERMARK_FILE = wmPath;
+    process.env.DISCORD_MUTED_CHANNELS_FILE = mutedPath;
+    try {
+      const { client, serverConn, discord } = await createTestPair();
+      const t = new Date();
+      // The same missed mention the sweep delivers from an unmuted channel.
+      discord.historyToReturn = [
+        { id: '102', authorId: 'u2', authorName: 'Bob', isBot: false, content: '<@bot_123> ping', cleanContent: '@bot ping', attachments: [], mentionsBot: true, timestamp: t, reactions: [] },
+      ];
+      const server = new DiscordMcplServer(discord as unknown as DiscordAdapter);
+      const serverPromise = server.serve(serverConn);
+      await mcplHandshake(client);
+      const regMsg = await client.nextMessage();
+      if (regMsg.type === 'request') client.sendResponse(regMsg.request.id, {});
+
+      // Nothing more arrives: the sweep skips the muted channel.
+      const next = await Promise.race([
+        // The read still pending at close() rejects; that rejection means nothing came.
+        client.nextMessage().catch(() => null),
+        new Promise<null>((resolve) => { const timer = setTimeout(() => resolve(null), 500); (timer as { unref?: () => void }).unref?.(); }),
+      ]);
+      client.close();
+      await serverPromise;
+      assert.equal(next, null, `no push from a muted channel, got ${JSON.stringify(next)?.slice(0, 200)}`);
+    } finally {
+      delete process.env.DISCORD_WATERMARK_FILE;
+      delete process.env.DISCORD_MUTED_CHANNELS_FILE;
+      for (const p of [wmPath, mutedPath]) if (existsSync(p)) unlinkSync(p);
+    }
+  });
+
   it('tracks missed ambient after unsubscribe and reports via channel_missed', async () => {
     const { client, serverConn, discord } = await createTestPair();
     const server = new DiscordMcplServer(discord as unknown as DiscordAdapter);
