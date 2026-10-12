@@ -1739,6 +1739,18 @@ describe('DiscordMcplServer', () => {
       );
     });
 
+    it("relabels a voice channel by its id when it's renamed into a thread label's shape", async (t) => {
+      const { client, discord } = await started(t);
+      discord.simulateChannelUpdate({ id: 'v1', guildId: 'g1', guildName: GUILD, type: 'voice', name: 'lounge' });
+      assert.deepEqual((await expectChanged(client)).added?.map((d) => d.label), ['#lounge (Test Guild)']);
+      // Every name is known, so the id label is the rule's answer, not less
+      // knowledge: it replaces `#lounge (Test Guild)`, which would otherwise
+      // name whichever channel is called lounge next.
+      discord.simulateChannelUpdate({ id: 'v1', guildId: 'g1', guildName: GUILD, type: 'voice', name: 'general › design' });
+      const relabelled = (await expectChanged(client)).updated ?? [];
+      assert.deepEqual(relabelled.map((d) => [d.label, d.metadata?.channelName]), [['discord:g1:v1', 'general › design']]);
+    });
+
     it('forgets an archived thread and registers it again by its next message; a deletion then has nothing to remove', async (t) => {
       const { client, discord } = await started(t);
       discord.facts.th1 = threadFacts('th1', 'design-chat');

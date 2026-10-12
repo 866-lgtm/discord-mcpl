@@ -146,6 +146,16 @@ function threadTags(thread: ThreadPlace): string[] {
   return thread.threadId ? ['chat:thread'] : [];
 }
 
+/** Whether descriptor `d` lacks a name that `known`, the same channel's
+ *  registered descriptor, has (toDescriptor's metadata names): what the cache
+ *  knows of a channel now can be less than what it knew. */
+function knowsLessThan(d: ChannelDescriptor, known: ChannelDescriptor): boolean {
+  const names = (x: ChannelDescriptor) => (x.metadata ?? {}) as { channelName?: string; guildName?: string; parentName?: string };
+  const now = names(d);
+  const then = names(known);
+  return (['channelName', 'guildName', 'parentName'] as const).some((k) => then[k] !== undefined && now[k] === undefined);
+}
+
 interface SavedTally {
   anchorId: string;
   talliedThrough?: string;
@@ -3064,14 +3074,16 @@ export class DiscordMcplServer {
    *  (channelUpdate firing on a topic edit, a manual refresh, each message in
    *  a channel) don't spam the host. What's known of a channel now can be
    *  less than what was (its guild or its name not cached), so a descriptor
-   *  labelled by its id never replaces one labelled by name. With no host
-   *  connected, the next connection's sync carries them. */
+   *  that lacks a name the registered one has doesn't replace it; one that
+   *  knows every name replaces it, whatever its label (a voice channel
+   *  renamed into a thread label's shape is labelled by its id). With no
+   *  host connected, the next connection's sync carries them. */
   private registerChannels(descriptors: ChannelDescriptor[]): { added: ChannelDescriptor[]; updated: ChannelDescriptor[] } {
     const added: ChannelDescriptor[] = [];
     const updated: ChannelDescriptor[] = [];
     for (const d of descriptors) {
       const known = this.channelManager.get(d.id);
-      if (known && d.label === d.id && known.label !== known.id) continue;
+      if (known && knowsLessThan(d, known)) continue;
       if (!known) added.push(d);
       else if (known.label !== d.label || JSON.stringify(known.metadata) !== JSON.stringify(d.metadata)) updated.push(d);
       this.channelManager.register(d);
