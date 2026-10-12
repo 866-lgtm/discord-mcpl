@@ -1622,7 +1622,10 @@ export class DiscordAdapter {
   private threadPlace(channel: unknown, channelId: string): ThreadPlace {
     const c = channel as { isThread?: () => boolean; name?: string | null; parentId?: string | null } | null | undefined;
     if (!c || typeof c.isThread !== 'function' || !c.isThread()) return {};
-    const parent = c.parentId ? (this.client.channels.cache.get(c.parentId) as { name?: string } | undefined) : undefined;
+    // A stale channel's name may no longer be Discord's, so it's unknown.
+    const parent = c.parentId && !this.isStale(c.parentId)
+      ? (this.client.channels.cache.get(c.parentId) as { name?: string } | undefined)
+      : undefined;
     return {
       threadId: channelId,
       ...(typeof c.name === 'string' && c.name.length > 0 ? { threadName: c.name } : {}),
@@ -1676,7 +1679,10 @@ export class DiscordAdapter {
       type,
       name: named(c.name),
       parentId: c.parentId ?? null,
-      parentName: named(parent?.name),
+      // A stale channel's name may no longer be Discord's: a thread's facts
+      // leave it unknown, so a registration keeps the name it knew
+      // (knowsLessThan) and a new one goes without.
+      parentName: c.parentId && this.isStale(c.parentId) ? null : named(parent?.name),
       archived: type === 'thread' && c.archived === true,
     };
     if (facts.archived && typeof c.archiveTimestamp === 'number' && Number.isFinite(c.archiveTimestamp)) {

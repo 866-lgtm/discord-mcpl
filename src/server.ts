@@ -3162,17 +3162,6 @@ export class DiscordMcplServer {
     ]);
   }
 
-  /**
-   * Re-derive the registered channels whose label can have changed because
-   * another channel took or gave up their name. A `#name (Guild)` label is
-   * kept only while it resolves back to its channel (channelLabelFor): a
-   * voice channel's name goes to a same-named text channel, and two channels
-   * of one name and kind lose it to each other. So a channel's creation,
-   * rename or deletion re-derives those labelled by id although they have a
-   * name (another channel held it) and those named like the channel
-   * (`name`); a guild joined, left, renamed or back re-derives every one,
-   * since a label names its guild.
-   */
   /** Whether the filters' answer for a thread rests on facts that are
    *  known: a thread whose channel is stale may be admitted through a
    *  category that's no longer the channel's, or not admitted through one
@@ -3193,6 +3182,17 @@ export class DiscordMcplServer {
     }
   }
 
+  /**
+   * Re-derive the registered channels whose label can have changed because
+   * another channel took or gave up their name. A `#name (Guild)` label is
+   * kept only while it resolves back to its channel (channelLabelFor): a
+   * voice channel's name goes to a same-named text channel, and two channels
+   * of one name and kind lose it to each other. So a channel's creation,
+   * rename or deletion re-derives those labelled by id although they have a
+   * name (another channel held it) and those named like the channel
+   * (`name`); a guild joined, left, renamed or back re-derives every one,
+   * since a label names its guild.
+   */
   private rederiveNamed(which: { name: string | null } | 'every'): void {
     const named = which === 'every' ? undefined : which.name?.toLowerCase();
     this.rederiveChannels(this.channelManager.getAll().filter((d) => {

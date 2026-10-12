@@ -1294,7 +1294,7 @@ it("a fresh fetch of a thread's channel derives the thread's label again", async
   (f.adapter as any).stale.set(P, { guildId: G });
   f.client.channels.cache.get(P).name = 'older';
   f.server.rederiveChannels(f.server.registeredInGuild(G));
-  assert.equal(f.label(TH), '#older › topic (Guild)');
+  assert.equal(f.label(TH), '#before › topic (Guild)', "a stale channel's cached name doesn't replace the one the thread had");
   t.mock.method(f.client.rest, 'get', async () => ({ ...parentData(ChannelType.GuildText), name: 'current' }));
   await f.adapter.getChannelMeta(P);
   assert.equal(f.label(TH), '#current › topic (Guild)');
@@ -1683,4 +1683,28 @@ it("a fresh fetch of a registered thread while its channel is stale leaves the t
   assert.equal(f.adapter.isStale(TX), false);
   assert.notEqual(f.label(TX), undefined);
   assert.equal(f.removed(idOf(TX)), false);
+});
+
+it("a delivery from a thread whose stale channel can't be looked up leaves that channel's cached name out of the thread's facts", { timeout: 5000 }, async (t) => {
+  t.mock.method(console, 'error', () => {});
+  for (const registered of [true, false]) {
+    const f = fixture(t);
+    if (registered) f.server.registerGuildDelivery(G, TH);
+    // Discord renamed P; an overtaken reply left an older name cached, stale.
+    f.client.channels.cache.get(P).name = 'older';
+    (f.adapter as any).stale.set(P, { guildId: G });
+    t.mock.method(f.client.rest, 'get', async () => { throw new Error('Service Unavailable'); });
+    f.gatewayCreate(T + 1000);
+    await until(() => f.pushes().length > 0);
+    assert.equal(f.pushes().length, 1, 'the message is delivered');
+    const known = f.server.channelManager.get(threadMcplId);
+    if (registered) {
+      assert.equal(known?.label, '#before › topic (Guild)', 'the registered label stands');
+      assert.equal((known?.metadata as { parentName?: string } | undefined)?.parentName, 'before');
+    } else {
+      assert.equal(known?.label, '› topic (Guild)', 'a new registration goes without the name');
+      assert.equal((known?.metadata as { parentName?: string } | undefined)?.parentName, undefined);
+    }
+    assert.ok(!JSON.stringify(f.pushes()[0]?.params).includes('older'), 'the delivery names no older channel name');
+  }
 });
