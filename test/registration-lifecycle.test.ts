@@ -1439,8 +1439,10 @@ it("a name that a stale channel holds resolves to no channel when its fetch fail
   assert.equal(result.isError, true);
   assert.match(result.content[0].text, /by its id/);
   assert.deepEqual(sent, [], 'nothing was sent');
-  // X may have taken any name meanwhile, so no name in its server resolves.
+  // X may have taken any name meanwhile, so no name in its server resolves,
+  // nor a name given without a server.
   assert.equal(f.adapter.resolveChannelRef('#before (Guild)').ok, false);
+  assert.equal(f.adapter.resolveChannelRef('#before').ok, false);
   assert.equal(f.adapter.resolveChannelRef(idOf(P)).ok, true, 'an id still does');
 });
 
@@ -1544,4 +1546,25 @@ it("the filters admit no channel of a server the guild filter leaves out", (t) =
   assert.equal(f.adapter.channelAdmitted(G, P, null), false);
   const g = fixture(t, { guildIds: [G] });
   assert.equal(g.adapter.channelAdmitted(G, P, null), true);
+});
+
+it("create_text_channel whose fetch afterwards fails relabels its server's channels by id", async (t) => {
+  const f = fixture(t);
+  f.server.registerGuildDelivery(G, P);
+  assert.equal(f.label(P), '#before (Guild)');
+  t.mock.method(f.client.rest, 'post', async () => channelData(X, ChannelType.GuildText, 'fresh-name'));
+  t.mock.method(f.client.rest, 'get', async () => { throw new Error('Service Unavailable'); });
+  await f.adapter.createTextChannel(G, 'fresh-name');
+  assert.equal(f.adapter.isStale(X), true);
+  assert.equal(f.label(P), idOf(P), "the new channel's name isn't known, so no name in the server resolves");
+});
+
+it("a batch of facts reads which servers' names are uncertain once, however many channels and stale marks there are", (t) => {
+  const f = fixture(t, { channels: Array.from({ length: 30 }, (_, i) => channelData(String(200000000000000000n + BigInt(i)), ChannelType.GuildText, 'c' + i)) });
+  for (let i = 0; i < 50; i++) (f.adapter as any).stale.set(String(300000000000000000n + BigInt(i)), { guildId: G });
+  const scans = t.mock.method(f.adapter as any, 'uncertainGuildNames');
+  const listed = f.adapter.getPostingChannels();
+  assert.ok(listed.length >= 30);
+  assert.equal(scans.mock.callCount(), 1);
+  assert.ok(listed.every((c) => c.nameResolves === true), 'marks for channels the server no longer lists block no name');
 });

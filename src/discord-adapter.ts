@@ -49,7 +49,14 @@ import { UNKNOWN_CHANNEL } from './discord-errors.js';
 
 /** The candidates a channel name resolves among, given the name
  *  (DiscordAdapter.nameView). */
-type NameView = (name: string) => ChannelCandidate[];
+/** The channels a name resolves among (nameView), with the guilds where
+ *  no name resolves while a channel there is stale (uncertainGuildNames),
+ *  each computed once per view. */
+interface NameView {
+  (name: string): ChannelCandidate[];
+  /** Lowercased names of the guilds whose names are uncertain now. */
+  uncertainGuilds(): ReadonlySet<string>;
+}
 
 /** How many times refetchChannel fetches a channel whose fetches Discord's
  *  reports keep overtaking, before it marks the channel stale. */
@@ -1895,7 +1902,8 @@ export class DiscordAdapter {
     // every label in that guild is its channel's id meanwhile (channelFacts).
     // A name-addressed tool fetches stale channels first (refreshStale), so
     // this holds only while a fetch fails.
-    if (this.uncertainNameHolder(parsed)) {
+    const uncertain = names.uncertainGuilds();
+    if (parsed.guild === undefined ? uncertain.size > 0 : uncertain.has(parsed.guild.toLowerCase())) {
       return {
         ok: false, reason: 'ambiguous',
         message: `${ref} can't be resolved by name right now: a channel in that server couldn't be fetched from Discord, so its current name isn't known, and it may be the one this name means. Address the channel by its id instead (list_channels gives each one's).`,
@@ -1904,23 +1912,21 @@ export class DiscordAdapter {
     return resolveChannelName(parsed, names(parsed.name));
   }
 
-  /** A stale channel a name reference could mean: its guild lists it now,
-   *  in a guild the guild filter admits and the reference names (or any,
-   *  for a name without a guild), and it's of a kind a name addresses. Its
-   *  category may be stale too, so the channel filters aren't applied. A
-   *  channel its guild no longer lists, such as one a return left out,
-   *  holds no name there. */
-  private uncertainNameHolder(ref: { name: string; guild?: string }): string | null {
-    const wantGuild = ref.guild?.toLowerCase();
+  /** The guilds, by lowercased name, where a stale channel may hold a name:
+   *  its guild lists it now, the guild filter admits that guild, and it's of
+   *  a kind a name addresses. Its category may be stale too, so the channel
+   *  filters aren't applied. A channel its guild no longer lists, such as
+   *  one a return left out, holds no name there. Read once per name view. */
+  private uncertainGuildNames(): Set<string> {
+    const names = new Set<string>();
     for (const [id, { guildId }] of this.stale) {
       if (!this.guildAdmitted(guildId)) continue;
       const guild = this.client.guilds.cache.get(guildId);
       const channel = guild?.channels.cache.get(id);
-      if (!guild || !channel) continue;
-      if (wantGuild !== undefined && guild.name?.toLowerCase() !== wantGuild) continue;
-      if (isNameAddressableKind(mapChannelType(channel.type))) return id;
+      if (!guild?.name || !channel) continue;
+      if (isNameAddressableKind(mapChannelType(channel.type))) names.add(guild.name.toLowerCase());
     }
-    return null;
+    return names;
   }
 
   /** The channels a name resolves among, read from the live cache (see
@@ -1935,7 +1941,8 @@ export class DiscordAdapter {
     const channelsOf = (g: Guild): Iterable<GuildBasedChannel> =>
       key === undefined ? g.channels.cache.values() : channelsNamed(g.channels.cache.values(), key);
     let byName: Map<string, ChannelCandidate[]> | undefined;
-    return (name) => {
+    let uncertain: Set<string> | undefined;
+    const view = ((name: string) => {
       if (!byName) {
         byName = new Map();
         const candidates = buildCandidates(
@@ -1956,7 +1963,9 @@ export class DiscordAdapter {
         }
       }
       return byName.get(name.toLowerCase()) ?? [];
-    };
+    }) as NameView;
+    view.uncertainGuilds = () => (uncertain ??= this.uncertainGuildNames());
+    return view;
   }
 
   /** Channel membership, by scope. Guild channels resolve to everyone whose
@@ -2351,7 +2360,7 @@ export class DiscordAdapter {
       // The channel was made, but its facts aren't verified: it's marked
       // stale, labelled by its id, until a fresh fetch.
       dbg('create-channel:refetch-failed', { channelId: created.id, error: (err as Error).message });
-      this.stale.set(created.id, { guildId });
+      this.markStale(created.id, guildId);
       return null;
     })) ?? created) as typeof created;
     // Labelled as listing labels it: by its id when its name is taken.
@@ -2987,13 +2996,19 @@ export class DiscordAdapter {
         return channel;
       }
       const guildId = channel && 'guildId' in channel ? channel.guildId : null;
-      if (guildId && !this.stale.has(channelId)) {
-        this.stale.set(channelId, { guildId });
-        this.channelStaleHandler?.(channelId);
-      }
+      if (guildId) this.markStale(channelId, guildId);
       dbg('gateway:fetch-overtaken', { channelId, tries, last: tries === FETCH_TRIES });
       if (tries === FETCH_TRIES) return channel;
     }
+  }
+
+  /** Mark a channel stale, after a fetch whose facts can't be trusted, and
+   *  tell the server when it wasn't already: its labels, and those of its
+   *  guild's other channels, no longer resolve (onChannelStale). */
+  private markStale(channelId: string, guildId: string): void {
+    if (this.stale.has(channelId)) return;
+    this.stale.set(channelId, { guildId });
+    this.channelStaleHandler?.(channelId);
   }
 
   /** Discord reported on a channel: a fetch of it that's out now may land

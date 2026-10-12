@@ -585,9 +585,10 @@ in the git log and PR descriptions.
     meanwhile; if that fetch fails the channel becomes stale, and if
     Discord says it's gone already the tool says so. A stale channel's
     facts decide nothing. Its current name isn't known, so while its
-    server lists it, no name in that server resolves, and every label
-    there is its channel's id until a fresh fetch; its category admits
-    none of its threads.
+    server lists a stale channel of a kind a name addresses, no name in
+    that server resolves, and the label of every such channel there is
+    its id until a fresh fetch; a thread keeps its display-only label.
+    A stale channel's category admits none of its threads.
     The registration listings leave it out. A name-addressed tool and
     `refresh_channels` fetch stale channels first, as a delivery from a
     thread fetches its stale channel first. A channel that Discord moves
