@@ -50,7 +50,7 @@ class MockDiscordAdapter {
   private _messageHandler?: (msg: DiscordMessageData) => void;
   private _channelCreateHandler?: (channel: ChannelFacts) => void;
   private _channelUpdateHandler?: (channel: ChannelFacts) => void;
-  private _channelDeleteHandler?: (guildId: string, channelId: string) => void;
+  private _channelDeleteHandler?: (guildId: string, channelId: string, threadIds: string[]) => void;
   private _guildCreateHandler?: (guildId: string, channels: ChannelFacts[]) => void;
   private _guildRenameHandler?: (guildId: string) => void;
   private _threadUpdateHandler?: (thread: ChannelFacts) => void;
@@ -94,8 +94,13 @@ class MockDiscordAdapter {
   onChannelUpdate(handler: (channel: ChannelFacts) => void): void {
     this._channelUpdateHandler = handler;
   }
-  onChannelDelete(handler: (guildId: string, channelId: string) => void): void {
+  onChannelDelete(handler: (guildId: string, channelId: string, threadIds: string[]) => void): void {
     this._channelDeleteHandler = handler;
+  }
+  onGuildDelete(): void {}
+  /** These tests' bot is in every guild. */
+  hasGuild(): boolean {
+    return true;
   }
   onGuildCreate(handler: (guildId: string, channels: ChannelFacts[]) => void): void {
     this._guildCreateHandler = handler;
@@ -247,8 +252,8 @@ class MockDiscordAdapter {
   simulateThreadDelete(guildId: string, threadId: string): void {
     this._threadDeleteHandler?.(guildId, threadId);
   }
-  simulateChannelDelete(guildId: string, channelId: string): void {
-    this._channelDeleteHandler?.(guildId, channelId);
+  simulateChannelDelete(guildId: string, channelId: string, threadIds: string[] = []): void {
+    this._channelDeleteHandler?.(guildId, channelId, threadIds);
   }
   /** What the client's cache holds of guild channels, by channel id. Empty
    *  by default: a delivery from a channel the cache doesn't hold registers

@@ -553,8 +553,12 @@ in the git log and PR descriptions.
     reaches the host, live or caught up by the reconnect sweep, or before an
     edit or deletion there does. An archived thread is forgotten, and the
     message that unarchives it registers it again, so the host holds the
-    live threads. A deleted thread is forgotten, and so is a deleted channel
-    with its threads; only what was registered is announced as removed.
+    live threads.
+  - **Removals are followed.** A deleted thread is forgotten, and so is a
+    deleted channel with its threads, and every channel of a server the bot
+    leaves or is removed from; that server's channels are registered again
+    if the bot rejoins, and an outage removes nothing. Only what was
+    registered is announced as removed.
   - **A label is made one way on every path.** A channel's is its address,
     `#name (Guild)`. A thread's is `#parent › thread (Guild)`, display-only,
     since `#thread (Guild)` would paste back as a same-named channel; a tool
@@ -563,7 +567,8 @@ in the git log and PR descriptions.
     resolve back to the channel (a voice channel named like a thread label,
     a kind no name resolves to), the label is the channel's id,
     `discord:<guild>:<channel>`, never a bare `#name` that another server's
-    channel could answer to. A rename of a channel, thread or server, or a
+    channel could answer to. A rename of a channel (a forum or media
+    channel's included, whose posts are threads), a thread or a server, or a
     name learned since, re-derives the labels it's in, announced as
     `updated`.
   - **Every host connection is given the whole registry,** whatever was
@@ -575,12 +580,15 @@ in the git log and PR descriptions.
   - **A push names its channel (`mcplChannelId`) once it's registered,**
     which is every channel a message is delivered from except a thread
     archived since its missed messages (the sweep delivers them without
-    it) and one deleted while the message was on its way. A DM's edit or
-    deletion names its DM too, registered under its other party's name when
-    that's known.
-  - **A deleted channel's watermark and missed tally go,** and so do those
-    of a channel the reconnect sweep finds Discord no longer knows (deleted
-    while the server was down, say), so later starts stop fetching it.
+    it), and one deleted, or in a server the bot left, while the message
+    was on its way. A DM's edit or deletion names its DM too, registered
+    under its other party's name when that's known.
+  - **A deleted channel's watermark and missed tally go,** as do those of a
+    channel the reconnect sweep finds Discord no longer knows (deleted while
+    the server was down, say), so later starts stop fetching it. A message
+    or catch-up delivered from a channel after its deletion doesn't bring
+    the watermark back. A server the bot leaves keeps its channels'
+    watermarks, since they still exist.
 - **DM whitelist fails closed on edits.** With `DISCORD_DM_USERS` set, a DM
   edit whose author is unknown (uncached message) was forwarded because the
   check required an author; it is now dropped, like creates.

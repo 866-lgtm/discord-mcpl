@@ -66,9 +66,10 @@ describe('edit/delete push events', () => {
       botUserId: 'bot',
       onMessage: noop, onReaction: noop,
       onChannelCreate: noop, onChannelUpdate: noop, onChannelDelete: noop, onGuildCreate: noop,
-      onGuildRename: noop, onThreadUpdate: noop, onThreadDelete: noop,
+      onGuildRename: noop, onThreadUpdate: noop, onThreadDelete: noop, onGuildDelete: noop,
       // Nothing is cached: a delivery keeps what the test registered.
       getCachedChannelFacts: () => null,
+      hasGuild: () => true,
       onMessageEdit: (h: EditHandler) => { edit = h; },
       onMessageDelete: (h: DeleteHandler) => { del = h; },
     };

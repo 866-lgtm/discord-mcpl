@@ -642,10 +642,11 @@ export class DiscordAdapter {
   private readyHandler?: () => void;
   private channelCreateHandler?: (channel: ChannelFacts) => void;
   private channelUpdateHandler?: (channel: ChannelFacts) => void;
-  private channelDeleteHandler?: (guildId: string, channelId: string) => void;
+  private channelDeleteHandler?: (guildId: string, channelId: string, threadIds: string[]) => void;
   private threadUpdateHandler?: (thread: ChannelFacts) => void;
   private threadDeleteHandler?: (guildId: string, threadId: string) => void;
   private guildCreateHandler?: (guildId: string, channels: ChannelFacts[]) => void;
+  private guildDeleteHandler?: (guildId: string) => void;
   private guildRenameHandler?: (guildId: string) => void;
 
   constructor(config: DiscordAdapterConfig) {
@@ -873,12 +874,18 @@ export class DiscordAdapter {
    *  its permissions) and the bot can view it, in a guild and channel the
    *  filters admit: a rename re-derives what's registered, and a channel the
    *  bot has just been let into (a permission overwrite on a private channel;
-   *  channelCreate doesn't fire for one that already existed) is registered. */
+   *  channelCreate doesn't fire for one that already existed) is registered.
+   *  Also fired for a forum or media channel (holdsPosts), which isn't
+   *  registered, since it holds no messages, but whose posts are threads
+   *  whose labels name it. */
   onChannelUpdate(handler: (channel: ChannelFacts) => void): void {
     this.channelUpdateHandler = handler;
   }
 
-  onChannelDelete(handler: (guildId: string, channelId: string) => void): void {
+  /** Fired when a guild channel is deleted, with the threads the client's
+   *  cache held under it: Discord sends no threadDelete for those, and
+   *  discord.js drops them from its caches along with their channel. */
+  onChannelDelete(handler: (guildId: string, channelId: string, threadIds: string[]) => void): void {
     this.channelDeleteHandler = handler;
   }
 
@@ -900,6 +907,21 @@ export class DiscordAdapter {
    *  server can register them the same way it does at boot. */
   onGuildCreate(handler: (guildId: string, channels: ChannelFacts[]) => void): void {
     this.guildCreateHandler = handler;
+  }
+
+  /** Fired when the bot leaves a guild or is removed from it (discord.js
+   *  `guildDelete`). discord.js drops the guild's channels from its caches
+   *  without a channelDelete for each. They still exist, and the guild's
+   *  guildCreate brings them back if the bot rejoins. An outage is
+   *  `guildUnavailable` instead, and keeps the guild cached. */
+  onGuildDelete(handler: (guildId: string) => void): void {
+    this.guildDeleteHandler = handler;
+  }
+
+  /** Whether the bot is in a guild: the client's cache holds every guild
+   *  it's in, one that's unavailable in an outage included. */
+  hasGuild(guildId: string): boolean {
+    return this.client.guilds.cache.has(guildId);
   }
 
   /** Fired when a guild the filters admit is renamed: its name is in every
@@ -2388,9 +2410,13 @@ export class DiscordAdapter {
       this.channelCreateHandler?.(facts);
     });
 
+    // A deleted channel's threads go with it. discord.js drops them from its
+    // caches without a threadDelete for each, but the deleted channel still
+    // lists the ones it held.
     this.client.on('channelDelete', (channel) => {
       if ('guildId' in channel && channel.guildId) {
-        this.channelDeleteHandler?.(channel.guildId, channel.id);
+        const threadIds = 'threads' in channel ? [...channel.threads.cache.keys()] : [];
+        this.channelDeleteHandler?.(channel.guildId, channel.id, threadIds);
       }
     });
 
@@ -2440,6 +2466,13 @@ export class DiscordAdapter {
       this.guildCreateHandler?.(guild.id, this.guildPostingChannels(guild));
     });
 
+    // The bot left a guild or was removed from it (onGuildDelete). Reported
+    // whatever the guild filter says: forgetting what was never registered
+    // costs nothing.
+    this.client.on('guildDelete', (guild) => {
+      this.guildDeleteHandler?.(guild.id);
+    });
+
     this.client.on('interactionCreate', (interaction) => {
       if (!interaction.isChatInputCommand()) return;
       if (
@@ -2456,10 +2489,13 @@ export class DiscordAdapter {
     // let the bot in (it was added to a private channel). The server
     // re-derives what it registered (a rename changes the label, and its
     // threads' labels) and registers a channel it hadn't; an update that
-    // changes neither (a topic, slowmode) announces nothing. A channel the
-    // bot can't view isn't reported.
+    // changes neither (a topic, slowmode) announces nothing. A forum or
+    // media channel is reported too (holdsPosts): the server doesn't
+    // register it, but its posts are threads whose labels name it. A channel
+    // the bot can't view isn't reported.
     this.client.on('channelUpdate', (_oldChannel, newChannel) => {
-      if (!('guild' in newChannel) || !isListedKind(mapChannelType(newChannel.type))) return;
+      if (!('guild' in newChannel)) return;
+      if (!isListedKind(mapChannelType(newChannel.type)) && !holdsPosts(newChannel.type)) return;
       const guild = newChannel.guild;
       if (this.guildIds?.length && !this.guildIds.includes(guild.id)) return;
       const me = guild.members.me;
@@ -2840,6 +2876,13 @@ export function isListedKind(type: DiscordChannelInfo['type']): boolean {
  *  and a forum its posts, which are threads. */
 export function holdsNoMessages(type: DiscordChannelInfo['type']): boolean {
   return type === 'category' || type === 'forum';
+}
+
+/** The Discord channel types whose posts are threads: a forum, and a media
+ *  channel, which mapChannelType leaves `unknown` since nothing addresses
+ *  it. Its name is in each post's label. */
+export function holdsPosts(type: ChannelType | undefined): boolean {
+  return type === ChannelType.GuildForum || type === ChannelType.GuildMedia;
 }
 
 /**
