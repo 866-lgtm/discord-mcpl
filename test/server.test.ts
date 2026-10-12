@@ -1541,9 +1541,11 @@ describe('DiscordMcplServer', () => {
     const noParent = await sweepOne('th4', sparse, sparse);
     const noParentText = (noParent.payload.content[0] as { text: string }).text;
     assert.ok(noParentText.startsWith('<missed thread="design-chat" channelId="th4" guild="Test Guild"'), noParentText);
+    assert.equal('threadParentName' in (noParent.origin as Record<string, unknown>), false, 'an unknown channel is left out of the origin');
     const noName = await sweepOne('th5', { name: null, guildId: 'g1', guildName: 'Test Guild', isDM: false, threadId: 'th5', threadParentName: 'general' });
     const noNameText = (noName.payload.content[0] as { text: string }).text;
     assert.ok(noNameText.startsWith('<missed channel="#general" thread="th5" channelId="th5" guild="Test Guild"'), noNameText);
+    assert.equal('threadName' in (noName.origin as Record<string, unknown>), false, 'an unknown name is left out of the origin');
   });
 
   it("the reconnect sweep's push for a channel or a DM carries its mcplChannelId and no thread tag", async () => {

@@ -906,7 +906,7 @@ describe('server integration', () => {
     assert.ok(!wire.includes(SUPPRESSED_CUSTOM_ID), 'no suppressed custom id on the wire');
   });
 
-  it("a reaction on a thread's message carries the thread's tag and fields, as the message's create does", () => {
+  it("a reaction on a thread's message names the thread in its origin, and keeps its own tags only", () => {
     const server = makeServer();
     server.filtersState.applyParsed(withKey());
     const { handler, sent } = wireReactionHandler(server);
@@ -914,12 +914,14 @@ describe('server integration', () => {
     handler({ ...reaction, threadId: 'chan1', threadName: 'design-chat', threadParentName: 'general' });
     handler(reaction);
     const [inThread, inChannel] = sent.map((s) => (s as { params: { tags: string[]; origin: Record<string, unknown> } }).params);
-    assert.deepEqual(inThread.tags, ['chat:reaction', 'chat:thread']);
+    // No chat:thread: a gate rule keyed on it, written for a thread's
+    // messages, would otherwise start matching its reactions.
+    assert.deepEqual(inThread.tags, ['chat:reaction']);
     assert.equal(inThread.origin.threadName, 'design-chat');
     assert.equal(inThread.origin.threadParentName, 'general');
     assert.equal('threadId' in inThread.origin, false, 'a Discord thread is named by its channel id');
-    assert.deepEqual(inChannel.tags, ['chat:reaction'], 'a channel message has no thread tag');
-    assert.equal('threadName' in inChannel.origin, false);
+    assert.deepEqual(inChannel.tags, ['chat:reaction']);
+    assert.equal('threadName' in inChannel.origin, false, 'a channel message has no thread fields');
   });
 
   it('withhold-everything posture drops every live reaction event', () => {

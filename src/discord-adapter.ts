@@ -150,7 +150,8 @@ export interface DiscordAttachment {
  *  fields name that thread, never one a message started: that is discord.js
  *  `message.thread`, a different conversation. All are absent when the
  *  channel isn't a thread. The adapter reads them in one place
- *  (`threadPlace`), for creates, edits and deletes, and channel lookups. */
+ *  (`threadPlace`), for creates, edits, deletes and reactions, and channel
+ *  lookups. */
 export interface ThreadPlace {
   /** The thread the message was posted in, which is its channel, so this
    *  equals the channel id. */
@@ -1370,10 +1371,11 @@ export class DiscordAdapter {
   }
 
   /** Resolve display metadata for a channel by ID — used by the reconnect
-   *  catch-up sweep to label `<missed>` blocks. Returns nulls for an
-   *  unresolvable channel rather than throwing; `isDM` is null when the
-   *  channel's kind isn't known. A thread the client knows only partly is
-   *  fetched past the cache, which would hand back that same partial. */
+   *  catch-up sweep to label `<missed>` blocks. Rejects when the lookup
+   *  fails (the sweep catches it); for a channel found, fields it can't name
+   *  are null, and `isDM` is null when the channel's kind isn't known. A
+   *  thread the client knows only partly is fetched past the cache, which
+   *  would hand back that same partial. */
   async getChannelMeta(channelId: string): Promise<ChannelMeta> {
     const force = threadChannelUnknown(this.client.channels.cache.get(channelId));
     const channel = await this.client.channels.fetch(channelId, { force });
@@ -2103,8 +2105,11 @@ export class DiscordAdapter {
     // filters say, as its creates are, so the edit or delete names it as its
     // create does. If the lookup fails, the thread stays as it was, and the
     // filters decide on what's known, as they do for its creates.
-    const partlyKnown = !!guildId && threadChannelUnknown(channel);
-    if (partlyKnown) {
+    // The channel is read from the cache again after the lookup: while it
+    // was pending, the cached entry can have been replaced (the guild
+    // removed and joined again builds a new thread object), and then only
+    // the cache holds what the lookup found.
+    if (guildId && threadChannelUnknown(channel)) {
       await this.lookUpThread(message.channelId);
       channel = this.client.channels.cache.get(message.channelId) ?? channel;
     }
@@ -2112,10 +2117,10 @@ export class DiscordAdapter {
     // channel is a thread under an allowlisted parent. Fetch only when that
     // missing parent could affect the decision; a directly allowed channel
     // or a channel with known parent metadata needs no lookup, and a partly
-    // known thread has had its lookup above. The fetch is forced, since
-    // discord.js would otherwise hand back that same cached partial.
+    // known thread (whose parentId key is there, null) has had its lookup
+    // above. The fetch is forced, since discord.js would otherwise hand back
+    // a cached partial.
     const needsParent = guildId
-      && !partlyKnown
       && !(channel && 'parentId' in channel)
       && !this.channelAllowed(guildId, message.channelId);
     if ((!guildId && !channel?.isDMBased()) || needsParent) {
@@ -2534,13 +2539,14 @@ export class DiscordAdapter {
 
   /** Fetch a thread so the cache holds its channel (threadChannelUnknown).
    *  Forced, since discord.js would otherwise return the cached partial. The
-   *  REST client's own timeout and retries bound the wait (15 s a try, three
-   *  retries, by default), so creates waiting behind it are held at most
-   *  that long. If the fetch fails, the thread stays as it was, and the
-   *  filters decide on what's known: a thread whose channel is unknown is
+   *  REST client's own timeout and retries bound each attempt (15 s a try,
+   *  three retries, by default), though a rate limit's Retry-After waits can
+   *  hold events waiting behind it longer. If the fetch fails, the thread
+   *  stays as it was, and the filters decide on what's known: where a
+   *  guild's channel list applies, a thread whose channel is unknown is
    *  admitted only if it's listed itself. That failure is logged, since the
-   *  thread's messages may then be filtered out though its channel is
-   *  admitted. */
+   *  thread's messages may then be
+   *  filtered out though its channel is admitted, and go unnamed. */
   private async lookUpThread(channelId: string): Promise<void> {
     try {
       await this.client.channels.fetch(channelId, { force: true });
@@ -2549,7 +2555,7 @@ export class DiscordAdapter {
       dbg('gateway:thread-lookup-failed', { channelId, error });
       console.error(
         `[discord-mcpl] Couldn't look up thread ${channelId} to find its channel (${error}). ` +
-          'Its events are filtered without it, so they pass only if the thread is listed itself.',
+          'Its events are decided without it: where its guild has a channel list, they pass only if the thread is listed itself, and they go unnamed.',
       );
     }
   }

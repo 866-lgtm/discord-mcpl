@@ -15,8 +15,8 @@ type Cached = {
   guildId?: string | null; guild?: { name?: string }; isDMBased?: () => boolean;
 };
 
-function fixture(t: TestContext) {
-  const adapter = new DiscordAdapter({ token: 'unused' });
+function fixture(t: TestContext, options: Partial<ConstructorParameters<typeof DiscordAdapter>[0]> = {}) {
+  const adapter = new DiscordAdapter({ token: 'unused', ...options });
   const internals = adapter as unknown as {
     client: Client;
     threadLookups: Map<string, Promise<void>>;
@@ -223,8 +223,9 @@ describe('thread fields', () => {
       threadId: 'thread-1', threadName: 'design-chat', threadParentName: 'general',
     };
     assert.deepEqual(f.adapter.getCachedChannelMeta('thread-1'), expected, 'from the cache');
-    t.mock.method(f.client.channels, 'fetch', async () => f.cache.get('thread-1'));
+    const fetched = t.mock.method(f.client.channels, 'fetch', async () => f.cache.get('thread-1'));
     assert.deepEqual(await f.adapter.getChannelMeta('thread-1'), expected, 'from Discord');
+    assert.equal((fetched.mock.calls[0]!.arguments[1] as { force?: boolean }).force, false, 'a complete thread is read through the cache');
     const channel = f.adapter.getCachedChannelMeta('chan-1');
     assert.ok(channel, 'the channel is cached');
     assert.equal('threadId' in channel, false, 'a channel is no thread');
@@ -235,16 +236,19 @@ describe('thread fields', () => {
   // A lookup gets past the cache, as discord.js's fetch with force does, and
   // fills it in. Given a gate, the first lookup waits for it, and any later
   // one answers at once.
-  function partlyKnownThread(f: ReturnType<typeof fixture>, t: TestContext, gate?: Promise<void>) {
+  function partlyKnownThread(f: ReturnType<typeof fixture>, t: TestContext, gate?: Promise<void>, fails = false) {
     const partly: Cached = { id: 'thread-2', type: ChannelType.PublicThread, parentId: null, isThread: () => true };
     f.cache.set('thread-2', partly);
     const forced: boolean[] = [];
     t.mock.method(f.client.channels, 'fetch', async (_id: string, options?: { force?: boolean }) => {
       forced.push(options?.force === true);
       await (gate && forced.length === 1 ? gate : new Promise((resolve) => setImmediate(resolve)));
+      if (fails) throw new Error('Missing Access');
       Object.assign(partly, { name: 'late-thread', parentId: 'chan-1' });
       return partly;
     });
+    // A failed lookup is logged; keep the test's output quiet.
+    t.mock.method(console, 'error', () => {});
     return { partly, forced };
   }
   const named = (m: { threadId?: string; threadName?: string; threadParentName?: string | null }) =>
@@ -285,7 +289,7 @@ describe('thread fields', () => {
     await f.settle();
     assert.deepEqual(named(f.edits[0]), lateThread, 'the edit');
     assert.deepEqual(named(f.deletes[0]), lateThread, 'the delete');
-    assert.ok(forced.length > 0 && forced.every(Boolean), 'each lookup is forced');
+    assert.deepEqual(forced, [true, true], 'the edit and the delete each look it up, past the cache');
   });
 
   it("give the sweep a partly known thread's lookup past the cache", async (t) => {
@@ -309,6 +313,58 @@ describe('thread fields', () => {
     f.emit('messageReactionAdd', reaction('chan-1', f.cache.get('chan-1')), user);
     await f.reacted(2);
     assert.deepEqual(named(f.reactions[0]), { threadId: 'thread-1', threadName: 'design-chat', threadParentName: 'general' });
-    assert.equal(f.reactions[1].threadId, undefined, 'a channel message has none');
+    const inChannel = f.reactions[1] as unknown as Record<string, unknown>;
+    assert.equal('threadId' in inChannel || 'threadName' in inChannel || 'threadParentName' in inChannel, false, 'a channel message has none');
+  });
+
+  it("come with a reaction that waits for its message's create, or looks a partly known thread up itself", async (t) => {
+    const f = fixture(t);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    t.after(() => release());
+    const { partly, forced } = partlyKnownThread(f, t, gate);
+    const posted = f.message({ channelId: 'thread-2', channel: partly });
+    const user = { id: 'u2', username: 'ann', partial: false };
+    f.emit('messageCreate', posted);
+    f.emit('messageReactionAdd', { partial: false, emoji: { name: '👍', id: null }, message: posted }, user);
+    for (let i = 0; i < 5; i++) await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(f.order, [], "the reaction waits for the create's lookup");
+    release();
+    await f.settle();
+    await f.reacted(1);
+    assert.deepEqual(f.order, ['create', 'reaction']);
+    assert.deepEqual(named(f.reactions[0]), lateThread);
+    assert.equal(forced.length, 1, "it uses the create's lookup");
+    // With no create waiting, a reaction in a partly known thread looks it up itself.
+    const g = fixture(t);
+    const other = partlyKnownThread(g, t);
+    g.emit('messageReactionAdd', { partial: false, emoji: { name: '👍', id: null }, message: g.message({ channelId: 'thread-2', channel: other.partly }) }, user);
+    await g.reacted(1);
+    assert.deepEqual(named(g.reactions[0]), lateThread);
+    assert.deepEqual(other.forced, [true]);
+  });
+
+  it("come with an edit and a delete whose thread lookup fails, decided by the filters on what's known", async (t) => {
+    // No channel list: they're delivered, the thread unnamed.
+    const open = fixture(t);
+    const a = partlyKnownThread(open, t, undefined, true);
+    const posted = open.message({ channelId: 'thread-2', channel: a.partly });
+    open.emit('messageUpdate', { ...posted, partial: false }, { ...posted, content: 'edited', cleanContent: 'edited', editedTimestamp: Date.now() });
+    open.emit('messageDelete', { ...posted, id: 'message-2' });
+    await open.settle();
+    assert.deepEqual(open.order.sort(), ['delete', 'edit']);
+    for (const info of [open.edits[0], open.deletes[0]]) {
+      assert.deepEqual(named(info), { threadId: 'thread-2', threadName: undefined, threadParentName: null });
+    }
+    // A channel list that admits only the thread's channel can't place it, so
+    // they're withheld, as its creates are.
+    const listed = fixture(t, { guildChannels: { g1: ['chan-1'] } });
+    const b = partlyKnownThread(listed, t, undefined, true);
+    const there = listed.message({ channelId: 'thread-2', channel: b.partly });
+    listed.emit('messageUpdate', { ...there, partial: false }, { ...there, content: 'edited', cleanContent: 'edited', editedTimestamp: Date.now() });
+    listed.emit('messageDelete', { ...there, id: 'message-2' });
+    await listed.settle();
+    assert.deepEqual(listed.order, [], 'withheld');
+    assert.deepEqual(b.forced, [true, true], 'each tried once, and fetched no more');
   });
 });
