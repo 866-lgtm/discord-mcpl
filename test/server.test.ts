@@ -194,6 +194,10 @@ class MockDiscordAdapter {
     return { ...this.channelMembersToReturn, channelId };
   }
 
+  async listMembers(_guildId: string): Promise<MockDiscordAdapter['channelMembersToReturn']['members']> {
+    return this.channelMembersToReturn.members;
+  }
+
   async createTextChannel(): Promise<DiscordChannelInfo> {
     return { id: 'c_new', name: 'new-channel', type: 'text', label: '#new-channel (TestGuild)' };
   }
@@ -960,6 +964,28 @@ describe('DiscordMcplServer', () => {
     assert.equal(payload.members.length, 3);
     assert.equal(payload.members[0].username, 'ra');
     assert.equal(payload.truncated, false);
+
+    client.close();
+    await serverPromise;
+  });
+
+  it('tools/call list_members returns the guild member directory', async () => {
+    const { client, serverConn, discord } = await createTestPair();
+    const server = new DiscordMcplServer(discord as unknown as DiscordAdapter);
+    const serverPromise = server.serve(serverConn);
+
+    await mcpHandshake(client);
+
+    const result = (await client.sendRequest('tools/call', {
+      name: 'list_members',
+      arguments: { guildId: 'g1' },
+    })) as { content: Array<{ type: string; text?: string }>; isError?: boolean };
+
+    assert.ok(!result.isError);
+    const payload = JSON.parse(result.content[0]?.text ?? 'null');
+    assert.ok(Array.isArray(payload));
+    assert.equal(payload.length, 3);
+    assert.equal(payload[0].id, 'u1');
 
     client.close();
     await serverPromise;

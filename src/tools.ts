@@ -179,6 +179,23 @@ export const toolDefinitions: ToolDefinition[] = [
     },
   },
   {
+    // Fork tool, kept alongside upstream's list_channel_members: a guild-wide
+    // directory keyed by guildId (the agent's system prompt names it).
+    name: 'list_members',
+    description:
+      'List the members of a Discord guild (humans and bots) with their ids, ' +
+      'usernames, and display names — use it to see who is around and to get ' +
+      'the id for a real ping: mention someone with <@id> (their numeric id), ' +
+      'not their name in brackets.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        guildId: { type: 'string', description: 'Discord guild ID' },
+      },
+      required: ['guildId'],
+    },
+  },
+  {
     name: 'list_channel_members',
     description: "List people associated with a Discord channel, with IDs and display names. For a guild channel: members who can view it; for a thread: joined members; for a DM: participants. Check scope, note and truncated, and for a thread unresolved (members listed by id only, whose names couldn't be read) and possiblyIncomplete (Discord returned one full page, so there may be more). This does not report who is online or reading now. Use fetch_history for messages.",
     inputSchema: {

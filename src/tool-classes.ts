@@ -54,6 +54,7 @@ export const TOOL_CLASSES: Record<string, readonly ToolClass[]> = {
   delete_message: ['comms'],
   fetch_history: ['comms'],
   fetch_around: ['comms'],
+  list_members: ['comms'],
   list_channel_members: ['comms'],
   list_guilds: ['comms'],
   list_channels: ['comms'],

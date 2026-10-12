@@ -1745,6 +1745,9 @@ export class DiscordMcplServer {
       case 'list_channels':
         return await this.discord.listChannels(args.guildId as string);
 
+      case 'list_members':
+        return await this.discord.listMembers(args.guildId as string);
+
       case 'list_channel_members':
         return await this.discord.listChannelMembers(args.channelId as string);
 

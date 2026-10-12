@@ -147,6 +147,7 @@ export function featureSetForTool(toolName: string): string | undefined {
       return 'discord.subscriptions';
     case 'list_guilds':
     case 'list_channels':
+    case 'list_members':
     case 'list_channel_members':
     case 'refresh_channels':
     case 'filters_get':
