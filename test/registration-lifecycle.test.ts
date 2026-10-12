@@ -315,6 +315,7 @@ it("a deletion delivered after its thread's channel was deleted doesn't register
 
 it('a create in a thread known only partly, which Discord answers Unknown Channel when looked up, registers and names nothing', { timeout: 5000 }, async (t) => {
   const f = fixture(t, { sparse: true });
+  const logged = t.mock.method(console, 'error', () => {});
   const { held, release } = holder(t);
   t.mock.method(f.client.rest, 'get', async () => { await held; throw unknownChannel(); });
   f.client.actions.MessageCreate.handle({
@@ -334,6 +335,7 @@ it('a create in a thread known only partly, which Discord answers Unknown Channe
   assert.equal(push.params.origin.mcplChannelId, undefined);
   assert.equal(f.server.channelManager.get(threadMcplId), undefined);
   assert.ok(f.server.deletedChannels.has(TH), 'the lookup reported the thread deleted');
+  assert.equal(logged.mock.calls.some((c) => String(c.arguments[0]).includes("Couldn't look up")), false, 'a deletion is no failed lookup');
 });
 
 it('a create delivered after its thread was deleted leaves the watermark the deletion dropped', async (t) => {
@@ -945,8 +947,28 @@ it("a stale channel's label is re-derived against the names other channels hold 
 it('create_text_channel labels the channel it creates as listing does, by its id when another channel of its name and kind holds the name', async (t) => {
   const f = fixture(t);
   t.mock.method(f.client.rest, 'post', async () => channelData(X, ChannelType.GuildText, 'before'));
+  t.mock.method(f.client.rest, 'get', async () => channelData(X, ChannelType.GuildText, 'before'));
   const created = await f.adapter.createTextChannel(G, 'before');
   assert.equal(created.label, idOf(X));
+});
+
+it("create_text_channel keeps what the gateway reported of the new channel while its POST was out", { timeout: 5000 }, async (t) => {
+  const f = fixture(t);
+  const { held, release } = holder(t);
+  let posted!: () => void;
+  const atPost = new Promise<void>((done) => { posted = done; });
+  t.mock.method(f.client.rest, 'post', async () => { posted(); await held; return channelData(X, ChannelType.GuildText, 'news'); });
+  t.mock.method(f.client.rest, 'get', async () => channelData(X, ChannelType.GuildText, 'renamed'));
+  const creating = f.adapter.createTextChannel(G, 'news');
+  await atPost;
+  // The gateway reports the channel, and then a rename, before the POST's reply lands.
+  f.client.actions.ChannelCreate.handle(channelData(X, ChannelType.GuildText, 'news'));
+  dispatch(f.client, 'CHANNEL_UPDATE', channelUpdate, { d: channelData(X, ChannelType.GuildText, 'renamed') });
+  release();
+  const created = await creating;
+  assert.equal(created.name, 'renamed');
+  assert.equal(f.client.channels.cache.get(X)?.name, 'renamed');
+  assert.equal(created.label, '#renamed (Guild)');
 });
 
 it("one channel's facts give the answer a whole view gives, beside a same-named voice channel and a same-named channel of another guild", (t) => {
@@ -1046,6 +1068,8 @@ it("a thread Discord answers Unknown Channel for when it's looked up loses its s
 });
 
 for (const [event, d] of [
+  ['THREAD_CREATE', { ...threadAt(false, T), id: X, name: 'current' }],
+  ['CHANNEL_CREATE', channelData(X, ChannelType.GuildText, 'news')],
   ['THREAD_DELETE', { id: X, guild_id: G, parent_id: P, type: ChannelType.PublicThread }],
   ['CHANNEL_DELETE', { id: '100000000000000022', guild_id: G, type: ChannelType.GuildText }],
   ['THREAD_LIST_SYNC', { guild_id: G, threads: [], members: [] }],
@@ -1189,6 +1213,15 @@ it("an overtaken try's reply marks its channel stale as it lands, until a fresh 
 });
 
 it("a reaction or a create in a guild the filter leaves out looks nothing up", { timeout: 5000 }, async (t) => {
+  // In a guild the filter admits, the same reaction looks its stale channel up.
+  const control = fixture(t, { guildIds: [G] });
+  control.comesBack();
+  const looked = t.mock.method(control.client.rest, 'get', async () => threadAt(false, T));
+  control.client.emit('messageReactionAdd', { partial: false, emoji: { name: '👍', id: null }, message: {
+    id: M, channelId: TH, guildId: G, channel: control.client.channels.cache.get(TH), partial: false,
+    author: { id: U, username: 'Bob' }, content: 'hi', cleanContent: 'hi',
+  } }, { id: U, username: 'Bob', partial: false });
+  await until(() => looked.mock.callCount() > 0);
   const f = fixture(t, { guildIds: ['100000000000000099'] });
   f.comesBack();
   assert.ok(f.adapter.isStale(TH));
@@ -1213,7 +1246,13 @@ it("a stale channel fetched fresh is registered again from what the fetch brough
   (f.adapter as any).stale.set(P, { guildId: G });
   f.client.channels.cache.get(P).name = 'older';
   f.server.rederiveChannels(f.server.registeredInGuild(G));
-  assert.equal(f.label(P), '#older (Guild)');
+  // Its cached facts decide nothing: what's registered stands, labelled by
+  // its id, since it answers no name meanwhile.
+  assert.equal(f.label(P), idOf(P));
+  assert.equal((f.server.channelManager.get(idOf(P))!.metadata as { channelName?: string }).channelName, 'before');
+  assert.equal(f.sent.some((x) => x.method === 'channels/changed'
+    && x.params.updated?.some((d: { id: string; metadata?: { channelName?: string } }) => d.id === idOf(P) && d.metadata?.channelName === 'older')), false,
+  'the older name was never announced');
   t.mock.method(f.client.rest, 'get', async () => ({ ...parentData(ChannelType.GuildText), name: 'current' }));
   await f.adapter.getChannelMeta(P);
   assert.equal(f.adapter.isStale(P), false);
@@ -1235,11 +1274,150 @@ it("a tool's fetch of a channel the cache doesn't hold is made again when an upd
 
 it("Unknown Channel takes the channel out of discord.js's cache, so no later read finds it live", async (t) => {
   const f = fixture(t);
-  f.comesBack();
+  (f.adapter as any).stale.set(TH, { guildId: G });
   assert.ok(f.client.channels.cache.has(TH));
+  assert.ok(f.client.guilds.cache.get(G).channels.cache.has(TH), "the guild's cache holds it");
+  assert.ok(f.client.channels.cache.get(P).threads.cache.has(TH), "and its channel's threads");
   t.mock.method(f.client.rest, 'get', async () => { throw unknownChannel(); });
   await assert.rejects(f.adapter.getChannelMeta(TH));
   assert.equal(f.client.channels.cache.has(TH), false);
+  assert.equal(f.client.guilds.cache.get(G).channels.cache.has(TH), false, "nor the guild's cache");
+  assert.equal(f.client.channels.cache.get(P).threads.cache.has(TH), false, "nor its channel's threads");
   assert.equal(f.adapter.isStale(TH), false);
   await assert.rejects(f.adapter.getChannelMeta(TH), 'read again, it is fetched again, and still unknown');
+});
+
+it("a fresh fetch of a thread's channel derives the thread's label again", async (t) => {
+  const f = fixture(t);
+  f.server.registerGuildDelivery(G, TH);
+  assert.equal(f.label(TH), '#before › topic (Guild)');
+  (f.adapter as any).stale.set(P, { guildId: G });
+  f.client.channels.cache.get(P).name = 'older';
+  f.server.rederiveChannels(f.server.registeredInGuild(G));
+  assert.equal(f.label(TH), '#older › topic (Guild)');
+  t.mock.method(f.client.rest, 'get', async () => ({ ...parentData(ChannelType.GuildText), name: 'current' }));
+  await f.adapter.getChannelMeta(P);
+  assert.equal(f.label(TH), '#current › topic (Guild)');
+});
+
+it('a fresh fetch that shows a registered thread archived forgets it, as an update would', async (t) => {
+  const f = fixture(t);
+  f.server.registerGuildDelivery(G, TH);
+  (f.adapter as any).stale.set(TH, { guildId: G });
+  t.mock.method(f.client.rest, 'get', async () => threadAt(true, T + 1000));
+  await f.adapter.getChannelMeta(TH);
+  assert.equal(f.label(TH), undefined);
+  assert.ok(f.removed(threadMcplId));
+});
+
+it('a fresh fetch that shows a registered channel outside the filters forgets it, with the threads admitted through it', async (t) => {
+  const f = filtered(t);
+  (f.adapter as any).stale.set(X, { guildId: G });
+  t.mock.method(f.client.rest, 'get', async () => inCategory(C2));
+  await f.adapter.getChannelMeta(X);
+  assert.equal(f.label(X), undefined);
+  assert.equal(f.label(TX), undefined);
+  assert.ok(f.removed(idOf(X)) && f.removed(idOf(TX)));
+});
+
+it("a tool's read that Discord answers Unknown Channel for takes the channel out of the registry, as a deletion", async (t) => {
+  const f = fixture(t);
+  watermarkFile(t);
+  f.server.registerGuildDelivery(G, TH);
+  f.server.forwardedWatermark.set(TH, '100');
+  (f.adapter as any).stale.set(TH, { guildId: G });
+  t.mock.method(f.client.rest, 'get', async () => { throw unknownChannel(); });
+  await assert.rejects(f.adapter.inspectionRefusal(TH));
+  assert.equal(f.label(TH), undefined);
+  assert.equal(f.server.forwardedWatermark.has(TH), false);
+  assert.ok(f.server.deletedChannels.has(TH));
+});
+
+it("Unknown Channel for a channel takes its own cached threads out too", async (t) => {
+  const f = fixture(t);
+  assert.ok(f.client.channels.cache.has(TH));
+  (f.adapter as any).stale.set(P, { guildId: G });
+  t.mock.method(f.client.rest, 'get', async () => { throw unknownChannel(); });
+  await assert.rejects(f.adapter.getChannelMeta(P));
+  assert.equal(f.client.channels.cache.has(P), false);
+  assert.equal(f.client.channels.cache.has(TH), false, 'its thread went with it');
+});
+
+it("a stale channel answers no name, so a name resolves to the channel that holds it now", async (t) => {
+  const Y = '100000000000000025';
+  const f = fixture(t, { channels: [channelData(X, ChannelType.GuildText, 'news'), channelData(Y, ChannelType.GuildVoice, 'archive')] });
+  const before = f.adapter.resolveChannelRef('#news (Guild)');
+  assert.equal(before.ok && before.id, X);
+  // Discord renamed them both; X's fetch was overtaken, so its cache keeps 'news'.
+  f.client.channels.cache.get(Y).name = 'news';
+  (f.adapter as any).stale.set(X, { guildId: G });
+  const resolved = f.adapter.resolveChannelRef('#news (Guild)');
+  assert.ok(resolved.ok);
+  assert.equal(resolved.ok && resolved.id, Y);
+  // Fetched fresh, X is found by the name Discord has for it.
+  t.mock.method(f.client.rest, 'get', async () => channelData(X, ChannelType.GuildText, 'archive'));
+  await f.adapter.refreshStale();
+  assert.equal(f.adapter.isStale(X), false);
+  const archive = f.adapter.resolveChannelRef('#archive (Guild)');
+  assert.equal(archive.ok && archive.id, X);
+});
+
+it("a name-addressed send fetches stale channels first, and sends where the name points now", async (t) => {
+  const Y = '100000000000000025';
+  const f = fixture(t, { channels: [channelData(X, ChannelType.GuildText, 'news'), channelData(Y, ChannelType.GuildVoice, 'news2')] });
+  f.client.channels.cache.get(Y).name = 'news';
+  (f.adapter as any).stale.set(X, { guildId: G });
+  const get = t.mock.method(f.client.rest, 'get', async () => channelData(X, ChannelType.GuildText, 'archive'));
+  const sent: string[] = [];
+  f.adapter.sendMessage = (async (channelId: string) => { sent.push(channelId); return { messageId: '1' }; }) as any;
+  await (f.server as any).handleToolCall('send_message', { channelId: '#news (Guild)', content: 'hi' });
+  assert.equal(get.mock.callCount(), 1, 'the stale channel was fetched before the name was resolved');
+  assert.deepEqual(sent, [Y]);
+});
+
+it("a listing leaves a stale channel out, so its cached facts register nothing", (t) => {
+  const f = filtered(t);
+  // X moved out of the filters, and an older reply put it back in C1 in the cache.
+  dispatch(f.client, 'CHANNEL_UPDATE', channelUpdate, { d: inCategory(C2) });
+  assert.equal(f.label(X), undefined);
+  f.client.channels.cache.get(X).parentId = C1;
+  (f.adapter as any).stale.set(X, { guildId: G });
+  assert.equal(f.adapter.getPostingChannels().some((c) => c.id === X), false);
+  (f.server as any).refreshChannels();
+  assert.equal(f.label(X), undefined);
+});
+
+it("refresh_channels fetches stale channels first and registers from what they bring", async (t) => {
+  const f = filtered(t);
+  dispatch(f.client, 'CHANNEL_UPDATE', channelUpdate, { d: inCategory(C2) });
+  f.client.channels.cache.get(X).parentId = C1;
+  (f.adapter as any).stale.set(X, { guildId: G });
+  const get = t.mock.method(f.client.rest, 'get', async () => inCategory(C2));
+  await (f.server as any).handleToolCall('refresh_channels', {});
+  assert.equal(get.mock.callCount(), 1);
+  assert.equal(f.adapter.isStale(X), false);
+  assert.equal(f.label(X), undefined, 'Discord has it outside the filters');
+});
+
+it("create_text_channel whose fetch afterwards fails keeps the channel stale and labels it by its id", async (t) => {
+  const f = fixture(t);
+  t.mock.method(f.client.rest, 'post', async () => channelData(X, ChannelType.GuildText, 'fresh-name'));
+  t.mock.method(f.client.rest, 'get', async () => { throw new Error('Service Unavailable'); });
+  const created = await f.adapter.createTextChannel(G, 'fresh-name');
+  assert.equal(created.id, X);
+  assert.equal(f.adapter.isStale(X), true);
+  assert.equal(created.label, idOf(X));
+});
+
+it("a fresh fetch that gives a channel a name re-derives the channels that held or hold it", async (t) => {
+  const V = '100000000000000009';
+  const f = fixture(t, { channels: [channelData(V, ChannelType.GuildVoice, 'news')] });
+  f.server.registerGuildDelivery(G, V);
+  assert.equal(f.label(V), '#news (Guild)');
+  // Discord renamed P to news; its fetch was overtaken, so the cache keeps 'before'.
+  (f.adapter as any).stale.set(P, { guildId: G });
+  t.mock.method(f.client.rest, 'get', async () => ({ ...parentData(ChannelType.GuildText), name: 'news' }));
+  await f.adapter.getChannelMeta(P);
+  // A text channel holds the name now, so the voice channel's label is its id.
+  assert.equal(f.label(V), idOf(V));
 });

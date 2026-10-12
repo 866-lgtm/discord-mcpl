@@ -35,6 +35,7 @@ function fixture(opts: {
   const sent: Array<{ channelId: string; options?: unknown }> = [];
   const adapter = {
     botUserId: 'bot',
+    refreshStale: async () => {},
     resolveChannelRef: (given: string) => {
       const id = opts.names?.[given];
       return id ? { ok: true, id } : { ok: false, message: `unknown ${given}` };

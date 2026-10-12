@@ -1624,6 +1624,9 @@ export class DiscordMcplServer {
         };
       }
       if (path === 'name-resolved' && !noResolver) {
+        // A stale channel answers no name (DiscordAdapter.refreshStale), so
+        // one whose fetch is fresh now is found by the name Discord has.
+        await this.discord.refreshStale();
         const resolved = this.discord.resolveChannelRef(given);
         if (!resolved.ok) {
           // Telemetry: log the failure with what was ASKED FOR, so drift is
@@ -1831,6 +1834,8 @@ export class DiscordMcplServer {
       }
 
       case 'refresh_channels':
+        // What's stale is fetched first, so its fresh facts are listed.
+        await this.discord.refreshStale();
         return this.refreshChannels();
 
       case 'fetch_history':
@@ -3136,14 +3141,22 @@ export class DiscordMcplServer {
    *  what it has. Their facts are read together, so their labels are checked
    *  against one view of the channels names resolve among. */
   private rederiveChannels(descriptors: ChannelDescriptor[]): void {
-    // A stale channel is re-derived too: its cached name may be older than
-    // Discord's, but its label's check reads the names other channels hold
-    // now, so a name another channel took falls back to the id.
+    const channelIdOf = (d: ChannelDescriptor) => (d.address as { channelId?: string } | undefined)?.channelId;
+    // A stale channel's cached facts decide nothing: what's registered of it
+    // stands, labelled by its id, since it answers no name until a fresh
+    // fetch derives it again (onChannelRefreshed).
+    const staleNamed = descriptors.filter((d) => {
+      const channelId = channelIdOf(d);
+      return channelId !== undefined && this.discord.isStale(channelId) && d.label !== d.id;
+    });
     const channelIds = descriptors
-      .map((d) => (d.address as { channelId?: string } | undefined)?.channelId)
-      .filter((id): id is string => id !== undefined);
+      .map(channelIdOf)
+      .filter((id): id is string => id !== undefined && !this.discord.isStale(id));
     const facts = this.discord.getCachedChannelFactsFor(channelIds);
-    this.registerChannels([...facts.values()].map((f) => this.guildDescriptor(f)));
+    this.registerChannels([
+      ...[...facts.values()].map((f) => this.guildDescriptor(f)),
+      ...staleNamed.map((d) => ({ ...d, label: d.id })),
+    ]);
   }
 
   /**
@@ -4037,14 +4050,31 @@ export class DiscordMcplServer {
 
     this.discord.onChannelDelete((guildId, channelId, threadIds) => this.channelDeleted(guildId, channelId, threadIds));
     this.discord.onThreadDelete((guildId, threadId) => this.channelDeleted(guildId, threadId));
-    // A stale channel fetched fresh: what was derived from its older facts,
-    // its own registration and its threads' labels, is derived again.
+    // A stale channel fetched fresh is taken as an update of it, since what
+    // was derived from its older facts may be wrong in any of them: a thread
+    // the fetch shows archived, or a channel it shows outside the filters,
+    // is forgotten, as an update would forget it. Otherwise its registration
+    // is derived again, with its threads' labels and the labels of channels
+    // that share or shared its name.
     this.discord.onChannelRefreshed((channelId) => {
-      const registered = this.channelManager.getAll()
-        .filter((d) => (d.address as { channelId?: string } | undefined)?.channelId === channelId);
-      if (registered.length > 0 || this.registeredThreadsOf(channelId).length > 0) {
-        this.rederiveChannels([...registered, ...this.registeredThreadsOf(channelId)]);
+      const facts = this.discord.getCachedChannelFacts(channelId);
+      if (!facts) return;
+      const id = mcplChannelId(facts.guildId, channelId);
+      const admitted = this.discord.channelAdmitted(facts.guildId, channelId, facts.parentId ?? null);
+      if (facts.type === 'thread') {
+        if (!this.channelManager.get(id)) return;
+        if (facts.archived || !admitted) this.forgetChannels([id]);
+        else this.registerChannels([this.guildDescriptor(facts)]);
+        return;
       }
+      if (!admitted) {
+        const gone = [id, ...this.registeredThreadsOf(channelId).filter((d) => !this.admitted(d)).map((d) => d.id)];
+        this.forgetChannels(gone.filter((g) => this.channelManager.get(g)));
+      } else if (isListedKind(facts.type)) {
+        this.registerChannels([this.guildDescriptor(facts)]);
+      }
+      this.rederiveChannels(this.registeredThreadsOf(channelId));
+      this.rederiveNamed({ name: facts.name });
     });
   }
 

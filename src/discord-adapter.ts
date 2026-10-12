@@ -1000,6 +1000,18 @@ export class DiscordAdapter {
     return !this.guildIds?.length || this.guildIds.includes(guildId);
   }
 
+  /** Fetch every stale channel again (refetchChannel), before a decision
+   *  that reads names or facts across channels: resolving a channel by
+   *  name, or listing what to register. A fresh fetch clears a mark and
+   *  registers the channel again (onChannelRefreshed); one that stays stale
+   *  is left out of those decisions. A failed fetch leaves its mark. */
+  async refreshStale(): Promise<void> {
+    if (this.stale.size === 0) return;
+    await Promise.all([...this.stale.keys()].map((id) => this.refetchChannel(id).catch((err: unknown) => {
+      dbg('stale:refresh-failed', { channelId: id, error: (err as Error).message });
+    })));
+  }
+
   /** Whether the channel filters admit a guild channel or thread, a thread
    *  through its channel (or its channel's category) or its own id, as
    *  ingress and listing decide. */
@@ -1367,11 +1379,11 @@ export class DiscordAdapter {
       if (guildId && (threadChannelUnknown(msg.channel) || this.isStale(msg.channelId))) {
         await this.lookUpChannel(guildId, msg.channelId);
       }
-      // Read again: the lookup can have replaced the cached entry.
-      const channel = this.client.channels.cache.get(msg.channelId) ?? msg.channel;
+      // msg.channel resolves through the client cache, so it's what the
+      // lookup left there.
       const parentId =
-        channel && 'parentId' in channel
-          ? ((channel as { parentId?: string | null }).parentId ?? null)
+        msg.channel && 'parentId' in msg.channel
+          ? ((msg.channel as { parentId?: string | null }).parentId ?? null)
           : null;
       if (!this.channelAllowed(guildId, msg.channelId, parentId)) return;
       const reactor = user.partial ? await user.fetch().catch(() => user) : user;
@@ -1884,7 +1896,10 @@ export class DiscordAdapter {
           {
             ...(this.guildIds?.length ? { guildIds: this.guildIds } : {}),
             mapType: mapChannelType,
-            allowed: (gid, cid, pid) => this.channelAllowed(gid, cid, pid),
+            // A stale channel's cached name may no longer be Discord's, so it
+            // answers no name until a fresh fetch, and its own label is its
+            // id meanwhile (channelFacts).
+            allowed: (gid, cid, pid) => !this.isStale(cid) && this.channelAllowed(gid, cid, pid),
           },
         );
         for (const c of candidates) {
@@ -2271,11 +2286,23 @@ export class DiscordAdapter {
   ): Promise<DiscordChannelInfo> {
     const guild = await this.client.guilds.fetch(guildId);
     if (!guild) throw new Error(`Guild ${guildId} not found`);
-    const channel = await guild.channels.create({
+    const created = await guild.channels.create({
       name,
       type: ChannelType.GuildText,
       parent: categoryId,
     });
+    // discord.js puts the POST's reply in the cache whenever it lands, over
+    // anything the gateway reported of the new channel meanwhile, such as a
+    // rename, and its id isn't known to be overtaken until then. So the
+    // channel is fetched again through the freshness rule, and that fill is
+    // what the cache keeps.
+    const channel = ((await this.refetchChannel(created.id).catch((err: unknown) => {
+      // The channel was made, but its facts aren't verified: it stays stale,
+      // labelled by its id, until a fresh fetch.
+      dbg('create-channel:refetch-failed', { channelId: created.id, error: (err as Error).message });
+      if ((err as { code?: unknown } | null)?.code !== UNKNOWN_CHANNEL) this.stale.set(created.id, { guildId });
+      return null;
+    })) ?? created) as typeof created;
     // Labelled as listing labels it: by its id when its name is taken.
     const facts = this.channelFacts(channel);
     return {
@@ -2318,6 +2345,10 @@ export class DiscordAdapter {
     const result: ChannelFacts[] = [];
     for (const channel of guild.channels.cache.values()) {
       if (!isListedKind(mapChannelType(channel.type))) continue;
+      // A stale channel's facts decide nothing until a fresh fetch, which
+      // registers it again (onChannelRefreshed); what's registered of it
+      // stands meanwhile.
+      if (this.isStale(channel.id)) continue;
       if (!this.channelAllowed(guild.id, channel.id, channel.parentId)) continue;
       const facts = this.channelFacts(channel, names);
       if (facts) result.push(facts);
@@ -2882,7 +2913,7 @@ export class DiscordAdapter {
         // A later try must ask Discord past what the earlier reply left cached.
         channel = await this.client.channels.fetch(channelId, { force: force || tries > 1 });
       } catch (err) {
-        if ((err as { code?: unknown } | null)?.code === UNKNOWN_CHANNEL) this.forgetCached(channelId);
+        if ((err as { code?: unknown } | null)?.code === UNKNOWN_CHANNEL) this.channelGone(channelId);
         throw err;
       } finally {
         out.delete(fetch);
@@ -2905,31 +2936,58 @@ export class DiscordAdapter {
     for (const fetch of this.fetchesOut.get(channelId) ?? []) fetch.overtaken = true;
   }
 
-  /** Drop what discord.js holds of a channel Discord says doesn't exist: the
-   *  client's cache, its guild's, and its channel's threads for a thread,
-   *  which discord.js leaves as they were when a fetch fails. */
-  private forgetCached(channelId: string): void {
-    this.stale.delete(channelId);
+  /** Discord says a channel doesn't exist, to any fetch of it: a deletion,
+   *  as the gateway reports one. The server forgets it, and the threads
+   *  discord.js holds under it, when the cache placed it in a guild (a
+   *  lookup reports one it didn't, lookUpChannel), and discord.js's caches
+   *  drop them (forgetCached). */
+  private channelGone(channelId: string): void {
     const held = this.client.channels.cache.get(channelId) as
-      | { guild?: { channels?: { cache: Map<string, unknown> } }; parent?: { threads?: { cache: Map<string, unknown> } } | null }
+      | { guildId?: string | null; threads?: { cache: Map<string, unknown> } }
       | undefined;
-    if (!held) return;
-    this.client.channels.cache.delete(channelId);
-    held.guild?.channels?.cache.delete(channelId);
-    held.parent?.threads?.cache.delete(channelId);
+    const guildId = held?.guildId ?? null;
+    const threadIds = [...(held?.threads?.cache.keys() ?? [])];
+    this.forgetCached(channelId);
+    if (guildId) this.channelDeleteHandler?.(guildId, channelId, threadIds);
+  }
+
+  /** Drop what discord.js holds of a channel Discord says doesn't exist: the
+   *  client's cache, its guild's, its channel's threads for a thread, and
+   *  its own threads, which went with it, as discord.js's own removal of a
+   *  deleted channel drops them. discord.js leaves all of it as it was when
+   *  a fetch fails. Read by ids, since a thread's parent getter throws when
+   *  it has no guild. */
+  private forgetCached(channelId: string): void {
+    type Held = { guildId?: string | null; parentId?: string | null; threads?: { cache: Map<string, unknown> } };
+    const held = this.client.channels.cache.get(channelId) as Held | undefined;
+    const ids = [channelId, ...(held?.threads?.cache.keys() ?? [])];
+    const guild = held?.guildId ? this.client.guilds.cache.get(held.guildId) : undefined;
+    const parent = held?.parentId ? (this.client.channels.cache.get(held.parentId) as Held | undefined) : undefined;
+    for (const id of ids) {
+      this.stale.delete(id);
+      this.client.channels.cache.delete(id);
+      guild?.channels.cache.delete(id);
+    }
+    parent?.threads?.cache.delete(channelId);
   }
 
   /** Discord's reports on guild channels, as the gateway dispatches them,
    *  before discord.js applies them: discord.js emits threadUpdate and
    *  channelUpdate only for a channel it holds, and a fetch can be out for
-   *  one it doesn't. A report on a channel overtakes the fetches of it. A
+   *  one it doesn't. A report on a channel overtakes the fetches of it,
+   *  its creation included: Discord sends a thread's when the bot learns of
+   *  it, not only when it's made, and a channel's while a fetch of the new
+   *  channel can be out (createTextChannel). A
    *  guild's payload, on a join or a return, and a sync of a guild's
    *  threads report on every channel they cover, and a channel's deletion
    *  takes its threads with it, without a report for each. A channel the
    *  cache doesn't hold has no guild or parent known until its fetch
    *  lands, so these overtake every fetch out. */
   private watchReports(): void {
-    for (const event of [GatewayDispatchEvents.ChannelUpdate, GatewayDispatchEvents.ThreadUpdate, GatewayDispatchEvents.ThreadDelete]) {
+    for (const event of [
+      GatewayDispatchEvents.ChannelCreate, GatewayDispatchEvents.ChannelUpdate,
+      GatewayDispatchEvents.ThreadCreate, GatewayDispatchEvents.ThreadUpdate, GatewayDispatchEvents.ThreadDelete,
+    ]) {
       this.client.ws.on(event, (data: { id?: unknown }) => {
         if (typeof data?.id === 'string') this.overtake(data.id);
       });

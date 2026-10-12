@@ -357,6 +357,7 @@ function mockAdapter(withResolver: boolean) {
   };
   if (!withResolver) return base;
   return Object.assign(base, {
+    async refreshStale() {},
     resolveChannelRef(ref: string) {
       // Delegate id/composite handling to the real parser, as the real adapter
       // does — otherwise the mock quietly diverges from the thing under test.

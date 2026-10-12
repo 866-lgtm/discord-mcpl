@@ -128,6 +128,7 @@ describe('the tool chokepoint', () => {
   it('a send addressed by name explains the name that was sent, not only the id it resolved to', async () => {
     const adapter = {
       resolveChannelRef: () => ({ ok: true as const, id: '777777777777777777', matched: undefined }),
+      refreshStale: async () => {},
       // #63's send path reads the channel's cached metadata for its receipt.
       getCachedChannelMeta: () => null,
       sendMessage: async () => { throw discordError('Unknown Channel', 10003, 404); },
