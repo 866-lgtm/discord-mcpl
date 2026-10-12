@@ -29,9 +29,7 @@ function fixture(t: TestContext) {
   s.setupDiscordForwarding();
 
   function open(channelId: string) {
-    const descriptor = toDescriptor('g1', 'Guild', {
-      id: channelId, name: channelId, type: 'text', label: '#' + channelId,
-    });
+    const descriptor = toDescriptor({ id: channelId, guildId: 'g1', guildName: 'Guild', type: 'text', name: channelId });
     s.channelManager.register(descriptor);
     s.channelManager.open(descriptor.id);
   }

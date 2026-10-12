@@ -13,13 +13,12 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ChannelType, type Client } from 'discord.js';
-import { DiscordAdapter } from '../src/discord-adapter.js';
-import { formatChannelLabel } from '../src/channel-names.js';
+import { DiscordAdapter, type ChannelFacts } from '../src/discord-adapter.js';
 import { DiscordMcplServer } from '../src/server.js';
 import { OPEN_CHOICES_SHOWN, resolveOpenTarget, toDescriptor, toDmDescriptor } from '../src/channels.js';
 
-const general = toDescriptor('g1', 'Guild', { id: 'c1', name: 'general', type: 'text', label: '#general (Guild)' });
-const dev = toDescriptor('g1', 'Guild', { id: 'c2', name: 'dev', type: 'text', label: '#dev (Guild)' });
+const general = toDescriptor({ id: 'c1', guildId: 'g1', guildName: 'Guild', name: 'general', type: 'text' });
+const dev = toDescriptor({ id: 'c2', guildId: 'g1', guildName: 'Guild', name: 'dev', type: 'text' });
 const dm = toDmDescriptor('d1', 'ra');
 
 const UNKNOWN_CHANNEL = -32023;
@@ -39,7 +38,7 @@ after(() => {
 });
 
 type Served =
-  | { kind: 'guild'; guildId: string; guildName: string; channel: { id: string; name: string; type: 'text'; label: string } }
+  | { kind: 'guild'; facts: ChannelFacts }
   | { kind: 'dm'; recipientId: string; recipientName: string };
 
 const historyItem = (channelId: string) => ({
@@ -69,6 +68,11 @@ function fixture(
     async lookUpServedChannel(guildSegment: string, channelId: string) {
       lookups.push(`${guildSegment}/${channelId}`);
       return opts.served?.(guildSegment, channelId) ?? null;
+    },
+    // The channel filters admit every channel here (their refusals are
+    // history-inspection-filter.test.ts's).
+    async inspectionRefusal() {
+      return null;
     },
   } as unknown as DiscordAdapter;
   const server = new DiscordMcplServer(adapter) as unknown as {
@@ -208,7 +212,7 @@ describe('channels/open: what selects', () => {
     // there, and it isn't registered for a request of another type.
     const served = (guild: string, channel: string): Served | null =>
       (guild === 'g1' && channel === 'c7'
-        ? { kind: 'guild', guildId: 'g1', guildName: 'Guild', channel: { id: 'c7', name: 'new', type: 'text', label: '#new (Guild)' } }
+        ? { kind: 'guild', facts: { id: 'c7', guildId: 'g1', guildName: 'Guild', name: 'new', type: 'text' } }
         : null);
     const cases: Array<[Record<string, unknown>, number, RegExp]> = [
       [{ address: null }, UNKNOWN_CHANNEL, /^No slack channel is registered, so there is none to open without a selector\. Nothing was opened\.$/],
@@ -245,7 +249,7 @@ describe('channels/open: what selects', () => {
 
   it('lists every choice up to ten, and past ten points to channels/list for the rest', () => {
     const rooms = (n: number) => Array.from({ length: n }, (_, i) =>
-      toDescriptor('g1', 'Guild', { id: `c${i}`, name: `room${i}`, type: 'text', label: `#room${i} (Guild)` }));
+      toDescriptor({ id: `c${i}`, guildId: 'g1', guildName: 'Guild', name: `room${i}`, type: 'text' }));
     assert.equal(OPEN_CHOICES_SHOWN, 10);
     const ten = resolveOpenTarget({ type: 'discord' }, rooms(10));
     assert.equal(ten.kind, 'refused');
@@ -285,10 +289,47 @@ describe("channels/open: an id the registry doesn't hold", () => {
     assert.deepEqual(f.subscribed(), ['d9']);
   });
 
+  it('opens and registers a thread, a voice channel, and an archived thread the host names, by the rule every path registers by', async () => {
+    const facts: Record<string, ChannelFacts> = {
+      th5: { id: 'th5', guildId: 'g1', guildName: 'Guild', type: 'thread', name: 'plans', parentId: 'c1', parentName: 'general', archived: false },
+      v5: { id: 'v5', guildId: 'g1', guildName: 'Guild', type: 'voice', name: 'lounge' },
+      // Archived: the registry holds live threads of its own accord, but the
+      // host named this one.
+      th6: { id: 'th6', guildId: 'g1', guildName: 'Guild', type: 'thread', name: 'old', parentId: 'c1', parentName: 'general', archived: true },
+    };
+    const f = fixture([general], {
+      served: (guild, channel) => (guild === 'g1' && facts[channel] ? { kind: 'guild', facts: facts[channel] } : null),
+    });
+    for (const [id, label] of [['th5', '#general › plans (Guild)'], ['v5', '#lounge (Guild)'], ['th6', '#general › old (Guild)']]) {
+      const res = await f.server.handleChannelOpen({ channelId: `discord:g1:${id}`, type: 'discord' });
+      assert.equal(res.channel.label, label, id);
+      assert.equal(f.server.channelManager.get(`discord:g1:${id}`)?.label, label, `${id} is registered`);
+      assert.equal(f.server.channelManager.isOpen(`discord:g1:${id}`), true, `${id} is open`);
+    }
+  });
+
+  it('refuses a channel deleted lately, and a thread of one, though Discord still answers for them', async () => {
+    const facts: Record<string, ChannelFacts> = {
+      c5: { id: 'c5', guildId: 'g1', guildName: 'Guild', type: 'text', name: 'gone' },
+      th7: { id: 'th7', guildId: 'g1', guildName: 'Guild', type: 'thread', name: 'orphan', parentId: 'c6', parentName: 'also-gone' },
+    };
+    const f = fixture([general], {
+      served: (guild, channel) => (guild === 'g1' && facts[channel] ? { kind: 'guild', facts: facts[channel] } : null),
+    });
+    const server = f.server as unknown as { channelDeleted(guildId: string, channelId: string): void };
+    server.channelDeleted('g1', 'c5');
+    server.channelDeleted('g1', 'c6');
+    for (const id of ['c5', 'th7']) {
+      await f.refused({ channelId: `discord:g1:${id}`, type: 'discord', history: { limit: 5 } }, UNKNOWN_CHANNEL, /^No channel this server serves matches/);
+      assert.equal(f.server.channelManager.get(`discord:g1:${id}`), undefined, `${id} isn't registered`);
+    }
+    f.nothingOpened();
+  });
+
   it('opens and registers a text channel the registry does not hold yet, by id or by address', async () => {
     const served = (guild: string, channel: string): Served | null =>
       (guild === 'g1' && channel === 'c7'
-        ? { kind: 'guild', guildId: 'g1', guildName: 'Guild', channel: { id: 'c7', name: 'new', type: 'text', label: '#new (Guild)' } }
+        ? { kind: 'guild', facts: { id: 'c7', guildId: 'g1', guildName: 'Guild', name: 'new', type: 'text' } }
         : null);
     for (const selector of [{ channelId: 'discord:g1:c7' }, { address: { guildId: 'g1', channelId: 'c7' } }]) {
       const f = fixture([general], { served });
@@ -303,7 +344,7 @@ describe("channels/open: an id the registry doesn't hold", () => {
     const f = fixture();
     await f.refused(
       { channelId: 'discord:g1:c9', type: 'discord', address: { guildId: 'g1', channelId: 'c1' }, history: { limit: 10 } }, UNKNOWN_CHANNEL,
-      /^No channel this server serves matches channelId "discord:g1:c9": Discord doesn't know it, or it isn't a text channel or DM the filters admit\. Nothing was opened\.$/,
+      /^No channel this server serves matches channelId "discord:g1:c9": Discord doesn't know it, or it isn't a channel messages are posted in, a thread, or a DM, that the filters admit\. Nothing was opened\.$/,
     );
     await f.refused({ type: 'discord', address: { guildId: 'g1', channelId: 'c9' } }, UNKNOWN_CHANNEL, /^No channel this server serves matches address "g1"\/"c9"/);
     assert.deepEqual(f.lookups, ['g1/c9', 'g1/c9']);
@@ -442,33 +483,51 @@ describe('the adapter: which channels an exact open may register', () => {
     assert.equal(await adapter.lookUpServedChannel('dm', 'gone'), null, 'Discord finds nothing');
   });
 
-  it('serves a text or announcement channel of its own guild that the filters admit, and nothing else', async (t) => {
+  it('serves a channel messages are posted in, or a thread, of its own guild that the filters admit, and nothing else', async (t) => {
     const { adapter, client } = adapterFixture(t, { guildIds: ['g1', 'g2'], guildChannels: { g2: ['listed'] } });
-    const channel = (id: string, type: number, guildId: string) => ({ id, type, guildId, name: id, parentId: null, guild: { name: `${guildId}-name` } });
+    const channel = (id: string, type: number, guildId: string, extra: Record<string, unknown> = {}) =>
+      ({ id, type, guildId, name: id, parentId: null, ...extra });
     const channels: Record<string, unknown> = {
       text: channel('text', ChannelType.GuildText, 'g1'),
       news: channel('news', ChannelType.GuildAnnouncement, 'g1'),
       voice: channel('voice', ChannelType.GuildVoice, 'g1'),
-      thread: channel('thread', ChannelType.PublicThread, 'g1'),
+      stage: channel('stage', ChannelType.GuildStageVoice, 'g1'),
+      thread: channel('thread', ChannelType.PublicThread, 'g1', { parentId: 'text', archived: false }),
+      archived: channel('archived', ChannelType.PublicThread, 'g1', { parentId: 'text', archived: true }),
+      forum: channel('forum', ChannelType.GuildForum, 'g1'),
+      category: channel('category', ChannelType.GuildCategory, 'g1'),
       elsewhere: channel('elsewhere', ChannelType.GuildText, 'g3'),
       unlisted: channel('unlisted', ChannelType.GuildText, 'g2'),
       listed: channel('listed', ChannelType.GuildText, 'g2'),
+      listedThread: channel('listedThread', ChannelType.PublicThread, 'g2', { parentId: 'listed' }),
+      unlistedThread: channel('unlistedThread', ChannelType.PublicThread, 'g2', { parentId: 'unlisted' }),
     };
     t.mock.method(client.channels, 'fetch', (async (id: string) => {
       if (id === 'broken') throw new Error('Service Unavailable');
       return channels[id] ?? null;
     }) as never);
+    // A guild's name comes from the client's guild cache, as the registry's
+    // other paths read it.
+    client.guilds.cache.set('g1', { name: 'g1-name' } as never);
+    // The facts its descriptor is made from, as every other path builds them.
     assert.deepEqual(await adapter.lookUpServedChannel('g1', 'text'), {
-      kind: 'guild', guildId: 'g1', guildName: 'g1-name',
-      channel: { id: 'text', name: 'text', type: 'text', parentId: undefined, label: formatChannelLabel('text', 'g1-name') },
+      kind: 'guild',
+      facts: { id: 'text', guildId: 'g1', guildName: 'g1-name', type: 'text', name: 'text', parentId: null, parentName: null, archived: false },
     });
-    assert.equal((await adapter.lookUpServedChannel('g1', 'news'))?.kind, 'guild', 'an announcement channel');
-    assert.equal(await adapter.lookUpServedChannel('g1', 'voice'), null, 'not a text channel');
-    assert.equal(await adapter.lookUpServedChannel('g1', 'thread'), null, 'threads are left to the registry');
+    for (const [id, kind] of [['news', 'announcement'], ['voice', 'voice'], ['stage', 'stage'], ['thread', 'thread'], ['archived', 'thread']] as const) {
+      const found = await adapter.lookUpServedChannel('g1', id);
+      assert.equal(found?.kind === 'guild' ? found.facts.type : null, kind, id);
+    }
+    const archived = await adapter.lookUpServedChannel('g1', 'archived');
+    assert.equal(archived?.kind === 'guild' && archived.facts.archived, true, 'an archived thread is served, and says so');
+    assert.equal(await adapter.lookUpServedChannel('g1', 'forum'), null, 'a forum holds no messages of its own');
+    assert.equal(await adapter.lookUpServedChannel('g1', 'category'), null, 'nor does a category');
     assert.equal(await adapter.lookUpServedChannel('g2', 'text'), null, 'named under another guild');
     assert.equal(await adapter.lookUpServedChannel('g3', 'elsewhere'), null, 'a guild the guild filter leaves out');
     assert.equal(await adapter.lookUpServedChannel('g2', 'unlisted'), null, "a channel the guild's channel list leaves out");
     assert.equal((await adapter.lookUpServedChannel('g2', 'listed'))?.kind, 'guild');
+    assert.equal((await adapter.lookUpServedChannel('g2', 'listedThread'))?.kind, 'guild', 'a thread of a listed channel');
+    assert.equal(await adapter.lookUpServedChannel('g2', 'unlistedThread'), null, "a thread of a channel the list leaves out");
     assert.equal(await adapter.lookUpServedChannel('g1', 'broken'), null, 'a lookup that fails');
   });
 });
