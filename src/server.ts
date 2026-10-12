@@ -3533,7 +3533,10 @@ export class DiscordMcplServer {
    *  (guildDescriptor), so a DM, thread or channel no traffic has registered
    *  since a restart still opens. Anything else is refused as unknown,
    *  lately deleted channels and their threads included, and a channel of
-   *  another type as bad params. An archived thread opens too, since the host
+   *  another type as bad params. A channel whose current facts aren't known
+   *  (`uncertain`: a stale channel, or a thread of one) is refused as an
+   *  open that failed, since its facts decide no registration and another
+   *  open fetches it again. An archived thread opens too, since the host
    *  named it, though the registry otherwise holds only live threads
    *  (registerGuildDelivery): it stays registered until it's deleted, or
    *  archived again once a message revives it. */
@@ -3547,6 +3550,13 @@ export class DiscordMcplServer {
         ERR_UNKNOWN_CHANNEL,
         `No channel this server serves matches ${target.via}: Discord doesn't know it, or it isn't a channel messages ` +
           'are posted in, a thread, or a DM, that the filters admit. Nothing was opened.',
+      );
+    }
+    if (found.kind === 'uncertain') {
+      throw new RequestRefusal(
+        ERR_CHANNEL_OPEN_FAILED,
+        `${target.via} can't be opened right now: Discord's current facts for it, or for the channel it's a thread of, ` +
+          "aren't known (the latest fetch failed or was overtaken by a change). Nothing was opened; another open fetches it again.",
       );
     }
     const desc = found.kind === 'dm'

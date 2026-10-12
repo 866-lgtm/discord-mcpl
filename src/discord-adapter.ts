@@ -1573,17 +1573,25 @@ export class DiscordAdapter {
    * forum, which hold no messages, a kind this server doesn't know, another
    * guild, a channel the filters refuse, and a lookup that fails or finds
    * nothing. A guild channel comes back as the facts its descriptor is made
-   * from. The cache is read first, then Discord, which caches what it
-   * fetches.
+   * from.
+   *
+   * The channel is read as the tools read one (channelById): from the cache
+   * when it holds the channel whole and current, else from Discord by the
+   * freshness rule, so Unknown Channel there is a deletion (channelGone). A
+   * thread's stale channel is looked up first, as a delivery's is, since its
+   * category may be what admits the thread. A channel that is still stale
+   * then, or a thread whose channel is, comes back as `uncertain`: its facts
+   * decide no registration until a fresh fetch.
    */
   async lookUpServedChannel(guildSegment: string, channelId: string): Promise<
     | { kind: 'guild'; facts: ChannelFacts }
     | { kind: 'dm'; recipientId: string; recipientName: string }
+    | { kind: 'uncertain' }
     | null
   > {
-    let channel: Channel | null | undefined;
+    let channel: Channel | null;
     try {
-      channel = this.client.channels.cache.get(channelId) ?? (await this.client.channels.fetch(channelId));
+      channel = await this.channelById(channelId);
     } catch (err) {
       dbg('lookUpServedChannel:failed', { channelId, error: err instanceof Error ? err.message : String(err) });
       return null;
@@ -1597,11 +1605,14 @@ export class DiscordAdapter {
       const recipient = (channel as DMChannel).recipient ?? (await this.client.users.fetch(recipientId).catch(() => null));
       return { kind: 'dm', recipientId, recipientName: recipient?.username ?? recipientId };
     }
+    if (!('guildId' in channel) || channel.guildId !== guildSegment) return null;
+    const staleParent = this.staleParentOf(channel);
+    if (staleParent) await this.lookUpChannel(channel.guildId, staleParent);
+    if (this.isStale(channelId) || (staleParent !== null && this.isStale(staleParent))) return { kind: 'uncertain' };
     const facts = this.channelFacts(channel);
-    if (!facts || facts.guildId !== guildSegment) return null;
+    if (!facts) return null;
     if (!isListedKind(facts.type) && facts.type !== 'thread') return null;
-    if (this.guildIds && !this.guildIds.includes(facts.guildId)) return null;
-    if (!this.channelAllowed(facts.guildId, facts.id, facts.parentId)) return null;
+    if (!this.channelAdmitted(facts.guildId, facts.id, facts.parentId ?? null)) return null;
     return { kind: 'guild', facts };
   }
 

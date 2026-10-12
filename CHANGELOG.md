@@ -361,7 +361,11 @@ in the git log and PR descriptions.
   history is fetched, and nothing is opened or subscribed, before a request
   names its channel, and a channel unregistered while the open is in
   progress isn't opened. `sinceLastSeen` reads the persisted watermark even
-  when it's the first thing to.
+  when it's the first thing to. An id the registry doesn't hold is looked up
+  as every fetch past the cache is: Discord's Unknown Channel there is a
+  deletion, and an id whose current facts can't be had (every try overtaken by
+  a change, or a thread whose stale channel can't be fetched fresh) is refused
+  as an open that failed (`-32024`).
 - **A refused DM's deletion no longer reaches the agent.** With a DM
   allowlist set, a refused sender's DM was never forwarded, but its deletion
   was: discord.js caches every DM it receives, so the tombstone carried the

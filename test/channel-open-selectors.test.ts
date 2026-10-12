@@ -39,7 +39,13 @@ after(() => {
 
 type Served =
   | { kind: 'guild'; facts: ChannelFacts }
-  | { kind: 'dm'; recipientId: string; recipientName: string };
+  | { kind: 'dm'; recipientId: string; recipientName: string }
+  | { kind: 'uncertain' };
+
+/** Wait, a turn at a time, for what a test can't await directly. */
+async function until(what: () => boolean): Promise<void> {
+  for (let i = 0; i < 100 && !what(); i++) await new Promise((done) => setImmediate(done));
+}
 
 const historyItem = (channelId: string) => ({
   id: '900', authorId: 'u1', authorName: 'Alice', isBot: false, content: `from ${channelId}`,
@@ -73,6 +79,14 @@ function fixture(
     // history-inspection-filter.test.ts's).
     async inspectionRefusal() {
       return null;
+    },
+    // A deletion re-derives what's registered from the cache, which holds
+    // nothing here, and nothing is stale.
+    isStale() {
+      return false;
+    },
+    getCachedChannelFactsFor() {
+      return new Map();
     },
   } as unknown as DiscordAdapter;
   const server = new DiscordMcplServer(adapter) as unknown as {
@@ -360,6 +374,16 @@ describe("channels/open: an id the registry doesn't hold", () => {
     assert.deepEqual(f.lookups, []);
     f.nothingOpened();
   });
+
+  it("refuses an id whose channel's current facts aren't known as an open that failed, and registers nothing", async () => {
+    const f = fixture([general], { served: () => ({ kind: 'uncertain' }) });
+    await f.refused(
+      { channelId: 'discord:g1:c8', type: 'discord', history: { limit: 5 } }, OPEN_FAILED,
+      /^channelId "discord:g1:c8" can't be opened right now: Discord's current facts for it, or for the channel it's a thread of, aren't known \(the latest fetch failed or was overtaken by a change\)\. Nothing was opened; another open fetches it again\.$/,
+    );
+    assert.equal(f.server.channelManager.get('discord:g1:c8'), undefined, "it isn't registered");
+    f.nothingOpened();
+  });
 });
 
 describe('channels/open: what arrives during the history fetch stands', () => {
@@ -507,12 +531,13 @@ describe('the adapter: which channels an exact open may register', () => {
       return channels[id] ?? null;
     }) as never);
     // A guild's name comes from the client's guild cache, as the registry's
-    // other paths read it.
-    client.guilds.cache.set('g1', { name: 'g1-name' } as never);
+    // other paths read it, and so do the channels its names resolve among.
+    const g1Channels = new Map(Object.entries(channels).filter(([, c]) => (c as { guildId: string }).guildId === 'g1'));
+    client.guilds.cache.set('g1', { id: 'g1', name: 'g1-name', channels: { cache: g1Channels } } as never);
     // The facts its descriptor is made from, as every other path builds them.
     assert.deepEqual(await adapter.lookUpServedChannel('g1', 'text'), {
       kind: 'guild',
-      facts: { id: 'text', guildId: 'g1', guildName: 'g1-name', type: 'text', name: 'text', parentId: null, parentName: null, archived: false },
+      facts: { id: 'text', guildId: 'g1', guildName: 'g1-name', type: 'text', name: 'text', parentId: null, parentName: null, archived: false, nameResolves: true },
     });
     for (const [id, kind] of [['news', 'announcement'], ['voice', 'voice'], ['stage', 'stage'], ['thread', 'thread'], ['archived', 'thread']] as const) {
       const found = await adapter.lookUpServedChannel('g1', id);
@@ -529,5 +554,66 @@ describe('the adapter: which channels an exact open may register', () => {
     assert.equal((await adapter.lookUpServedChannel('g2', 'listedThread'))?.kind, 'guild', 'a thread of a listed channel');
     assert.equal(await adapter.lookUpServedChannel('g2', 'unlistedThread'), null, "a thread of a channel the list leaves out");
     assert.equal(await adapter.lookUpServedChannel('g1', 'broken'), null, 'a lookup that fails');
+  });
+
+  it('looks a channel up by the freshness rule: overtaken on every try, it comes back uncertain, and looked up again it is fetched fresh', { timeout: 5000 }, async (t) => {
+    const { adapter, client } = adapterFixture(t, {});
+    const text = { id: 'text', type: ChannelType.GuildText, guildId: 'g1', name: 'text', parentId: null };
+    let held = true;
+    let out: () => void = () => {};
+    const fetch = t.mock.method(client.channels, 'fetch', (async () => {
+      if (held) await new Promise<void>((done) => { out = done; });
+      return text;
+    }) as never);
+    const lookup = adapter.lookUpServedChannel('g1', 'text');
+    for (let tries = 1; tries <= 3; tries++) {
+      await until(() => fetch.mock.callCount() === tries);
+      // Discord reports on the channel while its fetch is out.
+      client.ws.emit('CHANNEL_UPDATE', { id: 'text', guild_id: 'g1', type: ChannelType.GuildText, name: 'text', topic: `edit ${tries}` }, 0);
+      out();
+    }
+    assert.deepEqual(await lookup, { kind: 'uncertain' });
+    assert.equal(fetch.mock.callCount(), 3);
+    assert.equal(adapter.isStale('text'), true);
+    held = false;
+    assert.equal((await adapter.lookUpServedChannel('g1', 'text'))?.kind, 'guild', 'fetched fresh, it is served');
+    assert.equal(adapter.isStale('text'), false);
+  });
+
+  it("looks a thread's stale channel up first, and comes back uncertain while that channel stays stale", async (t) => {
+    // The guild's channel list admits category `cat`, which Discord moved
+    // `text` into; an older reply left `text` cached outside it, stale.
+    const { adapter, client } = adapterFixture(t, { guildChannels: { g1: ['cat'] } });
+    const text = { id: 'text', type: ChannelType.GuildText, guildId: 'g1', name: 'text', parentId: 'cat' };
+    const thread = { id: 'th', type: ChannelType.PublicThread, guildId: 'g1', name: 'th', parentId: 'text', archived: false, isThread: () => true };
+    client.channels.cache.set('text', { ...text, parentId: 'old' } as never);
+    (adapter as unknown as { stale: Map<string, { guildId: string }> }).stale.set('text', { guildId: 'g1' });
+    let channelFails = true;
+    const fetch = t.mock.method(client.channels, 'fetch', (async (id: string) => {
+      if (id === 'th') return thread;
+      if (channelFails) throw new Error('Service Unavailable');
+      client.channels.cache.set('text', text as never);
+      return text;
+    }) as never);
+    assert.deepEqual(await adapter.lookUpServedChannel('g1', 'th'), { kind: 'uncertain' }, "its channel's lookup failed, so it stays stale");
+    assert.deepEqual(fetch.mock.calls.map((c) => c.arguments[0]), ['th', 'text']);
+    channelFails = false;
+    const found = await adapter.lookUpServedChannel('g1', 'th');
+    assert.equal(found?.kind === 'guild' ? found.facts.id : null, 'th', "its channel fetched fresh, that channel's category admits it");
+    assert.equal(adapter.isStale('text'), false);
+  });
+
+  it("takes Discord's Unknown Channel, for a channel the cache placed in a guild, as its deletion, and serves nothing", async (t) => {
+    const { adapter, client } = adapterFixture(t, {});
+    client.channels.cache.set('text', { id: 'text', type: ChannelType.GuildText, guildId: 'g1', name: 'text', parentId: null } as never);
+    // Stale, so the lookup asks Discord rather than reading the cache.
+    (adapter as unknown as { stale: Map<string, { guildId: string }> }).stale.set('text', { guildId: 'g1' });
+    const deleted: string[] = [];
+    adapter.onChannelDelete((guildId, channelId) => { deleted.push(`${guildId}/${channelId}`); });
+    t.mock.method(client.channels, 'fetch', (async () => { throw Object.assign(new Error('Unknown Channel'), { code: 10003 }); }) as never);
+    assert.equal(await adapter.lookUpServedChannel('g1', 'text'), null);
+    assert.deepEqual(deleted, ['g1/text']);
+    assert.equal(client.channels.cache.has('text'), false);
+    assert.equal(adapter.isStale('text'), false);
   });
 });
