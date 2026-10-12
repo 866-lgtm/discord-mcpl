@@ -36,6 +36,7 @@ import { parseChannelRef } from '../src/channel-names.js';
 import { applyMentionCandidates } from '../src/discord-adapter.js';
 import { TOOL_CLASSES } from '../src/tool-classes.js';
 import type {
+  ChannelChange,
   ChannelFacts,
   ChannelMeta,
   DiscordAdapter,
@@ -49,8 +50,8 @@ import type {
 class MockDiscordAdapter {
   private _messageHandler?: (msg: DiscordMessageData) => void;
   private _channelCreateHandler?: (channel: ChannelFacts) => void;
-  private _channelUpdateHandler?: (channel: ChannelFacts) => void;
-  private _channelDeleteHandler?: (guildId: string, channelId: string) => void;
+  private _channelUpdateHandler?: (channel: ChannelFacts, change: ChannelChange) => void;
+  private _channelDeleteHandler?: (guildId: string, channelId: string, threadIds: string[]) => void;
   private _guildCreateHandler?: (guildId: string, channels: ChannelFacts[]) => void;
   private _guildRenameHandler?: (guildId: string) => void;
   private _threadUpdateHandler?: (thread: ChannelFacts) => void;
@@ -91,11 +92,25 @@ class MockDiscordAdapter {
   onChannelCreate(handler: (channel: ChannelFacts) => void): void {
     this._channelCreateHandler = handler;
   }
-  onChannelUpdate(handler: (channel: ChannelFacts) => void): void {
+  onChannelUpdate(handler: (channel: ChannelFacts, change: ChannelChange) => void): void {
     this._channelUpdateHandler = handler;
   }
-  onChannelDelete(handler: (guildId: string, channelId: string) => void): void {
+  onChannelDelete(handler: (guildId: string, channelId: string, threadIds: string[]) => void): void {
     this._channelDeleteHandler = handler;
+  }
+  onGuildDelete(): void {}
+  onGuildAvailable(): void {}
+  /** No guild here comes back from an outage. */
+  isStale(): boolean {
+    return false;
+  }
+  /** These tests' bot is in every guild. */
+  hasGuild(): boolean {
+    return true;
+  }
+  /** No filters here. */
+  channelAdmitted(): boolean {
+    return true;
   }
   onGuildCreate(handler: (guildId: string, channels: ChannelFacts[]) => void): void {
     this._guildCreateHandler = handler;
@@ -227,9 +242,11 @@ class MockDiscordAdapter {
     this._channelCreateHandler?.(channel);
   }
 
-  /** Simulate a channel's change: a rename, or the bot let into it. */
-  simulateChannelUpdate(channel: ChannelFacts): void {
-    this._channelUpdateHandler?.(channel);
+  /** Simulate a channel's change: a rename (the default), or an edit that
+   *  leaves its name, kind and category as they were, such as the bot let
+   *  into it. */
+  simulateChannelUpdate(channel: ChannelFacts, change: ChannelChange = { addressChanged: true, admitted: true }): void {
+    this._channelUpdateHandler?.(channel, change);
   }
 
   simulateGuildRename(guildId: string): void {
@@ -247,15 +264,21 @@ class MockDiscordAdapter {
   simulateThreadDelete(guildId: string, threadId: string): void {
     this._threadDeleteHandler?.(guildId, threadId);
   }
-  simulateChannelDelete(guildId: string, channelId: string): void {
-    this._channelDeleteHandler?.(guildId, channelId);
+  onChannelRefreshed(_handler: (channelId: string) => void): void {}
+  onChannelStale(_handler: (channelId: string) => void): void {}
+  async refreshStale(): Promise<void> {}
+  simulateChannelDelete(guildId: string, channelId: string, threadIds: string[] = []): void {
+    this._channelDeleteHandler?.(guildId, channelId, threadIds);
   }
   /** What the client's cache holds of guild channels, by channel id. Empty
    *  by default: a delivery from a channel the cache doesn't hold registers
-   *  it under its id, and leaves one registered already as it is. */
+   *  nothing, and names the channel only if it's registered already. */
   facts: Record<string, ChannelFacts> = {};
   getCachedChannelFacts(channelId: string): ChannelFacts | null {
     return this.facts[channelId] ?? null;
+  }
+  getCachedChannelFactsFor(channelIds: Iterable<string>): Map<string, ChannelFacts> {
+    return new Map([...channelIds].flatMap((id) => (this.facts[id] ? [[id, this.facts[id]] as const] : [])));
   }
 }
 
@@ -1426,6 +1449,9 @@ describe('DiscordMcplServer', () => {
     discord.simulateMessage(inThread('no-parent', { threadParentName: null }));
     const first = await nextRequest('push/event');
     client.sendResponse(first.id, { accepted: true });
+    // th2 is known only partly: the cache holds its partial, without its
+    // name or its channel.
+    discord.facts.th2 = { id: 'th2', guildId: 'g1', guildName: 'Test Server', type: 'thread', name: null, parentId: null, parentName: null };
     discord.simulateMessage(inThread('no-name', { channelId: 'th2', threadId: 'th2', channelName: null, threadName: undefined }));
     // th2 isn't registered yet, so it's registered before its push.
     const registered = await nextWithin(client);
@@ -1464,11 +1490,37 @@ describe('DiscordMcplServer', () => {
       assert.equal(origin.threadName, 'design-chat', tag);
       assert.equal(origin.threadParentName, 'general', tag);
     }
+    // A channel message's edit and delete carry neither.
+    await client.sendRequest(method.CHANNELS_OPEN, { type: 'discord', address: { guildId: 'g1', channelId: 'c1' } });
+    const plain = { guildId: 'g1', authorName: 'Bob' };
+    discord.simulateEdit('c1', 'm2', 'second version', false, { ...plain, editedAt: '2026-10-02T00:00:02.000Z' });
+    const plainEdit = await nextRequest('push/event');
+    client.sendResponse(plainEdit.id, { accepted: true });
+    discord.simulateDelete('c1', 'm2', false, plain);
+    const plainDel = await nextRequest('push/event');
+    client.sendResponse(plainDel.id, { accepted: true });
+    for (const [request, tag] of [[plainEdit, 'chat:edited'], [plainDel, 'chat:deleted']] as const) {
+      const p = request.params as PushEventParams;
+      assert.deepEqual(p.tags, [tag], tag);
+      const origin = p.origin as Record<string, unknown>;
+      assert.equal('threadName' in origin || 'threadParentName' in origin, false, tag);
+    }
   });
 
   /** One reconnect sweep over a channel with one missed mention, the channel
-   *  described as the adapter's cache gives it; returns the sweep's push. */
-  async function sweepOne(channelId: string, meta: ChannelMeta): Promise<PushEventParams> {
+   *  described as the adapter's cache gives it, and as its lookup from
+   *  Discord gives it (or fails, given an Error) when `rest` is given;
+   *  returns the sweep's push. */
+  /** The facts the client's cache holds of a channel it has meta for: the
+   *  adapter reads both from the one cache. */
+  function factsFromMeta(channelId: string, meta: ChannelMeta): ChannelFacts | null {
+    if (!meta.guildId) return null;
+    return meta.threadId
+      ? { id: channelId, guildId: meta.guildId, guildName: meta.guildName, type: 'thread', name: meta.threadName ?? null, parentName: meta.threadParentName ?? null }
+      : { id: channelId, guildId: meta.guildId, guildName: meta.guildName, type: 'text', name: meta.name };
+  }
+
+  async function sweepOne(channelId: string, meta: ChannelMeta | null, rest?: ChannelMeta | Error): Promise<PushEventParams> {
     const wmPath = join(tmpdir(), `discord-mcpl-wm-${process.pid}-sweep-${channelId}.json`);
     writeFileSync(wmPath, JSON.stringify({ watermarks: { [channelId]: '100' }, dmChannels: [] }));
     process.env.DISCORD_WATERMARK_FILE = wmPath;
@@ -1477,7 +1529,19 @@ describe('DiscordMcplServer', () => {
       discord.historyToReturn = [
         { id: '102', authorId: 'u2', authorName: 'Bob', isBot: false, content: '<@bot_123> ping', cleanContent: '@bot ping', attachments: [], mentionsBot: true, timestamp: new Date(), reactions: [] },
       ];
-      discord.cachedChannelMeta = { [channelId]: meta };
+      // The cache holds what it has meta for, and a fetch caches what it
+      // brings, as discord.js's does.
+      discord.cachedChannelMeta = meta ? { [channelId]: meta } : {};
+      const cached = meta && factsFromMeta(channelId, meta);
+      if (cached) discord.facts[channelId] = cached;
+      if (rest instanceof Error) discord.getChannelMeta = async () => { throw rest; };
+      else if (rest) {
+        discord.getChannelMeta = (async () => {
+          const fetched = factsFromMeta(channelId, rest);
+          if (fetched) discord.facts[channelId] = fetched;
+          return rest;
+        }) as never;
+      }
       const server = new DiscordMcplServer(discord as unknown as DiscordAdapter);
       const serverPromise = server.serve(serverConn);
       try {
@@ -1651,7 +1715,8 @@ describe('DiscordMcplServer', () => {
       discord.facts.thx = { id: 'thx', guildId: 'g9', guildName: null, type: 'thread', name: 'plans', parentId: 'cx', parentName: 'lobby' };
       // A voice room named like a thread label, which the resolver refuses as a name.
       discord.facts.v1 = { id: 'v1', guildId: 'g1', guildName: GUILD, type: 'voice', name: 'general › design' };
-      // A channel the cache doesn't hold at all.
+      // A channel the cache holds only as a partial, with no name.
+      discord.facts.unseen = { id: 'unseen', guildId: 'g1', guildName: null, type: 'unknown', name: null };
       for (const [channelId, guildId, extra] of [
         ['cx', 'g9', { guildId: 'g9', guildName: null }],
         ['thx', 'g9', { guildId: 'g9', guildName: null, threadId: 'thx', threadName: 'plans' }],
@@ -1673,7 +1738,9 @@ describe('DiscordMcplServer', () => {
       discord.simulateMessage(inThread('m1'));
       await expectChanged(client);
       await expectPush(client, 'discord:g1:th1');
-      // An uncached channel registers under its id, with no names to read.
+      // A channel the cache holds only as a partial registers under its id,
+      // with no names to read.
+      discord.facts.cz = { id: 'cz', guildId: 'g1', guildName: null, type: 'unknown', name: null };
       discord.simulateMessage(posted('m2', 'cz'));
       await expectChanged(client);
       await expectPush(client, 'discord:g1:cz');
@@ -1758,7 +1825,7 @@ describe('DiscordMcplServer', () => {
       await expectChanged(client);
       await expectPush(client, 'discord:g1:th1');
       // Archived: forgotten, so the registry holds the live threads.
-      discord.facts.th1 = threadFacts('th1', 'design-chat', { archived: true });
+      discord.facts.th1 = threadFacts('th1', 'design-chat', { archived: true, archivedAt: Date.now() - 60_000 });
       discord.simulateThreadUpdate(discord.facts.th1);
       assert.deepEqual((await expectChanged(client)).removed, ['discord:g1:th1']);
       // A message posted in it unarchives it, whatever the cache has heard
@@ -1927,9 +1994,9 @@ describe('DiscordMcplServer', () => {
       assert.deepEqual(saved.missed, {});
     });
 
-    it('the reconnect sweep registers what it delivers from, cached or not, and leaves out an archived thread and a forum', async (t) => {
+    it('the reconnect sweep registers what it delivers from once the cache holds it, and leaves out an archived thread and a forum', async (t) => {
       const wmPath = join(tmpdir(), `discord-mcpl-wm-${process.pid}-sweep-kinds.json`);
-      writeFileSync(wmPath, JSON.stringify({ watermarks: { c1: '100', thA: '100', cold: '100', forum1: '100', gone: '100' }, dmChannels: [] }));
+      writeFileSync(wmPath, JSON.stringify({ watermarks: { c1: '100', thA: '100', cold: '100', forum1: '100' }, dmChannels: [] }));
       process.env.DISCORD_WATERMARK_FILE = wmPath;
       t.after(() => {
         delete process.env.DISCORD_WATERMARK_FILE;
@@ -1951,15 +2018,12 @@ describe('DiscordMcplServer', () => {
         c1: { name: 'general', guildId: 'g1', guildName: GUILD, isDM: false },
         thA: { name: 'old-plans', guildId: 'g1', guildName: GUILD, isDM: false, threadId: 'thA', threadName: 'old-plans', threadParentName: 'general' },
         forum1: { name: 'ideas', guildId: 'g1', guildName: GUILD, isDM: false },
-        gone: { name: 'gone', guildId: 'g1', guildName: GUILD, isDM: false },
       } as never;
       discord.getChannelMeta = (async (channelId: string) => {
         assert.equal(channelId, 'cold');
         discord.facts.cold = { id: 'cold', guildId: 'g1', guildName: GUILD, type: 'voice', name: 'lounge' };
         return { name: 'lounge', guildId: 'g1', guildName: GUILD, isDM: false };
       }) as never;
-      // `gone` is placed by its meta, but the cache doesn't hold it: registered
-      // under its id, so every channel the sweep pushes is registered first.
       const server = new DiscordMcplServer(discord as unknown as DiscordAdapter);
       const serverPromise = server.serve(serverConn);
       endWith(t, { client, clientSocket }, () => serverPromise);
@@ -1972,8 +2036,6 @@ describe('DiscordMcplServer', () => {
       assert.deepEqual((await expectChanged(client)).added?.map((d) => [d.id, d.label]), [['discord:g1:cold', '#lounge (Test Guild)']]);
       await expectPush(client, 'discord:g1:cold');
       await expectPush(client, undefined); // forum1
-      assert.deepEqual((await expectChanged(client)).added?.map((d) => [d.id, d.label]), [['discord:g1:gone', 'discord:g1:gone']]);
-      await expectPush(client, 'discord:g1:gone');
     });
 
     it('registers and pushes nothing the filters exclude, and forgets a channel Discord no longer knows', async (t) => {
@@ -2012,6 +2074,58 @@ describe('DiscordMcplServer', () => {
       assert.equal(saved.watermarks.vanished, undefined, "a channel Discord doesn't know isn't fetched again");
       assert.ok(saved.watermarks.secret, "a refused channel's watermark moves on, as the live path's never revisits it");
     });
+  });
+
+  it("the reconnect sweep's header escapes a bidi control or a C1 line break in a name, as the live location does", async () => {
+    // Found in review by Daphne, whose probe this test is built from.
+    // (U+2028 and U+2029 can't be tried here: the transport's line framing
+    // splits a message on them before the header is read.)
+    const p = await sweepOne('th-bidi', {
+      name: 'plan\u202eend', guildId: 'g1', guildName: 'Test\u0085Guild', isDM: false,
+      threadId: 'th-bidi', threadName: 'plan\u202eend', threadParentName: 'gen\u202eeral',
+    });
+    const header = (p.payload.content[0] as { text: string }).text.split('\n')[0];
+    assert.equal(/[\u202e\u0085]/.test(header), false, JSON.stringify(header));
+    assert.ok(header.startsWith('<missed channel="#gen\\u202eeral" thread="plan\\u202eend" channelId="th-bidi" guild="Test\\u0085Guild"'), JSON.stringify(header));
+  });
+
+  it("the reconnect sweep looks up a cached thread whose channel isn't named, and keeps what the cache knew if that fails", async () => {
+    // As the cache holds a thread the client knows only partly: no name, no channel.
+    const partly: ChannelMeta = { name: null, guildId: 'g1', guildName: 'Test Guild', isDM: false, threadId: 'th3', threadParentName: null };
+    const looked = await sweepOne('th3', partly, {
+      name: 'late-thread', guildId: 'g1', guildName: 'Test Guild', isDM: false,
+      threadId: 'th3', threadName: 'late-thread', threadParentName: 'general',
+    });
+    const lookedText = (looked.payload.content[0] as { text: string }).text;
+    assert.ok(lookedText.startsWith('<missed channel="#general" thread="late-thread" channelId="th3"'), lookedText);
+    assert.equal((looked.origin as Record<string, unknown>).threadParentName, 'general');
+    const failed = await sweepOne('th3', partly, new Error('Missing Access'));
+    const failedText = (failed.payload.content[0] as { text: string }).text;
+    assert.ok(failedText.startsWith('<missed thread="th3" channelId="th3" guild="Test Guild"'), failedText);
+    assert.deepEqual(failed.tags, ['chat:thread'], 'still a thread');
+  });
+
+  it("the reconnect sweep's header names a thread without its channel, or by its id, when either isn't known", async () => {
+    // The parent isn't cached: the thread is named alone. (The lookup the
+    // sweep tries then finds no more, here as Discord would.)
+    const sparse: ChannelMeta = { name: 'design-chat', guildId: 'g1', guildName: 'Test Guild', isDM: false, threadId: 'th4', threadName: 'design-chat', threadParentName: null };
+    const noParent = await sweepOne('th4', sparse, sparse);
+    const noParentText = (noParent.payload.content[0] as { text: string }).text;
+    assert.ok(noParentText.startsWith('<missed thread="design-chat" channelId="th4" guild="Test Guild"'), noParentText);
+    assert.equal('threadParentName' in (noParent.origin as Record<string, unknown>), false, 'an unknown channel is left out of the origin');
+    const noName = await sweepOne('th5', { name: null, guildId: 'g1', guildName: 'Test Guild', isDM: false, threadId: 'th5', threadParentName: 'general' });
+    const noNameText = (noName.payload.content[0] as { text: string }).text;
+    assert.ok(noNameText.startsWith('<missed channel="#general" thread="th5" channelId="th5" guild="Test Guild"'), noNameText);
+    assert.equal('threadName' in (noName.origin as Record<string, unknown>), false, 'an unknown name is left out of the origin');
+  });
+
+  it("the reconnect sweep's push for a channel or a DM carries its mcplChannelId and no thread tag", async () => {
+    const channel = await sweepOne('c7', { name: 'general', guildId: 'g1', guildName: 'Test Guild', isDM: false });
+    assert.equal((channel.origin as Record<string, unknown>).mcplChannelId, 'discord:g1:c7');
+    assert.equal(channel.tags?.includes('chat:thread') ?? false, false, 'a channel is no thread');
+    const dm = await sweepOne('d7', { name: null, guildId: null, guildName: null, isDM: true });
+    assert.equal((dm.origin as Record<string, unknown>).mcplChannelId, 'discord:dm:d7');
+    assert.equal(dm.tags?.includes('chat:thread') ?? false, false, 'a DM is no thread');
   });
 
   it('renders reply target visibly and carries standard metadata on open channels', async () => {

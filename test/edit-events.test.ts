@@ -66,9 +66,18 @@ describe('edit/delete push events', () => {
       botUserId: 'bot',
       onMessage: noop, onReaction: noop,
       onChannelCreate: noop, onChannelUpdate: noop, onChannelDelete: noop, onGuildCreate: noop,
-      onGuildRename: noop, onThreadUpdate: noop, onThreadDelete: noop,
-      // Nothing is cached: a delivery keeps what the test registered.
-      getCachedChannelFacts: () => null,
+      onGuildRename: noop, onThreadUpdate: noop, onThreadDelete: noop, onGuildDelete: noop, onGuildAvailable: noop,
+      onChannelRefreshed: noop,
+      onChannelStale: noop,
+      refreshStale: async () => {},
+      // The cache holds chan1, as it holds a channel an edit or delete comes
+      // from, and nothing else.
+      getCachedChannelFacts: (id: string) =>
+        id === 'chan1' ? { id, guildId: 'g1', guildName: 'Guild', type: 'text', name: 'general' } : null,
+      getCachedChannelFactsFor: () => new Map(),
+      isStale: () => false,
+      hasGuild: () => true,
+      channelAdmitted: () => true,
       onMessageEdit: (h: EditHandler) => { edit = h; },
       onMessageDelete: (h: DeleteHandler) => { del = h; },
     };

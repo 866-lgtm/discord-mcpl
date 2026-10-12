@@ -15,8 +15,9 @@
 import { isSnowflake } from './channel-names.js';
 import { parseMcplChannelId } from './channels.js';
 
-/** Discord's JSON error codes for an id it can't resolve, or can't reach. */
-const UNKNOWN_CHANNEL = 10003;
+/** Discord's JSON error codes for an id it can't resolve, or can't reach. A
+ *  channel Discord answers with Unknown Channel no longer exists. */
+export const UNKNOWN_CHANNEL = 10003;
 const UNKNOWN_GUILD = 10004;
 const UNKNOWN_MESSAGE = 10008;
 const UNKNOWN_USER = 10013;
@@ -61,7 +62,8 @@ export function explainDiscordError(err: unknown, args: Record<string, unknown>,
         why =
           `${channel ? `No channel ${channel}` : 'No such channel'} is visible to this connection: ${recalled}, ` +
           'or the channel deleted. For a text, announcement, voice or stage channel, re-send with its name instead ' +
-          "(#name, or #name (Server)), or take its id from list_channels, which shows a server's channels. " +
+          "(#name, or #name (Server)), or take its label from list_channels, which shows a server's channels: " +
+          'a channel whose name reaches another channel, or has a thread label\'s shape, is listed by its id. ' +
           "A thread or DM has no name route: its id has to be copied from where it was shown, not recalled.";
       }
       break;

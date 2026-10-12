@@ -24,7 +24,13 @@ function adapterFixture(t: { after: (fn: () => void) => void }, config: { guildI
   const emit = client.emit.bind(client) as (event: string, ...args: unknown[]) => boolean;
   const channels = client.channels.cache as unknown as Map<string, unknown>;
   const guilds = client.guilds.cache as unknown as Map<string, unknown>;
-  return { adapter, client, emit, channels, guilds };
+  /** A guild the cache holds, whose channels are the cached ones in it, as
+   *  the name resolver reads them. */
+  const held = (id: string, name: string, more: Record<string, unknown> = {}) => ({
+    id, name, ...more,
+    channels: { cache: { values: () => [...channels.values()].filter((c) => (c as { guildId?: string }).guildId === id) } },
+  });
+  return { adapter, client, emit, channels, guilds, held };
 }
 
 const facts = (over: Partial<ChannelFacts> & Pick<ChannelFacts, 'id' | 'type'>): ChannelFacts => ({
@@ -112,8 +118,8 @@ describe('labels', () => {
 
 describe("the channel cache reports a channel's facts", () => {
   it('for a cached thread and channel, and nothing for an uncached id or a DM', (t) => {
-    const { adapter, channels, guilds } = adapterFixture(t);
-    guilds.set('g1', { id: 'g1', name: 'Test Server' });
+    const { adapter, channels, guilds, held } = adapterFixture(t);
+    guilds.set('g1', held('g1', 'Test Server'));
     channels.set('c1', { id: 'c1', type: ChannelType.GuildText, name: 'general', guildId: 'g1', parentId: 'cat1' });
     // A thread's parent is looked up by id: discord.js's `parent` getter
     // throws for a thread whose guild it hasn't cached.
@@ -135,10 +141,11 @@ describe("the channel cache reports a channel's facts", () => {
       id: 'th2', guildId: 'g1', guildName: 'Test Server', type: 'thread', name: 'old',
       parentId: 'gone', parentName: null, archived: true,
     });
-    // A channel's parent is its category, whose name no label uses.
+    // A channel's parent is its category, whose name no label uses. Its
+    // name resolves back to it.
     assert.deepEqual(adapter.getCachedChannelFacts('ann1'), {
       id: 'ann1', guildId: 'g1', guildName: 'Test Server', type: 'announcement', name: 'news',
-      parentId: 'cat1', parentName: null, archived: false,
+      parentId: 'cat1', parentName: null, archived: false, nameResolves: true,
     });
     assert.equal(adapter.getCachedChannelFacts('st1')?.type, 'stage');
     // A guild the cache doesn't hold: its name isn't known.
@@ -171,8 +178,8 @@ describe('the kinds registered by listing them', () => {
   });
 
   it('when one is created, in a guild the guild filter admits', (t) => {
-    const { adapter, emit, guilds } = adapterFixture(t, { guildIds: ['g1'] });
-    guilds.set('g1', { id: 'g1', name: 'Test Server' });
+    const { adapter, emit, guilds, held } = adapterFixture(t, { guildIds: ['g1'] });
+    guilds.set('g1', held('g1', 'Test Server'));
     const created: Array<[string, string | null]> = [];
     adapter.onChannelCreate((c) => created.push([c.id, c.guildName]));
     for (const [id, type] of kinds) emit('channelCreate', { id, type, name: `chan-${id}`, guildId: 'g1', parentId: null });
@@ -181,9 +188,9 @@ describe('the kinds registered by listing them', () => {
     assert.deepEqual(created, listed.map((id) => [id, 'Test Server']));
   });
 
-  it('when one changes and the bot can view it, but not a category or a channel hidden from it', (t) => {
-    const { adapter, emit, guilds } = adapterFixture(t);
-    const guild = { id: 'g1', name: 'Test Server', members: { me: { id: 'bot' } } };
+  it('when one changes, whether or not the bot can view it, but not a category', (t) => {
+    const { adapter, emit, guilds, held } = adapterFixture(t);
+    const guild = held('g1', 'Test Server', { members: { me: { id: 'bot' } } });
     guilds.set('g1', guild);
     const updated: string[] = [];
     adapter.onChannelUpdate((c) => updated.push(`${c.id}:${c.name}`));
@@ -194,15 +201,17 @@ describe('the kinds registered by listing them', () => {
     // Renamed: reported, so the server can re-derive what it registered.
     emit('channelUpdate', channel('v1', ChannelType.GuildVoice, 'lounge'), channel('v1', ChannelType.GuildVoice, 'cafe'));
     emit('channelUpdate', channel('cat1', ChannelType.GuildCategory, 'a'), channel('cat1', ChannelType.GuildCategory, 'b'));
+    // Hidden from the bot: listing registers it all the same
+    // (getPostingChannels), so its rename is reported too.
     emit('channelUpdate', channel('c9', ChannelType.GuildText, 'x'), channel('c9', ChannelType.GuildText, 'y', false));
-    assert.deepEqual(updated, ['v1:cafe']);
+    assert.deepEqual(updated, ['v1:cafe', 'c9:y']);
   });
 });
 
 describe('the events that change or end a registration', () => {
   it("report a thread's change with its facts, archived included, and its deletion", (t) => {
-    const { adapter, emit, channels, guilds } = adapterFixture(t);
-    guilds.set('g1', { id: 'g1', name: 'Test Server' });
+    const { adapter, emit, channels, guilds, held } = adapterFixture(t);
+    guilds.set('g1', held('g1', 'Test Server'));
     channels.set('c1', { id: 'c1', type: ChannelType.GuildText, name: 'general', guildId: 'g1', parentId: null });
     const changes: ChannelFacts[] = [];
     const deleted: Array<[string, string]> = [];

@@ -22,7 +22,9 @@ describe('explainDiscordError', () => {
     assert.match(text, /No channel 111111111111111111 is visible to this connection: the id may be mistyped or remembered rather than copied/);
     assert.match(text, /For a text, announcement, voice or stage channel, re-send with its name instead/,
       'the name cure is offered only for the kinds the name route resolves');
-    assert.match(text, /or take its id from list_channels/, 'a route to a real id');
+    assert.match(text, /or take its label from list_channels/, 'a route to a real address');
+    assert.match(text, /a channel whose name reaches another channel, or has a thread label's shape, is listed by its id/,
+      "the name cure isn't offered for a name the route refuses or sends elsewhere");
     assert.match(text, /A thread or DM has no name route: its id has to be copied from where it was shown, not recalled\./,
       'a thread or DM is never sent back to a name that could match another channel');
   });
@@ -126,6 +128,7 @@ describe('the tool chokepoint', () => {
   it('a send addressed by name explains the name that was sent, not only the id it resolved to', async () => {
     const adapter = {
       resolveChannelRef: () => ({ ok: true as const, id: '777777777777777777', matched: undefined }),
+      refreshStale: async () => {},
       // #63's send path reads the channel's cached metadata for its receipt.
       getCachedChannelMeta: () => null,
       sendMessage: async () => { throw discordError('Unknown Channel', 10003, 404); },

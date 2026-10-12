@@ -867,7 +867,10 @@ describe('server integration', () => {
     s.discord = {
       onMessage: noop, onMessageEdit: noop, onMessageDelete: noop,
       onChannelCreate: noop, onChannelUpdate: noop, onChannelDelete: noop, onGuildCreate: noop,
-      onGuildRename: noop, onThreadUpdate: noop, onThreadDelete: noop,
+      onGuildRename: noop, onThreadUpdate: noop, onThreadDelete: noop, onGuildDelete: noop, onGuildAvailable: noop,
+      onChannelRefreshed: noop,
+      onChannelStale: noop,
+      refreshStale: async () => {},
       onReaction: (h: (ev: Record<string, unknown>) => void) => { reactionHandler = h; },
     };
     const sent: unknown[] = [];
@@ -904,6 +907,24 @@ describe('server integration', () => {
     assert.ok(!wire.includes(SUPPRESSED_UNICODE), 'no suppressed glyph on the wire');
     assert.ok(!wire.includes(SUPPRESSED_BARE), 'no bare-variant glyph on the wire');
     assert.ok(!wire.includes(SUPPRESSED_CUSTOM_ID), 'no suppressed custom id on the wire');
+  });
+
+  it("a reaction on a thread's message names the thread in its origin, and keeps its own tags only", () => {
+    const server = makeServer();
+    server.filtersState.applyParsed(withKey());
+    const { handler, sent } = wireReactionHandler(server);
+    const reaction = { ...baseEvent, emoji: HARMLESS, emojiId: null, token: HARMLESS };
+    handler({ ...reaction, threadId: 'chan1', threadName: 'design-chat', threadParentName: 'general' });
+    handler(reaction);
+    const [inThread, inChannel] = sent.map((s) => (s as { params: { tags: string[]; origin: Record<string, unknown> } }).params);
+    // No chat:thread: a gate rule keyed on it, written for a thread's
+    // messages, would otherwise start matching its reactions.
+    assert.deepEqual(inThread.tags, ['chat:reaction']);
+    assert.equal(inThread.origin.threadName, 'design-chat');
+    assert.equal(inThread.origin.threadParentName, 'general');
+    assert.equal('threadId' in inThread.origin, false, 'a Discord thread is named by its channel id');
+    assert.deepEqual(inChannel.tags, ['chat:reaction']);
+    assert.equal('threadName' in inChannel.origin, false, 'a channel message has no thread fields');
   });
 
   it('withhold-everything posture drops every live reaction event', () => {
