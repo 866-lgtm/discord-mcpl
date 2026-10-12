@@ -41,6 +41,9 @@ function fixture(opts: {
     },
     getCachedChannelMeta: (id: string) => opts.cached?.[id] ?? null,
     getCachedChannelFacts: cachedFacts,
+    isStale: () => false,
+    getCachedChannelFactsFor: (ids: Iterable<string>) =>
+      new Map([...ids].flatMap((id) => { const f = cachedFacts(id); return f ? [[id, f] as const] : []; })),
     getCachedDmRecipientName: (id: string) => opts.dmRecipients?.[id] ?? null,
     // #65's read gate: no channel filters are configured here.
     async inspectionRefusal() { return null; },

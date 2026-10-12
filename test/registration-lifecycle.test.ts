@@ -3,18 +3,19 @@
  * the removals it makes without an event for each channel: a deleted channel
  * takes its threads with it, a guild the bot leaves takes all of its
  * channels, a channel Discord answers with Unknown Channel is deleted, and a
- * guild back from an outage is reconciled with what it has now. A delivery
- * that set out before such a removal neither names nor registers what was
- * removed, and a deleted channel's watermark stays dropped. A guild left and
- * joined again is registered again, as at boot, since its channels still
- * exist, and an outage removes nothing while it lasts. A forum or media
- * channel's rename reaches its posts' labels, and a hidden channel's rename
- * its own. A `#name (Guild)` label is kept only while it resolves back to its
- * channel.
+ * guild back from an outage is reconciled with what it has now, what it no
+ * longer lists held as stale until Discord reports it again. A delivery
+ * that set out before such a removal, or before an
+ * archive, neither names nor registers what was removed or archived, and a
+ * deleted channel's watermark stays dropped; a message posted after an
+ * archive registers the thread it unarchived. A guild left and joined again
+ * is registered again, as at boot, since its channels still exist, and an
+ * outage removes nothing while it lasts. A forum or media channel's rename
+ * reaches its posts' labels, and a hidden channel's rename its own. A
+ * `#name (Guild)` label is kept only while it resolves back to its channel,
+ * and a batch of labels reads one view of the channels names resolve among.
  *
- * Found in review by Daphne and in a haiku review; the deletion, rename and
- * guild cases are built from Daphne's probe. They drive discord.js's own
- * actions and gateway handlers.
+ * The cases drive discord.js's own actions and gateway handlers.
  */
 import { it, type TestContext } from 'node:test';
 import * as assert from 'node:assert/strict';
@@ -30,6 +31,7 @@ const require = createRequire(import.meta.url);
 const discordJs = dirname(require.resolve('discord.js'));
 const channelUpdate = require(resolve(discordJs, 'client/websocket/handlers/CHANNEL_UPDATE.js'));
 const guildCreate = require(resolve(discordJs, 'client/websocket/handlers/GUILD_CREATE.js'));
+const threadUpdate = require(resolve(discordJs, 'client/websocket/handlers/THREAD_UPDATE.js'));
 const Status = require(resolve(discordJs, 'util/Status.js'));
 
 const G = '100000000000000001';
@@ -49,6 +51,16 @@ const threadData = {
   thread_metadata: { archived: false, auto_archive_duration: 60, archive_timestamp: new Date().toISOString(), locked: false },
 };
 const attachment = { url: 'https://example.invalid/a.txt', name: 'a.txt', contentType: 'text/plain', size: 1 };
+/** A time to set Discord's clocks by, with others a second either side. */
+const T = Date.UTC(2026, 9, 12, 8, 0, 0);
+/** The thread as Discord sends it, archived or not, its archive status last
+ *  changed at `at`. */
+const threadAt = (archived: boolean, at: number) => ({
+  ...threadData,
+  thread_metadata: { archived, auto_archive_duration: 60, archive_timestamp: new Date(at).toISOString(), locked: false },
+});
+/** The id of a message created at `at`: a snowflake carries its time. */
+const snowflakeAt = (at: number) => ((BigInt(at) - 1420070400000n) << 22n).toString();
 
 function fixture(t: TestContext, opts: {
   /** The type of the thread's channel, P. */
@@ -98,6 +110,28 @@ function fixture(t: TestContext, opts: {
       sent.some((x) => x.method === 'channels/changed' && x.params[key]?.some((d: { id: string }) => d.id === id)),
     removed: (id: string) => sent.some((x) => x.method === 'channels/changed' && x.params.removed?.includes(id)),
     deleteThread: () => client.actions.ThreadDelete.handle({ id: TH, guild_id: G, parent_id: P, type: ChannelType.PublicThread }),
+    /** A message posted in the thread at `at`, mentioning the bot, as the
+     *  gateway delivers it. */
+    gatewayCreate: (at: number) => client.actions.MessageCreate.handle({
+      id: snowflakeAt(at), guild_id: G, channel_id: TH, channel_type: ChannelType.PublicThread, type: MessageType.Default,
+      content: `<@${BOT}> hi`, timestamp: new Date(at).toISOString(),
+      author: { id: U, username: 'Bob', discriminator: '0', avatar: null }, mentions: [bot], mention_roles: [], attachments: [], embeds: [], flags: 0,
+    }),
+    /** An edit of a message in the thread, as the adapter reports one. */
+    edit: (messageId: string) => server.forwardMessageEdit(TH, messageId, 'edited', false, {
+      guildId: G, authorName: 'Bob', threadId: TH, threadName: 'topic', threadParentName: 'before',
+    }),
+    /** The guild goes unavailable and comes back with its channel P and
+     *  these threads. */
+    comesBack: (threads: unknown[] = []) => {
+      client.actions.GuildDelete.handle({ id: G, unavailable: true });
+      guildCreate(client, {
+        d: {
+          id: G, name: 'Guild', unavailable: false, owner_id: BOT, member_count: 1, members: [{ user: bot, roles: [] }],
+          channels: [parentData(ChannelType.GuildText)], threads,
+        },
+      }, { id: 0 });
+    },
   };
 }
 
@@ -249,8 +283,10 @@ it("a deletion delivered after its thread's channel was deleted doesn't register
   f.client.actions.MessageDelete.handle({ id: message.id, channel_id: TH, guild_id: G });
   const pending = [...(f.adapter as any).messageEventDeliveries.values()];
   assert.ok(pending.length, 'the deletion is on its way');
+  f.server.forwardedWatermark.set(TH, '100');
   f.client.actions.ChannelDelete.handle({ id: P, guild_id: G, type: ChannelType.GuildText });
   assert.equal(f.client.channels.cache.has(TH), false, "discord.js dropped the channel's thread with it");
+  assert.equal(f.server.forwardedWatermark.has(TH), false, "the thread's watermark goes with its channel");
   await Promise.allSettled(pending);
   const push = f.pushes()[0];
   assert.ok(push, 'the deletion is delivered');
@@ -413,10 +449,15 @@ it('a guild back from an outage is reconciled with what it has now', async (t) =
   assert.equal(f.label(V), undefined);
   assert.equal(f.server.channelManager.get(threadMcplId), undefined);
   assert.ok(f.removed(idOf(V)) && f.removed(threadMcplId), 'and the host is told');
+  assert.ok(f.client.channels.cache.has(TH), "discord.js's client-wide cache keeps what the guild no longer lists");
+  assert.ok(f.adapter.isStale(V) && f.adapter.isStale(TH), 'marked stale');
   // Nothing gone this way is remembered as deleted: the thread may only have
   // been archived, and its next message registers it again.
-  await f.server.handleDiscordMessage(f.posted({ threadParentName: 'after' }));
+  f.gatewayCreate(T + 1000);
+  assert.equal(f.adapter.isStale(TH), false, 'a message posted there shows it is live');
+  await until(() => f.pushes().length > 0);
   assert.equal(f.pushes()[0]?.params.origin.mcplChannelId, threadMcplId);
+  assert.equal(f.label(TH), '#after › topic (Guild)');
 });
 
 it('a create on its way when the bot leaves the guild neither registers nor names its thread', async (t) => {
@@ -453,3 +494,237 @@ it("a guild left and joined again registers its channels again, as at boot, and 
   assert.equal(f.pushes()[0]?.params.origin.mcplChannelId, threadMcplId, 'and its message registers it');
   assert.ok(f.server.channelManager.get(threadMcplId));
 });
+
+for (const registered of [true, false]) {
+  it(`an archive that arrives while a create's attachments are fetched isn't undone by that create${registered ? '' : ', the thread\'s first'}`, async (t) => {
+    const f = fixture(t);
+    if (registered) f.server.registerGuildDelivery(G, TH);
+    const { held, release } = holder(t);
+    let fetching = false;
+    f.server.buildAttachmentBlocks = async () => { fetching = true; await held; return []; };
+    f.sent.length = 0;
+    const delivery = f.server.handleDiscordMessage(f.posted({ attachments: [attachment], timestamp: new Date(T) }));
+    assert.equal(fetching, true);
+    threadUpdate(f.client, { d: threadAt(true, T + 1000) });
+    assert.equal(f.adapter.getCachedChannelFacts(TH)?.archivedAt, T + 1000);
+    release();
+    await delivery;
+    const push = f.pushes()[0];
+    assert.ok(push, 'the message is still delivered');
+    assert.equal(push.params.origin.mcplChannelId, undefined);
+    assert.equal(f.server.channelManager.get(threadMcplId), undefined);
+    assert.equal(f.announced('added', threadMcplId), false, 'the archive stands');
+  });
+}
+
+it('a message posted after an archive registers the thread it unarchived, though the cache still says archived', async (t) => {
+  const f = fixture(t);
+  f.server.registerGuildDelivery(G, TH);
+  threadUpdate(f.client, { d: threadAt(true, T) });
+  assert.equal(f.server.channelManager.get(threadMcplId), undefined, 'the archive forgot it');
+  await f.server.handleDiscordMessage(f.posted({ timestamp: new Date(T + 1000) }));
+  assert.equal(f.pushes()[0]?.params.origin.mcplChannelId, threadMcplId);
+  assert.ok(f.server.channelManager.get(threadMcplId));
+});
+
+it("a message whose time equals its thread's archive leaves the thread archived", async (t) => {
+  const f = fixture(t);
+  threadUpdate(f.client, { d: threadAt(true, T) });
+  await f.server.handleDiscordMessage(f.posted({ timestamp: new Date(T) }));
+  assert.equal(f.pushes()[0]?.params.origin.mcplChannelId, undefined);
+  assert.equal(f.server.channelManager.get(threadMcplId), undefined);
+});
+
+for (const [when, archivedAt, registers] of [['after', T + 1000, false], ['before', T - 1000, true]] as const) {
+  it(`a create whose thread the lookup finds archived ${when} it was posted ${registers ? 'registers the thread it unarchived' : 'leaves the thread archived'}`, { timeout: 5000 }, async (t) => {
+    const f = fixture(t, { sparse: true });
+    const { held, release } = holder(t);
+    t.mock.method(f.client.rest, 'get', async () => { await held; return threadAt(true, archivedAt); });
+    f.gatewayCreate(T);
+    const lookup = (f.adapter as any).threadLookups.get(TH);
+    assert.ok(lookup, 'the create waits for the thread to be looked up');
+    release();
+    await lookup;
+    await until(() => f.pushes().length > 0);
+    assert.equal(f.pushes()[0]?.params.origin.mcplChannelId, registers ? threadMcplId : undefined);
+    assert.equal(f.server.channelManager.get(threadMcplId) !== undefined, registers);
+  });
+}
+
+it("a create that set out before its guild came back without the thread doesn't register it again", async (t) => {
+  const f = fixture(t);
+  f.server.registerGuildDelivery(G, TH);
+  const { held, release } = holder(t);
+  f.server.buildAttachmentBlocks = async () => { await held; return []; };
+  const delivery = f.server.handleDiscordMessage(f.posted({ attachments: [attachment] }));
+  f.comesBack();
+  assert.ok(f.adapter.isStale(TH), 'the guild came back without the thread');
+  assert.equal(f.server.channelManager.get(threadMcplId), undefined, 'and the registry forgot it');
+  release();
+  await delivery;
+  assert.equal(f.pushes()[0]?.params.origin.mcplChannelId, undefined);
+  assert.equal(f.server.channelManager.get(threadMcplId), undefined);
+});
+
+it('a create that set out before its guild came back registers a thread the guild still has', async (t) => {
+  const f = fixture(t);
+  const { held, release } = holder(t);
+  f.server.buildAttachmentBlocks = async () => { await held; return []; };
+  const delivery = f.server.handleDiscordMessage(f.posted({ attachments: [attachment] }));
+  f.comesBack([threadData]);
+  release();
+  await delivery;
+  assert.equal(f.pushes()[0]?.params.origin.mcplChannelId, threadMcplId);
+});
+
+it('a thread its guild came back without is registered by an edit once a threadUpdate reports it again', async (t) => {
+  const f = fixture(t);
+  f.server.registerGuildDelivery(G, TH);
+  f.server.subscribedChannels.add(TH);
+  f.comesBack();
+  await f.edit('1');
+  assert.equal(f.pushes().at(-1)?.params.origin.mcplChannelId, undefined, 'nothing has reported the thread since');
+  assert.equal(f.server.channelManager.get(threadMcplId), undefined);
+  threadUpdate(f.client, { d: threadAt(false, T) });
+  assert.equal(f.adapter.isStale(TH), false, 'Discord reported it again');
+  await f.edit('2');
+  assert.equal(f.pushes().at(-1)?.params.origin.mcplChannelId, threadMcplId);
+});
+
+it('a thread known only partly that its guild came back without is registered by an edit whose lookup began after the return', { timeout: 5000 }, async (t) => {
+  const f = fixture(t, { sparse: true });
+  f.server.subscribedChannels.add(TH);
+  f.comesBack();
+  assert.ok(f.adapter.isStale(TH));
+  t.mock.method(f.client.rest, 'get', async () => threadAt(false, T));
+  // An edit as the gateway delivers it: its thread is a partial, so the
+  // adapter looks it up before placing the edit.
+  f.client.emit('messageUpdate', { partial: true }, {
+    id: M, channelId: TH, guildId: G, partial: true, channel: f.client.channels.cache.get(TH),
+    content: 'edited', editedTimestamp: T + 2000, author: { id: U, username: 'Bob' },
+  });
+  await until(() => f.pushes().length > 0);
+  assert.equal(f.adapter.isStale(TH), false, 'the lookup reported it again');
+  assert.equal(f.pushes()[0]?.params.origin.mcplChannelId, threadMcplId);
+});
+
+it('a create whose thread lookup was out when the thread was archived stays unregistered, though the reply predates the archive', { timeout: 5000 }, async (t) => {
+  const f = fixture(t, { sparse: true });
+  const { held, release } = holder(t);
+  // The reply is the thread as Discord had it before the archive.
+  const before = threadAt(false, T - 1000);
+  t.mock.method(f.client.rest, 'get', async () => { await held; return before; });
+  f.gatewayCreate(T);
+  const lookup = (f.adapter as any).threadLookups.get(TH);
+  assert.ok(lookup, 'the create waits for the thread to be looked up');
+  threadUpdate(f.client, { d: threadAt(true, T + 1000) });
+  release();
+  await lookup;
+  await until(() => f.pushes().length > 0);
+  assert.equal(f.adapter.getCachedChannelFacts(TH)?.archived, false, 'the older reply overwrote the archive');
+  assert.equal(f.adapter.isStale(TH), true, 'so the cache is held as stale');
+  assert.equal(f.pushes()[0]?.params.origin.mcplChannelId, undefined);
+  assert.equal(f.server.channelManager.get(threadMcplId), undefined);
+});
+
+it("a create whose thread lookup was out when its guild came back without the thread doesn't register it, whatever the reply says", { timeout: 5000 }, async (t) => {
+  const f = fixture(t, { sparse: true });
+  const { held, release } = holder(t);
+  // The reply says the thread is live, as it was before the return.
+  t.mock.method(f.client.rest, 'get', async () => { await held; return threadAt(false, T); });
+  f.gatewayCreate(T + 1000);
+  const lookup = (f.adapter as any).threadLookups.get(TH);
+  assert.ok(lookup, 'the create waits for the thread to be looked up');
+  f.comesBack();
+  assert.ok(f.adapter.isStale(TH));
+  release();
+  await lookup;
+  await until(() => f.pushes().length > 0);
+  assert.equal(f.adapter.isStale(TH), true, 'the return stands over a reply that may be older');
+  assert.equal(f.pushes()[0]?.params.origin.mcplChannelId, undefined);
+  assert.equal(f.server.channelManager.get(threadMcplId), undefined);
+});
+
+it("a batch of facts reads every channel's name against one view of the candidates", async (t) => {
+  const many = Array.from({ length: 40 }, (_, i) => channelData(String(200000000000000000n + BigInt(i)), ChannelType.GuildText, `room-${i}`));
+  const f = fixture(t, { channels: many });
+  const cache = f.client.guilds.cache.get(G).channels.cache;
+  const values = cache.values.bind(cache);
+  let scans = 0;
+  cache.values = () => { scans++; return values(); };
+  const listed = f.adapter.getPostingChannels();
+  assert.equal(listed.length, 41);
+  assert.ok(listed.every((c) => c.nameResolves === true));
+  assert.equal(scans, 2, 'one pass lists the channels, and one builds the view');
+  scans = 0;
+  const facts = f.adapter.getCachedChannelFactsFor(many.map((c) => c.id));
+  assert.equal(facts.size, 40);
+  assert.equal(scans, 1);
+  for (const c of many) f.server.registerGuildDelivery(G, c.id);
+  scans = 0;
+  f.server.rederiveNamed('every');
+  assert.equal(scans, 1, 'a re-derivation of every registered channel builds one view');
+  t.mock.method(f.client.rest, 'get', async () => [parentData(ChannelType.GuildText), ...many]);
+  scans = 0;
+  const listing = await f.adapter.listChannels(G);
+  assert.equal(listing.length, 41);
+  assert.equal(scans, 1, 'and so does list_channels');
+});
+
+it("an edit that leaves a channel's name, kind and category as they were re-derives no other channel", (t) => {
+  const A = '100000000000000011';
+  const B = '100000000000000012';
+  const f = fixture(t, { channels: [channelData(A, ChannelType.GuildText, 'general'), channelData(B, ChannelType.GuildVoice, 'General')] });
+  f.server.registerGuildDelivery(G, A);
+  f.server.registerGuildDelivery(G, B);
+  assert.equal(f.label(B), idOf(B), 'the voice channel is labelled by its id');
+  const cache = f.client.guilds.cache.get(G).channels.cache;
+  const values = cache.values.bind(cache);
+  let scans = 0;
+  cache.values = () => { scans++; return values(); };
+  channelUpdate(f.client, { d: { ...channelData(A, ChannelType.GuildText, 'general'), topic: 'new topic' } });
+  assert.equal(scans, 1, "only the edited channel's own label is read");
+  scans = 0;
+  channelUpdate(f.client, { d: channelData(A, ChannelType.GuildText, 'lobby') });
+  assert.equal(scans, 2, 'a rename re-derives the channels its old name kept from theirs');
+  assert.equal(f.label(B), '#General (Guild)');
+});
+
+it('a guild that comes back again with a thread it came back without no longer holds it as stale', async (t) => {
+  const f = fixture(t);
+  f.server.subscribedChannels.add(TH);
+  f.comesBack();
+  assert.ok(f.adapter.isStale(TH));
+  f.comesBack([threadData]);
+  assert.equal(f.adapter.isStale(TH), false);
+  await f.edit('1');
+  assert.equal(f.pushes().at(-1)?.params.origin.mcplChannelId, threadMcplId);
+});
+
+for (const listed of [true, false]) {
+  it(`a guild left and joined again ${listed ? 'with' : 'without'} a thread it came back without registers ${listed ? 'it by an edit' : 'nothing for it'}, and holds a channel the rejoin leaves out as stale`, async (t) => {
+    const V = '100000000000000009';
+    const f = fixture(t, { channels: [channelData(V, ChannelType.GuildVoice, 'lounge')] });
+    f.server.subscribedChannels.add(TH);
+    f.comesBack();
+    assert.ok(f.adapter.isStale(TH) && f.adapter.isStale(V));
+    f.client.actions.GuildDelete.handle({ id: G });
+    // The leave removes the guild's cached channels, and with each the
+    // threads its threads.cache holds, the stale thread included. A channel
+    // the guild had stopped listing isn't among them, and stays.
+    assert.equal(f.client.channels.cache.has(TH), false);
+    assert.ok(f.client.channels.cache.has(V));
+    f.client.ws.status = Status.Ready;
+    guildCreate(f.client, {
+      d: {
+        id: G, name: 'Guild', owner_id: BOT, member_count: 1, members: [{ user: bot, roles: [] }],
+        channels: [parentData(ChannelType.GuildText)], threads: listed ? [threadData] : [],
+      },
+    }, { id: 0 });
+    assert.ok(f.adapter.isStale(V), 'the rejoin leaves the channel out too');
+    assert.equal(f.adapter.isStale(TH), false);
+    await f.edit('1');
+    assert.equal(f.pushes().at(-1)?.params.origin.mcplChannelId, listed ? threadMcplId : undefined);
+    assert.equal(f.server.channelManager.get(threadMcplId) !== undefined, listed);
+  });
+}

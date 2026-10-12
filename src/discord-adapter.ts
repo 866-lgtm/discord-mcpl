@@ -40,10 +40,24 @@ import {
   isSnowflake,
   parseChannelRef,
   resolveChannelName,
+  type ChannelCandidate,
   type ResolveResult,
 } from './channel-names.js';
 import { channelLabelFor } from './channels.js';
 import { UNKNOWN_CHANNEL } from './discord-errors.js';
+
+/** The candidates a channel name resolves among, given the name
+ *  (DiscordAdapter.nameView). */
+type NameView = (name: string) => ChannelCandidate[];
+
+/** What a channel update changed (DiscordAdapter.onChannelUpdate). */
+export interface ChannelChange {
+  /** Whether its name, its kind or its category changed: what decides
+   *  which channel a name resolves to (resolveChannelRef), the category
+   *  through the channel filters. A topic, position or permission edit
+   *  changes none of them. */
+  addressChanged: boolean;
+}
 
 /** Maximum attachments Discord accepts on a single message. */
 const MAX_DISCORD_ATTACHMENTS = 10;
@@ -255,6 +269,10 @@ export interface ChannelFacts {
   parentName?: string | null;
   /** For a thread, whether it's archived. */
   archived?: boolean;
+  /** For an archived thread, when Discord archived it (its
+   *  `archive_timestamp`, in ms), when the cache knows: a message posted
+   *  after it unarchived the thread, and one posted before it didn't. */
+  archivedAt?: number;
   /** For a kind a name can address, whether its `#name (Guild)` resolves
    *  back to it through the resolver tools use (resolveChannelRef). It
    *  doesn't when another channel holds the name: a same-named text channel,
@@ -635,6 +653,12 @@ export class DiscordAdapter {
   /** Creates waiting for their thread to be fetched, per channel, so later
    *  ones in the same thread are delivered after it, in order. */
   private threadLookups = new Map<string, Promise<void>>();
+  /** The guild channels and threads whose cached facts may be older than
+   *  what Discord has reported since (isStale), by id, with their guild. */
+  private stale = new Map<string, { guildId: string }>();
+  /** The channel fetches out now (refetchChannel), by channel id, each
+   *  marked once Discord reports on its channel while it's out. */
+  private fetchesOut = new Map<string, Set<{ overtaken: boolean }>>();
   private slashCommandHandler?: (interaction: ChatInputCommandInteraction) => void;
   private guildCommandDefs?: ApplicationCommandDataResolvable[];
 
@@ -652,7 +676,7 @@ export class DiscordAdapter {
   private heldDmRefusals: DmRefusal[] = [];
   private readyHandler?: () => void;
   private channelCreateHandler?: (channel: ChannelFacts) => void;
-  private channelUpdateHandler?: (channel: ChannelFacts) => void;
+  private channelUpdateHandler?: (channel: ChannelFacts, change: ChannelChange) => void;
   private channelDeleteHandler?: (guildId: string, channelId: string, threadIds: string[]) => void;
   private threadUpdateHandler?: (thread: ChannelFacts) => void;
   private threadDeleteHandler?: (guildId: string, threadId: string) => void;
@@ -888,8 +912,9 @@ export class DiscordAdapter {
    *  (getPostingChannels), so a rename re-derives what's registered, and one
    *  not yet registered is. Also fired for a forum or media channel
    *  (holdsPosts), which isn't registered, since it holds no messages, but
-   *  whose posts are threads whose labels name it. */
-  onChannelUpdate(handler: (channel: ChannelFacts) => void): void {
+   *  whose posts are threads whose labels name it. `change` says whether
+   *  the update can move a name from one channel to another. */
+  onChannelUpdate(handler: (channel: ChannelFacts, change: ChannelChange) => void): void {
     this.channelUpdateHandler = handler;
   }
 
@@ -936,15 +961,10 @@ export class DiscordAdapter {
    *  over what the guild has now: its channels of a listed kind the filters
    *  admit, and the ids of every channel and live thread it holds
    *  (`guild.channels.cache`, which discord.js refills from the guild's
-   *  payload). */
+   *  payload). The channels and threads the payload no longer lists stay in
+   *  the client-wide cache, marked stale (markUnlisted). */
   onGuildAvailable(handler: (guildId: string, channels: ChannelFacts[], present: ReadonlySet<string>) => void): void {
     this.guildAvailableHandler = handler;
-  }
-
-  /** Whether the bot is in a guild: the client's cache holds every guild
-   *  it's in, one that's unavailable in an outage included. */
-  hasGuild(guildId: string): boolean {
-    return this.client.guilds.cache.has(guildId);
   }
 
   /** Fired when a guild the filters admit is renamed: its name is in every
@@ -1459,8 +1479,12 @@ export class DiscordAdapter {
    *  thread the client knows only partly is fetched past the cache, which
    *  would hand back that same partial. */
   async getChannelMeta(channelId: string): Promise<ChannelMeta> {
-    const force = threadChannelUnknown(this.client.channels.cache.get(channelId));
-    const channel = await this.client.channels.fetch(channelId, { force });
+    // A channel the cache holds whole is read from it, as discord.js's fetch
+    // would; anything else is fetched from Discord (refetchChannel).
+    const cached = this.client.channels.cache.get(channelId);
+    const channel = cached && !cached.partial && !threadChannelUnknown(cached)
+      ? cached
+      : await this.refetchChannel(channelId);
     return this.extractChannelMeta(channel, channelId);
   }
 
@@ -1522,14 +1546,28 @@ export class DiscordAdapter {
     return this.channelFacts(this.client.channels.cache.get(channelId));
   }
 
+  /** getCachedChannelFacts for each of several channels, those the cache
+   *  holds, read against one view of the channels names resolve among
+   *  (nameView), as a re-derivation of many registered channels needs. */
+  getCachedChannelFactsFor(channelIds: Iterable<string>): Map<string, ChannelFacts> {
+    const names = this.nameView();
+    const result = new Map<string, ChannelFacts>();
+    for (const channelId of channelIds) {
+      const facts = this.channelFacts(this.client.channels.cache.get(channelId), names);
+      if (facts) result.set(channelId, facts);
+    }
+    return result;
+  }
+
   /** A guild channel's facts, read from the channel and the client's caches.
    *  The guild and a thread's parent are looked up by id, as threadPlace
    *  looks up a parent: discord.js's `ThreadChannel.parent` getter goes
-   *  through the thread's guild and throws when it has none. */
-  private channelFacts(channel: unknown): ChannelFacts | null {
+   *  through the thread's guild and throws when it has none. `names` is the
+   *  view nameResolves is read against; a batch of facts shares one. */
+  private channelFacts(channel: unknown, names: NameView = this.nameView()): ChannelFacts | null {
     const c = channel as {
       id?: string; guildId?: string | null; type?: number; name?: string | null;
-      parentId?: string | null; archived?: boolean | null;
+      parentId?: string | null; archived?: boolean | null; archiveTimestamp?: number | null;
     } | null | undefined;
     if (!c?.id || !c.guildId) return null;
     const type = mapChannelType(c.type);
@@ -1547,8 +1585,11 @@ export class DiscordAdapter {
       parentName: named(parent?.name),
       archived: type === 'thread' && c.archived === true,
     };
+    if (facts.archived && typeof c.archiveTimestamp === 'number' && Number.isFinite(c.archiveTimestamp)) {
+      facts.archivedAt = c.archiveTimestamp;
+    }
     if (isNameAddressableKind(type) && facts.name && facts.guildName) {
-      const resolved = this.resolveChannelRef(formatChannelLabel(facts.name, facts.guildName));
+      const resolved = this.resolveAmong(formatChannelLabel(facts.name, facts.guildName), names);
       facts.nameResolves = resolved.ok && resolved.id === facts.id;
     }
     return facts;
@@ -1697,11 +1738,12 @@ export class DiscordAdapter {
       throw new Error(`Guild ${guildId} not found`);
     }
     const channels = await guild.channels.fetch();
+    const names = this.nameView();
     const result: DiscordChannelInfo[] = [];
     channels.forEach((c: GuildBasedChannel | null) => {
       if (c) {
         if (!this.channelAllowed(guildId, c.id, c.parentId)) return;
-        const facts = this.channelFacts(c);
+        const facts = this.channelFacts(c, names);
         result.push({
           id: c.id,
           name: c.name,
@@ -1742,23 +1784,50 @@ export class DiscordAdapter {
    *    unusable. Threads remain addressable by id.
    */
   resolveChannelRef(ref: string): ResolveResult {
+    return this.resolveAmong(ref, this.nameView());
+  }
+
+  /** resolveChannelRef, against a given view of the candidates. A name is
+   *  matched only among candidates of that name (resolveChannelName compares
+   *  lowercased names), so its group is all the matcher needs. */
+  private resolveAmong(ref: string, names: NameView): ResolveResult {
     const parsed = parseChannelRef(ref);
     if (!parsed) {
       return { ok: false, reason: 'not-found', message: `Unusable channel reference: "${ref}"` };
     }
     if (parsed.kind === 'id') return { ok: true, id: parsed.id };
+    return resolveChannelName(parsed, names(parsed.name));
+  }
 
-    const candidates = buildCandidates(
-      [...this.client.guilds.cache.values()].map((g) => ({
-        id: g.id, name: g.name, channels: g.channels.cache.values(),
-      })),
-      {
-        ...(this.guildIds?.length ? { guildIds: this.guildIds } : {}),
-        mapType: mapChannelType,
-        allowed: (gid, cid, pid) => this.channelAllowed(gid, cid, pid),
-      },
-    );
-    return resolveChannelName(parsed, candidates);
+  /** The channels a name resolves among, read from the live cache (see
+   *  resolveChannelRef) when first asked and grouped by lowercased name. A
+   *  view is fresh for one call or one batch: a listing, or the facts of
+   *  many channels at once, reads every channel's name against the same
+   *  view instead of building the candidates again for each. */
+  private nameView(): NameView {
+    let byName: Map<string, ChannelCandidate[]> | undefined;
+    return (name) => {
+      if (!byName) {
+        byName = new Map();
+        const candidates = buildCandidates(
+          [...this.client.guilds.cache.values()].map((g) => ({
+            id: g.id, name: g.name, channels: g.channels.cache.values(),
+          })),
+          {
+            ...(this.guildIds?.length ? { guildIds: this.guildIds } : {}),
+            mapType: mapChannelType,
+            allowed: (gid, cid, pid) => this.channelAllowed(gid, cid, pid),
+          },
+        );
+        for (const c of candidates) {
+          const key = c.name.toLowerCase();
+          const group = byName.get(key);
+          if (group) group.push(c);
+          else byName.set(key, [c]);
+        }
+      }
+      return byName.get(name.toLowerCase()) ?? [];
+    };
   }
 
   /** Channel membership, by scope. Guild channels resolve to everyone whose
@@ -2162,23 +2231,25 @@ export class DiscordAdapter {
    *  channel of a listed kind (isListedKind) in the guilds the guild filter
    *  admits, that the channel filter admits. */
   getPostingChannels(): ChannelFacts[] {
+    const names = this.nameView();
     const result: ChannelFacts[] = [];
     for (const guild of this.client.guilds.cache.values()) {
       if (this.guildIds?.length && !this.guildIds.includes(guild.id)) continue;
-      result.push(...this.guildPostingChannels(guild));
+      result.push(...this.guildPostingChannels(guild, names));
     }
     return result;
   }
 
   /** One guild's channels of a listed kind that the channel filter admits,
    *  from the channel cache (the gateway fills it): getPostingChannels for a
-   *  guild the bot joins after startup. */
-  private guildPostingChannels(guild: Guild): ChannelFacts[] {
+   *  guild the bot joins after startup. Their names are read against one
+   *  view (nameView), or `names` when a larger listing shares its own. */
+  private guildPostingChannels(guild: Guild, names: NameView = this.nameView()): ChannelFacts[] {
     const result: ChannelFacts[] = [];
     for (const channel of guild.channels.cache.values()) {
       if (!isListedKind(mapChannelType(channel.type))) continue;
       if (!this.channelAllowed(guild.id, channel.id, channel.parentId)) continue;
-      const facts = this.channelFacts(channel);
+      const facts = this.channelFacts(channel, names);
       if (facts) result.push(facts);
     }
     return result;
@@ -2229,7 +2300,7 @@ export class DiscordAdapter {
       && !(channel && 'parentId' in channel)
       && !this.channelAllowed(guildId, message.channelId);
     if ((!guildId && !channel?.isDMBased()) || needsParent) {
-      channel = await this.client.channels.fetch(message.channelId, { force: true });
+      channel = await this.refetchChannel(message.channelId);
       guildId ??= channel && 'guildId' in channel ? channel.guildId : null;
     }
     if (!guildId && !channel?.isDMBased()) {
@@ -2372,6 +2443,9 @@ export class DiscordAdapter {
         mentionCount: message.mentions.users.size,
       };
       dbg('gateway:message-create', base);
+      // A message posted in a channel shows it's live, whatever older facts
+      // the cache holds of it (isStale).
+      this.stale.delete(message.channelId);
 
       // A thread the client knows only partly is fetched before the filters
       // decide, and this channel's later creates wait behind that fetch, so
@@ -2450,6 +2524,10 @@ export class DiscordAdapter {
     });
 
     this.client.on('threadUpdate', (_oldThread, newThread) => {
+      // Discord reported the thread as it is now: what the cache holds is
+      // current, unless a fetch that was out lands after this (overtake).
+      this.overtake(newThread.id);
+      this.stale.delete(newThread.id);
       const facts = this.channelFacts(newThread);
       if (facts) this.threadUpdateHandler?.(facts);
     });
@@ -2484,6 +2562,9 @@ export class DiscordAdapter {
     // fires for channels created later, not the ones that already existed on
     // join).
     this.client.on('guildCreate', (guild) => {
+      // A guild left and joined again can leave its old channels in the
+      // client-wide cache, as a return does.
+      this.markUnlisted(guild);
       void this.warmGuildMemberCache(guild);
       if (this.guildIds?.length && !this.guildIds.includes(guild.id)) return;
       // Register slash commands in guilds joined after startup.
@@ -2524,18 +2605,21 @@ export class DiscordAdapter {
     // the bot can view the channel doesn't decide it: listing registers every
     // channel the filters admit (getPostingChannels), so a hidden channel's
     // rename re-derives its label too.
-    this.client.on('channelUpdate', (_oldChannel, newChannel) => {
+    this.client.on('channelUpdate', (oldChannel, newChannel) => {
       if (!('guild' in newChannel)) return;
       if (!isListedKind(mapChannelType(newChannel.type)) && !holdsPosts(newChannel.type)) return;
       const guild = newChannel.guild;
       if (this.guildIds?.length && !this.guildIds.includes(guild.id)) return;
       if (!this.channelAllowed(guild.id, newChannel.id, newChannel.parentId)) return;
       const facts = this.channelFacts(newChannel);
-      if (facts) this.channelUpdateHandler?.(facts);
+      const old = oldChannel as { name?: string | null; type?: number; parentId?: string | null };
+      const addressChanged = old.name !== newChannel.name || old.type !== newChannel.type || old.parentId !== newChannel.parentId;
+      if (facts) this.channelUpdateHandler?.(facts, { addressChanged });
     });
 
     // A guild back from an outage or a gateway gap (onGuildAvailable).
     this.client.on('guildAvailable', (guild) => {
+      this.markUnlisted(guild);
       if (this.guildIds?.length && !this.guildIds.includes(guild.id)) return;
       this.guildAvailableHandler?.(guild.id, this.guildPostingChannels(guild), new Set(guild.channels.cache.keys()));
     });
@@ -2670,7 +2754,7 @@ export class DiscordAdapter {
    *  admitted, and go unnamed. */
   private async lookUpThread(guildId: string, channelId: string): Promise<void> {
     try {
-      await this.client.channels.fetch(channelId, { force: true });
+      await this.refetchChannel(channelId);
     } catch (err) {
       // Unknown Channel: the thread is gone, perhaps deleted with the channel
       // it hung off while its event waited, and nothing else will say so (a
@@ -2688,6 +2772,72 @@ export class DiscordAdapter {
           'Its events are decided without it: where its guild has a channel list, they pass only if the thread is listed itself, and they go unnamed.',
       );
     }
+  }
+
+  /** Fetch a channel past the cache, as Discord has it now. discord.js
+   *  patches the cached channel with the reply, so a reply that's older than
+   *  something Discord reported while the fetch was out (a threadUpdate for
+   *  the channel, or its guild coming back) can overwrite newer facts. Then
+   *  the channel is marked stale (isStale), until Discord reports it again.
+   *  A fetch nothing overtook brings the newest facts, and clears an earlier
+   *  mark. */
+  private async refetchChannel(channelId: string): Promise<Channel | null> {
+    const fetch = { overtaken: false };
+    let out = this.fetchesOut.get(channelId);
+    if (!out) this.fetchesOut.set(channelId, (out = new Set()));
+    out.add(fetch);
+    try {
+      const channel = await this.client.channels.fetch(channelId, { force: true });
+      const guildId = channel && 'guildId' in channel ? channel.guildId : null;
+      if (!fetch.overtaken) this.stale.delete(channelId);
+      else if (guildId) this.stale.set(channelId, { guildId });
+      return channel;
+    } finally {
+      out.delete(fetch);
+      if (out.size === 0) this.fetchesOut.delete(channelId);
+    }
+  }
+
+  /** Discord reported on a channel: a fetch of it that's out now may land
+   *  with older facts (refetchChannel). */
+  private overtake(channelId: string): void {
+    for (const fetch of this.fetchesOut.get(channelId) ?? []) fetch.overtaken = true;
+  }
+
+  /** Mark stale the channels and threads that a guild, back from an outage
+   *  or a gateway gap (onGuildAvailable) or joined again, no longer lists.
+   *  discord.js refills the guild's own cache from its payload
+   *  (Guild._patch), and keeps the rest in the client-wide cache with the
+   *  facts they had: a thread archived, or a channel deleted, meanwhile
+   *  reads as it did. A later threadUpdate only patches such a thread
+   *  (ChannelUpdateAction) and a fetch adds it with no guild
+   *  (ChannelManager.fetch), so neither puts it back in its guild's cache.
+   *  The payload reports on every channel of the guild, so a fetch of one
+   *  that's out now is overtaken. Marks from the guild's last payload go
+   *  first, and what's still unlisted is marked again. */
+  private markUnlisted(guild: Guild): void {
+    for (const [id, mark] of this.stale) if (mark.guildId === guild.id) this.stale.delete(id);
+    let marked = 0;
+    for (const channel of this.client.channels.cache.values()) {
+      const c = channel as { id: string; guildId?: string | null };
+      if (c.guildId !== guild.id || guild.channels.cache.has(c.id)) continue;
+      this.stale.set(c.id, { guildId: guild.id });
+      marked++;
+    }
+    for (const id of this.fetchesOut.keys()) {
+      if (guild.channels.cache.has(id) || this.stale.get(id)?.guildId === guild.id) this.overtake(id);
+    }
+    if (marked > 0) dbg('gateway:guild-unlisted', { guildId: guild.id, marked });
+  }
+
+  /** Whether what the client's cache holds of a guild channel or thread may
+   *  be older than what Discord has reported since: its guild came back, or
+   *  was joined again, without listing it (markUnlisted), or a fetch of it
+   *  landed after a newer report (refetchChannel). It stays stale until
+   *  Discord reports it again: a threadUpdate, a message posted in it, or a
+   *  fetch nothing overtook. */
+  isStale(channelId: string): boolean {
+    return this.stale.has(channelId);
   }
 
   /** Why a deliberate read of this channel is refused by the channel filters,

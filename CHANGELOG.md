@@ -551,9 +551,10 @@ in the git log and PR descriptions.
     to a voice channel.
   - **A thread is registered by its messages:** before its first message
     reaches the host, live or caught up by the reconnect sweep, or before an
-    edit or deletion there does. An archived thread is forgotten, and the
-    message that unarchives it registers it again, so the host holds the
-    live threads.
+    edit or deletion there does. An archived thread is forgotten, and a
+    message posted after the archive, which unarchives it, registers it
+    again, so the host holds the live threads. A message posted before the
+    archive, still on its way when the archive came, doesn't.
   - **Removals are followed.** A deleted thread is forgotten, and so is a
     deleted channel with the threads it's known to hold, registered or
     cached. So is a channel Discord answers with Unknown Channel, when a
@@ -563,9 +564,14 @@ in the git log and PR descriptions.
     threads by their messages. An outage removes nothing while it lasts, and
     a server back from one, or from a gap in the gateway connection, is
     reconciled with what it has then: what was deleted, or a thread
-    archived, meanwhile is forgotten, a new or renamed channel is
-    registered or re-derived. Only what was registered is announced as
-    removed.
+    archived, meanwhile is forgotten, and a new or renamed channel is
+    registered or re-derived. What the server no longer lists, on its
+    return or when the bot joins it again, isn't registered again until
+    Discord reports it (an update, a message posted there, or a fetch that
+    nothing newer overtook), so a delivery that set out before doesn't
+    register it. Neither does a delivery whose lookup Discord overtook with
+    an update, such as an archive. Only what was registered is announced
+    as removed.
   - **A label is made one way on every path,** `list_channels` and send
     receipts included. A channel's is its address, `#name (Guild)`. A
     thread's is `#parent › thread (Guild)`, or `› thread (Guild)` when its
@@ -593,8 +599,8 @@ in the git log and PR descriptions.
   - **A push names its channel (`mcplChannelId`) once it's registered,**
     which is every channel a message is delivered from except a thread
     archived since its missed messages (the sweep delivers them without
-    it), and one deleted, or in a server the bot left, while the message
-    was on its way. A DM's edit or deletion names its DM too, registered
+    it), and one deleted, archived or left out when its server came back,
+    or in a server the bot left, while the message was on its way. A DM's edit or deletion names its DM too, registered
     under its other party's name when that's known; one whose other party
     isn't known, in a DM not registered yet, goes without it.
   - **A deleted channel's watermark and missed tally go,** with those of the

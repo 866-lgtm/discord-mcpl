@@ -2932,7 +2932,7 @@ export class DiscordMcplServer {
       const sweptMcplId = isDM
         ? this.registerDmDelivery(channelId, { id: kept[0].authorId, name: kept[0].authorName })
         : guildId
-          ? this.registerGuildDelivery(guildId, channelId, { thread: meta?.threadId !== undefined })
+          ? this.registerGuildDelivery(guildId, channelId)
           : undefined;
 
       try {
@@ -2949,7 +2949,7 @@ export class DiscordMcplServer {
             // push's origin carries it, named when the channel is registered
             // (registerGuildDelivery says when it isn't: a thread archived
             // since its missed messages, a channel deleted or a guild left
-            // meanwhile).
+            // meanwhile, or one its guild came back without).
             ...(sweptMcplId ? { mcplChannelId: sweptMcplId } : {}),
             channelName: meta?.name ?? undefined,
             ...threadFields(thread),
@@ -3132,15 +3132,14 @@ export class DiscordMcplServer {
   /** Re-derive registered guild channels from what the cache knows of them
    *  now (a rename of the channel, its parent or its guild), announcing each
    *  whose label or metadata changed. One the cache no longer holds keeps
-   *  what it has. */
+   *  what it has. Their facts are read together, so their labels are checked
+   *  against one view of the channels names resolve among. */
   private rederiveChannels(descriptors: ChannelDescriptor[]): void {
-    const fresh: ChannelDescriptor[] = [];
-    for (const d of descriptors) {
-      const channelId = (d.address as { channelId?: string } | undefined)?.channelId;
-      const facts = channelId ? this.discord.getCachedChannelFacts(channelId) : null;
-      if (facts) fresh.push(this.guildDescriptor(facts));
-    }
-    this.registerChannels(fresh);
+    const channelIds = descriptors
+      .map((d) => (d.address as { channelId?: string } | undefined)?.channelId)
+      .filter((id): id is string => id !== undefined);
+    const facts = this.discord.getCachedChannelFactsFor(channelIds);
+    this.registerChannels([...facts.values()].map((f) => this.guildDescriptor(f)));
   }
 
   /**
@@ -3232,34 +3231,47 @@ export class DiscordMcplServer {
    * registered, which is when the delivery names it (origin.mcplChannelId);
    * undefined when it isn't.
    *
-   * The channel is described as the client's cache has it now. One the cache
-   * doesn't hold is registered under its id (channelLabelFor), with the kind
-   * `thread` when the delivery says it's a thread, else `unknown`; one
-   * registered already keeps its name (registerChannels). Not registered:
-   * - a channel of a guild the bot isn't in (hasGuild): it left, or was
-   *   removed, while the delivery was on its way;
+   * The channel is described as the client's cache has it now: a thread the
+   * client knows only partly by the partial it holds, labelled by its id
+   * (channelLabelFor); one registered already keeps its name
+   * (registerChannels). Not registered, and named only if registered:
+   * - a channel the cache doesn't hold: a message's channel is always there,
+   *   as a partial at least, until it's removed, as a guild the bot leaves
+   *   takes its channels with it;
+   * - a channel whose cached facts may be older than what Discord has
+   *   reported since (DiscordAdapter.isStale): its guild came back, from an
+   *   outage or a gap in the gateway connection, without it, or a fetch of
+   *   it landed after a newer report. It may have been archived or deleted
+   *   meanwhile, whatever the cache still says of it;
+   * - an archived thread, unless the message was posted in it after the
+   *   archive (`postedAt` later than `archivedAt`, by Discord's clocks),
+   *   which unarchived it, whatever the cache has heard yet. A message
+   *   posted before the archive, whose thread was archived while it was on
+   *   its way, leaves it archived, and so does one whose time equals the
+   *   archive's: the next message registers a thread wrongly left out, and
+   *   nothing would remove one wrongly registered. A thread is registered
+   *   while it's live and forgotten when it's archived, so the registry
+   *   holds the live threads, and a swept message from a thread archived
+   *   since is delivered without one.
+   * Neither registered nor named:
    * - a channel deleted lately, or a thread whose channel was
    *   (deletedLately): the delivery set out before the deletion;
-   * - a category or forum, which hold no messages;
-   * - an archived thread, unless a message was just posted in it (`posted`),
-   *   which unarchived it, whatever the cache has heard yet. A thread is
-   *   registered while it's live and forgotten when it's archived, so the
-   *   registry holds the live threads, and a swept message from a thread
-   *   archived since is delivered without one.
+   * - a category or forum, which hold no messages.
    */
   private registerGuildDelivery(
     guildId: string,
     channelId: string,
-    opts: { posted?: boolean; thread?: boolean } = {},
+    opts: { postedAt?: number } = {},
   ): string | undefined {
-    if (!this.discord.hasGuild(guildId) || this.deletedLately(guildId, channelId)) return undefined;
+    if (this.deletedLately(guildId, channelId)) return undefined;
     const id = mcplChannelId(guildId, channelId);
     const facts = this.discord.getCachedChannelFacts(channelId);
     if (facts && holdsNoMessages(facts.type)) return undefined;
-    if (facts?.archived && !opts.posted) return this.channelManager.get(id) ? id : undefined;
-    this.registerChannels([this.guildDescriptor(
-      facts ?? { id: channelId, guildId, guildName: null, type: opts.thread ? 'thread' : 'unknown', name: null },
-    )]);
+    const named = this.channelManager.get(id) ? id : undefined;
+    if (!facts || this.discord.isStale(channelId)) return named;
+    const unarchived = opts.postedAt !== undefined && (facts.archivedAt === undefined || opts.postedAt > facts.archivedAt);
+    if (facts.archived && !unarchived) return named;
+    this.registerChannels([this.guildDescriptor(facts)]);
     return id;
   }
 
@@ -3572,7 +3584,7 @@ export class DiscordMcplServer {
       );
     }
     return info?.guildId
-      ? this.registerGuildDelivery(info.guildId, channelId, { thread: info.threadId !== undefined })
+      ? this.registerGuildDelivery(info.guildId, channelId)
       : undefined;
   }
 
@@ -3927,10 +3939,12 @@ export class DiscordMcplServer {
     // is registered or re-derived, and so are the threads registered under
     // it, whose labels name it. A forum or media channel isn't registered,
     // holding no messages, but its posts' labels name it too.
-    this.discord.onChannelUpdate((channel) => {
+    this.discord.onChannelUpdate((channel, change) => {
       if (isListedKind(channel.type)) this.registerChannels([this.guildDescriptor(channel)]);
       this.rederiveChannels(this.registeredThreadsOf(channel.id));
-      this.rederiveNamed({ name: channel.name });
+      // Only a new name, kind or category can give a name to another
+      // channel, or take one from it.
+      if (change.addressChanged) this.rederiveNamed({ name: channel.name });
     });
 
     // Bot joined a new guild after startup: register its existing channels
@@ -4405,12 +4419,14 @@ export class DiscordMcplServer {
     // leave out is registered here: every thread, by its messages, so only
     // threads with activity are, never a server's whole thread archive.
     // Registered after the last await, and whether the channel is open read
-    // then too, so the delivery names what's registered when it goes out: a
-    // channel deleted, or a guild left, while the attachments were fetched
-    // is neither registered nor named (registerGuildDelivery).
+    // then too, so the delivery names what's registered when it goes out,
+    // judged by what's newest (registerGuildDelivery): a thread archived
+    // after this message was posted stays archived, and a channel deleted, a
+    // guild left, or a channel its guild came back without, while the
+    // attachments were fetched, isn't registered.
     const registeredId = isDM
       ? this.registerDmDelivery(msg.channelId, { id: msg.authorId, name: msg.authorName })
-      : this.registerGuildDelivery(guildId, msg.channelId, { posted: true, thread: msg.threadId !== undefined });
+      : this.registerGuildDelivery(guildId, msg.channelId, { postedAt: msg.timestamp.getTime() });
     const channelIsOpen = this.channelManager.isOpen(channelMcplId);
     dbg('handleDiscordMessage:forwarding', {
       channelMcplId,
@@ -4527,8 +4543,9 @@ export class DiscordMcplServer {
           // is Discord-internal; DMs especially only ever arrive via push/event
           // (channel closed), so without this the host can't route a reply back
           // to the DM (item-3 redux, DM sub-case). Named once registered, as
-          // every channel a message is posted in is, except one deleted, or
-          // in a guild the bot left, while this message was on its way
+          // every channel a message is posted in is, except one deleted,
+          // archived, or left out when its guild came back, or in a guild the
+          // bot left, while this message was on its way
           // (registerGuildDelivery).
           ...(registeredId ? { mcplChannelId: registeredId } : {}),
           channelName: msg.channelName,
