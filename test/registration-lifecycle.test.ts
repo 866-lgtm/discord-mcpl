@@ -1568,3 +1568,17 @@ it("a batch of facts reads which servers' names are uncertain once, however many
   assert.equal(scans.mock.callCount(), 1);
   assert.ok(listed.every((c) => c.nameResolves === true), 'marks for channels the server no longer lists block no name');
 });
+
+it("a stale channel in a server whose name isn't known keeps names given without a server from resolving", (t) => {
+  const Y = '100000000000000025';
+  const G2 = '100000000000000027';
+  const X2 = '100000000000000028';
+  const f = fixture(t, { channels: [channelData(Y, ChannelType.GuildVoice, 'news')] });
+  // discord.js's stub for a guild it knows only by id, with a channel a fetch put in its cache.
+  const stub = f.client.guilds._add({ id: G2, unavailable: true });
+  f.client.channels._add({ id: X2, guild_id: G2, type: ChannelType.GuildText, name: 'former', parent_id: null }, stub);
+  (f.adapter as any).stale.set(X2, { guildId: G2 });
+  assert.equal(f.adapter.resolveChannelRef('#news').ok, false, 'X2 may be news now');
+  const qualified = f.adapter.resolveChannelRef('#news (Guild)');
+  assert.equal(qualified.ok && qualified.id, Y, 'a name in a named server with nothing stale still resolves');
+});

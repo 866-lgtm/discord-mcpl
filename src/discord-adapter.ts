@@ -54,8 +54,10 @@ import { UNKNOWN_CHANNEL } from './discord-errors.js';
  *  each computed once per view. */
 interface NameView {
   (name: string): ChannelCandidate[];
-  /** Lowercased names of the guilds whose names are uncertain now. */
-  uncertainGuilds(): ReadonlySet<string>;
+  /** Where names are uncertain now: the lowercased names of those guilds,
+   *  and whether any guild is, a guild whose name isn't known included,
+   *  which a name given without a guild could mean. */
+  uncertainGuilds(): { readonly named: ReadonlySet<string>; readonly any: boolean };
 }
 
 /** How many times refetchChannel fetches a channel whose fetches Discord's
@@ -1903,7 +1905,7 @@ export class DiscordAdapter {
     // A name-addressed tool fetches stale channels first (refreshStale), so
     // this holds only while a fetch fails.
     const uncertain = names.uncertainGuilds();
-    if (parsed.guild === undefined ? uncertain.size > 0 : uncertain.has(parsed.guild.toLowerCase())) {
+    if (parsed.guild === undefined ? uncertain.any : uncertain.named.has(parsed.guild.toLowerCase())) {
       return {
         ok: false, reason: 'ambiguous',
         message: `${ref} can't be resolved by name right now: a channel in that server couldn't be fetched from Discord, so its current name isn't known, and it may be the one this name means. Address the channel by its id instead (list_channels gives each one's).`,
@@ -1912,21 +1914,26 @@ export class DiscordAdapter {
     return resolveChannelName(parsed, names(parsed.name));
   }
 
-  /** The guilds, by lowercased name, where a stale channel may hold a name:
+  /** The guilds where a stale channel may hold a name, by lowercased name,
+   *  and whether there's any, a guild without a known name included:
    *  its guild lists it now, the guild filter admits that guild, and it's of
    *  a kind a name addresses. Its category may be stale too, so the channel
    *  filters aren't applied. A channel its guild no longer lists, such as
    *  one a return left out, holds no name there. Read once per name view. */
-  private uncertainGuildNames(): Set<string> {
-    const names = new Set<string>();
+  private uncertainGuildNames(): { named: Set<string>; any: boolean } {
+    const named = new Set<string>();
+    let any = false;
     for (const [id, { guildId }] of this.stale) {
       if (!this.guildAdmitted(guildId)) continue;
       const guild = this.client.guilds.cache.get(guildId);
       const channel = guild?.channels.cache.get(id);
-      if (!guild?.name || !channel) continue;
-      if (isNameAddressableKind(mapChannelType(channel.type))) names.add(guild.name.toLowerCase());
+      if (!guild || !channel || !isNameAddressableKind(mapChannelType(channel.type))) continue;
+      // A guild whose name isn't known can't be named, but a name given
+      // without a guild could mean one of its channels.
+      any = true;
+      if (guild.name) named.add(guild.name.toLowerCase());
     }
-    return names;
+    return { named, any };
   }
 
   /** The channels a name resolves among, read from the live cache (see
@@ -1941,7 +1948,7 @@ export class DiscordAdapter {
     const channelsOf = (g: Guild): Iterable<GuildBasedChannel> =>
       key === undefined ? g.channels.cache.values() : channelsNamed(g.channels.cache.values(), key);
     let byName: Map<string, ChannelCandidate[]> | undefined;
-    let uncertain: Set<string> | undefined;
+    let uncertain: { named: Set<string>; any: boolean } | undefined;
     const view = ((name: string) => {
       if (!byName) {
         byName = new Map();
