@@ -3173,6 +3173,26 @@ export class DiscordMcplServer {
    * (`name`); a guild joined, left, renamed or back re-derives every one,
    * since a label names its guild.
    */
+  /** Whether the filters' answer for a thread rests on facts that are
+   *  known: a thread whose channel is stale may be admitted through a
+   *  category that's no longer the channel's, or not admitted through one
+   *  that is now (channelAllowed), so its registration stays as it is
+   *  until that channel's fresh fetch or update decides it. */
+  private threadAdmissionKnown(thread: { parentId?: string | null }): boolean {
+    return !thread.parentId || !this.discord.isStale(thread.parentId);
+  }
+
+  /** A registered thread's facts, as an update brings them: registered
+   *  again while the filters admit it, forgotten when they don't. */
+  private registerOrForgetThread(thread: ChannelFacts): void {
+    const id = mcplChannelId(thread.guildId, thread.id);
+    if (this.discord.channelAdmitted(thread.guildId, thread.id, thread.parentId ?? null)) {
+      this.registerChannels([this.guildDescriptor(thread)]);
+    } else {
+      this.forgetChannels([id]);
+    }
+  }
+
   private rederiveNamed(which: { name: string | null } | 'every'): void {
     const named = which === 'every' ? undefined : which.name?.toLowerCase();
     this.rederiveChannels(this.channelManager.getAll().filter((d) => {
@@ -4002,7 +4022,8 @@ export class DiscordMcplServer {
         this.registerChannels([this.guildDescriptor(channel)]);
       }
       // Only a new name, kind or category can change its threads' labels,
-      // or give a name to another channel, or take one from it.
+      // or give a name to another channel, or take one from it, and so can
+      // a channel that's no longer stale, giving its guild's names back.
       if (change.addressChanged) {
         this.rederiveChannels(this.registeredThreadsOf(channel.id));
         this.rederiveNamed({ name: channel.name });
@@ -4047,11 +4068,8 @@ export class DiscordMcplServer {
     this.discord.onThreadUpdate((thread) => {
       const id = mcplChannelId(thread.guildId, thread.id);
       if (!this.channelManager.get(id)) return;
-      if (thread.archived || !this.discord.channelAdmitted(thread.guildId, thread.id, thread.parentId ?? null)) {
-        this.forgetChannels([id]);
-      } else {
-        this.registerChannels([this.guildDescriptor(thread)]);
-      }
+      if (thread.archived) this.forgetChannels([id]);
+      else if (this.threadAdmissionKnown(thread)) this.registerOrForgetThread(thread);
     });
 
     // A fetch left a channel stale: its current name isn't known, so no
@@ -4080,8 +4098,8 @@ export class DiscordMcplServer {
       const admitted = this.discord.channelAdmitted(facts.guildId, channelId, facts.parentId ?? null);
       if (facts.type === 'thread') {
         if (!this.channelManager.get(id)) return;
-        if (facts.archived || !admitted) this.forgetChannels([id]);
-        else this.registerChannels([this.guildDescriptor(facts)]);
+        if (facts.archived) this.forgetChannels([id]);
+        else if (this.threadAdmissionKnown(facts)) this.registerOrForgetThread(facts);
         return;
       }
       if (!admitted) {

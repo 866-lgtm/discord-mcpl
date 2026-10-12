@@ -1458,6 +1458,7 @@ it("a stale channel renamed while its fetch was out keeps every name in its serv
   f.adapter.sendMessage = (async (channelId: string) => { sent.push(channelId); return { messageId: '1' }; }) as any;
   const result = await (f.server as any).handleToolCall('send_message', { channelId: '#news (Guild)', content: 'hi' });
   assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /current name may be this one/);
   assert.deepEqual(sent, [], "X may be news now, and the text channel would win it");
 });
 
@@ -1581,4 +1582,105 @@ it("a stale channel in a server whose name isn't known keeps names given without
   assert.equal(f.adapter.resolveChannelRef('#news').ok, false, 'X2 may be news now');
   const qualified = f.adapter.resolveChannelRef('#news (Guild)');
   assert.equal(qualified.ok && qualified.id, Y, 'a name in a named server with nothing stale still resolves');
+});
+
+it("an update of a stale channel that changes only its topic gives its server's names back", (t) => {
+  const f = fixture(t, { channels: [channelData(X, ChannelType.GuildText, 'news')] });
+  f.server.registerGuildDelivery(G, P);
+  assert.equal(f.label(P), '#before (Guild)');
+  (f.adapter as any).markStale(X, G);
+  assert.equal(f.label(P), idOf(P));
+  dispatch(f.client, 'CHANNEL_UPDATE', channelUpdate, { d: { ...channelData(X, ChannelType.GuildText, 'news'), topic: 'new topic' } });
+  assert.equal(f.adapter.isStale(X), false);
+  assert.equal(f.label(P), '#before (Guild)');
+});
+
+it("a thread update while its channel is stale leaves the thread registered, its admission unknown", (t) => {
+  const f = filtered(t);
+  // X's cached category may be older than Discord's: its filter answer isn't known.
+  (f.adapter as any).stale.set(X, { guildId: G });
+  dispatch(f.client, 'THREAD_UPDATE', threadUpdate, { d: { ...threadInX, name: 'renamed' } });
+  assert.notEqual(f.label(TX), undefined);
+  assert.equal(f.removed(idOf(TX)), false);
+});
+
+it("a reaction or an edit in a thread whose channel is stale looks the channel up first", { timeout: 5000 }, async (t) => {
+  for (const event of ['reaction', 'edit'] as const) {
+    const f = filtered(t);
+    (f.adapter as any).stale.set(X, { guildId: G });
+    const get = t.mock.method(f.client.rest, 'get', async () => inCategory(C1));
+    const channel = f.client.channels.cache.get(TX);
+    if (event === 'reaction') {
+      const message = { id: M, channelId: TX, guildId: G, channel, partial: false, author: { id: U, username: 'Bob' }, content: 'hi', cleanContent: 'hi' };
+      f.client.emit('messageReactionAdd', { partial: false, emoji: { name: '👍', id: null }, message }, { id: U, username: 'Bob', partial: false });
+    } else {
+      f.server.subscribedChannels.add(TX);
+      f.client.emit('messageUpdate', { partial: true }, {
+        id: M, channelId: TX, guildId: G, partial: true, channel, content: 'edited', editedTimestamp: T + 2000, author: { id: U, username: 'Bob' },
+      });
+    }
+    await until(() => get.mock.callCount() > 0 && !f.adapter.isStale(X));
+    assert.equal(f.adapter.isStale(X), false, event);
+    assert.match(String(get.mock.calls[0]?.arguments[0]), new RegExp(X), event);
+  }
+});
+
+it("a create in a thread known only partly whose channel turns out stale looks the channel up too", { timeout: 5000 }, async (t) => {
+  const f = fixture(t, { sparse: true });
+  (f.adapter as any).stale.set(P, { guildId: G });
+  const routes: string[] = [];
+  t.mock.method(f.client.rest, 'get', async (route: string) => {
+    routes.push(String(route));
+    return String(route).includes(TH) ? threadAt(false, T) : parentData(ChannelType.GuildText);
+  });
+  f.gatewayCreate(T);
+  await until(() => f.pushes().length > 0);
+  assert.ok(routes.some((r) => r.includes(TH)) && routes.some((r) => r.includes(P)), routes.join(' '));
+  assert.equal(f.adapter.isStale(P), false);
+});
+
+it("a message in a thread whose stale channel is fetched fresh in an admitted category is delivered", { timeout: 5000 }, async (t) => {
+  const f = filtered(t);
+  (f.adapter as any).stale.set(X, { guildId: G });
+  t.mock.method(f.client.rest, 'get', async () => inCategory(C1));
+  f.client.actions.MessageCreate.handle({
+    id: M, guild_id: G, channel_id: TX, type: MessageType.Default, content: `<@${BOT}> hi`, timestamp: new Date().toISOString(),
+    author: { id: U, username: 'Bob', discriminator: '0', avatar: null }, mentions: [bot], mention_roles: [], attachments: [], embeds: [], flags: 0,
+  });
+  await until(() => f.pushes().length > 0);
+  assert.equal(f.pushes().length, 1);
+});
+
+it("a stale channel in a server the guild filter leaves out, or a stale thread, keeps no name from resolving", (t) => {
+  const G2 = '100000000000000027';
+  const X2 = '100000000000000028';
+  const f = fixture(t, { guildIds: [G] });
+  const other = f.client.guilds._add({ id: G2, name: 'Other', unavailable: false });
+  f.client.channels._add({ id: X2, guild_id: G2, type: ChannelType.GuildText, name: 'former', parent_id: null }, other);
+  (f.adapter as any).stale.set(X2, { guildId: G2 });
+  (f.adapter as any).stale.set(TH, { guildId: G });
+  const bare = f.adapter.resolveChannelRef('#before');
+  assert.equal(bare.ok && bare.id, P);
+});
+
+it("a name qualified by a server resolves when a server known only by id holds a channel of that name", (t) => {
+  const Y = '100000000000000025';
+  const G2 = '100000000000000027';
+  const X2 = '100000000000000028';
+  const f = fixture(t, { channels: [channelData(Y, ChannelType.GuildText, 'news')] });
+  const stub = f.client.guilds._add({ id: G2, unavailable: true });
+  f.client.channels._add({ id: X2, guild_id: G2, type: ChannelType.GuildText, name: 'news', parent_id: null }, stub);
+  const qualified = f.adapter.resolveChannelRef('#news (Guild)');
+  assert.equal(qualified.ok && qualified.id, Y);
+});
+
+it("a fresh fetch of a registered thread while its channel is stale leaves the thread registered", async (t) => {
+  const f = filtered(t);
+  (f.adapter as any).stale.set(X, { guildId: G });
+  (f.adapter as any).stale.set(TX, { guildId: G });
+  t.mock.method(f.client.rest, 'get', async () => ({ ...threadInX, name: 'renamed' }));
+  await f.adapter.getChannelMeta(TX);
+  assert.equal(f.adapter.isStale(TX), false);
+  assert.notEqual(f.label(TX), undefined);
+  assert.equal(f.removed(idOf(TX)), false);
 });

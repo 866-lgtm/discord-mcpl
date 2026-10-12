@@ -584,21 +584,29 @@ in the git log and PR descriptions.
     after the POST, so the cache keeps what the gateway reported of it
     meanwhile; if that fetch fails the channel becomes stale, and if
     Discord says it's gone already the tool says so. A stale channel's
-    facts decide nothing. Its current name isn't known, so while its
-    server lists a stale channel of a kind a name addresses, no name in
-    that server resolves, and the label of every such channel there is
-    its id until a fresh fetch; a thread keeps its display-only label.
-    A stale channel's category admits none of its threads.
-    The registration listings leave it out. A name-addressed tool and
-    `refresh_channels` fetch stale channels first, as a delivery from a
-    thread fetches its stale channel first. A channel that Discord moves
-    out of what the channel filters admit is forgotten, with the threads
-    admitted through it, as on a server's return, and a delivery on its
-    way from it doesn't register it again. Editing the filters file
-    registers what it newly admits, and `filters_update` registers the
-    channels of a server it newly admits; neither forgets what they stop
-    admitting until a restart, as before. Only what was registered is
-    announced as removed.
+    facts decide no registration and no name, until a fresh fetch or an
+    update of the channel clears its mark. Its current name isn't known,
+    so while a server lists a stale channel of a kind a name addresses,
+    no name in that server resolves, and no name given without a server
+    resolves anywhere. The label of every channel a name addresses there
+    is its id meanwhile, as is a stale thread's; a thread that isn't
+    stale keeps its display-only label. A stale channel's category admits
+    none of its threads, and a registered thread whose channel is stale
+    stays registered until that channel's fresh fetch or update decides.
+    The registration listings leave a stale channel out. A name-addressed
+    tool and `refresh_channels` fetch stale channels first, as a delivery
+    from a thread fetches its stale channel first; if that lookup fails,
+    the filters decide the delivery on what the cache holds. A channel
+    that Discord moves out of what the channel filters admit is
+    forgotten, with the threads admitted through it, as on a server's
+    return, and a delivery on its way from it doesn't register it again.
+    Editing the filters, through the file or `filters_update`, registers
+    the channels of a server they newly admit; a channel newly listed in
+    a server already admitted is registered by its next message or
+    `refresh_channels`. Neither edit forgets what the filters stop
+    admitting: that goes at a restart, at its server's return, or when
+    an update or fresh fetch shows it outside them. Only what was
+    registered is announced as removed.
   - **`list_channels` reads a server's channels from the gateway's
     cache** instead of fetching them from Discord, so it can't leave older
     facts in the cache than an update brought meanwhile. It lists the same

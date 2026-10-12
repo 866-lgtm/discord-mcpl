@@ -47,8 +47,6 @@ import {
 import { channelLabelFor, mcplChannelId } from './channels.js';
 import { UNKNOWN_CHANNEL } from './discord-errors.js';
 
-/** The candidates a channel name resolves among, given the name
- *  (DiscordAdapter.nameView). */
 /** The channels a name resolves among (nameView), with the guilds where
  *  no name resolves while a channel there is stale (uncertainGuildNames),
  *  each computed once per view. */
@@ -1011,9 +1009,10 @@ export class DiscordAdapter {
     this.guildRenameHandler = handler;
   }
 
-  /** A thread's channel, when it's stale: its category, which the filters
-   *  can admit the thread through, may be older than Discord's, so a
-   *  delivery looks it up too before the filters decide (channelAllowed). */
+  /** A thread's channel, when it's stale: the channel's category, which
+   *  the filters can admit the thread through, may be older than Discord's,
+   *  so a delivery looks the channel up too before the filters decide
+   *  (channelAllowed). */
   private staleParentOf(channel: unknown): string | null {
     const thread = channel as { isThread?: () => boolean; parentId?: string | null } | null | undefined;
     if (!thread?.isThread?.() || !thread.parentId) return null;
@@ -1028,8 +1027,9 @@ export class DiscordAdapter {
   /** Fetch every stale channel again (refetchChannel), before a decision
    *  that reads names or facts across channels: resolving a channel by
    *  name, or listing what to register. A fresh fetch clears a mark and
-   *  registers the channel again (onChannelRefreshed); one that stays stale
-   *  is left out of those decisions. A failed fetch leaves its mark. */
+   *  registers the channel again (onChannelRefreshed); while one stays
+   *  stale, its guild's names don't resolve and it's left out of listing.
+   *  A failed fetch, or one overtaken on every try, leaves its mark. */
   async refreshStale(): Promise<void> {
     if (this.stale.size === 0) return;
     await Promise.all([...this.stale.keys()].map((id) => this.refetchChannel(id).catch((err: unknown) => {
@@ -1900,15 +1900,17 @@ export class DiscordAdapter {
     if (parsed.kind === 'id') return { ok: true, id: parsed.id };
     // A stale channel's current name isn't known: Discord may have renamed
     // it to any name, this one included, so no name in its guild resolves
-    // while it's stale, whichever channel holds the name in the cache. So
-    // every label in that guild is its channel's id meanwhile (channelFacts).
-    // A name-addressed tool fetches stale channels first (refreshStale), so
-    // this holds only while a fetch fails.
+    // while it's stale, whichever channel holds the name in the cache, and
+    // no name given without a guild resolves while any guild has one. So
+    // the label of every channel a name addresses there is its id meanwhile
+    // (channelFacts). A name-addressed tool fetches stale channels first
+    // (refreshStale), so this holds while no fetch of the channel is fresh.
     const uncertain = names.uncertainGuilds();
     if (parsed.guild === undefined ? uncertain.any : uncertain.named.has(parsed.guild.toLowerCase())) {
+      const where = parsed.guild === undefined ? 'a server this name could mean' : 'that server';
       return {
         ok: false, reason: 'ambiguous',
-        message: `${ref} can't be resolved by name right now: a channel in that server couldn't be fetched from Discord, so its current name isn't known, and it may be the one this name means. Address the channel by its id instead (list_channels gives each one's).`,
+        message: `${ref} can't be resolved by name right now: Discord's current facts for a channel in ${where} aren't known (its latest fetch failed or was overtaken by a change), so its current name may be this one. Address the channel by its id instead (list_channels gives each one's).`,
       };
     }
     return resolveChannelName(parsed, names(parsed.name));
@@ -1953,8 +1955,9 @@ export class DiscordAdapter {
       if (!byName) {
         byName = new Map();
         const candidates = buildCandidates(
+          // A guild known only by id has no name yet (discord.js's stub).
           [...this.client.guilds.cache.values()].map((g) => ({
-            id: g.id, name: g.name, channels: channelsOf(g),
+            id: g.id, name: g.name ?? '', channels: channelsOf(g),
           })),
           {
             ...(this.guildIds?.length ? { guildIds: this.guildIds } : {}),
@@ -2791,8 +2794,10 @@ export class DiscordAdapter {
     // rename re-derives its label too. A channel moved out of what the
     // filters admit is reported as no longer admitted, and forgotten.
     this.client.on('channelUpdate', (oldChannel, newChannel) => {
-      // Discord reported the channel as it is now (see threadUpdate).
-      this.stale.delete(newChannel.id);
+      // Discord reported the channel as it is now (see threadUpdate). One
+      // that was stale gives its guild's names back (resolveAmong), as a new
+      // name would, so it counts as a change of address.
+      const wasStale = this.stale.delete(newChannel.id);
       if (!('guild' in newChannel)) return;
       if (!isListedKind(mapChannelType(newChannel.type)) && !holdsPosts(newChannel.type)) return;
       const guild = newChannel.guild;
@@ -2800,7 +2805,7 @@ export class DiscordAdapter {
       const admitted = this.channelAllowed(guild.id, newChannel.id, newChannel.parentId);
       const facts = this.channelFacts(newChannel);
       const old = oldChannel as { name?: string | null; type?: number; parentId?: string | null };
-      const addressChanged = old.name !== newChannel.name || old.type !== newChannel.type || old.parentId !== newChannel.parentId;
+      const addressChanged = wasStale || old.name !== newChannel.name || old.type !== newChannel.type || old.parentId !== newChannel.parentId;
       if (facts) this.channelUpdateHandler?.(facts, { addressChanged, admitted });
     });
 
