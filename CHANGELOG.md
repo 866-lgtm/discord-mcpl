@@ -555,37 +555,52 @@ in the git log and PR descriptions.
     message that unarchives it registers it again, so the host holds the
     live threads.
   - **Removals are followed.** A deleted thread is forgotten, and so is a
-    deleted channel with its threads, and every channel of a server the bot
-    leaves or is removed from; that server's channels are registered again
-    if the bot rejoins, and an outage removes nothing. Only what was
-    registered is announced as removed.
-  - **A label is made one way on every path.** A channel's is its address,
-    `#name (Guild)`. A thread's is `#parent › thread (Guild)`, display-only,
-    since `#thread (Guild)` would paste back as a same-named channel; a tool
-    given one refuses it, even where a voice channel has that name. Where a
-    name isn't known (a server the client hasn't cached), or wouldn't
-    resolve back to the channel (a voice channel named like a thread label,
-    a kind no name resolves to), the label is the channel's id,
-    `discord:<guild>:<channel>`, never a bare `#name` that another server's
-    channel could answer to. A rename of a channel (a forum or media
-    channel's included, whose posts are threads), a thread or a server, or a
-    name learned since, re-derives the labels it's in, announced as
-    `updated`.
+    deleted channel with the threads it's known to hold, registered or
+    cached. So is a channel Discord answers with Unknown Channel, when a
+    thread is looked up or the reconnect sweep fetches it. Every channel of
+    a server the bot leaves or is removed from is forgotten too; if the bot
+    rejoins, the server's channels are registered again, as at boot, and its
+    threads by their messages. An outage removes nothing while it lasts, and
+    a server back from one, or from a gap in the gateway connection, is
+    reconciled with what it has then: what was deleted, or a thread
+    archived, meanwhile is forgotten, a new or renamed channel is
+    registered or re-derived. Only what was registered is announced as
+    removed.
+  - **A label is made one way on every path,** `list_channels` and send
+    receipts included. A channel's is its address, `#name (Guild)`. A
+    thread's is `#parent › thread (Guild)`, or `› thread (Guild)` when its
+    channel's name isn't known, display-only either way, since
+    `#thread (Guild)` would paste back as a same-named channel; a tool given
+    one refuses it, even where a voice channel has that name. Where a name
+    isn't known (a server the client hasn't cached), or wouldn't resolve
+    back to the channel, the label is the channel's id,
+    `discord:<guild>:<channel>`, never a bare `#name` that another channel
+    could answer to. A name doesn't resolve back for a kind no name resolves
+    to, a voice channel named like a thread label, a voice or stage channel
+    beside a same-named text channel (Discord's stock "General" pair, where
+    the name reaches the text channel), and two channels of one name and
+    kind. A rename of a channel (hidden from the bot or not, and a forum or
+    media channel's, whose posts are threads), a thread or a server, a name
+    learned since, or a channel taking or freeing a name, re-derives the
+    labels it's in, announced as `updated`.
   - **Every host connection is given the whole registry,** whatever was
     registered while another host, or none, was connected, and is told of
     the channels removed while no host was connected. A restart starts
-    afresh: threads and DMs come back as they're active, and a host that
-    keeps a server's channels across a reconnect keeps a thread deleted or
-    archived while the server was down.
+    afresh: threads and DMs come back as they're active. Nothing announces
+    the removal of a thread deleted or archived while discord-mcpl was
+    down, so a host that keeps a Discord server's channels across a
+    reconnect keeps such a thread.
   - **A push names its channel (`mcplChannelId`) once it's registered,**
     which is every channel a message is delivered from except a thread
     archived since its missed messages (the sweep delivers them without
     it), and one deleted, or in a server the bot left, while the message
     was on its way. A DM's edit or deletion names its DM too, registered
-    under its other party's name when that's known.
-  - **A deleted channel's watermark and missed tally go,** as do those of a
-    channel the reconnect sweep finds Discord no longer knows (deleted while
-    the server was down, say), so later starts stop fetching it. A message
+    under its other party's name when that's known; one whose other party
+    isn't known, in a DM not registered yet, goes without it.
+  - **A deleted channel's watermark and missed tally go,** with those of the
+    threads it's known to hold, as do those of a channel the reconnect sweep
+    finds Discord no longer knows (deleted while discord-mcpl was down,
+    say), so later starts stop fetching it. A message
     or catch-up delivered from a channel after its deletion doesn't bring
     the watermark back. A server the bot leaves keeps its channels'
     watermarks, since they still exist.

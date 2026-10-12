@@ -263,7 +263,7 @@ describe('channelLabel', () => {
 
 const TYPES: Record<number, string> = {
   0: 'text', 2: 'voice', 4: 'category', 11: 'thread', 12: 'thread',
-  13: 'unknown', 15: 'forum', 16: 'unknown',
+  13: 'stage', 15: 'forum', 16: 'unknown',
 };
 const mapType = (t: number | undefined) => TYPES[t ?? -1] ?? 'unknown';
 const chan = (id: string, name: string, type: number, parentId: string | null = null) =>
@@ -280,9 +280,10 @@ describe('buildCandidates', () => {
       chan('5', 'a-forum', 15), chan('6', 'a-stage', 13), chan('7', 'media', 16),
     ]);
     const got = buildCandidates([g], { mapType, allowed: allowAll });
-    assert.deepEqual(got.map((c) => c.name).sort(), ['text-room', 'voice-room']);
-    // Forums 400 on a bare send; stage/media land in 'unknown'. All still
-    // reachable by id -- excluded from NAME addressing only.
+    assert.deepEqual(got.map((c) => c.name).sort(), ['a-stage', 'text-room', 'voice-room']);
+    // Forums 400 on a bare send, and media lands in 'unknown'. All still
+    // reachable by id -- excluded from NAME addressing only. A stage
+    // channel's text chat takes messages, as a voice channel's does.
   });
 
   it('carries the type through, so the tie-break has something to work with', () => {

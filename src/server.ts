@@ -58,15 +58,15 @@ import { MessageFlags } from 'discord.js';
 import { toolDefinitions } from './tools.js';
 import { withToolClasses } from './tool-classes.js';
 import { featureSets, isEnabled, featureSetForTool } from './feature-sets.js';
-import { ChannelManager, mcplChannelId, parseMcplChannelId, toDescriptor, toDmDescriptor } from './channels.js';
+import { ChannelManager, channelLabelFor, mcplChannelId, parseMcplChannelId, toDescriptor, toDmDescriptor } from './channels.js';
 import {
   channelLabel,
-  formatChannelLabel,
+  isNameAddressableKind,
   isSnowflake,
   looksLikeExplicitName,
   type AddressingPath,
 } from './channel-names.js';
-import { explainDiscordError, type ExplainContext } from './discord-errors.js';
+import { UNKNOWN_CHANNEL, explainDiscordError, type ExplainContext } from './discord-errors.js';
 import { saveFiltersFile, loadFiltersFile, DiscordFiltersState, type DiscordFilters } from './filters.js';
 import { StateTracker } from './state.js';
 import { existsSync, readFileSync } from 'node:fs';
@@ -361,8 +361,6 @@ const RECENT_CREATES_MAX = 512;
 /** How many deleted channel ids the server remembers (deletedChannels). A
  *  delivery is on its way for seconds, not for a thousand deletions. */
 const DELETED_CHANNELS_KEPT = 1000;
-/** Discord's JSON error code for a channel it doesn't know. */
-const DISCORD_UNKNOWN_CHANNEL = 10003;
 /** Attachment blocks above this size are not kept for edits (inline images). */
 const RECENT_CREATE_ATTACHMENT_BYTES = 64 * 1024;
 
@@ -2308,9 +2306,11 @@ export class DiscordMcplServer {
     } else {
       const meta = this.resolveChannelMeta(discordChannelId);
       canonical = meta.mcplChannelId;
-      if (meta.guildId && meta.channelName && meta.guildName) {
-        fallbackLabel = formatChannelLabel(meta.channelName, meta.guildName);
-      }
+      // An unregistered channel is labelled as it would be registered
+      // (channelLabelFor): a thread's label is its display form, never a
+      // `#name (Guild)` that pastes back as a same-named channel.
+      const facts = this.discord.getCachedChannelFacts?.(discordChannelId);
+      if (facts) fallbackLabel = channelLabelFor(facts);
     }
     const label = (canonical ? this.channelManager.get(canonical)?.label : undefined) ?? fallbackLabel;
     const id = canonical ?? `discord:?:${discordChannelId}`;
@@ -2742,14 +2742,20 @@ export class DiscordMcplServer {
       } catch (err) {
         dbg('sweep:fetch-failed', { channelId, error: errorText(err) });
         // Discord doesn't know the channel: it was deleted, perhaps while
-        // the server was down, or with a deleted channel it hung off, so no
-        // deletion event reached the server. There is nothing left to catch
-        // up on, so its watermark and missed tally go, as a deletion's do,
-        // and later starts stop fetching it. Any other failure keeps them,
-        // to try again at the next start.
-        if ((err as { code?: unknown } | null)?.code === DISCORD_UNKNOWN_CHANNEL) {
-          const tallied = this.missedTally.delete(channelId);
-          if (this.forwardedWatermark.delete(channelId) || tallied) this.saveWatermark();
+        // discord-mcpl was down, or with a deleted channel it hung off, so no
+        // deletion event reached it. Where its guild is known, that is its
+        // deletion (channelDeleted): it's forgotten, remembered as deleted,
+        // and loses its watermark and missed tally. Otherwise those two go,
+        // so later starts stop fetching it. Any other failure keeps them, to
+        // try again at the next start.
+        if ((err as { code?: unknown } | null)?.code === UNKNOWN_CHANNEL) {
+          const guildId = this.guildOfChannel(channelId);
+          if (guildId) {
+            this.channelDeleted(guildId, channelId);
+          } else {
+            const tallied = this.missedTally.delete(channelId);
+            if (this.forwardedWatermark.delete(channelId) || tallied) this.saveWatermark();
+          }
         }
         continue;
       }
@@ -3137,6 +3143,48 @@ export class DiscordMcplServer {
     this.registerChannels(fresh);
   }
 
+  /**
+   * Re-derive the registered channels whose label can have changed because
+   * another channel took or gave up their name. A `#name (Guild)` label is
+   * kept only while it resolves back to its channel (channelLabelFor): a
+   * voice channel's name goes to a same-named text channel, and two channels
+   * of one name and kind lose it to each other. So a channel's creation,
+   * rename or deletion re-derives those labelled by id although they have a
+   * name (another channel held it) and those named like the channel
+   * (`name`); a guild joined, left, renamed or back re-derives every one,
+   * since a label names its guild.
+   */
+  private rederiveNamed(which: { name: string | null } | 'every'): void {
+    const named = which === 'every' ? undefined : which.name?.toLowerCase();
+    this.rederiveChannels(this.channelManager.getAll().filter((d) => {
+      const m = d.metadata as { channelType?: string; channelName?: string } | undefined;
+      if (!m?.channelType || !isNameAddressableKind(m.channelType) || !m.channelName) return false;
+      return which === 'every' || d.label === d.id || m.channelName.toLowerCase() === named;
+    }));
+  }
+
+  /**
+   * A guild is back (from an outage, or in a new gateway session) with what
+   * it has now: its listed channels, and the ids of every channel and live
+   * thread it holds. Discord doesn't replay what happened while it was away,
+   * so a registered channel or thread it no longer has is forgotten (deleted,
+   * or a thread archived, meanwhile), and so is a listed channel the filters
+   * no longer admit; its listed channels are registered or re-derived, and
+   * the threads that remain with them. Nothing is remembered as deleted
+   * (deletedChannels): what's gone may only have been archived.
+   */
+  private guildReturned(guildId: string, channels: ChannelFacts[], present: ReadonlySet<string>): void {
+    const listed = new Set(channels.map((c) => c.id));
+    this.forgetChannels(this.registeredInGuild(guildId).filter((d) => {
+      const channelId = (d.address as { channelId: string }).channelId;
+      const type = (d.metadata as { channelType?: string } | undefined)?.channelType;
+      return !present.has(channelId) || (type !== undefined && isListedKind(type as ChannelFacts['type']) && !listed.has(channelId));
+    }).map((d) => d.id));
+    this.registerChannels(channels.map((c) => this.guildDescriptor(c)));
+    this.rederiveChannels(this.registeredInGuild(guildId));
+    this.rederiveNamed('every');
+  }
+
   /** Registered threads whose channel is `channelId`. */
   private registeredThreadsOf(channelId: string): ChannelDescriptor[] {
     return this.channelManager.getAll().filter((d) => {
@@ -3148,6 +3196,17 @@ export class DiscordMcplServer {
   /** Registered channels and threads of a guild. */
   private registeredInGuild(guildId: string): ChannelDescriptor[] {
     return this.channelManager.getAll().filter((d) => (d.address as { guildId?: string } | undefined)?.guildId === guildId);
+  }
+
+  /** The guild a channel is in, as the client's cache or the registry knows
+   *  it; undefined for a DM, or a channel neither knows. */
+  private guildOfChannel(channelId: string): string | undefined {
+    const cached = this.discord.getCachedChannelFacts(channelId)?.guildId;
+    if (cached) return cached;
+    const address = this.channelManager.getAll()
+      .map((d) => d.address as { guildId?: string; channelId?: string } | undefined)
+      .find((a) => a?.channelId === channelId);
+    return address?.guildId && address.guildId !== 'dm' ? address.guildId : undefined;
   }
 
   /** Whether a guild channel was deleted lately, or the channel a thread is
@@ -3245,6 +3304,8 @@ export class DiscordMcplServer {
     }
     if (pruned) this.saveWatermark();
     this.forgetChannels(ids.map((id) => mcplChannelId(guildId, id)));
+    // A name the deleted channel held can go back to a channel labelled by id.
+    this.rederiveNamed({ name: null });
   }
 
   /** Re-enumerate every channel currently visible to the bot and register any
@@ -3855,8 +3916,11 @@ export class DiscordMcplServer {
     // The registry follows Discord whether or not a host is connected; a
     // host connecting later is given all of it, removals included
     // (syncChannelsWithHost).
+    // A channel's name can take a label's name from a channel registered
+    // under it (rederiveNamed).
     this.discord.onChannelCreate((channel) => {
       this.registerChannels([this.guildDescriptor(channel)]);
+      this.rederiveNamed({ name: channel.name });
     });
 
     // A listed channel changed (renamed, moved, or the bot let into it): it
@@ -3866,6 +3930,7 @@ export class DiscordMcplServer {
     this.discord.onChannelUpdate((channel) => {
       if (isListedKind(channel.type)) this.registerChannels([this.guildDescriptor(channel)]);
       this.rederiveChannels(this.registeredThreadsOf(channel.id));
+      this.rederiveNamed({ name: channel.name });
     });
 
     // Bot joined a new guild after startup: register its existing channels
@@ -3873,20 +3938,29 @@ export class DiscordMcplServer {
     // (channelCreate only covers channels created *after* the join).
     this.discord.onGuildCreate((guildId, channels) => {
       const { added } = this.registerChannels(channels.map((c) => this.guildDescriptor(c)));
+      this.rederiveNamed('every');
       dbg('onGuildCreate', { guildId, total: channels.length, added: added.length });
     });
 
     // The bot left a guild, or was removed from it: what's registered there
     // is forgotten. Its channels still exist, so they keep their watermarks
-    // and aren't remembered as deleted (deletedChannels); the guild's
-    // guildCreate registers them again if the bot rejoins.
+    // and aren't remembered as deleted (deletedChannels). If the bot
+    // rejoins, the guild's guildCreate registers its listed channels again,
+    // as boot does, and its threads come back by their messages.
     this.discord.onGuildDelete((guildId) => {
       this.forgetChannels(this.registeredInGuild(guildId).map((d) => d.id));
+      this.rederiveNamed('every');
     });
+
+    // A guild back from an outage or a gateway gap: Discord doesn't replay
+    // what happened while it was away, so the registry is reconciled with
+    // what the guild has now (guildReturned).
+    this.discord.onGuildAvailable((guildId, channels, present) => this.guildReturned(guildId, channels, present));
 
     // A guild's name is in every label of its channels.
     this.discord.onGuildRename((guildId) => {
       this.rederiveChannels(this.registeredInGuild(guildId));
+      this.rederiveNamed('every');
     });
 
     // A registered thread that's archived is forgotten, so the registry

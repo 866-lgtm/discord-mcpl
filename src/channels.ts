@@ -32,21 +32,29 @@ export function parseMcplChannelId(id: string): { guildId: string; channelId: st
  * message delivered from it, an edit or delete), so a label means the same
  * whichever path made it.
  * - A channel the resolver names (text, announcement, voice, stage): its
- *   address, `#name (Guild)`, the string a tool's channelId accepts back.
+ *   address, `#name (Guild)`, the string a tool's channelId accepts back,
+ *   while that resolves back to it (nameResolves).
  * - A thread: `#parent › thread (Guild)`, display only (formatThreadLabel
- *   says why). Threads are addressed by id.
+ *   says why), or `› thread (Guild)` when its channel's name isn't known.
+ *   Threads are addressed by id.
  * - Anything else: its composite id, `discord:<guild>:<channel>`, which
  *   addresses exactly this channel. That is the label when the guild's or
  *   the channel's name isn't known (a bare `#name` would resolve to a
  *   same-named channel in whichever guild has one), for a kind the resolver
- *   doesn't name, and for a voice or stage channel whose name has a thread
- *   label's shape (`general › design`), which the resolver refuses as a name.
- * The server re-derives a registered label when what it's made from changes.
+ *   doesn't name, for a voice or stage channel whose name has a thread
+ *   label's shape (`general › design`), which the resolver refuses as a
+ *   name, and for a channel whose name resolves to another channel: a voice
+ *   channel beside a same-named text channel, which the resolver prefers,
+ *   or two channels of one name and kind.
+ * The server re-derives a registered label when what it's made from changes,
+ * another channel's name included.
  */
 export function channelLabelFor(c: ChannelFacts): string {
   if (c.guildName && c.name) {
     if (c.type === 'thread') return formatThreadLabel(c.parentName, c.name, c.guildName);
-    if (isNameAddressableKind(c.type) && !isThreadLabelShape(c.name)) return formatChannelLabel(c.name, c.guildName);
+    if (isNameAddressableKind(c.type) && !isThreadLabelShape(c.name) && c.nameResolves !== false) {
+      return formatChannelLabel(c.name, c.guildName);
+    }
   }
   return mcplChannelId(c.guildId, c.id);
 }

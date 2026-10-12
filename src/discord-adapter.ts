@@ -36,11 +36,14 @@ import { dbg } from './debug-log.js';
 import {
   buildCandidates,
   formatChannelLabel,
+  isNameAddressableKind,
   isSnowflake,
   parseChannelRef,
   resolveChannelName,
   type ResolveResult,
 } from './channel-names.js';
+import { channelLabelFor } from './channels.js';
+import { UNKNOWN_CHANNEL } from './discord-errors.js';
 
 /** Maximum attachments Discord accepts on a single message. */
 const MAX_DISCORD_ATTACHMENTS = 10;
@@ -225,12 +228,14 @@ export interface DiscordChannelInfo {
   name: string;
   type: 'text' | 'announcement' | 'voice' | 'stage' | 'category' | 'thread' | 'forum' | 'unknown';
   parentId?: string;
-  /** Guild-qualified display label, `#name (GuildName)` — the form a
-   *  registered channel's label takes (channelLabelFor) and the same string
-   *  the channelId argument accepts. Returned so listings hand back something
-   *  PASTEABLE: the not-found error tells agents to "use list_channels to see
-   *  what is addressable", which was only true once this field existed. Both
-   *  forms are present on purpose — label to compose a send now, id to store. */
+  /** The channel's label, made as a registered channel's is
+   *  (channelLabelFor): `#name (GuildName)` where that name resolves back to
+   *  it, otherwise its id, `discord:<guild>:<channel>`. Either form is a
+   *  string the channelId argument accepts. Returned so listings hand back
+   *  something PASTEABLE: the not-found error tells agents to "use
+   *  list_channels to see what is addressable", which was only true once this
+   *  field existed. Both forms are present on purpose — label to compose a
+   *  send now, id to store. */
   label: string;
 }
 
@@ -250,6 +255,12 @@ export interface ChannelFacts {
   parentName?: string | null;
   /** For a thread, whether it's archived. */
   archived?: boolean;
+  /** For a kind a name can address, whether its `#name (Guild)` resolves
+   *  back to it through the resolver tools use (resolveChannelRef). It
+   *  doesn't when another channel holds the name: a same-named text channel,
+   *  which the resolver prefers to a voice or stage channel, or another of
+   *  its kind. Then its label is its id (channelLabelFor). */
+  nameResolves?: boolean;
 }
 
 /** One member of a channel, as the agent should see them. */
@@ -647,6 +658,7 @@ export class DiscordAdapter {
   private threadDeleteHandler?: (guildId: string, threadId: string) => void;
   private guildCreateHandler?: (guildId: string, channels: ChannelFacts[]) => void;
   private guildDeleteHandler?: (guildId: string) => void;
+  private guildAvailableHandler?: (guildId: string, channels: ChannelFacts[], present: ReadonlySet<string>) => void;
   private guildRenameHandler?: (guildId: string) => void;
 
   constructor(config: DiscordAdapterConfig) {
@@ -871,13 +883,12 @@ export class DiscordAdapter {
   }
 
   /** Fired when a channel of a listed kind changes (its name, its category,
-   *  its permissions) and the bot can view it, in a guild and channel the
-   *  filters admit: a rename re-derives what's registered, and a channel the
-   *  bot has just been let into (a permission overwrite on a private channel;
-   *  channelCreate doesn't fire for one that already existed) is registered.
-   *  Also fired for a forum or media channel (holdsPosts), which isn't
-   *  registered, since it holds no messages, but whose posts are threads
-   *  whose labels name it. */
+   *  its permissions), in a guild and channel the filters admit, whether or
+   *  not the bot can view it: listing registers such a channel either way
+   *  (getPostingChannels), so a rename re-derives what's registered, and one
+   *  not yet registered is. Also fired for a forum or media channel
+   *  (holdsPosts), which isn't registered, since it holds no messages, but
+   *  whose posts are threads whose labels name it. */
   onChannelUpdate(handler: (channel: ChannelFacts) => void): void {
     this.channelUpdateHandler = handler;
   }
@@ -916,6 +927,18 @@ export class DiscordAdapter {
    *  `guildUnavailable` instead, and keeps the guild cached. */
   onGuildDelete(handler: (guildId: string) => void): void {
     this.guildDeleteHandler = handler;
+  }
+
+  /** Fired when a guild the filters admit is available again (discord.js
+   *  `guildAvailable`): after an outage, after a new gateway session (READY
+   *  marks every held guild unavailable first), and for each guild at login.
+   *  Discord doesn't replay what happened while it was away, so this hands
+   *  over what the guild has now: its channels of a listed kind the filters
+   *  admit, and the ids of every channel and live thread it holds
+   *  (`guild.channels.cache`, which discord.js refills from the guild's
+   *  payload). */
+  onGuildAvailable(handler: (guildId: string, channels: ChannelFacts[], present: ReadonlySet<string>) => void): void {
+    this.guildAvailableHandler = handler;
   }
 
   /** Whether the bot is in a guild: the client's cache holds every guild
@@ -1277,7 +1300,7 @@ export class DiscordAdapter {
       // A create still waiting for its thread's lookup goes first, so a
       // reaction never arrives before the message it's on.
       await this.threadLookups.get(msg.channelId);
-      if (guildId && threadChannelUnknown(msg.channel)) await this.lookUpThread(msg.channelId);
+      if (guildId && threadChannelUnknown(msg.channel)) await this.lookUpThread(guildId, msg.channelId);
       const parentId =
         msg.channel && 'parentId' in msg.channel
           ? ((msg.channel as { parentId?: string | null }).parentId ?? null)
@@ -1514,7 +1537,7 @@ export class DiscordAdapter {
     const parent = type === 'thread' && c.parentId
       ? (this.client.channels.cache.get(c.parentId) as { name?: string } | undefined)
       : undefined;
-    return {
+    const facts: ChannelFacts = {
       id: c.id,
       guildId: c.guildId,
       guildName: named(this.client.guilds.cache.get(c.guildId)?.name),
@@ -1524,6 +1547,11 @@ export class DiscordAdapter {
       parentName: named(parent?.name),
       archived: type === 'thread' && c.archived === true,
     };
+    if (isNameAddressableKind(type) && facts.name && facts.guildName) {
+      const resolved = this.resolveChannelRef(formatChannelLabel(facts.name, facts.guildName));
+      facts.nameResolves = resolved.ok && resolved.id === facts.id;
+    }
+    return facts;
   }
 
   /** Compare two Discord snowflake IDs numerically without BigInt parsing.
@@ -1673,12 +1701,13 @@ export class DiscordAdapter {
     channels.forEach((c: GuildBasedChannel | null) => {
       if (c) {
         if (!this.channelAllowed(guildId, c.id, c.parentId)) return;
+        const facts = this.channelFacts(c);
         result.push({
           id: c.id,
           name: c.name,
           type: mapChannelType(c.type),
           parentId: c.parentId ?? undefined,
-          label: formatChannelLabel(c.name, guild.name),
+          label: facts ? channelLabelFor(facts) : formatChannelLabel(c.name, guild.name),
         });
       }
     });
@@ -2186,7 +2215,7 @@ export class DiscordAdapter {
     // removed and joined again builds a new thread object), and then only
     // the cache holds what the lookup found.
     if (guildId && threadChannelUnknown(channel)) {
-      await this.lookUpThread(message.channelId);
+      await this.lookUpThread(guildId, message.channelId);
       channel = this.client.channels.cache.get(message.channelId) ?? channel;
     }
     // Packet guild identity alone does not establish whether an uncached
@@ -2349,7 +2378,7 @@ export class DiscordAdapter {
       // they're delivered in order.
       const waiting = this.threadLookups.get(message.channelId);
       if (waiting || (message.guildId && threadChannelUnknown(message.channel))) {
-        const next = (waiting ?? this.lookUpThread(message.channelId))
+        const next = (waiting ?? this.lookUpThread(message.guildId!, message.channelId))
           .then(() => this.acceptMessage(message, base))
           .catch((err) => console.error('[discord-mcpl] Failed to deliver a thread message:', (err as Error).message));
         this.threadLookups.set(message.channelId, next);
@@ -2491,19 +2520,24 @@ export class DiscordAdapter {
     // threads' labels) and registers a channel it hadn't; an update that
     // changes neither (a topic, slowmode) announces nothing. A forum or
     // media channel is reported too (holdsPosts): the server doesn't
-    // register it, but its posts are threads whose labels name it. A channel
-    // the bot can't view isn't reported.
+    // register it, but its posts are threads whose labels name it. Whether
+    // the bot can view the channel doesn't decide it: listing registers every
+    // channel the filters admit (getPostingChannels), so a hidden channel's
+    // rename re-derives its label too.
     this.client.on('channelUpdate', (_oldChannel, newChannel) => {
       if (!('guild' in newChannel)) return;
       if (!isListedKind(mapChannelType(newChannel.type)) && !holdsPosts(newChannel.type)) return;
       const guild = newChannel.guild;
       if (this.guildIds?.length && !this.guildIds.includes(guild.id)) return;
-      const me = guild.members.me;
-      if (!me) return;
       if (!this.channelAllowed(guild.id, newChannel.id, newChannel.parentId)) return;
-      if (!(newChannel.permissionsFor(me)?.has(PermissionsBitField.Flags.ViewChannel) ?? false)) return;
       const facts = this.channelFacts(newChannel);
       if (facts) this.channelUpdateHandler?.(facts);
+    });
+
+    // A guild back from an outage or a gateway gap (onGuildAvailable).
+    this.client.on('guildAvailable', (guild) => {
+      if (this.guildIds?.length && !this.guildIds.includes(guild.id)) return;
+      this.guildAvailableHandler?.(guild.id, this.guildPostingChannels(guild), new Set(guild.channels.cache.keys()));
     });
 
     this.client.on('error', (err: Error) => {
@@ -2627,16 +2661,26 @@ export class DiscordAdapter {
    *  Forced, since discord.js would otherwise return the cached partial. The
    *  REST client's own timeout and retries bound each attempt (15 s a try,
    *  three retries, by default), though a rate limit's Retry-After waits can
-   *  hold events waiting behind it longer. If the fetch fails, the thread
-   *  stays as it was, and the filters decide on what's known: where a
-   *  guild's channel list applies, a thread whose channel is unknown is
-   *  admitted only if it's listed itself. That failure is logged, since the
-   *  thread's messages may then be
-   *  filtered out though its channel is admitted, and go unnamed. */
-  private async lookUpThread(channelId: string): Promise<void> {
+   *  hold events waiting behind it longer. A fetch Discord answers with
+   *  Unknown Channel reports the thread deleted. If the fetch fails otherwise,
+   *  the thread stays as it was, and the filters decide on what's known:
+   *  where a guild's channel list applies, a thread whose channel is unknown
+   *  is admitted only if it's listed itself. That failure is logged, since
+   *  the thread's messages may then be filtered out though its channel is
+   *  admitted, and go unnamed. */
+  private async lookUpThread(guildId: string, channelId: string): Promise<void> {
     try {
       await this.client.channels.fetch(channelId, { force: true });
     } catch (err) {
+      // Unknown Channel: the thread is gone, perhaps deleted with the channel
+      // it hung off while its event waited, and nothing else will say so (a
+      // thread known only partly isn't in its channel's threads.cache). It's
+      // reported as deleted, so what waits on it registers and names nothing.
+      if ((err as { code?: unknown } | null)?.code === UNKNOWN_CHANNEL) {
+        dbg('gateway:thread-lookup-gone', { channelId });
+        this.threadDeleteHandler?.(guildId, channelId);
+        return;
+      }
       const error = (err as Error).message;
       dbg('gateway:thread-lookup-failed', { channelId, error });
       console.error(

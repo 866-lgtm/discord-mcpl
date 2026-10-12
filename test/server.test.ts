@@ -98,6 +98,7 @@ class MockDiscordAdapter {
     this._channelDeleteHandler = handler;
   }
   onGuildDelete(): void {}
+  onGuildAvailable(): void {}
   /** These tests' bot is in every guild. */
   hasGuild(): boolean {
     return true;

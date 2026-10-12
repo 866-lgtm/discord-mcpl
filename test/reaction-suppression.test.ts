@@ -867,7 +867,7 @@ describe('server integration', () => {
     s.discord = {
       onMessage: noop, onMessageEdit: noop, onMessageDelete: noop,
       onChannelCreate: noop, onChannelUpdate: noop, onChannelDelete: noop, onGuildCreate: noop,
-      onGuildRename: noop, onThreadUpdate: noop, onThreadDelete: noop, onGuildDelete: noop,
+      onGuildRename: noop, onThreadUpdate: noop, onThreadDelete: noop, onGuildDelete: noop, onGuildAvailable: noop,
       onReaction: (h: (ev: Record<string, unknown>) => void) => { reactionHandler = h; },
     };
     const sent: unknown[] = [];
