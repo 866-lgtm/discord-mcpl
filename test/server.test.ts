@@ -104,6 +104,10 @@ class MockDiscordAdapter {
   isStale(): boolean {
     return false;
   }
+  /** These tests' bot is in every guild. */
+  hasGuild(): boolean {
+    return true;
+  }
   onGuildCreate(handler: (guildId: string, channels: ChannelFacts[]) => void): void {
     this._guildCreateHandler = handler;
   }
@@ -237,7 +241,7 @@ class MockDiscordAdapter {
   /** Simulate a channel's change: a rename (the default), or an edit that
    *  leaves its name, kind and category as they were, such as the bot let
    *  into it. */
-  simulateChannelUpdate(channel: ChannelFacts, change: ChannelChange = { addressChanged: true }): void {
+  simulateChannelUpdate(channel: ChannelFacts, change: ChannelChange = { addressChanged: true, admitted: true }): void {
     this._channelUpdateHandler?.(channel, change);
   }
 
@@ -1814,7 +1818,7 @@ describe('DiscordMcplServer', () => {
       await expectChanged(client);
       await expectPush(client, 'discord:g1:th1');
       // Archived: forgotten, so the registry holds the live threads.
-      discord.facts.th1 = threadFacts('th1', 'design-chat', { archived: true });
+      discord.facts.th1 = threadFacts('th1', 'design-chat', { archived: true, archivedAt: Date.now() - 60_000 });
       discord.simulateThreadUpdate(discord.facts.th1);
       assert.deepEqual((await expectChanged(client)).removed, ['discord:g1:th1']);
       // A message posted in it unarchives it, whatever the cache has heard
@@ -1983,9 +1987,9 @@ describe('DiscordMcplServer', () => {
       assert.deepEqual(saved.missed, {});
     });
 
-    it('the reconnect sweep registers what it delivers from once the cache holds it, and leaves out an archived thread, a forum, and a channel the cache doesn\'t hold', async (t) => {
+    it('the reconnect sweep registers what it delivers from once the cache holds it, and leaves out an archived thread and a forum', async (t) => {
       const wmPath = join(tmpdir(), `discord-mcpl-wm-${process.pid}-sweep-kinds.json`);
-      writeFileSync(wmPath, JSON.stringify({ watermarks: { c1: '100', thA: '100', cold: '100', forum1: '100', gone: '100' }, dmChannels: [] }));
+      writeFileSync(wmPath, JSON.stringify({ watermarks: { c1: '100', thA: '100', cold: '100', forum1: '100' }, dmChannels: [] }));
       process.env.DISCORD_WATERMARK_FILE = wmPath;
       t.after(() => {
         delete process.env.DISCORD_WATERMARK_FILE;
@@ -2007,15 +2011,12 @@ describe('DiscordMcplServer', () => {
         c1: { name: 'general', guildId: 'g1', guildName: GUILD, isDM: false },
         thA: { name: 'old-plans', guildId: 'g1', guildName: GUILD, isDM: false, threadId: 'thA', threadName: 'old-plans', threadParentName: 'general' },
         forum1: { name: 'ideas', guildId: 'g1', guildName: GUILD, isDM: false },
-        gone: { name: 'gone', guildId: 'g1', guildName: GUILD, isDM: false },
       } as never;
       discord.getChannelMeta = (async (channelId: string) => {
         assert.equal(channelId, 'cold');
         discord.facts.cold = { id: 'cold', guildId: 'g1', guildName: GUILD, type: 'voice', name: 'lounge' };
         return { name: 'lounge', guildId: 'g1', guildName: GUILD, isDM: false };
       }) as never;
-      // `gone` is placed by its meta, but the cache doesn't hold it:
-      // delivered, neither registered nor named.
       const server = new DiscordMcplServer(discord as unknown as DiscordAdapter);
       const serverPromise = server.serve(serverConn);
       endWith(t, { client, clientSocket }, () => serverPromise);
@@ -2028,7 +2029,6 @@ describe('DiscordMcplServer', () => {
       assert.deepEqual((await expectChanged(client)).added?.map((d) => [d.id, d.label]), [['discord:g1:cold', '#lounge (Test Guild)']]);
       await expectPush(client, 'discord:g1:cold');
       await expectPush(client, undefined); // forum1
-      await expectPush(client, undefined); // gone
     });
 
     it('registers and pushes nothing the filters exclude, and forgets a channel Discord no longer knows', async (t) => {

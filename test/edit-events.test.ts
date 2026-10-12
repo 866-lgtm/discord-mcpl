@@ -73,6 +73,7 @@ describe('edit/delete push events', () => {
         id === 'chan1' ? { id, guildId: 'g1', guildName: 'Guild', type: 'text', name: 'general' } : null,
       getCachedChannelFactsFor: () => new Map(),
       isStale: () => false,
+      hasGuild: () => true,
       onMessageEdit: (h: EditHandler) => { edit = h; },
       onMessageDelete: (h: DeleteHandler) => { del = h; },
     };

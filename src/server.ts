@@ -3135,9 +3135,10 @@ export class DiscordMcplServer {
    *  what it has. Their facts are read together, so their labels are checked
    *  against one view of the channels names resolve among. */
   private rederiveChannels(descriptors: ChannelDescriptor[]): void {
+    // A stale channel's cached facts may be older than what's registered.
     const channelIds = descriptors
       .map((d) => (d.address as { channelId?: string } | undefined)?.channelId)
-      .filter((id): id is string => id !== undefined);
+      .filter((id): id is string => id !== undefined && !this.discord.isStale(id));
     const facts = this.discord.getCachedChannelFactsFor(channelIds);
     this.registerChannels([...facts.values()].map((f) => this.guildDescriptor(f)));
   }
@@ -3236,8 +3237,7 @@ export class DiscordMcplServer {
    * (channelLabelFor); one registered already keeps its name
    * (registerChannels). Not registered, and named only if registered:
    * - a channel the cache doesn't hold: a message's channel is always there,
-   *   as a partial at least, until it's removed, as a guild the bot leaves
-   *   takes its channels with it;
+   *   as a partial at least, until it's removed;
    * - a channel whose cached facts may be older than what Discord has
    *   reported since (DiscordAdapter.isStale): its guild came back, from an
    *   outage or a gap in the gateway connection, without it, or a fetch of
@@ -3248,29 +3248,42 @@ export class DiscordMcplServer {
    *   which unarchived it, whatever the cache has heard yet. A message
    *   posted before the archive, whose thread was archived while it was on
    *   its way, leaves it archived, and so does one whose time equals the
-   *   archive's: the next message registers a thread wrongly left out, and
-   *   nothing would remove one wrongly registered. A thread is registered
+   *   archive's, or one whose thread's archive time isn't known: the next
+   *   message registers a thread wrongly left out, and nothing would remove
+   *   one wrongly registered. A thread is registered
    *   while it's live and forgotten when it's archived, so the registry
    *   holds the live threads, and a swept message from a thread archived
    *   since is delivered without one.
    * Neither registered nor named:
+   * - a channel of a guild the bot isn't in (hasGuild): it left, or was
+   *   removed, while the delivery was on its way. Leaving takes the
+   *   channels the guild's cache holds, with their threads, out of the
+   *   client's cache, but not a channel the guild had stopped listing, or
+   *   that channel's threads;
    * - a channel deleted lately, or a thread whose channel was
    *   (deletedLately): the delivery set out before the deletion;
    * - a category or forum, which hold no messages.
+   * A withheld registration is logged with its reason.
    */
   private registerGuildDelivery(
     guildId: string,
     channelId: string,
     opts: { postedAt?: number } = {},
   ): string | undefined {
-    if (this.deletedLately(guildId, channelId)) return undefined;
+    const withheld = (reason: string, named?: string): string | undefined => {
+      dbg('registry:withheld', { guildId, channelId, reason, named: named !== undefined });
+      return named;
+    };
+    if (!this.discord.hasGuild(guildId)) return withheld('guild-left');
+    if (this.deletedLately(guildId, channelId)) return withheld('deleted');
     const id = mcplChannelId(guildId, channelId);
     const facts = this.discord.getCachedChannelFacts(channelId);
     if (facts && holdsNoMessages(facts.type)) return undefined;
     const named = this.channelManager.get(id) ? id : undefined;
-    if (!facts || this.discord.isStale(channelId)) return named;
-    const unarchived = opts.postedAt !== undefined && (facts.archivedAt === undefined || opts.postedAt > facts.archivedAt);
-    if (facts.archived && !unarchived) return named;
+    if (!facts) return withheld('uncached', named);
+    if (this.discord.isStale(channelId)) return withheld('stale', named);
+    const unarchived = opts.postedAt !== undefined && facts.archivedAt !== undefined && opts.postedAt > facts.archivedAt;
+    if (facts.archived && !unarchived) return withheld('archived', named);
     this.registerChannels([this.guildDescriptor(facts)]);
     return id;
   }
@@ -3938,9 +3951,16 @@ export class DiscordMcplServer {
     // A listed channel changed (renamed, moved, or the bot let into it): it
     // is registered or re-derived, and so are the threads registered under
     // it, whose labels name it. A forum or media channel isn't registered,
-    // holding no messages, but its posts' labels name it too.
+    // holding no messages, but its posts' labels name it too. One moved out
+    // of what the filters admit is forgotten, as a guild's return forgets
+    // it (guildReturned).
     this.discord.onChannelUpdate((channel, change) => {
-      if (isListedKind(channel.type)) this.registerChannels([this.guildDescriptor(channel)]);
+      const id = mcplChannelId(channel.guildId, channel.id);
+      if (!change.admitted) {
+        if (this.channelManager.get(id)) this.forgetChannels([id]);
+      } else if (isListedKind(channel.type)) {
+        this.registerChannels([this.guildDescriptor(channel)]);
+      }
       this.rederiveChannels(this.registeredThreadsOf(channel.id));
       // Only a new name, kind or category can give a name to another
       // channel, or take one from it.
@@ -4430,6 +4450,7 @@ export class DiscordMcplServer {
     const channelIsOpen = this.channelManager.isOpen(channelMcplId);
     dbg('handleDiscordMessage:forwarding', {
       channelMcplId,
+      registeredId,
       channelIsOpen,
       path: channelIsOpen ? 'channels/incoming' : 'push/event',
     });
