@@ -344,8 +344,10 @@ in the git log and PR descriptions.
   posted in (text, announcement, voice or stage), a thread, or a DM, that
   the filters admit, so a DM or thread after a restart still opens. An
   archived thread opens too, since the host named it. Any other id is
-  refused, a lately deleted channel or a thread of one included, whatever an
-  address beside it says. A request with no selector (`channelId` absent or
+  refused, a lately deleted channel, a thread of one, and a channel of a
+  guild the bot has left included, whatever an address beside it says. A
+  channel outlives its deleted category. A request with no selector
+  (`channelId` absent or
   null, and `address` absent, null or `{}`) opens the one registered channel
   of its type, DMs and threads counted, and is refused when there are none or
   several; a refusal over several lists the first ten and points to

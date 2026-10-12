@@ -60,12 +60,14 @@ interface OpenResult {
 function fixture(
   channels: unknown[] = [general, dev],
   opts: {
-    served?: (guildSegment: string, channelId: string) => Served | null;
+    served?: (guildSegment: string, channelId: string) => Served | null | Promise<Served | null>;
     history?: (channelId: string) => Promise<unknown[]>;
   } = {},
 ) {
   const fetched: Array<{ channelId: string; after?: string }> = [];
   const lookups: string[] = [];
+  /** Guilds the bot has left (hasGuild). */
+  const left = new Set<string>();
   const adapter = {
     async fetchHistory(channelId: string, o?: { after?: string }) {
       fetched.push({ channelId, ...(o?.after !== undefined ? { after: o.after } : {}) });
@@ -84,6 +86,9 @@ function fixture(
     // nothing here, and nothing is stale.
     isStale() {
       return false;
+    },
+    hasGuild(guildId: string) {
+      return !left.has(guildId);
     },
     getCachedChannelFactsFor() {
       return new Map();
@@ -117,7 +122,7 @@ function fixture(
       return true;
     });
   };
-  return { server, fetched, lookups, subscribed, nothingOpened, refused };
+  return { server, fetched, lookups, left, subscribed, nothingOpened, refused };
 }
 
 /** A history fetch held open until released, so a test can act during it. */
@@ -373,6 +378,35 @@ describe("channels/open: an id the registry doesn't hold", () => {
     );
     assert.deepEqual(f.lookups, []);
     f.nothingOpened();
+  });
+
+  it('refuses a channel of a guild the bot has left, read after the lookup, and registers nothing', async () => {
+    const kept: ChannelFacts = { id: 'c8', guildId: 'g2', guildName: 'Gone', name: 'kept', type: 'text' };
+    // discord.js can keep a channel past the leave, so the lookup still finds it.
+    const f = fixture([general], { served: () => ({ kind: 'guild', facts: kept }) });
+    f.left.add('g2');
+    await f.refused({ channelId: 'discord:g2:c8', type: 'discord', history: { limit: 5 } }, UNKNOWN_CHANNEL, /^No channel this server serves matches/);
+    // The bot leaves while the lookup is out.
+    const g = fixture([general], {
+      served: async () => {
+        g.left.add('g1');
+        return { kind: 'guild', facts: { ...kept, guildId: 'g1', guildName: 'Guild' } };
+      },
+    });
+    await g.refused({ channelId: 'discord:g1:c8', type: 'discord', history: { limit: 5 } }, UNKNOWN_CHANNEL, /^No channel this server serves matches/);
+    for (const x of [f, g]) {
+      assert.deepEqual(x.server.channelManager.getAll().map((c) => c.id), [general.id], 'nothing more is registered');
+      x.nothingOpened();
+    }
+  });
+
+  it('opens a text channel whose category was deleted, since a channel outlives its category', async () => {
+    const survivor: ChannelFacts = { id: 'c9', guildId: 'g1', guildName: 'Guild', name: 'survivor', type: 'text', parentId: 'cat1' };
+    const f = fixture([general], { served: (guild, channel) => (channel === 'c9' ? { kind: 'guild', facts: survivor } : null) });
+    (f.server as unknown as { channelDeleted(guildId: string, channelId: string): void }).channelDeleted('g1', 'cat1');
+    const res = await f.server.handleChannelOpen({ channelId: 'discord:g1:c9', type: 'discord' });
+    assert.equal(res.channel.id, 'discord:g1:c9');
+    assert.equal(f.server.channelManager.get('discord:g1:c9')?.label, '#survivor (Guild)');
   });
 
   it("refuses an id whose channel's current facts aren't known as an open that failed, and registers nothing", async () => {

@@ -3532,8 +3532,8 @@ export class DiscordMcplServer {
    *  registered, and announced, now, by the rule every path registers by
    *  (guildDescriptor), so a DM, thread or channel no traffic has registered
    *  since a restart still opens. Anything else is refused as unknown,
-   *  lately deleted channels and their threads included, and a channel of
-   *  another type as bad params. A channel whose current facts aren't known
+   *  lately deleted channels and their threads included, and channels of a
+   *  guild the bot has left, and a channel of another type as bad params. A channel whose current facts aren't known
    *  (`uncertain`: a stale channel, or a thread of one) is refused as an
    *  open that failed, since its facts decide no registration and another
    *  open fetches it again. An archived thread opens too, since the host
@@ -3543,9 +3543,16 @@ export class DiscordMcplServer {
   private async registerServedChannel(target: { id: string; via: string }, type: unknown): Promise<ChannelDescriptor> {
     const parsed = parseMcplChannelId(target.id)!; // resolveOpenTarget hands back only ids that parse
     const found = await this.discord.lookUpServedChannel(parsed.guildId, parsed.channelId);
+    // Read after the lookup's waits, as a delivery's registration reads it
+    // (registerGuildDelivery). The bot may have left the guild meanwhile, and
+    // discord.js keeps a channel the guild had stopped listing past the leave.
+    // A thread went with its channel when that was deleted lately, but a
+    // channel outlives its deleted category (deletedLately).
+    const left = found?.kind === 'guild' && !this.discord.hasGuild(found.facts.guildId);
     const deleted = this.deletedChannels.has(parsed.channelId)
-      || (found?.kind === 'guild' && !!found.facts.parentId && this.deletedChannels.has(found.facts.parentId));
-    if (!found || deleted) {
+      || (found?.kind === 'guild' && found.facts.type === 'thread' && !!found.facts.parentId
+        && this.deletedChannels.has(found.facts.parentId));
+    if (!found || left || deleted) {
       throw new RequestRefusal(
         ERR_UNKNOWN_CHANNEL,
         `No channel this server serves matches ${target.via}: Discord doesn't know it, or it isn't a channel messages ` +
