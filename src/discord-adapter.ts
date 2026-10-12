@@ -32,6 +32,7 @@ import {
 import { existsSync, statSync } from 'node:fs';
 import { basename } from 'node:path';
 import { dbg } from './debug-log.js';
+import { mcplChannelId } from './channels.js';
 
 import {
   buildCandidates,
@@ -1616,6 +1617,11 @@ export class DiscordAdapter {
           name: t.name,
           type: 'thread',
           parentId: t.parentId ?? undefined,
+          // Id form, not `#name (Guild)`: resolveChannelRef deliberately
+          // excludes threads from name resolution (thread names aren't
+          // unique), so a name label would never resolve. The MCPL composite
+          // is still pasteable and addresses the thread by id.
+          label: mcplChannelId(guildId, t.id),
         });
       });
     } catch {
