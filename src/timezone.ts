@@ -28,7 +28,41 @@ export function resolveAgentTimeZone(configured = process.env.AGENT_TIMEZONE): s
   return zone;
 }
 
-export function formatAgentDateTime(value: Date | number, timeZone = resolveAgentTimeZone()): string {
+/** Rendering style for agent-visible timestamps on message lines.
+ *    full    2026-01-15T04:34:56-08:00 [America/Los_Angeles]   (default)
+ *    compact 2026-01-15 04:34
+ *    time    04:34
+ *    none    (empty — callers omit the timestamp entirely)
+ *  The zone still governs conversion for every style; only the rendered
+ *  verbosity changes. Full costs ~45 chars per line, which adds up across a
+ *  long backscroll — compact/time exist for context-budget-conscious
+ *  deployments. */
+export type TimestampStyle = 'full' | 'compact' | 'time' | 'none';
+
+const TIMESTAMP_STYLES: ReadonlySet<string> = new Set(['full', 'compact', 'time', 'none']);
+
+/** Resolve the style for agent-visible timestamps (AGENT_TIMESTAMP_STYLE).
+ *  Same never-throw contract as resolveAgentTimeZone, for the same reason:
+ *  this is evaluated at module scope in a stdio child, and an exception here
+ *  kills the subprocess before the MCPL handshake. Unknown values warn on
+ *  stderr and fall back to 'full'. */
+export function resolveTimestampStyle(configured = process.env.AGENT_TIMESTAMP_STYLE): TimestampStyle {
+  const style = configured?.trim().toLowerCase();
+  if (!style) return 'full';
+  if (TIMESTAMP_STYLES.has(style)) return style as TimestampStyle;
+  console.error(
+    `[timezone] Invalid AGENT_TIMESTAMP_STYLE ${JSON.stringify(configured)} — ` +
+    `falling back to "full" (valid: full, compact, time, none)`,
+  );
+  return 'full';
+}
+
+export function formatAgentDateTime(
+  value: Date | number,
+  timeZone = resolveAgentTimeZone(),
+  style: TimestampStyle = 'full',
+): string {
+  if (style === 'none') return '';
   const date = value instanceof Date ? value : new Date(value);
   const parts = new Intl.DateTimeFormat('en-CA', {
     timeZone,
@@ -37,6 +71,8 @@ export function formatAgentDateTime(value: Date | number, timeZone = resolveAgen
     hourCycle: 'h23', timeZoneName: 'longOffset',
   }).formatToParts(date);
   const get = (type: Intl.DateTimeFormatPartTypes) => parts.find((part) => part.type === type)?.value ?? '';
+  if (style === 'time') return `${get('hour')}:${get('minute')}`;
+  if (style === 'compact') return `${get('year')}-${get('month')}-${get('day')} ${get('hour')}:${get('minute')}`;
   const rawOffset = get('timeZoneName');
   const offset = rawOffset === 'GMT' ? '+00:00' : rawOffset.replace('GMT', '');
   return `${get('year')}-${get('month')}-${get('day')}T${get('hour')}:${get('minute')}:${get('second')}${offset} [${timeZone}]`;

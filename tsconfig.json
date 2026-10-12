@@ -3,6 +3,7 @@
     "target": "ES2022",
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
+    "resolveJsonModule": true,
     "lib": ["ES2022"],
     "outDir": "./dist",
     "rootDir": ".",
@@ -15,6 +16,6 @@
     "sourceMap": true,
     "composite": true
   },
-  "include": ["src/**/*", "test/**/*"],
+  "include": ["src/**/*", "test/**/*", "package.json"],
   "exclude": ["node_modules", "dist"]
 }

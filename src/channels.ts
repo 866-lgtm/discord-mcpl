@@ -4,6 +4,7 @@
 
 import type { ChannelDescriptor } from '@animalabs/mcpl-core';
 import type { DiscordChannelInfo } from './discord-adapter.js';
+import { formatChannelLabel } from './channel-names.js';
 
 export type DiscordChannelDescriptor = ChannelDescriptor & {
   initiallyOpen?: boolean;
@@ -36,10 +37,45 @@ export function toDescriptor(
   return {
     id: mcplChannelId(guildId, channel.id),
     type: 'discord',
-    label: `#${channel.name} (${guildName})`,
+    // Same formatter the resolver parses back, so this descriptor's label is
+    // by construction a valid channelId argument.
+    label: formatChannelLabel(channel.name, guildName),
     direction: 'bidirectional',
     address: { guildId, channelId: channel.id },
     metadata: { channelType: channel.type, parentId: channel.parentId },
+    initiallyOpen,
+    capabilities: {
+      history: { maxMessages: maxHistory, supportsBeforeMessage: true },
+      acknowledgment: { kind: 'reaction', supportsValue: true },
+    },
+  };
+}
+
+/** Convert a DM channel to an MCPL ChannelDescriptor.
+ *
+ * DMs have no guild — the id uses the `dm` pseudo-guild segment
+ * (`discord:dm:<channelId>`), matching the id handleDiscordMessage forwards
+ * events under. Without this descriptor DMs were never registered at all
+ * (registration only ran off guild events), so `channel_open` on a DM id
+ * could never resolve and DM open/subscription state never stuck
+ * (observed on Mythos, 2026-07-18). */
+export function toDmDescriptor(
+  channelId: string,
+  recipientName: string,
+  initiallyOpen = false,
+  maxHistory = 500,
+  recipientId?: string,
+): DiscordChannelDescriptor {
+  return {
+    id: mcplChannelId('dm', channelId),
+    type: 'discord',
+    label: `DM: ${recipientName}`,
+    direction: 'bidirectional',
+    address: { guildId: 'dm', channelId },
+    // recipientName/recipientId make DM addressing people-first: the host
+    // resolves `>>@name` and `<@id>` mention tokens against them (explicit
+    // prose routing), instead of forcing agents through raw channel ids.
+    metadata: { channelType: 'dm', recipientName, ...(recipientId ? { recipientId } : {}) },
     initiallyOpen,
     capabilities: {
       history: { maxMessages: maxHistory, supportsBeforeMessage: true },

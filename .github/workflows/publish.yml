@@ -22,6 +22,17 @@ jobs:
         with:
           node-version: 24
 
+      # npm version <level> updates the manifest/lockfile and creates a
+      # matching tag. Refuse tags cut without that version update.
+      - name: Verify release tag matches package version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          package_version="$(node -p "require('./package.json').version")"
+          if [ "$GITHUB_REF_NAME" != "v$package_version" ]; then
+            echo "::error::Release tag $GITHUB_REF_NAME does not match package.json version $package_version. Use npm version to cut releases."
+            exit 1
+          fi
+
       - name: Install dependencies
         run: npm install
 

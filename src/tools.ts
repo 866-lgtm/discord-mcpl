@@ -11,18 +11,15 @@ export interface ToolDefinition {
     properties: Record<string, unknown>;
     required?: string[];
   };
+  /** MCP `_meta` extension slot. tools/list adds the MCPL RFC-008
+   *  `mcpl/class` key here (see tool-classes.ts), merged with any others. */
+  _meta?: Record<string, unknown>;
 }
 
 /** Reusable schema for the optional `files` attachment parameter on send tools. */
 const FILES_PROP = {
   type: 'array',
-  description:
-    'Optional file attachments to upload with the message. This (discord-mcpl) ' +
-    'surface uploads by host file PATH — each entry is read from a local ' +
-    'filesystem path on the host (e.g. a file you created in your workspace or ' +
-    'sandbox); it does NOT accept inline base64 bytes. (The portal surface is the ' +
-    'opposite: it wants inline base64 bytes.) Up to 10 files per message; size ' +
-    'limits are enforced by Discord.',
+  description: 'Optional attachments: up to 10 files, each supplied by its absolute filesystem path on this host. Discord upload-size limits apply.',
   items: {
     type: 'object',
     properties: {
@@ -34,28 +31,43 @@ const FILES_PROP = {
   },
 };
 
-/**
- * Shared param descriptions that spell out how this surface's ids differ from
- * the portal surface, so an agent that learned one does not silently mis-call
- * the other. discord-mcpl talks to Discord directly; portal/portal-mcpl talks
- * to a relay and uses a different id scheme.
- */
+/** Keep everyday addressing instructions local; edge cases live in docs/tool-reference.md. */
 const CHANNEL_ID_DESC =
-  'Discord channel snowflake (the raw numeric channel id). Surface marker: ' +
-  'discord-mcpl namespaces its MCPL channels as `discord:<guildId>:<channelId>` ' +
-  '— a different id space from the portal surface (`portal:<channelId>`).';
+  'Destination channel. Copy its qualified name from a channel listing (e.g. "#kitchen-table (Separatrix)"), ' +
+  'or use a numeric Discord channel ID. Threads, categories and forum roots require numeric IDs. ' +
+  'Ambiguous names return choices.';
 
-/** Contrasts a per-channel Discord snowflake against portal's global relay id. */
 const MESSAGE_ID_KIND =
-  'Discord message snowflake — unique only WITHIN its channel, so you must pass ' +
-  'channelId together with messageId. (The portal surface instead takes a ' +
-  'durable, globally-unique relay message id and needs messageId alone — no ' +
-  'channelId.)';
+  'Numeric Discord ID of the target message, copied from incoming messages or fetched history. ' +
+  'Also supply the channel containing it.';
+
+const RECEIPT_PROVENANCE =
+  ' The result names where it went: channelId (canonical, discord:<guild|dm>:<channel>, or null ' +
+  'when the server can\'t place the channel), discordChannelId and channelLabel. A failed or ' +
+  'uncertain send keeps its own outcome text and adds the attempted destination. The canonical id ' +
+  'is authoritative when a label differs.';
+
+const HISTORY_PROVENANCE =
+  ' Each message names its channel: a source header [source: <canonical id> · <label>], plus ' +
+  'channelId (canonical, discord:<guild|dm>:<channel>) and channelLabel. A channel the server can\'t ' +
+  'place has channelId null and a header id of discord:?:<channel>. The canonical id is ' +
+  'authoritative when a label differs.';
+
+const TARGET_RULE =
+  'Give exactly one of messageId or latestFrom; the other may be omitted or null. ';
+
+const LATEST_FROM_DESC =
+  'Instead of messageId: the author whose newest message to target, as @username, display name, ' +
+  'or numeric user id (people and bots alike). Picks their newest message (never a system notice) among the 100 most ' +
+  'recent in the channel, resolved once when the call runs; an ambiguous name returns choices, ' +
+  'a name that can\'t be checked against the channel\'s members is refused (use the numeric id), ' +
+  'and no match in that window is refused rather than guessed. The result echoes the chosen ' +
+  'message (id, author, time, excerpt).';
 
 export const toolDefinitions: ToolDefinition[] = [
   {
     name: 'send_message',
-    description: 'Send a message to a Discord channel, optionally with file attachments',
+    description: "Send a message to an explicit Discord channel, optionally with local file attachments. Use reply_message to reply to a particular message." + RECEIPT_PROVENANCE,
     inputSchema: {
       type: 'object',
       properties: {
@@ -68,21 +80,22 @@ export const toolDefinitions: ToolDefinition[] = [
   },
   {
     name: 'reply_message',
-    description: 'Reply to a specific message in a Discord channel, optionally with file attachments',
+    description: 'Reply to a specific message in a Discord channel, optionally with file attachments.' + RECEIPT_PROVENANCE,
     inputSchema: {
       type: 'object',
       properties: {
         channelId: { type: 'string', description: CHANNEL_ID_DESC },
-        messageId: { type: 'string', description: 'Message to reply to. ' + MESSAGE_ID_KIND },
+        messageId: { type: ['string', 'null'], description: TARGET_RULE + 'Message to reply to. ' + MESSAGE_ID_KIND },
+        latestFrom: { type: ['string', 'null'], description: TARGET_RULE + LATEST_FROM_DESC },
         content: { type: 'string', description: 'Reply content (optional if files are attached)' },
         files: FILES_PROP,
       },
-      required: ['channelId', 'messageId'],
+      required: ['channelId'],
     },
   },
   {
     name: 'send_dm',
-    description: "Send a direct message to a Discord user, identified by @username / display name (of someone in a shared server or who has DMed the bot) or by numeric user ID. To reply to a DM you received, pass the sender's name or id. Optionally include file attachments.",
+    description: "Send a direct message to a Discord user, identified by @username / display name (of someone in a shared server or who has DMed the bot) or by numeric user ID. To reply to a DM you received, pass the sender's name or id. Optionally include file attachments." + RECEIPT_PROVENANCE,
     inputSchema: {
       type: 'object',
       properties: {
@@ -100,10 +113,11 @@ export const toolDefinitions: ToolDefinition[] = [
       type: 'object',
       properties: {
         channelId: { type: 'string', description: CHANNEL_ID_DESC },
-        messageId: { type: 'string', description: 'Message to react to. ' + MESSAGE_ID_KIND },
+        messageId: { type: ['string', 'null'], description: TARGET_RULE + 'Message to react to. ' + MESSAGE_ID_KIND },
+        latestFrom: { type: ['string', 'null'], description: TARGET_RULE + LATEST_FROM_DESC },
         emoji: { type: 'string', description: 'A unicode emoji (e.g. 👍), or a custom server emoji as `:name:` (discover names/ids with list_emojis) or its full `<:name:id>` token.' },
       },
-      required: ['channelId', 'messageId', 'emoji'],
+      required: ['channelId', 'emoji'],
     },
   },
   {
@@ -113,10 +127,11 @@ export const toolDefinitions: ToolDefinition[] = [
       type: 'object',
       properties: {
         channelId: { type: 'string', description: CHANNEL_ID_DESC },
-        messageId: { type: 'string', description: 'Message whose reaction should be removed. ' + MESSAGE_ID_KIND },
+        messageId: { type: ['string', 'null'], description: TARGET_RULE + 'Message whose reaction should be removed. ' + MESSAGE_ID_KIND },
+        latestFrom: { type: ['string', 'null'], description: TARGET_RULE + LATEST_FROM_DESC },
         emoji: { type: 'string', description: 'The unicode or custom emoji previously added by this bot.' },
       },
-      required: ['channelId', 'messageId', 'emoji'],
+      required: ['channelId', 'emoji'],
     },
   },
   {
@@ -146,7 +161,7 @@ export const toolDefinitions: ToolDefinition[] = [
   },
   {
     name: 'list_guilds',
-    description: 'List Discord guilds (servers) the bot is in',
+    description: "List Discord servers known to the connected bot, with IDs, names and member counts. Use a guild ID with list_channels to enumerate its channels. This does not list ambient-message subscriptions.",
     inputSchema: {
       type: 'object',
       properties: {},
@@ -154,7 +169,7 @@ export const toolDefinitions: ToolDefinition[] = [
   },
   {
     name: 'list_channels',
-    description: 'List channels in a Discord guild',
+    description: "List channels in one Discord server, specified by guildId, subject to configured channel filters. Returns channel IDs, names, types, parent IDs and labels. Listing a channel does not subscribe to its traffic. Use list_subscriptions for ambient subscriptions.",
     inputSchema: {
       type: 'object',
       properties: {
@@ -164,27 +179,19 @@ export const toolDefinitions: ToolDefinition[] = [
     },
   },
   {
-    name: 'list_members',
-    description:
-      'List the members of a Discord guild (humans and bots) with their ids, ' +
-      'usernames, and display names — use it to see who is around and to get ' +
-      'the id for a real ping: mention someone with <@id> (their numeric id), ' +
-      'not their name in brackets.',
+    name: 'list_channel_members',
+    description: "List people associated with a Discord channel, with IDs and display names. For a guild channel: members who can view it; for a thread: joined members; for a DM: participants. Check scope, note and truncated, and for a thread unresolved (members listed by id only, whose names couldn't be read) and possiblyIncomplete (Discord returned one full page, so there may be more). This does not report who is online or reading now. Use fetch_history for messages.",
     inputSchema: {
       type: 'object',
       properties: {
-        guildId: { type: 'string', description: 'Discord guild ID' },
+        channelId: { type: 'string', description: CHANNEL_ID_DESC },
       },
-      required: ['guildId'],
+      required: ['channelId'],
     },
   },
   {
     name: 'list_emojis',
-    description:
-      'List the custom (server) emojis available to use. Put `token` (e.g. ' +
-      '`<:name:id>`) in message content to render one, or pass `reactionArg` ' +
-      '(`:name:`) to add_reaction. Reactions and message emojis draw from this ' +
-      'same set. Returns name, id, animated flag, message `token`, and `reactionArg`.',
+    description: "List custom server emojis available to the bot, with names and IDs. Supply guildId for one server or omit it to span known servers. These are emoji assets, not recent reactions.",
     inputSchema: {
       type: 'object',
       properties: {
@@ -213,8 +220,20 @@ export const toolDefinitions: ToolDefinition[] = [
     description:
       'Show the active event filters: which guilds/channels can deliver events to you ' +
       '(guild whitelist, optional per-guild channel whitelist) and which users may DM you. ' +
-      'null means unrestricted. Filters gate delivery only — the bot must also be a ' +
-      'member of a guild to see it at all.',
+      'null means unrestricted. dmNotice says whether senders of refused DMs get an automatic ' +
+      'delivery notice (off until you turn it on), and whether its state is `persisted` (notices are ' +
+      'suspended while it is not). Filters gate delivery, and the per-guild channel list also ' +
+      'bounds list_channels, list_channel_members, fetch_history and fetch_around, which refuse ' +
+      'a channel outside it. The bot must also be a ' +
+      'member of a guild to see it at all. Reports the config plane\'s desired-vs-effective ' +
+      'state (live / stale / unavailable — whitelists and suppression share one lifecycle, so ' +
+      'a broken filters file makes ALL of them stale together) and reaction-suppression state ' +
+      '(status/count/digest and baseline drift counts, never the entries themselves): some reaction markers are ' +
+      'withheld from your view across every surface. Those entries are operator-maintained ' +
+      'in the filters file and not adjustable from this tool surface — that is a facility ' +
+      'not built yet (a referential suppress-by-key surface is planned host-side), not a ' +
+      'policy about you. Note: some reactions on your account are placed by the host, not ' +
+      'by you; "me": true on a reaction is not evidence you authored it.',
     inputSchema: {
       type: 'object',
       properties: {},
@@ -223,11 +242,16 @@ export const toolDefinitions: ToolDefinition[] = [
   {
     name: 'filters_update',
     description:
-      'Hot-adjust the event filters — takes effect immediately, no restart. Requires ' +
-      'DISCORD_FILTERS_FILE to be configured (filters_get tells you). If the guild filter ' +
+      'Hot-adjust the event filters — takes effect immediately, no restart. Guild and DM ' +
+      'whitelist changes require DISCORD_FILTERS_FILE to be configured (filters_get tells you); ' +
+      'setDmNotice does not. If the guild filter ' +
       'is currently unrestricted, the first add/remove materializes it as the list of all ' +
       'current guilds first, so nothing silently drops. Newly-allowed guilds have their ' +
-      'channels registered right away.',
+      'channels registered right away. Reaction-suppression entries are operator-owned and ' +
+      'ride through updates untouched; this tool has no parameter that can carry them. ' +
+      'If the filters file is missing or unparseable on disk, updates are refused without ' +
+      'writing anything — an operator repairs the file (hot reload applies it within seconds) ' +
+      'and the update can then be retried.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -252,19 +276,22 @@ export const toolDefinitions: ToolDefinition[] = [
             'Replace the DM-user whitelist with these user ids. CAREFUL: an empty array ' +
             'means UNRESTRICTED (DMs from anyone), matching the env-unset semantics. Omit to leave DMs unchanged.',
         },
+        setDmNotice: {
+          type: 'boolean',
+          description:
+            'Whether a sender whose DM the whitelist refuses gets an automatic delivery notice from this ' +
+            'connection (at most once per 24 hours per sender, and at most 10 an hour across all senders; ' +
+            'it never quotes or forwards their message). Off by default, so refused DMs are dropped without ' +
+            'any notice until you set it true. Setting it false stops every notice not yet reserved; one already ' +
+            'being sent still goes out. Saved with the notice state, so it ' +
+            'works and survives restarts even when DISCORD_FILTERS_FILE is not configured. Omit to leave it unchanged.',
+        },
       },
     },
   },
   {
     name: 'fetch_history',
-    description:
-      'Fetch message history from a channel. By default returns the most recent ' +
-      'messages. Use `before` (a message ID) to scroll further back — pass the ID ' +
-      'of the oldest message you have seen to page backwards through older history. ' +
-      'Use `after` (a message ID) to fetch only messages newer than a given point. ' +
-      'The `before`/`after` cursors are Discord message snowflakes (the portal ' +
-      'surface accepts a relay id or a snowflake there). ' +
-      'Pagination is automatic, so `limit` may exceed Discord\'s 100-per-request cap.',
+    description: "Read past messages from a Discord channel, including message IDs. Use before/after message IDs and limit to select history; configured backscroll limits may reduce the amount. Use list_channel_members for people rather than messages." + HISTORY_PROVENANCE,
     inputSchema: {
       type: 'object',
       properties: {
@@ -291,7 +318,7 @@ export const toolDefinitions: ToolDefinition[] = [
     description:
       'Scroll to a specific message and fetch the surrounding context. Returns a ' +
       'window of messages centred on `messageId` (the message itself plus roughly ' +
-      'half the window on either side). Single request, so `limit` is capped at 100.',
+      'half the window on either side). Single request, so `limit` is capped at 100.' + HISTORY_PROVENANCE,
     inputSchema: {
       type: 'object',
       properties: {
@@ -357,8 +384,11 @@ export const toolDefinitions: ToolDefinition[] = [
     description:
       'Mute a Discord channel entirely: no ambient messages, no wake on @mentions ' +
       'or replies, and it will NOT auto-subscribe you back in when mentioned. Also ' +
-      'drops any existing ambient subscription. Use this to stay out of a channel ' +
-      'that keeps pulling you in. Persisted across restarts. Reverse with unmute_channel.',
+      'drops any existing ambient subscription, turns off its reaction visibility and ' +
+      'closes the bridge channel. Use this ' +
+      'to stay out of a channel that keeps pulling you in. Persisted across restarts. ' +
+      'Reverse with unmute_channel and explicitly reopen to restore ambient traffic. ' +
+      'If the host still lists it as open, use channel_close before channel_open.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -370,8 +400,10 @@ export const toolDefinitions: ToolDefinition[] = [
   {
     name: 'unmute_channel',
     description:
-      'Un-mute a Discord channel: mentions and DMs reach you again. Does not by ' +
-      'itself reopen ordinary traffic — use channel_open for that. Persisted across restarts.',
+      'Un-mute a Discord channel: mentions and DMs reach you again. Ordinary traffic, and ' +
+      'reactions unless set_reaction_visibility turned them on during the mute, stay stopped ' +
+      'until channel_open with its MCPL channel id. If the host still lists ' +
+      'it as open, use channel_close then channel_open to reconcile. Persisted across restarts.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -382,10 +414,7 @@ export const toolDefinitions: ToolDefinition[] = [
   },
   {
     name: 'list_subscriptions',
-    description:
-      'List the Discord channels currently subscribed for ambient message ' +
-      'delivery. Also reports `unsubscribedWithBacklog`: channels you have ' +
-      'unsubscribed from that have since accumulated missed ambient messages.',
+    description: "Inspect ambient-message subscriptions and the recorded missed-message backlog for unsubscribed channels. For channel discovery, use list_guilds to find servers, then list_channels with a guildId to see channels allowed by its configured filters.",
     inputSchema: {
       type: 'object',
       properties: {},
