@@ -108,6 +108,10 @@ class MockDiscordAdapter {
   hasGuild(): boolean {
     return true;
   }
+  /** No filters here. */
+  channelAdmitted(): boolean {
+    return true;
+  }
   onGuildCreate(handler: (guildId: string, channels: ChannelFacts[]) => void): void {
     this._guildCreateHandler = handler;
   }

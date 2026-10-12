@@ -74,6 +74,7 @@ describe('edit/delete push events', () => {
       getCachedChannelFactsFor: () => new Map(),
       isStale: () => false,
       hasGuild: () => true,
+      channelAdmitted: () => true,
       onMessageEdit: (h: EditHandler) => { edit = h; },
       onMessageDelete: (h: DeleteHandler) => { del = h; },
     };

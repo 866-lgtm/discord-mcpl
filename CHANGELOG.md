@@ -568,17 +568,18 @@ in the git log and PR descriptions.
     reconciled with what it has then: what was deleted, or a thread
     archived, meanwhile is forgotten, and a new or renamed channel is
     registered or re-derived. What the server no longer lists, on its
-    return or when the bot joins it again, is registered again only by a
-    delivery after Discord reports it (an update, a message posted there,
-    or a fetch that nothing newer overtook), so a delivery that set out
-    before doesn't register it. A lookup that Discord overtook with a report
-    on its channel, such as an archive or a rename, is made again, so what
-    a delivery waiting on it registers is no older than that report. A
-    channel moved out of what the channel filters admit is forgotten, as
-    on a server's return. Only what was registered is announced as
-    removed.
+    return or when the bot joins it again, may have changed unseen: a
+    message, edit or deletion from it, or the reconnect sweep, looks it up
+    from Discord again before deciding, and a delivery that set out before
+    the return doesn't register it. A lookup that Discord overtook with a
+    report on its channel, such as an archive or a rename, is made again,
+    so what a delivery waiting on it registers is no older than that
+    report. A channel moved out of what the channel filters admit is
+    forgotten, with the threads admitted through it, as on a server's
+    return. Only what was registered is announced as removed.
   - **A channel's label, its address, is made one way on every path,**
-    `list_channels`, `create_channel` and send receipts included. A channel's is its address, `#name (Guild)`. A
+    `list_channels`, `create_text_channel` and send receipts included. A
+    channel's is its address, `#name (Guild)`. A
     thread's is `#parent › thread (Guild)`, or `› thread (Guild)` when its
     channel's name isn't known, display-only either way, since
     `#thread (Guild)` would paste back as a same-named channel; a tool given

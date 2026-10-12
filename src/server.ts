@@ -2767,16 +2767,17 @@ export class DiscordMcplServer {
 
       const newestId = msgs[msgs.length - 1].id;
 
-      // Cache first. A lookup when the cache doesn't hold the channel, or
-      // holds a thread whose parent channel it can't name, which may be one
-      // the client knows only partly, as the live path looks those up (a
-      // thread whose parent just isn't cached is read from the cache again).
+      // Cache first. A lookup when the cache doesn't hold the channel, holds
+      // a thread whose parent channel it can't name, which may be one the
+      // client knows only partly, or holds facts that may be older than
+      // Discord's (isStale), as the live path looks those up (a thread whose
+      // parent just isn't cached is read from the cache again).
       // A failed lookup leaves a trace instead of silently shipping a
       // name-less block (issue #28), and what the cache knew stands. Resolved
       // before anything is delivered, because the ingress decision below
       // needs the channel's identity.
       let meta = this.discord.getCachedChannelMeta(channelId);
-      if (!meta || (meta.threadId && meta.threadParentName === null)) {
+      if (!meta || (meta.threadId && meta.threadParentName === null) || this.discord.isStale(channelId)) {
         const cached = meta;
         meta = (await this.discord.getChannelMeta(channelId).catch((err) => {
           dbg('sweep:channel-meta-failed', { channelId, error: errorText(err) });
@@ -3168,8 +3169,9 @@ export class DiscordMcplServer {
    * it has now: its listed channels, and the ids of every channel and live
    * thread it holds. Discord doesn't replay what happened while it was away,
    * so a registered channel or thread it no longer has is forgotten (deleted,
-   * or a thread archived, meanwhile), and so is a listed channel the filters
-   * no longer admit; its listed channels are registered or re-derived, and
+   * or a thread archived, meanwhile), and so is a listed channel, or a
+   * thread, the filters no longer admit; its listed channels are registered
+   * or re-derived, and
    * the threads that remain with them. Nothing is remembered as deleted
    * (deletedChannels): what's gone may only have been archived.
    */
@@ -3178,7 +3180,9 @@ export class DiscordMcplServer {
     this.forgetChannels(this.registeredInGuild(guildId).filter((d) => {
       const channelId = (d.address as { channelId: string }).channelId;
       const type = (d.metadata as { channelType?: string } | undefined)?.channelType;
-      return !present.has(channelId) || (type !== undefined && isListedKind(type as ChannelFacts['type']) && !listed.has(channelId));
+      return !present.has(channelId)
+        || (type !== undefined && isListedKind(type as ChannelFacts['type']) && !listed.has(channelId))
+        || (type === 'thread' && !this.admitted(d));
     }).map((d) => d.id));
     this.registerChannels(channels.map((c) => this.guildDescriptor(c)));
     this.rederiveChannels(this.registeredInGuild(guildId));
@@ -3196,6 +3200,15 @@ export class DiscordMcplServer {
   /** Registered channels and threads of a guild. */
   private registeredInGuild(guildId: string): ChannelDescriptor[] {
     return this.channelManager.getAll().filter((d) => (d.address as { guildId?: string } | undefined)?.guildId === guildId);
+  }
+
+  /** Whether the channel filters still admit a registered guild channel or
+   *  thread, a thread through the channel its metadata names. */
+  private admitted(d: ChannelDescriptor): boolean {
+    const address = d.address as { guildId?: string; channelId?: string } | undefined;
+    if (!address?.guildId || !address.channelId || address.guildId === 'dm') return true;
+    const parentId = (d.metadata as { parentId?: string | null } | undefined)?.parentId ?? null;
+    return this.discord.channelAdmitted(address.guildId, address.channelId, parentId);
   }
 
   /** The guild a channel is in, as the client's cache or the registry knows
@@ -3240,9 +3253,11 @@ export class DiscordMcplServer {
    *   as a partial at least, until it's removed;
    * - a channel whose cached facts may be older than what Discord has
    *   reported since (DiscordAdapter.isStale): its guild came back, from an
-   *   outage or a gap in the gateway connection, without it, or a fetch of
-   *   it landed after a newer report. It may have been archived or deleted
-   *   meanwhile, whatever the cache still says of it;
+   *   outage or a gap in the gateway connection, without it, or its fetch
+   *   kept landing after newer reports. It may have been archived or
+   *   deleted meanwhile, whatever the cache still says of it. A delivery
+   *   from it fetches it again first, so it's stale here when the delivery
+   *   set out before the mark, or that fetch failed or was overtaken;
    * - an archived thread, unless the message was posted in it after the
    *   archive (`postedAt` later than `archivedAt`, by Discord's clocks),
    *   which unarchived it, whatever the cache has heard yet. A message
@@ -3952,19 +3967,23 @@ export class DiscordMcplServer {
     // is registered or re-derived, and so are the threads registered under
     // it, whose labels name it. A forum or media channel isn't registered,
     // holding no messages, but its posts' labels name it too. One moved out
-    // of what the filters admit is forgotten, as a guild's return forgets
-    // it (guildReturned).
+    // of what the filters admit is forgotten, with the threads the filters
+    // admitted through it, as a guild's return forgets them (guildReturned).
     this.discord.onChannelUpdate((channel, change) => {
       const id = mcplChannelId(channel.guildId, channel.id);
       if (!change.admitted) {
-        if (this.channelManager.get(id)) this.forgetChannels([id]);
+        // Its threads are admitted through it, unless the filters list one.
+        const gone = [id, ...this.registeredThreadsOf(channel.id).filter((d) => !this.admitted(d)).map((d) => d.id)];
+        this.forgetChannels(gone.filter((g) => this.channelManager.get(g)));
       } else if (isListedKind(channel.type)) {
         this.registerChannels([this.guildDescriptor(channel)]);
       }
-      this.rederiveChannels(this.registeredThreadsOf(channel.id));
-      // Only a new name, kind or category can give a name to another
-      // channel, or take one from it.
-      if (change.addressChanged) this.rederiveNamed({ name: channel.name });
+      // Only a new name, kind or category can change its threads' labels,
+      // or give a name to another channel, or take one from it.
+      if (change.addressChanged) {
+        this.rederiveChannels(this.registeredThreadsOf(channel.id));
+        this.rederiveNamed({ name: channel.name });
+      }
     });
 
     // Bot joined a new guild after startup: register its existing channels
