@@ -988,6 +988,11 @@ export class DiscordAdapter {
     this.guildRenameHandler = handler;
   }
 
+  /** Whether the guild filter (guildIds) admits a guild. */
+  private guildAdmitted(guildId: string): boolean {
+    return !this.guildIds?.length || this.guildIds.includes(guildId);
+  }
+
   /** Whether the channel filters admit a guild channel or thread, a thread
    *  through its channel (or its channel's category) or its own id, as
    *  ingress and listing decide. */
@@ -1351,7 +1356,10 @@ export class DiscordAdapter {
       // A create still waiting for its thread's lookup goes first, so a
       // reaction never arrives before the message it's on.
       await this.threadLookups.get(msg.channelId);
-      if (guildId && threadChannelUnknown(msg.channel)) await this.lookUpChannel(guildId, msg.channelId);
+      if (guildId && !this.guildAdmitted(guildId)) return;
+      if (guildId && (threadChannelUnknown(msg.channel) || this.isStale(msg.channelId))) {
+        await this.lookUpChannel(guildId, msg.channelId);
+      }
       const parentId =
         msg.channel && 'parentId' in msg.channel
           ? ((msg.channel as { parentId?: string | null }).parentId ?? null)
@@ -1765,16 +1773,24 @@ export class DiscordAdapter {
     }));
   }
 
+  /** A guild's channels as the gateway keeps them: GUILD_CREATE lists every
+   *  channel and updates follow, so the guild's own cache is whole while the
+   *  guild is available, and reading it writes nothing to the cache that a
+   *  REST reply could make older (refetchChannel). Threads aren't listed, as
+   *  the REST list never had them; categories and forums are. A guild in an
+   *  outage is refused rather than listed from what it held before. */
   async listChannels(guildId: string): Promise<DiscordChannelInfo[]> {
     const guild = await this.client.guilds.fetch(guildId);
     if (!guild?.channels) {
       throw new Error(`Guild ${guildId} not found`);
     }
-    const channels = await guild.channels.fetch();
+    if (!guild.available) {
+      throw new Error(`Guild ${guildId} is unavailable (a Discord outage); its channels can't be listed until it's back`);
+    }
     const names = this.nameView();
     const result: DiscordChannelInfo[] = [];
-    channels.forEach((c: GuildBasedChannel | null) => {
-      if (c) {
+    guild.channels.cache.forEach((c: GuildBasedChannel) => {
+      if (!c.isThread()) {
         if (!this.channelAllowed(guildId, c.id, c.parentId)) return;
         const facts = this.channelFacts(c, names);
         result.push({
@@ -2317,14 +2333,17 @@ export class DiscordAdapter {
     const authorName = message.author?.username;
     let channel: Channel | null | undefined = message.channel ?? this.client.channels.cache.get(message.channelId);
     let guildId = message.guildId ?? (channel && 'guildId' in channel ? channel.guildId : null);
-    // A thread the client knows only partly is looked up whatever the
-    // filters say, as its creates are, so the edit or delete names it as its
-    // create does. If the lookup fails, the thread stays as it was, and the
-    // filters decide on what's known, as they do for its creates.
+    // A thread the client knows only partly, or a channel whose cached facts
+    // may be older than Discord's (isStale), is looked up whatever the
+    // channel filters say, as its creates are, so the edit or delete is
+    // placed and named as its create is. If the lookup fails, the channel
+    // stays as it was, and the filters decide on what's known, as they do
+    // for its creates. A guild the filters leave out needs no lookup.
     // The channel is read from the cache again after the lookup: while it
     // was pending, the cached entry can have been replaced (the guild
     // removed and joined again builds a new thread object), and then only
     // the cache holds what the lookup found.
+    if (guildId && !this.guildAdmitted(guildId)) return null;
     if (guildId && (threadChannelUnknown(channel) || this.isStale(message.channelId))) {
       await this.lookUpChannel(guildId, message.channelId);
       channel = this.client.channels.cache.get(message.channelId) ?? channel;
@@ -2490,7 +2509,9 @@ export class DiscordAdapter {
       // filters decide, and this channel's later creates wait behind that
       // fetch, so they're delivered in order.
       const waiting = this.threadLookups.get(message.channelId);
-      if (waiting || (message.guildId && (threadChannelUnknown(message.channel) || this.isStale(message.channelId)))) {
+      const lookUp = message.guildId !== null && this.guildAdmitted(message.guildId)
+        && (threadChannelUnknown(message.channel) || this.isStale(message.channelId));
+      if (waiting || lookUp) {
         const next = (waiting ?? this.lookUpChannel(message.guildId!, message.channelId))
           .then(() => this.acceptMessage(message, base))
           .catch((err) => console.error('[discord-mcpl] Failed to deliver a thread message:', (err as Error).message));
@@ -2810,7 +2831,6 @@ export class DiscordAdapter {
       // registers and names nothing.
       if ((err as { code?: unknown } | null)?.code === UNKNOWN_CHANNEL) {
         dbg('gateway:channel-lookup-gone', { channelId });
-        this.stale.delete(channelId);
         this.threadDeleteHandler?.(guildId, channelId);
         return;
       }
@@ -2823,28 +2843,27 @@ export class DiscordAdapter {
     }
   }
 
-  /** Fetch a channel past the cache, as Discord has it now. discord.js
-   *  patches the cached channel with the reply, so a reply that's older than
-   *  something Discord reported while the fetch was out (watchReports) can
-   *  overwrite newer facts. Such a fetch is made again, so the reply kept is
-   *  newer than every report, and a fetch nothing overtook clears an earlier
-   *  stale mark. One overtaken FETCH_TRIES times, or one whose later try
-   *  fails after an overtaken one, leaves the channel marked stale
-   *  (isStale). */
+  /** Fetch a channel past the cache, as Discord has it now. This is the
+   *  freshness rule every fill of the cache from Discord that can later
+   *  supply registration facts follows. discord.js patches the cached
+   *  channel with the reply, so a reply that's older than something Discord
+   *  reported while the fetch was out (watchReports) can overwrite newer
+   *  facts. Such a reply marks the channel stale (isStale) as it lands, and
+   *  the channel is fetched again, up to FETCH_TRIES in all; a fetch nothing
+   *  overtook clears the mark. So the mark stays whenever no fresh fetch
+   *  follows an overtaken one, every try overtaken or a later try failing.
+   *  Unknown Channel means the channel is gone, which drops its mark. */
   private async refetchChannel(channelId: string): Promise<Channel | null> {
-    let channel: Channel | null = null;
     for (let tries = 1; ; tries++) {
       const fetch = { overtaken: false };
       let out = this.fetchesOut.get(channelId);
       if (!out) this.fetchesOut.set(channelId, (out = new Set()));
       out.add(fetch);
+      let channel: Channel | null;
       try {
         channel = await this.client.channels.fetch(channelId, { force: true });
       } catch (err) {
-        // An earlier try's overtaken reply is in the cache: it stays stale.
-        const held = tries > 1 ? this.client.channels.cache.get(channelId) : undefined;
-        const guildId = held && 'guildId' in held ? held.guildId : null;
-        if (guildId) this.stale.set(channelId, { guildId });
+        if ((err as { code?: unknown } | null)?.code === UNKNOWN_CHANNEL) this.stale.delete(channelId);
         throw err;
       } finally {
         out.delete(fetch);
@@ -2854,12 +2873,11 @@ export class DiscordAdapter {
         this.stale.delete(channelId);
         return channel;
       }
-      if (tries === FETCH_TRIES) break;
+      const guildId = channel && 'guildId' in channel ? channel.guildId : null;
+      if (guildId) this.stale.set(channelId, { guildId });
+      if (tries === FETCH_TRIES) return channel;
       dbg('gateway:fetch-overtaken', { channelId, tries });
     }
-    const guildId = channel && 'guildId' in channel ? channel.guildId : null;
-    if (guildId) this.stale.set(channelId, { guildId });
-    return channel;
   }
 
   /** Discord reported on a channel: a fetch of it that's out now may land

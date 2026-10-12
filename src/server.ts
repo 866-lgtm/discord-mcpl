@@ -3136,10 +3136,12 @@ export class DiscordMcplServer {
    *  what it has. Their facts are read together, so their labels are checked
    *  against one view of the channels names resolve among. */
   private rederiveChannels(descriptors: ChannelDescriptor[]): void {
-    // A stale channel's cached facts may be older than what's registered.
+    // A stale channel is re-derived too: its cached name may be older than
+    // Discord's, but its label's check reads the names other channels hold
+    // now, so a name another channel took falls back to the id.
     const channelIds = descriptors
       .map((d) => (d.address as { channelId?: string } | undefined)?.channelId)
-      .filter((id): id is string => id !== undefined && !this.discord.isStale(id));
+      .filter((id): id is string => id !== undefined);
     const facts = this.discord.getCachedChannelFactsFor(channelIds);
     this.registerChannels([...facts.values()].map((f) => this.guildDescriptor(f)));
   }
@@ -3257,7 +3259,11 @@ export class DiscordMcplServer {
    *   kept landing after newer reports. It may have been archived or
    *   deleted meanwhile, whatever the cache still says of it. A delivery
    *   from it fetches it again first, so it's stale here when the delivery
-   *   set out before the mark, or that fetch failed or was overtaken;
+   *   decided on facts from before the mark, or that fetch failed or was
+   *   overtaken;
+   * - a channel the channel filters no longer admit (channelAdmitted), a
+   *   thread through its channel: an update moved it out while the delivery
+   *   was on its way;
    * - an archived thread, unless the message was posted in it after the
    *   archive (`postedAt` later than `archivedAt`, by Discord's clocks),
    *   which unarchived it, whatever the cache has heard yet. A message
@@ -3278,7 +3284,7 @@ export class DiscordMcplServer {
    * - a channel deleted lately, or a thread whose channel was
    *   (deletedLately): the delivery set out before the deletion;
    * - a category or forum, which hold no messages.
-   * A withheld registration is logged with its reason.
+   * A withheld registration is written to the debug log with its reason.
    */
   private registerGuildDelivery(
     guildId: string,
@@ -3297,6 +3303,7 @@ export class DiscordMcplServer {
     const named = this.channelManager.get(id) ? id : undefined;
     if (!facts) return withheld('uncached', named);
     if (this.discord.isStale(channelId)) return withheld('stale', named);
+    if (!this.discord.channelAdmitted(guildId, channelId, facts.parentId ?? null)) return withheld('not-admitted', named);
     const unarchived = opts.postedAt !== undefined && facts.archivedAt !== undefined && opts.postedAt > facts.archivedAt;
     if (facts.archived && !unarchived) return withheld('archived', named);
     this.registerChannels([this.guildDescriptor(facts)]);
