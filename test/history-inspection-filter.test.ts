@@ -43,7 +43,7 @@ function adapterWith(t: TestContext, config: Partial<DiscordAdapterConfig>) {
   t.after(() => client.destroy());
   // channelAllowed reads a thread's channel from the cache to find its
   // category (#73), as the gateway leaves it there for a guild's channels.
-  client.channels.cache.set(UNDER_CATEGORY, { id: UNDER_CATEGORY, parentId: CATEGORY } as never);
+  client.channels.cache.set(UNDER_CATEGORY, { id: UNDER_CATEGORY, isDMBased: () => false, ...channels[UNDER_CATEGORY], parentId: CATEGORY } as never);
   (client.channels as unknown as { fetch: unknown }).fetch = async (id: string) => {
     if (id === DM) return { id, isDMBased: () => true };
     // As discord.js's DiscordAPIError carries it: Discord's JSON code.

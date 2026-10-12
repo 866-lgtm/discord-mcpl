@@ -67,6 +67,7 @@ describe('edit/delete push events', () => {
       onMessage: noop, onReaction: noop,
       onChannelCreate: noop, onChannelUpdate: noop, onChannelDelete: noop, onGuildCreate: noop,
       onGuildRename: noop, onThreadUpdate: noop, onThreadDelete: noop, onGuildDelete: noop, onGuildAvailable: noop,
+      onChannelRefreshed: noop,
       // The cache holds chan1, as it holds a channel an edit or delete comes
       // from, and nothing else.
       getCachedChannelFacts: (id: string) =>

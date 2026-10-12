@@ -693,6 +693,7 @@ export class DiscordAdapter {
   private channelDeleteHandler?: (guildId: string, channelId: string, threadIds: string[]) => void;
   private threadUpdateHandler?: (thread: ChannelFacts) => void;
   private threadDeleteHandler?: (guildId: string, threadId: string) => void;
+  private channelRefreshedHandler?: (channelId: string) => void;
   private guildCreateHandler?: (guildId: string, channels: ChannelFacts[]) => void;
   private guildDeleteHandler?: (guildId: string) => void;
   private guildAvailableHandler?: (guildId: string, channels: ChannelFacts[], present: ReadonlySet<string>) => void;
@@ -953,6 +954,12 @@ export class DiscordAdapter {
     this.threadDeleteHandler = handler;
   }
 
+  /** A stale channel was fetched fresh (refetchChannel): what's registered
+   *  of it may have been derived from the older facts it replaced. */
+  onChannelRefreshed(handler: (channelId: string) => void): void {
+    this.channelRefreshedHandler = handler;
+  }
+
   /** Fired when the bot joins a new guild after startup. The handler receives
    *  the guild's channels of a listed kind that the filters admit, so the
    *  server can register them the same way it does at boot. */
@@ -1037,7 +1044,7 @@ export class DiscordAdapter {
    *  carries `notPosted: true` was raised before anything was sent: the
    *  channel lookup failed or found no text channel. */
   async sendDmNotice(channelId: string, content: string, nonce: string): Promise<{ messageId: string }> {
-    const channel = await this.client.channels.fetch(channelId).catch((err: unknown) => {
+    const channel = await this.channelById(channelId).catch((err: unknown) => {
       throw Object.assign(
         new Error(`could not look up channel ${channelId}: ${err instanceof Error ? err.message : String(err)}`),
         { notPosted: true },
@@ -1060,7 +1067,7 @@ export class DiscordAdapter {
     content: string,
     options?: { replyTo?: string; files?: OutgoingFile[]; requireReplyTarget?: boolean },
   ): Promise<{ messageId: string }> {
-    const channel = await this.client.channels.fetch(channelId);
+    const channel = await this.channelById(channelId);
     if (!channel || !('send' in channel)) {
       throw new Error(`Channel ${channelId} not found or not a text channel`);
     }
@@ -1201,7 +1208,7 @@ export class DiscordAdapter {
   }
 
   async editMessage(channelId: string, messageId: string, content: string): Promise<void> {
-    const channel = await this.client.channels.fetch(channelId);
+    const channel = await this.channelById(channelId);
     if (!channel || !('messages' in channel)) {
       throw new Error(`Channel ${channelId} not found`);
     }
@@ -1282,7 +1289,7 @@ export class DiscordAdapter {
   }
 
   async deleteMessage(channelId: string, messageId: string): Promise<void> {
-    const channel = await this.client.channels.fetch(channelId);
+    const channel = await this.channelById(channelId);
     if (!channel || !('messages' in channel)) {
       throw new Error(`Channel ${channelId} not found`);
     }
@@ -1291,7 +1298,7 @@ export class DiscordAdapter {
   }
 
   async addReaction(channelId: string, messageId: string, emoji: string): Promise<void> {
-    const channel = await this.client.channels.fetch(channelId);
+    const channel = await this.channelById(channelId);
     if (!channel || !('messages' in channel)) {
       throw new Error(`Channel ${channelId} not found`);
     }
@@ -1300,7 +1307,7 @@ export class DiscordAdapter {
   }
 
   async removeReaction(channelId: string, messageId: string, emoji: string): Promise<void> {
-    const channel = await this.client.channels.fetch(channelId);
+    const channel = await this.channelById(channelId);
     if (!channel || !('messages' in channel)) {
       throw new Error(`Channel ${channelId} not found`);
     }
@@ -1360,9 +1367,11 @@ export class DiscordAdapter {
       if (guildId && (threadChannelUnknown(msg.channel) || this.isStale(msg.channelId))) {
         await this.lookUpChannel(guildId, msg.channelId);
       }
+      // Read again: the lookup can have replaced the cached entry.
+      const channel = this.client.channels.cache.get(msg.channelId) ?? msg.channel;
       const parentId =
-        msg.channel && 'parentId' in msg.channel
-          ? ((msg.channel as { parentId?: string | null }).parentId ?? null)
+        channel && 'parentId' in channel
+          ? ((channel as { parentId?: string | null }).parentId ?? null)
           : null;
       if (!this.channelAllowed(guildId, msg.channelId, parentId)) return;
       const reactor = user.partial ? await user.fetch().catch(() => user) : user;
@@ -1401,7 +1410,7 @@ export class DiscordAdapter {
     channelId: string,
     options?: { limit?: number; before?: string; after?: string },
   ): Promise<HistoryMessage[]> {
-    const channel = await this.client.channels.fetch(channelId);
+    const channel = await this.channelById(channelId);
     if (!channel || !('messages' in channel)) {
       throw new Error(`Channel ${channelId} not found`);
     }
@@ -1480,7 +1489,7 @@ export class DiscordAdapter {
     messageId: string,
     limit = 50,
   ): Promise<HistoryMessage[]> {
-    const channel = await this.client.channels.fetch(channelId);
+    const channel = await this.channelById(channelId);
     if (!channel || !('messages' in channel)) {
       throw new Error(`Channel ${channelId} not found`);
     }
@@ -1518,14 +1527,19 @@ export class DiscordAdapter {
    *  thread the client knows only partly is fetched past the cache, which
    *  would hand back that same partial. */
   async getChannelMeta(channelId: string): Promise<ChannelMeta> {
-    // A channel the cache holds whole, and current, is read from it, as
-    // discord.js's fetch would; anything else is fetched from Discord
-    // (refetchChannel), which clears a stale mark when nothing overtakes it.
+    return this.extractChannelMeta(await this.channelById(channelId), channelId);
+  }
+
+  /** A channel as the tools and reads use it. One the cache holds whole,
+   *  and current, is read from it, as discord.js's fetch would; anything
+   *  else is fetched from Discord through refetchChannel, so the fill
+   *  follows the freshness rule and clears a stale mark when nothing
+   *  overtakes it. */
+  private async channelById(channelId: string): Promise<Channel | null> {
     const cached = this.client.channels.cache.get(channelId);
-    const channel = cached && !cached.partial && !threadChannelUnknown(cached) && !this.isStale(channelId)
-      ? cached
-      : await this.refetchChannel(channelId);
-    return this.extractChannelMeta(channel, channelId);
+    if (cached && !cached.partial && !threadChannelUnknown(cached) && !this.isStale(channelId)) return cached;
+    // One the cache doesn't hold, discord.js's own fetch asks Discord for.
+    return this.refetchChannel(channelId, { force: cached !== undefined });
   }
 
   /** Cache-only variant of getChannelMeta: gateway-cache lookup, no REST,
@@ -1657,7 +1671,7 @@ export class DiscordAdapter {
   }
 
   async sendTyping(channelId: string): Promise<void> {
-    const channel = await this.client.channels.fetch(channelId);
+    const channel = await this.channelById(channelId);
     if (channel && 'sendTyping' in channel) {
       await (channel as TextChannel).sendTyping();
     }
@@ -1673,7 +1687,7 @@ export class DiscordAdapter {
     channelId: string,
   ): Promise<{ recipientId: string; recipientName: string } | null> {
     try {
-      const channel = await this.client.channels.fetch(channelId);
+      const channel = await this.channelById(channelId);
       if (!channel || channel.type !== ChannelType.DM) return null;
       const dm = channel as DMChannel;
       const recipient =
@@ -1739,7 +1753,7 @@ export class DiscordAdapter {
     channelId: string,
   ): Promise<{ label: string; channelName?: string; guildName?: string; isDM: boolean }> {
     try {
-      const channel = await this.client.channels.fetch(channelId);
+      const channel = await this.channelById(channelId);
       if (!channel) return { label: channelId, isDM: false };
       const ch = channel as { guild?: Guild; recipient?: User; name?: string };
       if (ch.guild) {
@@ -1906,7 +1920,7 @@ export class DiscordAdapter {
     channelId: string,
     opts: { cap?: boolean; withPermission?: bigint; warmups?: Map<string, boolean> } = {},
   ): Promise<DiscordChannelMembers> {
-    const channel = await this.client.channels.fetch(channelId);
+    const channel = await this.channelById(channelId);
     if (!channel) throw new Error(`Channel ${channelId} not found`);
     const warm = async (guild: Guild): Promise<boolean> => {
       let warmed = opts.warmups?.get(guild.id);
@@ -2058,7 +2072,7 @@ export class DiscordAdapter {
     // '@' (or '@' and spaces) names no one: refused before anything is read.
     const bare = raw.replace(/^@/, '').trim();
     if (!bare) return { ok: false, message: 'latestFrom names no one; nothing was done.' };
-    const channel = await this.client.channels.fetch(channelId);
+    const channel = await this.channelById(channelId);
     if (!channel) throw new Error(`Channel ${channelId} not found`);
     const refused = await this.latestFromFilterRefusal(channel, channelId);
     if (refused) return { ok: false, message: refused };
@@ -2274,7 +2288,7 @@ export class DiscordAdapter {
   }
 
   async deleteChannel(channelId: string): Promise<void> {
-    const channel = await this.client.channels.fetch(channelId);
+    const channel = await this.channelById(channelId);
     if (!channel) throw new Error(`Channel ${channelId} not found`);
     if ('delete' in channel) {
       await (channel as TextChannel).delete();
@@ -2852,8 +2866,12 @@ export class DiscordAdapter {
    *  the channel is fetched again, up to FETCH_TRIES in all; a fetch nothing
    *  overtook clears the mark. So the mark stays whenever no fresh fetch
    *  follows an overtaken one, every try overtaken or a later try failing.
-   *  Unknown Channel means the channel is gone, which drops its mark. */
-  private async refetchChannel(channelId: string): Promise<Channel | null> {
+   *  A fresh try that clears a mark tells the server (onChannelRefreshed),
+   *  so what it derived from the older facts is derived again. Unknown
+   *  Channel means the channel is gone: its mark goes, and so does what
+   *  discord.js still holds of it (forgetCached), so no later read finds it
+   *  live. */
+  private async refetchChannel(channelId: string, { force = true }: { force?: boolean } = {}): Promise<Channel | null> {
     for (let tries = 1; ; tries++) {
       const fetch = { overtaken: false };
       let out = this.fetchesOut.get(channelId);
@@ -2861,22 +2879,23 @@ export class DiscordAdapter {
       out.add(fetch);
       let channel: Channel | null;
       try {
-        channel = await this.client.channels.fetch(channelId, { force: true });
+        // A later try must ask Discord past what the earlier reply left cached.
+        channel = await this.client.channels.fetch(channelId, { force: force || tries > 1 });
       } catch (err) {
-        if ((err as { code?: unknown } | null)?.code === UNKNOWN_CHANNEL) this.stale.delete(channelId);
+        if ((err as { code?: unknown } | null)?.code === UNKNOWN_CHANNEL) this.forgetCached(channelId);
         throw err;
       } finally {
         out.delete(fetch);
         if (out.size === 0) this.fetchesOut.delete(channelId);
       }
       if (!fetch.overtaken) {
-        this.stale.delete(channelId);
+        if (this.stale.delete(channelId)) this.channelRefreshedHandler?.(channelId);
         return channel;
       }
       const guildId = channel && 'guildId' in channel ? channel.guildId : null;
       if (guildId) this.stale.set(channelId, { guildId });
+      dbg('gateway:fetch-overtaken', { channelId, tries, last: tries === FETCH_TRIES });
       if (tries === FETCH_TRIES) return channel;
-      dbg('gateway:fetch-overtaken', { channelId, tries });
     }
   }
 
@@ -2884,6 +2903,20 @@ export class DiscordAdapter {
    *  with older facts (refetchChannel). */
   private overtake(channelId: string): void {
     for (const fetch of this.fetchesOut.get(channelId) ?? []) fetch.overtaken = true;
+  }
+
+  /** Drop what discord.js holds of a channel Discord says doesn't exist: the
+   *  client's cache, its guild's, and its channel's threads for a thread,
+   *  which discord.js leaves as they were when a fetch fails. */
+  private forgetCached(channelId: string): void {
+    this.stale.delete(channelId);
+    const held = this.client.channels.cache.get(channelId) as
+      | { guild?: { channels?: { cache: Map<string, unknown> } }; parent?: { threads?: { cache: Map<string, unknown> } } | null }
+      | undefined;
+    if (!held) return;
+    this.client.channels.cache.delete(channelId);
+    held.guild?.channels?.cache.delete(channelId);
+    held.parent?.threads?.cache.delete(channelId);
   }
 
   /** Discord's reports on guild channels, as the gateway dispatches them,
@@ -2949,7 +2982,7 @@ export class DiscordAdapter {
    *  DMs and guilds without a guildChannels entry pass; guildIds and dmUsers
    *  bound delivery, not reads. */
   async inspectionRefusal(channelId: string): Promise<string | null> {
-    const channel = await this.client.channels.fetch(channelId);
+    const channel = await this.channelById(channelId);
     // A lookup that finds nothing can't be placed, so it fails closed, with
     // the not-found error the read itself would give.
     if (!channel) throw new Error(`Channel ${channelId} not found`);

@@ -4037,6 +4037,15 @@ export class DiscordMcplServer {
 
     this.discord.onChannelDelete((guildId, channelId, threadIds) => this.channelDeleted(guildId, channelId, threadIds));
     this.discord.onThreadDelete((guildId, threadId) => this.channelDeleted(guildId, threadId));
+    // A stale channel fetched fresh: what was derived from its older facts,
+    // its own registration and its threads' labels, is derived again.
+    this.discord.onChannelRefreshed((channelId) => {
+      const registered = this.channelManager.getAll()
+        .filter((d) => (d.address as { channelId?: string } | undefined)?.channelId === channelId);
+      if (registered.length > 0 || this.registeredThreadsOf(channelId).length > 0) {
+        this.rederiveChannels([...registered, ...this.registeredThreadsOf(channelId)]);
+      }
+    });
   }
 
   /** Fetch + convert a message's attachments into MCPL content blocks so the

@@ -569,20 +569,26 @@ in the git log and PR descriptions.
     archived, meanwhile is forgotten, and a new or renamed channel is
     registered or re-derived. What the server no longer lists, on its
     return or when the bot joins it again, may have changed unseen: a
-    message, edit, deletion or reaction from it, or the reconnect sweep,
-    looks it up from Discord again before deciding, and a delivery that
-    decided on facts from before the return doesn't register it. A lookup that Discord overtook with a
-    report on its channel, such as an archive or a rename, is made again,
-    so what a delivery waiting on it registers is no older than that
-    report. A channel moved out of what the channel filters admit is
+    message, edit, deletion or reaction from it, a tool, or the reconnect
+    sweep, looks it up from Discord again before deciding, and a delivery
+    that decided on facts from before the return doesn't register it. A
+    lookup that Discord overtook with a report on its channel, such as an
+    archive or a rename, is made again, so what a delivery waiting on it
+    registers is no older than that report, and what was registered from
+    the older facts meanwhile is registered again from the fresh ones. A
+    channel Discord says doesn't exist is dropped from the cache. A
+    channel moved out of what the channel filters admit is
     forgotten, with the threads admitted through it, as on a server's
     return, and a delivery on its way from it doesn't register it again.
     Only what was registered is announced as removed.
   - **`list_channels` reads a server's channels from the gateway's
     cache** instead of fetching them from Discord, so it can't leave older
-    facts in the cache than an update brought meanwhile. It lists what it
-    did, threads still excluded, and refuses a server in an outage rather
-    than listing what it held before.
+    facts in the cache than an update brought meanwhile. It lists the same
+    channels as before, threads still excluded, and refuses a server in an
+    outage rather than listing what it held before.
+  - **A reaction in a server the guild filter leaves out is dropped,** as
+    its messages are. It used to pass when the server had no channel
+    filter of its own.
   - **A channel's label, its address, is made one way on every path,**
     `list_channels`, `create_text_channel` and send receipts included. A
     channel's is its address, `#name (Guild)`. A
@@ -611,9 +617,12 @@ in the git log and PR descriptions.
   - **A push names its channel (`mcplChannelId`) once it's registered,**
     which is every channel a message is delivered from except a thread
     archived since its missed messages (the sweep delivers them without
-    it), and a channel deleted, a thread archived, or a channel left out
-    when its server came back, or in a server the bot left, while the
-    message was on its way. A DM's edit or deletion names its DM too, registered
+    it), and a channel deleted, a thread archived, a channel left out when
+    its server came back or moved out of what the channel filters admit,
+    or one in a server the bot left, while the message was on its way. A
+    channel whose facts may be older than Discord's, because its lookup
+    failed or every try was overtaken, and one discord.js doesn't hold,
+    are delivered without it too. A DM's edit or deletion names its DM too, registered
     under its other party's name when that's known; one whose other party
     isn't known, in a DM not registered yet, goes without it.
   - **A deleted channel's watermark and missed tally go,** with those of the

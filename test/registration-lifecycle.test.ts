@@ -77,8 +77,14 @@ function fixture(t: TestContext, opts: {
   sparse?: boolean;
   /** The guild's channel filter: the channels and categories it admits. */
   guildChannels?: string[];
+  /** The guild filter: the guilds it admits. */
+  guildIds?: string[];
 } = {}) {
-  const adapter = new DiscordAdapter({ token: 'unused', ...(opts.guildChannels ? { guildChannels: { [G]: opts.guildChannels } } : {}) });
+  const adapter = new DiscordAdapter({
+    token: 'unused',
+    ...(opts.guildChannels ? { guildChannels: { [G]: opts.guildChannels } } : {}),
+    ...(opts.guildIds ? { guildIds: opts.guildIds } : {}),
+  });
   const client = adapter.rawClient as any;
   t.after(() => client.destroy());
   client.user = client.users._add({ ...bot, bot: true });
@@ -327,6 +333,7 @@ it('a create in a thread known only partly, which Discord answers Unknown Channe
   assert.ok(push, 'the message is still delivered');
   assert.equal(push.params.origin.mcplChannelId, undefined);
   assert.equal(f.server.channelManager.get(threadMcplId), undefined);
+  assert.ok(f.server.deletedChannels.has(TH), 'the lookup reported the thread deleted');
 });
 
 it('a create delivered after its thread was deleted leaves the watermark the deletion dropped', async (t) => {
@@ -1068,15 +1075,21 @@ it("a channel update that changes no name, kind or category re-derives none of i
   assert.equal(f.label(TH), '#after › topic (Guild)');
 });
 
-it("list_channels lists the guild's own channels from the cache, without its threads, and refuses a guild in an outage", async (t) => {
+it("list_channels lists the guild's own channels from the cache, every kind but threads, and refuses a guild in an outage", async (t) => {
   const V = '100000000000000009';
-  const f = fixture(t, { channels: [channelData(V, ChannelType.GuildVoice, 'lounge')] });
+  const A = '100000000000000023';
+  const F = '100000000000000024';
+  const f = fixture(t, { channels: [
+    channelData(V, ChannelType.GuildVoice, 'lounge'), channelData(A, ChannelType.GuildAnnouncement, 'news'),
+    channelData(F, ChannelType.GuildForum, 'ideas'), ...categories,
+  ] });
   const get = t.mock.method(f.client.rest, 'get', async () => []);
   const listed = await f.adapter.listChannels(G);
-  assert.deepEqual(listed.map((c) => c.id).sort(), [P, V].sort(), 'the thread in the cache is not listed');
+  assert.deepEqual(listed.map((c) => c.id).sort(), [P, V, A, F, C1, C2].sort(), 'the thread in the cache is not listed');
   assert.equal(get.mock.callCount(), 0);
+  // The guild comes back with P alone: the listing is what it came back with.
   f.comesBack();
-  assert.equal((await f.adapter.listChannels(G)).some((c) => c.id === TH), false);
+  assert.deepEqual((await f.adapter.listChannels(G)).map((c) => c.id), [P]);
   f.client.actions.GuildDelete.handle({ id: G, unavailable: true });
   await assert.rejects(f.adapter.listChannels(G), /unavailable/);
 });
@@ -1098,13 +1111,25 @@ it('a reaction from a stale channel looks it up first', { timeout: 5000 }, async
 
 it('a create on its way when its channel moves out of the filters neither registers it again nor names it', async (t) => {
   const f = fixture(t, { guildChannels: [C1, P], channels: [...categories, inCategory(C1)] });
+  const post = () => f.posted({ channelId: X, channelName: 'news', threadId: undefined, threadName: undefined, threadParentName: undefined, attachments: [attachment] });
+  // Without the move, the same delivery registers the channel and names it.
+  const control = fixture(t, { guildChannels: [C1, P], channels: [...categories, inCategory(C1)] });
+  control.server.buildAttachmentBlocks = async () => [];
+  await control.server.handleDiscordMessage(post());
+  assert.equal(control.pushes().length, 1);
+  assert.equal(control.pushes()[0]!.params.origin.mcplChannelId, idOf(X));
+  assert.equal(control.label(X), '#news (Guild)');
   const { held, release } = holder(t);
-  f.server.buildAttachmentBlocks = async () => { await held; return []; };
-  const delivery = f.server.handleDiscordMessage(f.posted({ channelId: X, channelName: 'news', threadId: undefined, threadName: undefined, threadParentName: undefined, attachments: [attachment] }));
+  let reached!: () => void;
+  const atAttachments = new Promise<void>((done) => { reached = done; });
+  f.server.buildAttachmentBlocks = async () => { reached(); await held; return []; };
+  const delivery = f.server.handleDiscordMessage(post());
+  await atAttachments;
   dispatch(f.client, 'CHANNEL_UPDATE', channelUpdate, { d: inCategory(C2) });
   release();
   await delivery;
-  assert.equal(f.pushes()[0]?.params.origin.mcplChannelId, undefined);
+  assert.equal(f.pushes().length, 1, 'the message is still delivered');
+  assert.equal(f.pushes()[0]!.params.origin.mcplChannelId, undefined);
   assert.equal(f.label(X), undefined);
 });
 
@@ -1113,9 +1138,11 @@ it('a thread the filter lists by its own id stays registered when its channel mo
   f.client.channels._add(threadInX);
   f.server.registerGuildDelivery(G, X);
   f.server.registerGuildDelivery(G, TX);
+  assert.equal(f.label(X), '#news (Guild)');
+  assert.equal(f.label(TX), '#news › x-topic (Guild)');
   dispatch(f.client, 'CHANNEL_UPDATE', channelUpdate, { d: inCategory(C2) });
   assert.equal(f.label(X), undefined);
-  assert.ok(f.label(TX), 'still admitted by its own id');
+  assert.equal(f.label(TX), '#news › x-topic (Guild)', 'still admitted by its own id');
 });
 
 it("a stale channel's meta that Discord answers Unknown Channel for loses its mark", async (t) => {
@@ -1128,8 +1155,7 @@ it("a stale channel's meta that Discord answers Unknown Channel for loses its ma
 });
 
 it("an edit in a guild the filter leaves out looks nothing up", { timeout: 5000 }, async (t) => {
-  const f = fixture(t);
-  (f.adapter as any).guildIds = ['100000000000000099'];
+  const f = fixture(t, { guildIds: ['100000000000000099'] });
   f.comesBack();
   const get = t.mock.method(f.client.rest, 'get', async () => threadAt(false, T));
   f.client.emit('messageUpdate', { partial: true }, {
@@ -1160,4 +1186,60 @@ it("an overtaken try's reply marks its channel stale as it lands, until a fresh 
   gates[1]!();
   await lookup;
   assert.equal(f.adapter.isStale(TH), false);
+});
+
+it("a reaction or a create in a guild the filter leaves out looks nothing up", { timeout: 5000 }, async (t) => {
+  const f = fixture(t, { guildIds: ['100000000000000099'] });
+  f.comesBack();
+  assert.ok(f.adapter.isStale(TH));
+  const get = t.mock.method(f.client.rest, 'get', async () => threadAt(false, T));
+  const message = {
+    id: M, channelId: TH, guildId: G, channel: f.client.channels.cache.get(TH), partial: false,
+    author: { id: U, username: 'Bob' }, content: 'hi', cleanContent: 'hi',
+  };
+  f.client.emit('messageReactionAdd', { partial: false, emoji: { name: '👍', id: null }, message }, { id: U, username: 'Bob', partial: false });
+  f.gatewayCreate(T);
+  for (let i = 0; i < 10; i++) await new Promise((done) => setImmediate(done));
+  assert.equal(get.mock.callCount(), 0);
+  assert.equal(f.pushes().length, 0);
+});
+
+it("a stale channel fetched fresh is registered again from what the fetch brought", async (t) => {
+  const f = fixture(t);
+  f.server.registerGuildDelivery(G, P);
+  assert.equal(f.label(P), '#before (Guild)');
+  // An overtaken reply left an older name in the cache and marked it stale,
+  // and a re-derivation meanwhile registered that name.
+  (f.adapter as any).stale.set(P, { guildId: G });
+  f.client.channels.cache.get(P).name = 'older';
+  f.server.rederiveChannels(f.server.registeredInGuild(G));
+  assert.equal(f.label(P), '#older (Guild)');
+  t.mock.method(f.client.rest, 'get', async () => ({ ...parentData(ChannelType.GuildText), name: 'current' }));
+  await f.adapter.getChannelMeta(P);
+  assert.equal(f.adapter.isStale(P), false);
+  assert.equal(f.label(P), '#current (Guild)');
+});
+
+it("a tool's fetch of a channel the cache doesn't hold is made again when an update overtakes it", { timeout: 5000 }, async (t) => {
+  const f = fixture(t);
+  const { release, calls } = lookups(t, f, [channelData(X, ChannelType.GuildText, 'older'), channelData(X, ChannelType.GuildText, 'news')]);
+  const refusal = f.adapter.inspectionRefusal(X);
+  await until(() => calls() === 1);
+  f.client.ws.emit('CHANNEL_UPDATE', channelData(X, ChannelType.GuildText, 'news'), 0);
+  release();
+  assert.equal(await refusal, null);
+  assert.equal(calls(), 2);
+  assert.equal(f.client.channels.cache.get(X)?.name, 'news');
+  assert.equal(f.adapter.isStale(X), false);
+});
+
+it("Unknown Channel takes the channel out of discord.js's cache, so no later read finds it live", async (t) => {
+  const f = fixture(t);
+  f.comesBack();
+  assert.ok(f.client.channels.cache.has(TH));
+  t.mock.method(f.client.rest, 'get', async () => { throw unknownChannel(); });
+  await assert.rejects(f.adapter.getChannelMeta(TH));
+  assert.equal(f.client.channels.cache.has(TH), false);
+  assert.equal(f.adapter.isStale(TH), false);
+  await assert.rejects(f.adapter.getChannelMeta(TH), 'read again, it is fetched again, and still unknown');
 });
