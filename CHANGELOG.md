@@ -354,7 +354,8 @@ in the git log and PR descriptions.
   `main`, an empty-string `channelId` is refused rather than read as absent,
   and address ids must be strings. Refusals carry MCPL's codes: unknown
   channel (`-32023`), invalid params (`-32602`), or open failed (`-32024`,
-  when the history fetch fails, or a `channels/close` or `mute_channel` for
+  when the history fetch fails, the channel filters refuse reading its
+  history or can't be checked, or a `channels/close` or `mute_channel` for
   the channel arrives while the open is in progress, which then stands). No
   history is fetched, and nothing is opened or subscribed, before a request
   names its channel, and a channel unregistered while the open is in

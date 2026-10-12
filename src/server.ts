@@ -3273,10 +3273,20 @@ export class DiscordMcplServer {
       // before the filters narrowed stays registered until restart, so the
       // registry alone doesn't keep it out. A refusal fails the open before
       // anything is read or subscribed.
-      const refusal = await this.discord.inspectionRefusal(parsed.channelId);
+      // Both answers say the open couldn't go ahead (MCPL's open failed),
+      // as a failed history fetch does.
+      let refusal: string | null;
+      try {
+        refusal = await this.discord.inspectionRefusal(parsed.channelId);
+      } catch (err) {
+        throw new RequestRefusal(
+          ERR_CHANNEL_OPEN_FAILED,
+          `${desc.id} couldn't be checked against the channel filters, so nothing was opened: ${errorText(err)}`,
+        );
+      }
       if (refusal) {
         dbg('channel-open:inspection-refused', { channelId: desc.id });
-        throw new Error(refusal);
+        throw new RequestRefusal(ERR_CHANNEL_OPEN_FAILED, `${refusal} Nothing was opened.`);
       }
       const limit = this.capHistoryLimit(parsed.channelId, Math.min(500, Math.max(0, requested)));
       if (params.history?.sinceLastSeen) this.ensureWatermarkLoaded();

@@ -232,8 +232,12 @@ describe('channels/open backscroll', () => {
     for (const id of [EXCLUDED, THREAD_OF_EXCLUDED]) {
       await assert.rejects(
         server.handleChannelOpen({ channelId: mcplChannelId(G1, id), type: 'discord', history: { limit: 20 } }),
-        REFUSAL,
-        id,
+        (err: Error & { code?: unknown }) => {
+          // MCPL's open failed: the open couldn't go ahead.
+          assert.equal(err.code, -32024, id);
+          assert.match(err.message, /is outside this residence's configured channel filters — filters bound inspection as well as delivery\. Nothing was read\. Nothing was opened\.$/, id);
+          return true;
+        },
       );
       assert.equal(opened(id), false, `${id} is neither open nor subscribed`);
       assert.equal(server.reactionChannels.has(id), false, `${id}: reaction visibility unchanged`);
@@ -247,7 +251,11 @@ describe('channels/open backscroll', () => {
     const { server, reads, opened } = serverWith(t);
     await assert.rejects(
       server.handleChannelOpen({ channelId: mcplChannelId(G1, LOOKUP_FAILS), type: 'discord', history: { limit: 20 } }),
-      /^Error: Unknown Channel$/,
+      (err: Error & { code?: unknown }) => {
+        assert.equal(err.code, -32024);
+        assert.equal(err.message, `${mcplChannelId(G1, LOOKUP_FAILS)} couldn't be checked against the channel filters, so nothing was opened: Unknown Channel`);
+        return true;
+      },
     );
     assert.equal(opened(LOOKUP_FAILS), false);
     assert.deepEqual(reads, [], 'no history was read');
