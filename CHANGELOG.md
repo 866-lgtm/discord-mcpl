@@ -577,21 +577,27 @@ in the git log and PR descriptions.
     registers is no older than that report. The fresh facts count as an
     update of the channel, so what was registered from the older ones
     meanwhile is registered again, or forgotten when they show a thread
-    archived or a channel outside the filters. A channel Discord says
-    doesn't exist, to a lookup or to a tool, is handled as deleted, and
-    dropped from discord.js's cache with its threads. A channel that
-    `create_text_channel` makes is fetched again after the POST, so the
-    cache keeps what the gateway reported of it meanwhile, and one whose
-    fetch fails stays stale. A stale channel answers no name and is
-    labelled by its id until a fresh fetch, listings leave it out, and
-    a name-addressed tool and `refresh_channels` fetch stale channels
-    first. A channel that Discord moves out of what the channel filters
-    admit is forgotten, with the threads admitted through it, as on a
-    server's return, and a delivery on its way from it doesn't register
-    it again. Editing the filters themselves (`filters_update`, or the
-    filters file) registers what they newly admit and leaves registered
-    what they stop admitting until a restart, as before. Only what was
-    registered is announced as removed.
+    archived or a channel outside the filters. A guild channel the cache
+    holds that Discord says doesn't exist, to a lookup or to a tool, is
+    handled as deleted, and dropped from discord.js's cache with its
+    threads. A channel that `create_text_channel` makes is fetched again
+    after the POST, so the cache keeps what the gateway reported of it
+    meanwhile; if that fetch fails the channel becomes stale, and if
+    Discord says it's gone already the tool says so. A stale channel's
+    facts decide nothing. Its current name isn't known, so while its
+    server lists it, no name in that server resolves, and every label
+    there is its channel's id until a fresh fetch; its category admits
+    none of its threads.
+    The registration listings leave it out. A name-addressed tool and
+    `refresh_channels` fetch stale channels first, as a delivery from a
+    thread fetches its stale channel first. A channel that Discord moves
+    out of what the channel filters admit is forgotten, with the threads
+    admitted through it, as on a server's return, and a delivery on its
+    way from it doesn't register it again. Editing the filters file
+    registers what it newly admits, and `filters_update` registers the
+    channels of a server it newly admits; neither forgets what they stop
+    admitting until a restart, as before. Only what was registered is
+    announced as removed.
   - **`list_channels` reads a server's channels from the gateway's
     cache** instead of fetching them from Discord, so it can't leave older
     facts in the cache than an update brought meanwhile. It lists the same
@@ -631,11 +637,12 @@ in the git log and PR descriptions.
     it), and a channel deleted, a thread archived, a channel left out when
     its server came back or moved out of what the channel filters admit,
     or one in a server the bot left, while the message was on its way. A
-    channel whose facts may be older than Discord's, because its lookup
-    failed or every try was overtaken, and one discord.js doesn't hold,
-    are delivered without it too, unless they're registered already. A DM's edit or deletion names its DM too, registered
-    under its other party's name when that's known; one whose other party
-    isn't known, in a DM not registered yet, goes without it.
+    stale channel, whose lookup failed while it was stale or whose every
+    try was overtaken, and one discord.js doesn't hold, are delivered
+    without it too, unless they're registered already. A DM's edit or
+    deletion names its DM too, registered under its other party's name
+    when that's known; one whose other party isn't known, in a DM not
+    registered yet, goes without it.
   - **A deleted channel's watermark and missed tally go,** with those of the
     threads it's known to hold, as do those of a channel the reconnect sweep
     finds Discord no longer knows (deleted while discord-mcpl was down,

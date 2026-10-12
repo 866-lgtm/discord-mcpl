@@ -265,6 +265,7 @@ class MockDiscordAdapter {
     this._threadDeleteHandler?.(guildId, threadId);
   }
   onChannelRefreshed(_handler: (channelId: string) => void): void {}
+  onChannelStale(_handler: (channelId: string) => void): void {}
   async refreshStale(): Promise<void> {}
   simulateChannelDelete(guildId: string, channelId: string, threadIds: string[] = []): void {
     this._channelDeleteHandler?.(guildId, channelId, threadIds);

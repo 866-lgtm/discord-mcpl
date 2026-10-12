@@ -64,6 +64,7 @@ import {
   isNameAddressableKind,
   isSnowflake,
   looksLikeExplicitName,
+  parseChannelRef,
   type AddressingPath,
 } from './channel-names.js';
 import { UNKNOWN_CHANNEL, explainDiscordError, type ExplainContext } from './discord-errors.js';
@@ -1624,9 +1625,11 @@ export class DiscordMcplServer {
         };
       }
       if (path === 'name-resolved' && !noResolver) {
-        // A stale channel answers no name (DiscordAdapter.refreshStale), so
-        // one whose fetch is fresh now is found by the name Discord has.
-        await this.discord.refreshStale();
+        // A name a stale channel holds resolves to no channel
+        // (DiscordAdapter.resolveChannelRef), so stale channels are fetched
+        // first, and one whose fetch is fresh now is found by the name
+        // Discord has. An id needs no name.
+        if (parseChannelRef(given)?.kind === 'name') await this.discord.refreshStale();
         const resolved = this.discord.resolveChannelRef(given);
         if (!resolved.ok) {
           // Telemetry: log the failure with what was ASKED FOR, so drift is
@@ -4044,8 +4047,22 @@ export class DiscordMcplServer {
     this.discord.onThreadUpdate((thread) => {
       const id = mcplChannelId(thread.guildId, thread.id);
       if (!this.channelManager.get(id)) return;
-      if (thread.archived) this.forgetChannels([id]);
-      else this.registerChannels([this.guildDescriptor(thread)]);
+      if (thread.archived || !this.discord.channelAdmitted(thread.guildId, thread.id, thread.parentId ?? null)) {
+        this.forgetChannels([id]);
+      } else {
+        this.registerChannels([this.guildDescriptor(thread)]);
+      }
+    });
+
+    // A fetch left a channel stale: its current name isn't known, so no
+    // name in its guild resolves (resolveChannelRef), and the labels there
+    // are derived again, by id. Its fresh fetch derives them again by name
+    // (onChannelRefreshed).
+    this.discord.onChannelStale((channelId) => {
+      const registered = this.channelManager.getAll()
+        .filter((d) => (d.address as { channelId?: string } | undefined)?.channelId === channelId);
+      if (registered.length > 0) this.rederiveChannels(registered);
+      this.rederiveNamed('every');
     });
 
     this.discord.onChannelDelete((guildId, channelId, threadIds) => this.channelDeleted(guildId, channelId, threadIds));

@@ -694,6 +694,7 @@ export class DiscordAdapter {
   private threadUpdateHandler?: (thread: ChannelFacts) => void;
   private threadDeleteHandler?: (guildId: string, threadId: string) => void;
   private channelRefreshedHandler?: (channelId: string) => void;
+  private channelStaleHandler?: (channelId: string) => void;
   private guildCreateHandler?: (guildId: string, channels: ChannelFacts[]) => void;
   private guildDeleteHandler?: (guildId: string) => void;
   private guildAvailableHandler?: (guildId: string, channels: ChannelFacts[], present: ReadonlySet<string>) => void;
@@ -960,6 +961,12 @@ export class DiscordAdapter {
     this.channelRefreshedHandler = handler;
   }
 
+  /** A fetch left a channel stale (refetchChannel): what's registered of it
+   *  may carry a name that no longer resolves to it (resolveAmong). */
+  onChannelStale(handler: (channelId: string) => void): void {
+    this.channelStaleHandler = handler;
+  }
+
   /** Fired when the bot joins a new guild after startup. The handler receives
    *  the guild's channels of a listed kind that the filters admit, so the
    *  server can register them the same way it does at boot. */
@@ -995,6 +1002,15 @@ export class DiscordAdapter {
     this.guildRenameHandler = handler;
   }
 
+  /** A thread's channel, when it's stale: its category, which the filters
+   *  can admit the thread through, may be older than Discord's, so a
+   *  delivery looks it up too before the filters decide (channelAllowed). */
+  private staleParentOf(channel: unknown): string | null {
+    const thread = channel as { isThread?: () => boolean; parentId?: string | null } | null | undefined;
+    if (!thread?.isThread?.() || !thread.parentId) return null;
+    return this.isStale(thread.parentId) ? thread.parentId : null;
+  }
+
   /** Whether the guild filter (guildIds) admits a guild. */
   private guildAdmitted(guildId: string): boolean {
     return !this.guildIds?.length || this.guildIds.includes(guildId);
@@ -1016,7 +1032,7 @@ export class DiscordAdapter {
    *  through its channel (or its channel's category) or its own id, as
    *  ingress and listing decide. */
   channelAdmitted(guildId: string, channelId: string, parentId: string | null): boolean {
-    return this.channelAllowed(guildId, channelId, parentId);
+    return this.guildAdmitted(guildId) && this.channelAllowed(guildId, channelId, parentId);
   }
 
   /** Whether the bot is in a guild: the client's cache holds every guild
@@ -1379,6 +1395,8 @@ export class DiscordAdapter {
       if (guildId && (threadChannelUnknown(msg.channel) || this.isStale(msg.channelId))) {
         await this.lookUpChannel(guildId, msg.channelId);
       }
+      const staleParent = guildId ? this.staleParentOf(msg.channel) : null;
+      if (guildId && staleParent) await this.lookUpChannel(guildId, staleParent);
       // msg.channel resolves through the client cache, so it's what the
       // lookup left there.
       const parentId =
@@ -1871,7 +1889,38 @@ export class DiscordAdapter {
       return { ok: false, reason: 'not-found', message: `Unusable channel reference: "${ref}"` };
     }
     if (parsed.kind === 'id') return { ok: true, id: parsed.id };
+    // A stale channel's current name isn't known: Discord may have renamed
+    // it to any name, this one included, so no name in its guild resolves
+    // while it's stale, whichever channel holds the name in the cache. So
+    // every label in that guild is its channel's id meanwhile (channelFacts).
+    // A name-addressed tool fetches stale channels first (refreshStale), so
+    // this holds only while a fetch fails.
+    if (this.uncertainNameHolder(parsed)) {
+      return {
+        ok: false, reason: 'ambiguous',
+        message: `${ref} can't be resolved by name right now: a channel in that server couldn't be fetched from Discord, so its current name isn't known, and it may be the one this name means. Address the channel by its id instead (list_channels gives each one's).`,
+      };
+    }
     return resolveChannelName(parsed, names(parsed.name));
+  }
+
+  /** A stale channel a name reference could mean: its guild lists it now,
+   *  in a guild the guild filter admits and the reference names (or any,
+   *  for a name without a guild), and it's of a kind a name addresses. Its
+   *  category may be stale too, so the channel filters aren't applied. A
+   *  channel its guild no longer lists, such as one a return left out,
+   *  holds no name there. */
+  private uncertainNameHolder(ref: { name: string; guild?: string }): string | null {
+    const wantGuild = ref.guild?.toLowerCase();
+    for (const [id, { guildId }] of this.stale) {
+      if (!this.guildAdmitted(guildId)) continue;
+      const guild = this.client.guilds.cache.get(guildId);
+      const channel = guild?.channels.cache.get(id);
+      if (!guild || !channel) continue;
+      if (wantGuild !== undefined && guild.name?.toLowerCase() !== wantGuild) continue;
+      if (isNameAddressableKind(mapChannelType(channel.type))) return id;
+    }
+    return null;
   }
 
   /** The channels a name resolves among, read from the live cache (see
@@ -1896,10 +1945,7 @@ export class DiscordAdapter {
           {
             ...(this.guildIds?.length ? { guildIds: this.guildIds } : {}),
             mapType: mapChannelType,
-            // A stale channel's cached name may no longer be Discord's, so it
-            // answers no name until a fresh fetch, and its own label is its
-            // id meanwhile (channelFacts).
-            allowed: (gid, cid, pid) => !this.isStale(cid) && this.channelAllowed(gid, cid, pid),
+            allowed: (gid, cid, pid) => this.channelAllowed(gid, cid, pid),
           },
         );
         for (const c of candidates) {
@@ -2297,10 +2343,15 @@ export class DiscordAdapter {
     // channel is fetched again through the freshness rule, and that fill is
     // what the cache keeps.
     const channel = ((await this.refetchChannel(created.id).catch((err: unknown) => {
-      // The channel was made, but its facts aren't verified: it stays stale,
-      // labelled by its id, until a fresh fetch.
+      // Discord says the new channel is gone already: deleted since, which
+      // refetchChannel reported (channelGone).
+      if ((err as { code?: unknown } | null)?.code === UNKNOWN_CHANNEL) {
+        throw new Error(`Channel ${created.id} was created, but Discord says it no longer exists`);
+      }
+      // The channel was made, but its facts aren't verified: it's marked
+      // stale, labelled by its id, until a fresh fetch.
       dbg('create-channel:refetch-failed', { channelId: created.id, error: (err as Error).message });
-      if ((err as { code?: unknown } | null)?.code !== UNKNOWN_CHANNEL) this.stale.set(created.id, { guildId });
+      this.stale.set(created.id, { guildId });
       return null;
     })) ?? created) as typeof created;
     // Labelled as listing labels it: by its id when its name is taken.
@@ -2393,6 +2444,9 @@ export class DiscordAdapter {
       await this.lookUpChannel(guildId, message.channelId);
       channel = this.client.channels.cache.get(message.channelId) ?? channel;
     }
+    // A stale thread's channel is looked up too: its category can admit it.
+    const staleParent = guildId ? this.staleParentOf(channel) : null;
+    if (guildId && staleParent) await this.lookUpChannel(guildId, staleParent);
     // Packet guild identity alone does not establish whether an uncached
     // channel is a thread under an allowlisted parent. Fetch only when that
     // missing parent could affect the decision; a directly allowed channel
@@ -2554,10 +2608,16 @@ export class DiscordAdapter {
       // filters decide, and this channel's later creates wait behind that
       // fetch, so they're delivered in order.
       const waiting = this.threadLookups.get(message.channelId);
-      const lookUp = message.guildId !== null && this.guildAdmitted(message.guildId)
-        && (threadChannelUnknown(message.channel) || this.isStale(message.channelId));
-      if (waiting || lookUp) {
-        const next = (waiting ?? this.lookUpChannel(message.guildId!, message.channelId))
+      const admittedGuild = message.guildId !== null && this.guildAdmitted(message.guildId);
+      const lookUp = admittedGuild && (threadChannelUnknown(message.channel) || this.isStale(message.channelId));
+      const parentLookUp = admittedGuild ? this.staleParentOf(message.channel) : null;
+      if (waiting || lookUp || parentLookUp) {
+        const next = (waiting ?? (lookUp ? this.lookUpChannel(message.guildId!, message.channelId) : Promise.resolve()))
+          .then(async () => {
+            // After its own lookup, the thread's channel may show as stale.
+            const parentId = this.staleParentOf(this.client.channels.cache.get(message.channelId));
+            if (parentId && admittedGuild) await this.lookUpChannel(message.guildId!, parentId);
+          })
           .then(() => this.acceptMessage(message, base))
           .catch((err) => console.error('[discord-mcpl] Failed to deliver a thread message:', (err as Error).message));
         this.threadLookups.set(message.channelId, next);
@@ -2821,8 +2881,11 @@ export class DiscordAdapter {
     const allowed = this.guildChannels.get(guildId);
     if (!allowed) return true;
     if (parentId != null && !allowed.has(channelId) && !allowed.has(parentId)) {
+      // A stale channel's category may no longer be its own, so it admits
+      // none of its threads until a fresh fetch (staleParentOf); one listed
+      // by its own id, or by its channel's, still passes.
       const parent = this.client.channels.cache.get(parentId) as { parentId?: string | null } | undefined;
-      if (parent?.parentId != null && allowed.has(parent.parentId)) return true;
+      if (parent?.parentId != null && !this.isStale(parentId) && allowed.has(parent.parentId)) return true;
     }
     return allowed.has(channelId) || (parentId != null && allowed.has(parentId));
   }
@@ -2924,7 +2987,10 @@ export class DiscordAdapter {
         return channel;
       }
       const guildId = channel && 'guildId' in channel ? channel.guildId : null;
-      if (guildId) this.stale.set(channelId, { guildId });
+      if (guildId && !this.stale.has(channelId)) {
+        this.stale.set(channelId, { guildId });
+        this.channelStaleHandler?.(channelId);
+      }
       dbg('gateway:fetch-overtaken', { channelId, tries, last: tries === FETCH_TRIES });
       if (tries === FETCH_TRIES) return channel;
     }
