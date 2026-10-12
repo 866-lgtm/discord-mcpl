@@ -2727,12 +2727,16 @@ export class DiscordMcplServer {
       // instead of silently shipping a name-less block (issue #28). Resolved
       // before anything is delivered, because the ingress decision below
       // needs the channel's identity.
+      // A cached thread whose channel isn't named may be one the client knows
+      // only partly, which the lookup fills in, as the live path's does; if
+      // that lookup fails, what the cache knew stands.
       let meta = this.discord.getCachedChannelMeta(channelId);
-      if (!meta) {
-        meta = await this.discord.getChannelMeta(channelId).catch((err) => {
+      if (!meta || (meta.threadId && meta.threadParentName === null)) {
+        const cached = meta;
+        meta = (await this.discord.getChannelMeta(channelId).catch((err) => {
           dbg('sweep:channel-meta-failed', { channelId, error: errorText(err) });
           return null;
-        });
+        })) ?? cached;
       }
       // A channel is a DM only when that's known: recorded as one when a DM
       // was forwarded, or reported so by Discord. A failed lookup is never
@@ -2835,14 +2839,16 @@ export class DiscordMcplServer {
       // channel it hangs off and the thread itself.
       const thread: ThreadPlace = meta ?? {};
       const place = messagePlace(meta?.name, thread);
+      // Names are quoted as the live location quotes them, so a bidi control
+      // or line separator in one can't reorder or split the header.
       const attrs: string[] = [];
-      if (place.channel) attrs.push(`channel=${JSON.stringify(`#${place.channel}`)}`);
-      if (place.thread) attrs.push(`thread=${JSON.stringify(place.thread)}`);
+      if (place.channel) attrs.push(`channel=${quotedValue(`#${place.channel}`)}`);
+      if (place.thread) attrs.push(`thread=${quotedValue(place.thread)}`);
       // channelId is load-bearing: it's what fetch_around/fetch_history need to
       // let the agent jump to any of these messages and read the full context.
       // For a thread it is the thread's own id.
       attrs.push(`channelId="${channelId}"`);
-      if (meta?.guildName) attrs.push(`guild=${JSON.stringify(meta.guildName)}`);
+      if (meta?.guildName) attrs.push(`guild=${quotedValue(meta.guildName)}`);
       else if (isDM) attrs.push('dm="true"');
       // count = number of actual mentions; lines = total delivered (mentions +
       // their ±2min vicinity) so the agent knows how much is context vs ping.
@@ -3601,8 +3607,9 @@ export class DiscordMcplServer {
           emojiToken: ev.token,
           onOwnMessage: ev.onOwnMessage,
           action: ev.action,
+          ...threadFields(ev),
         } as Record<string, unknown>,
-        tags: [ev.action === 'add' ? 'chat:reaction' : 'chat:reaction-remove'],
+        tags: [ev.action === 'add' ? 'chat:reaction' : 'chat:reaction-remove', ...threadTags(ev)],
         payload: { content: [textContent(line)] },
       } satisfies PushEventParams).catch(() => {});
     });

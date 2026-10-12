@@ -906,6 +906,22 @@ describe('server integration', () => {
     assert.ok(!wire.includes(SUPPRESSED_CUSTOM_ID), 'no suppressed custom id on the wire');
   });
 
+  it("a reaction on a thread's message carries the thread's tag and fields, as the message's create does", () => {
+    const server = makeServer();
+    server.filtersState.applyParsed(withKey());
+    const { handler, sent } = wireReactionHandler(server);
+    const reaction = { ...baseEvent, emoji: HARMLESS, emojiId: null, token: HARMLESS };
+    handler({ ...reaction, threadId: 'chan1', threadName: 'design-chat', threadParentName: 'general' });
+    handler(reaction);
+    const [inThread, inChannel] = sent.map((s) => (s as { params: { tags: string[]; origin: Record<string, unknown> } }).params);
+    assert.deepEqual(inThread.tags, ['chat:reaction', 'chat:thread']);
+    assert.equal(inThread.origin.threadName, 'design-chat');
+    assert.equal(inThread.origin.threadParentName, 'general');
+    assert.equal('threadId' in inThread.origin, false, 'a Discord thread is named by its channel id');
+    assert.deepEqual(inChannel.tags, ['chat:reaction'], 'a channel message has no thread tag');
+    assert.equal('threadName' in inChannel.origin, false);
+  });
+
   it('withhold-everything posture drops every live reaction event', () => {
     const server = makeServer();
     server.filtersState.markBroken('invalid');
