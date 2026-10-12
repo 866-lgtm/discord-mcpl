@@ -586,9 +586,10 @@ in the git log and PR descriptions.
     Discord says it's gone already the tool says so. A stale channel's
     facts decide no registration and no name, until a fresh fetch or an
     update of the channel clears its mark. Its current name isn't known,
-    so while a server lists a stale channel of a kind a name addresses,
-    no name in that server resolves, and no name given without a server
-    resolves anywhere. The label of every channel a name addresses there
+    so while a server the guild filter admits lists a stale
+    channel of a kind a name addresses, no name in that server
+    resolves, and no name given without a server resolves anywhere.
+    The label of every channel a name addresses there
     is its id meanwhile, as is a stale thread's; a thread that isn't
     stale keeps its display-only label. A stale channel's category admits
     none of its threads, and a registered thread whose channel is stale
