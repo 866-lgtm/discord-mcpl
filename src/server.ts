@@ -2761,16 +2761,21 @@ export class DiscordMcplServer {
 
       const newestId = msgs[msgs.length - 1].id;
 
-      // Cache-first, REST only as fallback; a failed lookup leaves a trace
-      // instead of silently shipping a name-less block (issue #28). Resolved
+      // Cache first. A lookup when the cache doesn't hold the channel, or
+      // holds a thread whose parent channel it can't name, which may be one
+      // the client knows only partly, as the live path looks those up (a
+      // thread whose parent just isn't cached is read from the cache again).
+      // A failed lookup leaves a trace instead of silently shipping a
+      // name-less block (issue #28), and what the cache knew stands. Resolved
       // before anything is delivered, because the ingress decision below
       // needs the channel's identity.
       let meta = this.discord.getCachedChannelMeta(channelId);
-      if (!meta) {
-        meta = await this.discord.getChannelMeta(channelId).catch((err) => {
+      if (!meta || (meta.threadId && meta.threadParentName === null)) {
+        const cached = meta;
+        meta = (await this.discord.getChannelMeta(channelId).catch((err) => {
           dbg('sweep:channel-meta-failed', { channelId, error: errorText(err) });
           return null;
-        });
+        })) ?? cached;
       }
       // A channel is a DM only when that's known: recorded as one when a DM
       // was forwarded, or reported so by Discord. A failed lookup is never
@@ -2873,14 +2878,17 @@ export class DiscordMcplServer {
       // channel it hangs off and the thread itself.
       const thread: ThreadPlace = meta ?? {};
       const place = messagePlace(meta?.name, thread);
+      // Names are escaped with the live location's quoting (quotedValue), so
+      // a bidi control or line separator in one can't reorder or split the
+      // header.
       const attrs: string[] = [];
-      if (place.channel) attrs.push(`channel=${JSON.stringify(`#${place.channel}`)}`);
-      if (place.thread) attrs.push(`thread=${JSON.stringify(place.thread)}`);
+      if (place.channel) attrs.push(`channel=${quotedValue(`#${place.channel}`)}`);
+      if (place.thread) attrs.push(`thread=${quotedValue(place.thread)}`);
       // channelId is load-bearing: it's what fetch_around/fetch_history need to
       // let the agent jump to any of these messages and read the full context.
       // For a thread it is the thread's own id.
       attrs.push(`channelId="${channelId}"`);
-      if (meta?.guildName) attrs.push(`guild=${JSON.stringify(meta.guildName)}`);
+      if (meta?.guildName) attrs.push(`guild=${quotedValue(meta.guildName)}`);
       else if (isDM) attrs.push('dm="true"');
       // count = number of actual mentions; lines = total delivered (mentions +
       // their ±2min vicinity) so the agent knows how much is context vs ping.
@@ -3749,7 +3757,10 @@ export class DiscordMcplServer {
       if (!isEnabled('discord.messaging', this.enabledFeatureSets)) return;
       // Reaction visibility is a per-channel opt-in (default off). Reactions
       // NEVER wake the agent — the reaction tags match no wake policy — they
-      // just land in context so the agent sees them when next active.
+      // just land in context so the agent sees them when next active. A
+      // reaction in a thread names the thread in its origin but keeps the
+      // reaction tags only, so a gate rule keyed on chat:thread, written for a
+      // thread's messages, doesn't start matching its reactions.
       // SPEC §16.2 defines `chat:reaction` and `chat:reaction-remove` as
       // distinct tags: collapsing both onto `chat:reaction` made any consumer
       // rule for "reactions to my messages" fire on un-reactions too, with the
@@ -3807,6 +3818,7 @@ export class DiscordMcplServer {
           emojiToken: ev.token,
           onOwnMessage: ev.onOwnMessage,
           action: ev.action,
+          ...threadFields(ev),
         } as Record<string, unknown>,
         tags: [ev.action === 'add' ? 'chat:reaction' : 'chat:reaction-remove'],
         payload: { content: [textContent(line)] },

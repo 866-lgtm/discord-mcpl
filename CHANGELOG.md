@@ -41,7 +41,8 @@ in the git log and PR descriptions.
   its MCPL `threadId`, and no message carries one now.** A host that keys
   conversations by channel and thread filed such a message under the thread
   it started; it now files it under its channel alone, with the channel's
-  other messages. A message posted in a thread was already filed under the
+  other messages. This change doesn't move what a host filed before the
+  upgrade. A message posted in a thread was already filed under the
   thread's own channel id and stays there.
 
 ### Added
@@ -516,14 +517,23 @@ in the git log and PR descriptions.
   carries `threadName` (the thread's name) and `threadParentName` (the
   channel it hangs off, new), each left out when it isn't known: in the
   `channels/incoming` metadata, in a push's origin, and in the origins of
-  its edits and deletions, which are tagged `chat:thread` too. A thread the
-  client knew only partly is looked up before its message is converted, so
-  its message is named as any other thread's.
+  its edits and deletions, which are tagged `chat:thread` too, and of
+  reactions to it, which keep their own tags only, so a gate rule keyed on
+  `chat:thread` doesn't start matching them. A thread the client knew only
+  partly is looked up first, past discord.js's cache, so its messages, and
+  their edits, deletions and reactions, are named as any other thread's;
+  each waits for that lookup before it is delivered, as a create already
+  did. If the lookup fails, the channel filters decide on what is known,
+  and what they let through goes unnamed (a message or an edit or deletion
+  still tagged `chat:thread`).
 - **The reconnect sweep names a thread as the live path does.** A thread's
   missed messages were headed `<missed channel="#<thread name>" …>`, as if
   the thread were a channel of its own name, and pushed without tags. The
-  header now reads `<missed channel="#<parent>" thread="<name>" …>`, the push
-  carries `chat:thread` and the thread's fields, and every sweep push, a
+  header now reads `<missed channel="#<parent>" thread="<name>" …>`, or
+  `thread="<name>"` alone when the parent isn't known, with the thread's id
+  for a name it lacks, and escapes each name with the live location's
+  quoting. The push carries `chat:thread` and the thread's fields, a thread
+  the client knew only partly is looked up first, and every sweep push, a
   DM's included, now carries the `mcplChannelId` a live push's origin
   carries.
 - **Every channel messages are posted in is registered, threads included,

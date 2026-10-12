@@ -1464,11 +1464,28 @@ describe('DiscordMcplServer', () => {
       assert.equal(origin.threadName, 'design-chat', tag);
       assert.equal(origin.threadParentName, 'general', tag);
     }
+    // A channel message's edit and delete carry neither.
+    await client.sendRequest(method.CHANNELS_OPEN, { type: 'discord', address: { guildId: 'g1', channelId: 'c1' } });
+    const plain = { guildId: 'g1', authorName: 'Bob' };
+    discord.simulateEdit('c1', 'm2', 'second version', false, { ...plain, editedAt: '2026-10-02T00:00:02.000Z' });
+    const plainEdit = await nextRequest('push/event');
+    client.sendResponse(plainEdit.id, { accepted: true });
+    discord.simulateDelete('c1', 'm2', false, plain);
+    const plainDel = await nextRequest('push/event');
+    client.sendResponse(plainDel.id, { accepted: true });
+    for (const [request, tag] of [[plainEdit, 'chat:edited'], [plainDel, 'chat:deleted']] as const) {
+      const p = request.params as PushEventParams;
+      assert.deepEqual(p.tags, [tag], tag);
+      const origin = p.origin as Record<string, unknown>;
+      assert.equal('threadName' in origin || 'threadParentName' in origin, false, tag);
+    }
   });
 
   /** One reconnect sweep over a channel with one missed mention, the channel
-   *  described as the adapter's cache gives it; returns the sweep's push. */
-  async function sweepOne(channelId: string, meta: ChannelMeta): Promise<PushEventParams> {
+   *  described as the adapter's cache gives it, and as its lookup from
+   *  Discord gives it (or fails, given an Error) when `rest` is given;
+   *  returns the sweep's push. */
+  async function sweepOne(channelId: string, meta: ChannelMeta | null, rest?: ChannelMeta | Error): Promise<PushEventParams> {
     const wmPath = join(tmpdir(), `discord-mcpl-wm-${process.pid}-sweep-${channelId}.json`);
     writeFileSync(wmPath, JSON.stringify({ watermarks: { [channelId]: '100' }, dmChannels: [] }));
     process.env.DISCORD_WATERMARK_FILE = wmPath;
@@ -1477,7 +1494,9 @@ describe('DiscordMcplServer', () => {
       discord.historyToReturn = [
         { id: '102', authorId: 'u2', authorName: 'Bob', isBot: false, content: '<@bot_123> ping', cleanContent: '@bot ping', attachments: [], mentionsBot: true, timestamp: new Date(), reactions: [] },
       ];
-      discord.cachedChannelMeta = { [channelId]: meta };
+      discord.cachedChannelMeta = meta ? { [channelId]: meta } : {};
+      if (rest instanceof Error) discord.getChannelMeta = async () => { throw rest; };
+      else if (rest) discord.channelMeta = rest;
       const server = new DiscordMcplServer(discord as unknown as DiscordAdapter);
       const serverPromise = server.serve(serverConn);
       try {
@@ -2012,6 +2031,58 @@ describe('DiscordMcplServer', () => {
       assert.equal(saved.watermarks.vanished, undefined, "a channel Discord doesn't know isn't fetched again");
       assert.ok(saved.watermarks.secret, "a refused channel's watermark moves on, as the live path's never revisits it");
     });
+  });
+
+  it("the reconnect sweep's header escapes a bidi control or a C1 line break in a name, as the live location does", async () => {
+    // Found in review by Daphne, whose probe this test is built from.
+    // (U+2028 and U+2029 can't be tried here: the transport's line framing
+    // splits a message on them before the header is read.)
+    const p = await sweepOne('th-bidi', {
+      name: 'plan\u202eend', guildId: 'g1', guildName: 'Test\u0085Guild', isDM: false,
+      threadId: 'th-bidi', threadName: 'plan\u202eend', threadParentName: 'gen\u202eeral',
+    });
+    const header = (p.payload.content[0] as { text: string }).text.split('\n')[0];
+    assert.equal(/[\u202e\u0085]/.test(header), false, JSON.stringify(header));
+    assert.ok(header.startsWith('<missed channel="#gen\\u202eeral" thread="plan\\u202eend" channelId="th-bidi" guild="Test\\u0085Guild"'), JSON.stringify(header));
+  });
+
+  it("the reconnect sweep looks up a cached thread whose channel isn't named, and keeps what the cache knew if that fails", async () => {
+    // As the cache holds a thread the client knows only partly: no name, no channel.
+    const partly: ChannelMeta = { name: null, guildId: 'g1', guildName: 'Test Guild', isDM: false, threadId: 'th3', threadParentName: null };
+    const looked = await sweepOne('th3', partly, {
+      name: 'late-thread', guildId: 'g1', guildName: 'Test Guild', isDM: false,
+      threadId: 'th3', threadName: 'late-thread', threadParentName: 'general',
+    });
+    const lookedText = (looked.payload.content[0] as { text: string }).text;
+    assert.ok(lookedText.startsWith('<missed channel="#general" thread="late-thread" channelId="th3"'), lookedText);
+    assert.equal((looked.origin as Record<string, unknown>).threadParentName, 'general');
+    const failed = await sweepOne('th3', partly, new Error('Missing Access'));
+    const failedText = (failed.payload.content[0] as { text: string }).text;
+    assert.ok(failedText.startsWith('<missed thread="th3" channelId="th3" guild="Test Guild"'), failedText);
+    assert.deepEqual(failed.tags, ['chat:thread'], 'still a thread');
+  });
+
+  it("the reconnect sweep's header names a thread without its channel, or by its id, when either isn't known", async () => {
+    // The parent isn't cached: the thread is named alone. (The lookup the
+    // sweep tries then finds no more, here as Discord would.)
+    const sparse: ChannelMeta = { name: 'design-chat', guildId: 'g1', guildName: 'Test Guild', isDM: false, threadId: 'th4', threadName: 'design-chat', threadParentName: null };
+    const noParent = await sweepOne('th4', sparse, sparse);
+    const noParentText = (noParent.payload.content[0] as { text: string }).text;
+    assert.ok(noParentText.startsWith('<missed thread="design-chat" channelId="th4" guild="Test Guild"'), noParentText);
+    assert.equal('threadParentName' in (noParent.origin as Record<string, unknown>), false, 'an unknown channel is left out of the origin');
+    const noName = await sweepOne('th5', { name: null, guildId: 'g1', guildName: 'Test Guild', isDM: false, threadId: 'th5', threadParentName: 'general' });
+    const noNameText = (noName.payload.content[0] as { text: string }).text;
+    assert.ok(noNameText.startsWith('<missed channel="#general" thread="th5" channelId="th5" guild="Test Guild"'), noNameText);
+    assert.equal('threadName' in (noName.origin as Record<string, unknown>), false, 'an unknown name is left out of the origin');
+  });
+
+  it("the reconnect sweep's push for a channel or a DM carries its mcplChannelId and no thread tag", async () => {
+    const channel = await sweepOne('c7', { name: 'general', guildId: 'g1', guildName: 'Test Guild', isDM: false });
+    assert.equal((channel.origin as Record<string, unknown>).mcplChannelId, 'discord:g1:c7');
+    assert.equal(channel.tags?.includes('chat:thread') ?? false, false, 'a channel is no thread');
+    const dm = await sweepOne('d7', { name: null, guildId: null, guildName: null, isDM: true });
+    assert.equal((dm.origin as Record<string, unknown>).mcplChannelId, 'discord:dm:d7');
+    assert.equal(dm.tags?.includes('chat:thread') ?? false, false, 'a DM is no thread');
   });
 
   it('renders reply target visibly and carries standard metadata on open channels', async () => {
