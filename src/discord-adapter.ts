@@ -1609,6 +1609,11 @@ export class DiscordAdapter {
     return this.extractChannelMeta(channel, channelId);
   }
 
+  /** A cached channel's name is known only while its facts are fresh. */
+  private knownName(channelId: string, name: unknown): string | null {
+    return typeof name === 'string' && name.length > 0 && !this.isStale(channelId) ? name : null;
+  }
+
   private extractChannelMeta(channel: unknown, channelId: string): ChannelMeta {
     if (!channel) return { name: null, guildId: null, guildName: null, isDM: null };
     const c = channel as {
@@ -1624,7 +1629,7 @@ export class DiscordAdapter {
     const isDM = typeof c.isDMBased === 'function' ? c.isDMBased() : guildId ? false : null;
     return {
       // A stale channel's name may no longer be Discord's, so it's unknown.
-      name: typeof c.name === 'string' && c.name.length > 0 && !this.isStale(channelId) ? c.name : null,
+      name: this.knownName(channelId, c.name),
       guildId,
       guildName: c.guild?.name ?? null,
       isDM,
@@ -1644,13 +1649,14 @@ export class DiscordAdapter {
     if (!c || typeof c.isThread !== 'function' || !c.isThread()) return {};
     // A stale channel's name may no longer be Discord's, so it's unknown,
     // the thread's own as well as its channel's.
-    const parent = c.parentId && !this.isStale(c.parentId)
+    const parent = c.parentId
       ? (this.client.channels.cache.get(c.parentId) as { name?: string } | undefined)
       : undefined;
+    const threadName = this.knownName(channelId, c.name);
     return {
       threadId: channelId,
-      ...(typeof c.name === 'string' && c.name.length > 0 && !this.isStale(channelId) ? { threadName: c.name } : {}),
-      threadParentName: typeof parent?.name === 'string' && parent.name.length > 0 ? parent.name : null,
+      ...(threadName !== null ? { threadName } : {}),
+      threadParentName: c.parentId ? this.knownName(c.parentId, parent?.name) : null,
     };
   }
 
@@ -1698,12 +1704,12 @@ export class DiscordAdapter {
       guildId: c.guildId,
       guildName: named(this.client.guilds.cache.get(c.guildId)?.name),
       type,
-      name: named(c.name),
+      name: this.knownName(c.id, c.name),
       parentId: c.parentId ?? null,
       // A stale channel's name may no longer be Discord's: a thread's facts
       // leave it unknown, so a registration keeps the name it knew
       // (knowsLessThan) and a new one goes without.
-      parentName: c.parentId && this.isStale(c.parentId) ? null : named(parent?.name),
+      parentName: c.parentId ? this.knownName(c.parentId, parent?.name) : null,
       archived: type === 'thread' && c.archived === true,
     };
     if (facts.archived && typeof c.archiveTimestamp === 'number' && Number.isFinite(c.archiveTimestamp)) {
@@ -2114,7 +2120,7 @@ export class DiscordAdapter {
         return gm ? toInfo(gm) : { id: tm.id, username: tm.id, displayName: tm.id, isBot: false };
       });
       const listed = finish(
-        channel.name,
+        this.knownName(channelId, channel.name),
         'thread-joined',
         members,
         'Joined members only. Users with access to the parent channel may be able to read a public thread without joining it.' +
@@ -2152,7 +2158,7 @@ export class DiscordAdapter {
           || (guildChannel as GuildBasedChannel & { permissionsFor(m: GuildMember): Readonly<PermissionsBitField> | null })
             .permissionsFor(m)?.has(opts.withPermission) === true)
         .map(toInfo);
-      return finish(guildChannel.name, 'guild-channel', members);
+      return finish(this.knownName(channelId, guildChannel.name), 'guild-channel', members);
     }
 
     throw new Error(`Channel ${channelId} has no queryable membership (type ${channel.type})`);
@@ -3255,9 +3261,7 @@ export class DiscordAdapter {
     // so downstream rendering can distinguish "unknown" from "DM". A stale
     // channel's name may no longer be Discord's, so it's unknown too.
     const channel = message.channel as { name?: string } | null;
-    const channelName = channel && typeof channel.name === 'string' && channel.name.length > 0 && !this.isStale(message.channelId)
-      ? channel.name
-      : null;
+    const channelName = this.knownName(message.channelId, channel?.name);
     const guildName = message.guild?.name ?? null;
     // `cleanContent` resolves <@id>, <@&roleId>, <#channelId> to
     // @username / @role / #channel (with raw-content fallback), forwarded

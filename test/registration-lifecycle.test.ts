@@ -1729,6 +1729,27 @@ it("list_channels leaves out the channels the channel filter excludes, categorie
   assert.deepEqual(listed.map((c) => c.id).sort(), [P, C1, X].sort());
 });
 
+it("a cached stale channel has no known name", (t) => {
+  const f = fixture(t);
+  assert.equal(f.adapter.getCachedChannelFacts(P)?.name, 'before');
+
+  (f.adapter as any).markStale(P, G);
+
+  assert.equal(f.adapter.getCachedChannelFacts(P)?.name, null);
+  assert.equal(f.adapter.getCachedChannelFacts(P)?.guildName, 'Guild');
+});
+
+it("an unregistered stale thread's provenance uses its composite id", (t) => {
+  const f = fixture(t);
+  assert.equal(f.server.channelManager.get(threadMcplId), undefined);
+  assert.equal(f.server.channelProvenance(TH).channelLabel, '#before › topic (Guild)');
+
+  (f.adapter as any).markStale(TH, G);
+
+  assert.equal(f.server.channelProvenance(TH).channelLabel, threadMcplId);
+  assert.equal(f.server.channelManager.get(threadMcplId), undefined);
+});
+
 it("a registered thread marked stale is labelled by its id", (t) => {
   const f = fixture(t);
   f.server.registerGuildDelivery(G, TH);

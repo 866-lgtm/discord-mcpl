@@ -95,6 +95,40 @@ function makeAdapter(
 
 // ── Tests ──
 
+describe('listChannelMembers: channel-name freshness', () => {
+  for (const kind of ['guild-channel', 'thread-joined'] as const) {
+    it('omits a stale ' + kind + " name when every channel fetch is overtaken", async () => {
+      const alice = member('u1', 'Alice');
+      const guild = fakeGuild([alice]);
+      const channel = kind === 'guild-channel'
+        ? guildChannel('c1', guild, [alice])
+        : thread('c1', guild, ['u1'], 'parent');
+      const adapter = makeAdapter({ c1: channel, parent: guildChannel('parent', guild, [alice]) });
+      const internals = adapter as unknown as {
+        client: { channels: { fetch(id: string): Promise<unknown> } };
+        overtake(id: string): void;
+        markStale(id: string, guildId: string): void;
+      };
+      internals.markStale('c1', guild.id);
+      let fetches = 0;
+      internals.client.channels.fetch = async (id) => {
+        fetches++;
+        internals.overtake(id);
+        return channel;
+      };
+
+      const result = await adapter.listChannelMembers('c1');
+
+      assert.ok(fetches > 1, 'the lookup retried the overtaken fetch');
+      assert.equal(adapter.isStale('c1'), true);
+      assert.equal(result.channelName, null);
+      assert.equal(result.scope, kind);
+      assert.equal(result.members.length, 1);
+    });
+  }
+});
+
+
 describe('listChannelMembers: guild channels', () => {
   it('returns the permission-computed viewer list after a successful cache warm', async () => {
     const alice = member('u1', 'Alice');
