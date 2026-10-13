@@ -568,41 +568,45 @@ in the git log and PR descriptions.
     reconciled with what it has then: what was deleted, or a thread archived,
     meanwhile is forgotten, and a new or renamed channel is registered or
     re-derived. A sync of a server's threads, which Discord sends when the
-    bot can see a channel again, covers the channels in its `channel_ids`, or
-    the whole server when it has none. A registered thread under a covered
-    channel that the sync doesn't list is forgotten, since it was archived or
-    deleted while the bot couldn't see it, and so is one the sync drops from
-    discord.js's cache. A thread whose channel isn't known, such as one whose
-    lookup failed, is under no covered channel, so only a sync of the whole
-    server forgets it. A registered thread the sync lists counts as updated.
-    What the server no longer lists, on its return or when the bot joins it
-    again, may have changed unseen: a message, edit, deletion or reaction
-    from it, a tool, or the reconnect sweep, looks it up from Discord again
-    before deciding, and a delivery that decided on facts from before the
-    return doesn't register it. A lookup that Discord overtook with a report
-    on its channel, such as an archive or a rename, is made again, so what a
-    delivery waiting on it registers is no older than that report. The fresh
-    facts count as an update of the channel, so what was registered from the
-    older ones meanwhile is registered again, or forgotten when they show a
-    thread archived or a channel outside the filters. A guild channel the
-    cache holds that Discord says doesn't exist, to a lookup or to a tool, is
-    handled as deleted, and dropped from discord.js's cache with its threads.
-    A channel that `create_text_channel` makes is fetched again after the
-    POST, so the cache keeps what the gateway reported of it meanwhile; if
-    that fetch fails the channel becomes stale, and if Discord says it's gone
-    already the tool says so. A stale channel's facts decide no registration
-    or name until a fresh fetch or an update clears its mark, or, for a
-    thread, a sync that lists it. Meanwhile a delivery from a stale channel,
-    or from a thread in it, carries no name for that channel in its fields,
-    and its label is the registered one: a stale channel's or thread's is its
-    id, while a registered thread that isn't stale itself, under a stale
-    channel, keeps its display-only label, with the names it was registered
-    with. Its current name isn't known, so while a server the guild filter
-    admits lists a stale channel of a kind a name addresses, no name in that
-    server resolves, and no name given without a server resolves anywhere.
-    The label of every channel a name addresses there is its id meanwhile, as
-    is a stale thread's; a thread that isn't stale keeps its display-only
-    label. A stale channel's category admits none of its threads, and a
+    bot gains access to a channel, covers the channels in its `channel_ids`,
+    or the whole server when it has none. A registered thread under a covered
+    channel that the sync doesn't list is forgotten, since it's archived,
+    deleted or no longer visible to the bot, and so is one the sync drops
+    from discord.js's cache. A thread whose channel neither the cache nor its
+    registration knows, such as one registered from a message whose lookup
+    failed, is under no covered channel, so only a sync of the whole server
+    forgets it. A registered thread the sync lists counts as updated, so one
+    whose channel is stale stays as it is until that channel's fresh fetch or
+    update. What the server no longer lists, on its return or when the bot
+    joins it again, may have changed unseen: a message, edit, deletion or
+    reaction from it, a tool, or the reconnect sweep, looks it up from
+    Discord again before deciding, and a delivery that decided on facts from
+    before the return doesn't register it. A lookup that Discord overtook
+    with a report on its channel, such as an archive or a rename, is made
+    again, so what a delivery waiting on it registers is no older than that
+    report. The fresh facts count as an update of the channel, so what was
+    registered from the older ones meanwhile is registered again, or
+    forgotten when they show a thread archived or a channel outside the
+    filters. A guild channel the cache holds that Discord says doesn't exist,
+    to a lookup or to a tool, is handled as deleted, and dropped from
+    discord.js's cache with its threads. A channel that `create_text_channel`
+    makes is fetched again after the POST, so the cache keeps what the
+    gateway reported of it meanwhile; if that fetch fails, or every try is
+    overtaken, the channel becomes stale and the tool reports the name it
+    made it with, and if Discord says it's gone already the tool says so. A
+    stale channel's facts decide no registration or name until a fresh fetch
+    or an update clears its mark, or, for a thread, a sync that lists it.
+    Meanwhile a delivery from a stale channel, or from a thread in it,
+    carries no name for that channel in its fields, and its label is the
+    registered one: a stale channel's or thread's is its id, while a
+    registered thread that isn't stale itself, under a stale channel, keeps
+    its display-only label, with the names it was registered with. Its
+    current name isn't known, so while a server the guild filter admits lists
+    a stale channel of a kind a name addresses, no name in that server
+    resolves, and no name given without a server resolves anywhere. The label
+    of every channel a name addresses there is its id meanwhile, as is a
+    stale thread's; a thread that isn't stale keeps its display-only label. A
+    stale channel's threads aren't admitted through its category, and a
     registered thread whose channel is stale stays registered, as far as the
     filters go, until that channel's fresh fetch or update decides. The
     registration listings leave a stale channel out. Before a name-addressed
@@ -624,10 +628,12 @@ in the git log and PR descriptions.
   - **`list_channels` reads a server's channels from the gateway's cache**
     instead of fetching them from Discord, so it can't leave older facts in
     the cache than an update brought meanwhile. It lists the same channels as
-    before, threads still excluded. It refuses a server in an outage, before
-    fetching anything for it, rather than listing what it held before.
-    Otherwise it fetches that server's stale channels first, and leaves out
-    one still stale, whether its fetch failed or every try was overtaken.
+    before, threads still excluded. It refuses a server in an outage rather
+    than listing what it held before: before fetching anything for it, and
+    again after, since an outage can begin while its stale channels are
+    fetched. Otherwise it fetches that server's stale channels first, and
+    leaves out one still stale, whether its fetch failed or every try was
+    overtaken.
   - **A reaction in a server the guild filter leaves out is dropped,** as
     its messages are. It used to pass when the server had no channel
     filter of its own.

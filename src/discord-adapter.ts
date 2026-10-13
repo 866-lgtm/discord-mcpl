@@ -2443,7 +2443,8 @@ export class DiscordAdapter {
       this.markStale(created.id, guildId);
       return null;
     })) ?? created) as typeof created;
-    // Labelled as listing labels it: by its id when its name is taken.
+    // Labelled as listing labels it: by its id when its name is taken, or
+    // while its facts are stale.
     const facts = this.channelFacts(channel);
     // Its name as Discord has it now, or, while that isn't known (the fetch
     // failed, or was overtaken on every try), the name it was made with.
@@ -2855,7 +2856,7 @@ export class DiscordAdapter {
       for (const [id, parentId] of scope?.held ?? []) {
         if (listed.has(id) || !(covered === null || (parentId !== null && covered.has(parentId)))) continue;
         dropped.add(id);
-        if (this.client.channels.cache.has(id)) this.forgetCached(id);
+        this.forgetCached(id);
       }
       // What discord.js dropped leaves its mark with nothing cached.
       for (const [id, mark] of this.stale) {

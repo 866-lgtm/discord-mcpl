@@ -1420,11 +1420,12 @@ it("create_text_channel whose fetch afterwards is overtaken on every try reports
   const f = fixture(t);
   t.mock.method(f.client.rest, 'post', async () => channelData(X, ChannelType.GuildText, 'made'));
   // Each reply is older than a report that arrives while it's out.
-  t.mock.method(f.client.rest, 'get', async () => {
+  const get = t.mock.method(f.client.rest, 'get', async () => {
     (f.adapter as any).overtake(X);
     return channelData(X, ChannelType.GuildText, 'older-reply');
   });
   const created = await f.adapter.createTextChannel(G, 'made');
+  assert.equal(get.mock.callCount(), 3, 'each of its three tries is overtaken');
   assert.equal(f.adapter.isStale(X), true);
   assert.equal(f.client.channels.cache.get(X)?.name, 'older-reply');
   assert.equal(created.name, 'made');
@@ -2084,7 +2085,7 @@ it("thread sync scope survives nested actions and clears after completion or err
   assert.equal((f.adapter as any).applyingThreadSync, undefined);
 });
 
-it("a sync that comes outside discord.js's action is logged, and forgets nothing it omits", (t) => {
+it("a sync that comes outside discord.js's action is logged, forgets nothing it omits, and takes what it lists as reported", (t) => {
   const f = fixture(t);
   f.server.registerGuildDelivery(G, TH);
   const logged = t.mock.method(console, 'error', () => {});
@@ -2094,6 +2095,11 @@ it("a sync that comes outside discord.js's action is logged, and forgets nothing
   assert.ok(logged.mock.calls.some((call) => String(call.arguments[0]).includes("outside discord.js's ThreadListSync action")));
   assert.ok(f.server.channelManager.get(threadMcplId), 'the thread it omits stays registered');
   assert.equal(f.removed(threadMcplId), false);
+  // A thread it lists is taken as reported: its stale mark clears.
+  (f.adapter as any).markStale(TH, G);
+  f.client.emit('threadListSync', new Map([[TH, f.client.channels.cache.get(TH)]]), f.client.guilds.cache.get(G));
+  assert.equal(f.adapter.isStale(TH), false);
+  assert.ok(f.server.channelManager.get(threadMcplId));
 });
 
 it("construction refuses a discord.js client without the thread sync action", async (t) => {
