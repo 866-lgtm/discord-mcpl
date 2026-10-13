@@ -128,7 +128,6 @@ describe('listChannelMembers: channel-name freshness', () => {
   }
 });
 
-
 describe('listChannelMembers: guild channels', () => {
   it('returns the permission-computed viewer list after a successful cache warm', async () => {
     const alice = member('u1', 'Alice');

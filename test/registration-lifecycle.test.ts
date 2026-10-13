@@ -1117,7 +1117,9 @@ it("list_channels lists the guild's own channels from the cache, every kind but 
   f.comesBack();
   assert.deepEqual((await f.adapter.listChannels(G)).map((c) => c.id), [P]);
   f.client.actions.GuildDelete.handle({ id: G, unavailable: true });
+  (f.adapter as any).stale.set(P, { guildId: G });
   await assert.rejects(f.adapter.listChannels(G), /unavailable/);
+  assert.equal(get.mock.callCount(), 0, 'nothing is fetched for a guild in an outage');
 });
 
 it('a reaction from a stale channel looks it up first', { timeout: 5000 }, async (t) => {
@@ -1411,6 +1413,38 @@ it("create_text_channel whose fetch afterwards fails keeps the channel stale and
   assert.equal(created.id, X);
   assert.equal(f.adapter.isStale(X), true);
   assert.equal(created.label, idOf(X));
+  assert.equal(created.name, 'fresh-name', 'the name it was made with');
+});
+
+it("create_text_channel whose fetch afterwards is overtaken on every try reports the name it made the channel with", async (t) => {
+  const f = fixture(t);
+  t.mock.method(f.client.rest, 'post', async () => channelData(X, ChannelType.GuildText, 'made'));
+  // Each reply is older than a report that arrives while it's out.
+  t.mock.method(f.client.rest, 'get', async () => {
+    (f.adapter as any).overtake(X);
+    return channelData(X, ChannelType.GuildText, 'older-reply');
+  });
+  const created = await f.adapter.createTextChannel(G, 'made');
+  assert.equal(f.adapter.isStale(X), true);
+  assert.equal(f.client.channels.cache.get(X)?.name, 'older-reply');
+  assert.equal(created.name, 'made');
+  assert.equal(created.label, idOf(X));
+});
+
+it("a stale channel's registration keeps what it was registered with, however often it's derived again", (t) => {
+  const f = filtered(t);
+  const meta = () => f.server.channelManager.get(idOf(X))?.metadata;
+  (f.adapter as any).markStale(X, G);
+  assert.equal(f.label(X), idOf(X));
+  // An older reply moved it to the other category, and renamed it.
+  const cached = f.client.channels.cache.get(X);
+  cached.parentId = C2;
+  cached.name = 'renamed';
+  // Another channel going stale derives every named registration again.
+  (f.adapter as any).markStale(P, G);
+  assert.equal(f.label(X), idOf(X));
+  assert.equal(meta()?.parentId, C1);
+  assert.equal(meta()?.channelName, 'news');
 });
 
 it("a fresh fetch that gives a channel a name re-derives the channels that held or hold it", async (t) => {
@@ -1439,7 +1473,7 @@ it("a name that a stale channel holds resolves to no channel when its fetch fail
   assert.equal(get.mock.callCount(), 1, 'the stale channel was fetched first');
   assert.equal(f.adapter.isStale(X), true);
   assert.equal(result.isError, true);
-  assert.match(result.content[0].text, /by its id/);
+  assert.match(result.content[0].text, /by its id instead: meanwhile the registered label of each channel a name addresses there is its id/);
   assert.deepEqual(sent, [], 'nothing was sent');
   // X may have taken any name meanwhile, so no name in its server resolves,
   // nor a name given without a server.
@@ -1908,14 +1942,95 @@ it("a sync clears the stale mark of a thread discord.js dropped", (t) => {
   assert.equal(f.adapter.isStale(TH), false);
 });
 
+it("a sync covering channels leaves a thread whose channel isn't known, and a sync of the whole server drops it", (t) => {
+  // Known only from a message: no channel, and in no channel's threads cache.
+  const f = fixture(t, { sparse: true });
+  assert.equal(f.client.channels.cache.get(TH).parentId, null);
+  assert.equal(f.server.registerGuildDelivery(G, TH), threadMcplId);
+
+  dispatch(f.client, 'THREAD_LIST_SYNC', threadListSync, {
+    d: { guild_id: G, channel_ids: [P], threads: [], members: [] },
+  });
+  assert.equal(f.client.channels.cache.has(TH), true, 'a sync of P can\'t tell it is P\'s');
+  assert.ok(f.server.channelManager.get(threadMcplId));
+
+  dispatch(f.client, 'THREAD_LIST_SYNC', threadListSync, {
+    d: { guild_id: G, threads: [], members: [] },
+  });
+  assert.equal(f.client.channels.cache.has(TH), false, "the adapter drops it: discord.js reaches only channels' threads caches");
+  assert.equal(f.server.channelManager.get(threadMcplId), undefined);
+  assert.ok(f.removed(threadMcplId));
+});
+
+it("a sync forgets a thread it drops from the cache whose registration doesn't know its channel", async (t) => {
+  const f = fixture(t, { sparse: true });
+  assert.equal(f.server.registerGuildDelivery(G, TH), threadMcplId);
+  assert.equal(f.server.channelManager.get(threadMcplId)?.metadata.parentId, undefined);
+  // A tool's fetch teaches the cache the thread's channel, and puts it in P's
+  // threads cache, without deriving the registration again.
+  t.mock.method(f.client.rest, 'get', async () => threadAt(false, T));
+  await (f.adapter as any).refetchChannel(TH);
+  assert.equal(f.client.channels.cache.get(P).threads.cache.has(TH), true);
+  assert.equal(f.server.channelManager.get(threadMcplId)?.metadata.parentId, undefined);
+
+  dispatch(f.client, 'THREAD_LIST_SYNC', threadListSync, {
+    d: { guild_id: G, channel_ids: [P], threads: [], members: [] },
+  });
+  assert.equal(f.client.channels.cache.has(TH), false, 'discord.js dropped it');
+  assert.equal(f.server.channelManager.get(threadMcplId), undefined);
+  assert.ok(f.removed(threadMcplId));
+});
+
+it("a covered sync leaves an archived thread it doesn't list, as discord.js does", (t) => {
+  const f = fixture(t, { sparse: true });
+  // Patched outside P's threads cache, so only the adapter could drop it.
+  dispatch(f.client, 'THREAD_UPDATE', threadUpdate, { d: threadAt(true, T) });
+  assert.equal(f.client.channels.cache.get(TH).archived, true);
+  assert.equal(f.client.channels.cache.get(P).threads.cache.has(TH), false);
+
+  dispatch(f.client, 'THREAD_LIST_SYNC', threadListSync, {
+    d: { guild_id: G, channel_ids: [P], threads: [], members: [] },
+  });
+  assert.equal(f.client.channels.cache.has(TH), true);
+});
+
+it("a sync's marks cleanup leaves another server's uncached channel stale", (t) => {
+  const f = fixture(t);
+  f.client.guilds._add(namesake());
+  // A mark with nothing cached behind it, in another server.
+  (f.adapter as any).forgetCached(W2);
+  (f.adapter as any).stale.set(W2, { guildId: G2 });
+
+  dispatch(f.client, 'THREAD_LIST_SYNC', threadListSync, {
+    d: { guild_id: G, channel_ids: [P], threads: [], members: [] },
+  });
+  assert.equal(f.adapter.isStale(W2), true);
+});
+
+it("a sync that lists a registered thread the filters no longer admit forgets it, as an update would", (t) => {
+  const f = filtered(t);
+  // The filter stops admitting C1, and with it X and its thread; an edit of
+  // the filters forgets nothing by itself.
+  f.adapter.updateFilters({ guildChannels: { [G]: [P] } });
+  assert.equal(f.adapter.channelAdmitted(G, TX, X), false);
+  assert.ok(f.server.channelManager.get(idOf(TX)));
+
+  dispatch(f.client, 'THREAD_LIST_SYNC', threadListSync, {
+    d: { guild_id: G, channel_ids: [X], threads: [threadInX], members: [] },
+  });
+  assert.equal(f.server.channelManager.get(idOf(TX)), undefined);
+  assert.ok(f.removed(idOf(TX)));
+  assert.equal(f.server.deletedChannels.has(TX), false);
+});
+
 it("queued syncs keep their scopes when a newer equal-list sync runs first", async (t) => {
   const f = fixture(t, { channels: [channelData(C1, ChannelType.GuildText, 'other')] });
   f.server.registerGuildDelivery(G, TH);
   const scopes: Array<string[] | null> = [];
   const reconcile = (f.adapter as any).threadsSyncedHandler;
-  f.adapter.onThreadsSynced((guildId, covered, listed) => {
+  f.adapter.onThreadsSynced((guildId, covered, listed, dropped) => {
     scopes.push(covered === null ? null : [...covered]);
-    reconcile(guildId, covered, listed);
+    reconcile(guildId, covered, listed, dropped);
   });
   const packet = (parentId: string) => ({
     t: 'THREAD_LIST_SYNC', d: { guild_id: G, channel_ids: [parentId], threads: [], members: [] },
@@ -1953,7 +2068,7 @@ it("thread sync scope survives nested actions and clears after completion or err
     if (!nested) {
       nested = true;
       f.client.actions.ThreadListSync.handle(inner);
-      assert.equal((f.adapter as any).applyingThreadSync, outer, 'the outer payload is restored');
+      assert.equal((f.adapter as any).applyingThreadSync?.data, outer, 'the outer payload is restored');
     }
   });
   f.client.actions.ThreadListSync.handle(outer);
@@ -2011,7 +2126,7 @@ for (const covered of ['its channel', 'every channel'] as const) {
   });
 }
 
-it("a thread lookup out when a sync of its server's threads drops it, which Discord then answers Unknown Channel for, handles the thread as deleted", { timeout: 5000 }, async (t) => {
+it("a thread lookup in flight when a sync of its server's threads drops the thread, answered Unknown Channel, handles the thread as deleted", { timeout: 5000 }, async (t) => {
   const f = fixture(t);
   watermarkFile(t);
   f.server.registerGuildDelivery(G, TH);
@@ -2055,11 +2170,17 @@ it("list_channels fetches a stale channel first, and lists it as Discord has it 
   // it in C1 with its older name, stale.
   f.client.channels.cache.get(X).name = 'news-older';
   (f.adapter as any).stale.set(X, { guildId: G });
-  const get = t.mock.method(f.client.rest, 'get', async () => ({ ...inCategory(C2), name: 'news-newer' }));
+  // And renamed P, which an older reply left with its older name.
+  f.client.channels.cache.get(P).name = 'before-older';
+  (f.adapter as any).stale.set(P, { guildId: G });
+  const get = t.mock.method(f.client.rest, 'get', async (route: string) =>
+    route.endsWith(X) ? { ...inCategory(C2), name: 'news-newer' } : { ...parentData(ChannelType.GuildText), name: 'after' });
   const listed = await f.adapter.listChannels(G);
-  assert.equal(get.mock.callCount(), 1);
+  assert.equal(get.mock.callCount(), 2);
   assert.equal(f.adapter.isStale(X), false);
-  assert.deepEqual(listed.map((c) => c.id).sort(), [P, C1].sort(), 'Discord has it outside the filters');
+  assert.equal(f.adapter.isStale(P), false);
+  assert.deepEqual(listed.map((c) => c.id).sort(), [P, C1].sort(), 'Discord has X outside the filters');
+  assert.equal(listed.find((c) => c.id === P)?.name, 'after');
 });
 
 it("list_channels leaves out a channel still stale when its fetch fails", async (t) => {
@@ -2093,12 +2214,13 @@ it("a delivery from a stale channel or thread whose lookup fails leaves out the 
     // Discord renamed it; an overtaken reply left an older name cached, stale.
     f.client.channels.cache.get(where).name = 'older-name';
     (f.adapter as any).stale.set(where, { guildId: G });
-    t.mock.method(f.client.rest, 'get', async () => { throw new Error('Service Unavailable'); });
+    const get = t.mock.method(f.client.rest, 'get', async () => { throw new Error('Service Unavailable'); });
     f.client.actions.MessageCreate.handle({
       id: M, guild_id: G, channel_id: where, type: MessageType.Default, content: `<@${BOT}> hi`, timestamp: new Date(T).toISOString(),
       author: { id: U, username: 'Bob', discriminator: '0', avatar: null }, mentions: [bot], mention_roles: [], attachments: [], embeds: [], flags: 0,
     });
     await until(() => f.pushes().length > 0);
+    assert.ok(get.mock.callCount() > 0, `${where}: it was looked up first`);
     assert.equal(f.pushes().length, 1, `${where}: the message is delivered`);
     assert.equal(f.adapter.isStale(where), true, where);
     assert.ok(!JSON.stringify(f.pushes()[0]?.params).includes('older-name'), where);

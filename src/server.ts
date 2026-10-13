@@ -3171,6 +3171,18 @@ export class DiscordMcplServer {
     return !thread.parentId || !this.discord.isStale(thread.parentId);
   }
 
+  /** A thread Discord reported on, by an update, a fresh fetch, or a sync
+   *  that lists it, when it's registered: forgotten when it's archived, and
+   *  otherwise registered again or forgotten as the filters decide, once
+   *  their answer is known (threadAdmissionKnown). One that isn't registered
+   *  is left to its next message. */
+  private threadReported(thread: ChannelFacts): void {
+    const id = mcplChannelId(thread.guildId, thread.id);
+    if (!this.channelManager.get(id)) return;
+    if (thread.archived) this.forgetChannels([id]);
+    else if (this.threadAdmissionKnown(thread)) this.registerOrForgetThread(thread);
+  }
+
   /** A registered thread's facts, as an update brings them: registered
    *  again while the filters admit it, forgotten when they don't. */
   private registerOrForgetThread(thread: ChannelFacts): void {
@@ -4065,17 +4077,14 @@ export class DiscordMcplServer {
     // unarchives it, registers it again. Its watermark stays, since it can
     // come back. A registered thread otherwise changed (renamed, locked) is
     // re-derived. An unregistered one waits for a message.
-    this.discord.onThreadUpdate((thread) => {
-      const id = mcplChannelId(thread.guildId, thread.id);
-      if (!this.channelManager.get(id)) return;
-      if (thread.archived) this.forgetChannels([id]);
-      else if (this.threadAdmissionKnown(thread)) this.registerOrForgetThread(thread);
-    });
+    this.discord.onThreadUpdate((thread) => this.threadReported(thread));
 
     // A fetch left a channel stale: its current name isn't known, so no
-    // name in its guild resolves (resolveChannelRef), and the labels there
-    // are derived again, by id. Its fresh fetch derives them again by name
-    // (onChannelRefreshed).
+    // name in its guild resolves (resolveChannelRef), and the labels of the
+    // channels a name addresses there are derived again, by id, its own
+    // registration's too. A registered thread's label, display only, keeps
+    // the names it was registered with (knowsLessThan). Its fresh fetch
+    // derives them again by name (onChannelRefreshed).
     this.discord.onChannelStale((channelId) => {
       const registered = this.channelManager.getAll()
         .filter((d) => (d.address as { channelId?: string } | undefined)?.channelId === channelId);
@@ -4085,16 +4094,28 @@ export class DiscordMcplServer {
 
     this.discord.onChannelDelete((guildId, channelId, threadIds) => this.channelDeleted(guildId, channelId, threadIds));
     this.discord.onThreadDelete((guildId, threadId) => this.channelDeleted(guildId, threadId));
-    // Forget registered threads omitted within the sync's covered channels, or across the guild for a whole-guild sync. An omitted thread may be archived, so this does not remember a deletion. Listed registered threads derive their facts again.
-    this.discord.onThreadsSynced((guildId, covered, synced) => {
+    // Discord synced a guild's threads (onThreadsSynced). A registered
+    // thread it doesn't list is forgotten when its registration places it
+    // under a channel the sync covers (any, for a whole-guild sync), or the
+    // sync dropped it from the cache, which places a thread by the channel
+    // the cache knew for it. It isn't remembered as deleted, since it may
+    // only have been archived. A thread whose channel neither knows is under
+    // none. A registered thread the sync lists is taken as updated.
+    this.discord.onThreadsSynced((guildId, covered, listed, dropped) => {
       const channelOf = (d: ChannelDescriptor) => (d.address as { channelId: string }).channelId;
       const threads = this.registeredInGuild(guildId)
         .filter((d) => (d.metadata as { channelType?: string } | undefined)?.channelType === 'thread');
-      this.forgetChannels(threads.filter((d) => {
+      const omitted = (d: ChannelDescriptor): boolean => {
+        if (listed.has(channelOf(d))) return false;
         const parentId = (d.metadata as { parentId?: string } | undefined)?.parentId;
-        return !synced.has(channelOf(d)) && (covered === null || (parentId !== undefined && covered.has(parentId)));
-      }).map((d) => d.id));
-      this.rederiveChannels(threads.filter((d) => synced.has(channelOf(d))));
+        return covered === null || dropped.has(channelOf(d)) || (parentId !== undefined && covered.has(parentId));
+      };
+      this.forgetChannels(threads.filter(omitted).map((d) => d.id));
+      for (const d of threads) {
+        if (!listed.has(channelOf(d))) continue;
+        const facts = this.discord.getCachedChannelFacts(channelOf(d));
+        if (facts) this.threadReported(facts);
+      }
     });
     // A stale channel fetched fresh is taken as an update of it, since what
     // was derived from its older facts may be wrong in any of them: a thread
@@ -4108,9 +4129,7 @@ export class DiscordMcplServer {
       const id = mcplChannelId(facts.guildId, channelId);
       const admitted = this.discord.channelAdmitted(facts.guildId, channelId, facts.parentId ?? null);
       if (facts.type === 'thread') {
-        if (!this.channelManager.get(id)) return;
-        if (facts.archived) this.forgetChannels([id]);
-        else if (this.threadAdmissionKnown(facts)) this.registerOrForgetThread(facts);
+        this.threadReported(facts);
         return;
       }
       if (!admitted) {

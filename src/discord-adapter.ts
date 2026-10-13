@@ -80,6 +80,17 @@ export interface ChannelChange {
   admitted: boolean;
 }
 
+/** A sync of a guild's threads (DiscordAdapter.onThreadsSynced): the
+ *  channels it covers, or null for the whole guild; the live threads it
+ *  lists; and the live threads the client held under those channels that it
+ *  dropped from discord.js's caches. */
+export type ThreadsSyncedHandler = (
+  guildId: string,
+  covered: ReadonlySet<string> | null,
+  listed: ReadonlySet<string>,
+  dropped: ReadonlySet<string>,
+) => void;
+
 /** Maximum attachments Discord accepts on a single message. */
 const MAX_DISCORD_ATTACHMENTS = 10;
 
@@ -707,8 +718,11 @@ export class DiscordAdapter {
   private guildDeleteHandler?: (guildId: string) => void;
   private guildAvailableHandler?: (guildId: string, channels: ChannelFacts[], present: ReadonlySet<string>) => void;
   private guildRenameHandler?: (guildId: string) => void;
-  private threadsSyncedHandler?: (guildId: string, covered: ReadonlySet<string> | null, synced: ReadonlySet<string>) => void;
-  private applyingThreadSync?: GatewayThreadListSyncDispatchData;
+  private threadsSyncedHandler?: ThreadsSyncedHandler;
+  /** The thread sync discord.js is applying now, and the live threads of its
+   *  guild the client held, with their channels, as it began
+   *  (installThreadSyncScope). */
+  private applyingThreadSync?: { data: GatewayThreadListSyncDispatchData; held: Map<string, string | null> };
 
   constructor(config: DiscordAdapterConfig) {
     this.token = config.token;
@@ -966,10 +980,20 @@ export class DiscordAdapter {
     this.threadDeleteHandler = handler;
   }
 
-  /** Fired when Discord syncs a guild's threads, with the covered parent channel ids (null means the whole guild) and the listed thread ids.
-   * The adapter drops unlisted live cached threads within that coverage, including threads outside their parent's thread cache. Listed threads have fresh facts before the handler runs.
-   * An omitted thread may be archived or deleted, so the sync is not a deletion report. */
-  onThreadsSynced(handler: (guildId: string, covered: ReadonlySet<string> | null, synced: ReadonlySet<string>) => void): void {
+  /** Fired when Discord syncs a guild's threads (discord.js
+   *  `threadListSync`, sent when the bot gains access to a channel), with
+   *  the channels the sync covers (its `channel_ids`, or null for the whole
+   *  guild), the live threads it lists, and the live threads the client held
+   *  under those channels that it dropped from discord.js's caches, without
+   *  a threadDelete for each: discord.js drops those their channels' threads
+   *  caches hold, and the adapter the ones held outside them, such as a
+   *  thread first cached as a partial. A thread is placed by the channel the
+   *  client knew for it as the sync began; one whose channel wasn't known is
+   *  under no covered channel, so only a sync of the whole guild drops it.
+   *  An omitted thread may only have been archived, so a sync reports no
+   *  deletion. The listed threads' stale marks are cleared before the
+   *  handler runs, since the sync reports them as Discord has them. */
+  onThreadsSynced(handler: ThreadsSyncedHandler): void {
     this.threadsSyncedHandler = handler;
   }
 
@@ -1045,7 +1069,8 @@ export class DiscordAdapter {
    *  a mark and registers the channel again (onChannelRefreshed); while one
    *  stays stale, its guild's names don't resolve and it's left out of
    *  listing. A failed fetch, or one overtaken on every try, leaves its
-   *  mark. */
+   *  mark. Given a guild, only that guild's stale channels are fetched, as a
+   *  listing of it needs; a name given without a guild reads every guild's. */
   async refreshStale(guildId?: string): Promise<void> {
     const listed = [...this.stale].filter(([id, mark]) => {
       if (guildId !== undefined && mark.guildId !== guildId) return false;
@@ -1865,13 +1890,13 @@ export class DiscordAdapter {
    *  guild is available, and reading it writes nothing to the cache that a
    *  REST reply could make older (refetchChannel). Threads aren't listed, as
    *  the REST list never had them; categories and forums are. A guild in an
-   *  outage is refused rather than listed from what it held before. A stale
-   *  channel is fetched first (refreshStale), as for a name, so it's listed
-   *  as Discord has it now; one still stale is left out, as the
-   *  registration listings leave it out (guildPostingChannels), since its
-   *  category and name may be older than Discord's. */
+   *  outage is refused, before anything is fetched for it, rather than
+   *  listed from what it held before. A stale channel of the guild is
+   *  fetched first (refreshStale), through the freshness rule, as for a
+   *  name, so it's listed as Discord has it now; one still stale is left
+   *  out, as the registration listings leave it out (guildPostingChannels),
+   *  since its category and name may be older than Discord's. */
   async listChannels(guildId: string): Promise<DiscordChannelInfo[]> {
-    await this.refreshStale(guildId);
     const guild = await this.client.guilds.fetch(guildId);
     if (!guild?.channels) {
       throw new Error(`Guild ${guildId} not found`);
@@ -1879,6 +1904,7 @@ export class DiscordAdapter {
     if (!guild.available) {
       throw new Error(`Guild ${guildId} is unavailable (a Discord outage); its channels can't be listed until it's back`);
     }
+    await this.refreshStale(guildId);
     const names = this.nameView();
     const result: DiscordChannelInfo[] = [];
     guild.channels.cache.forEach((c: GuildBasedChannel) => {
@@ -1950,7 +1976,7 @@ export class DiscordAdapter {
       const where = parsed.guild === undefined ? 'a server this name could mean' : 'that server';
       return {
         ok: false, reason: 'ambiguous',
-        message: `${ref} can't be resolved by name right now: Discord's current facts for a channel in ${where} aren't known (its latest fetch failed or was overtaken by a change), so its current name may be this one. Address the channel by its id instead (list_channels gives each one's).`,
+        message: `${ref} can't be resolved by name right now: Discord's current facts for a channel in ${where} aren't known (its latest fetch failed or was overtaken by a change), so its current name may be this one. Address the channel by its id instead: meanwhile the registered label of each channel a name addresses there is its id, and list_channels gives the id of each channel whose facts are current.`,
       };
     }
     return resolveChannelName(parsed, names(parsed.name));
@@ -2396,6 +2422,8 @@ export class DiscordAdapter {
       type: ChannelType.GuildText,
       parent: categoryId,
     });
+    // The name Discord made the channel with, the POST's reply's.
+    const madeAs = created.name;
     // discord.js puts the POST's reply in the cache whenever it lands, over
     // anything the gateway reported of the new channel meanwhile, such as a
     // rename, and its id isn't known to be overtaken until then. So the
@@ -2415,9 +2443,11 @@ export class DiscordAdapter {
     })) ?? created) as typeof created;
     // Labelled as listing labels it: by its id when its name is taken.
     const facts = this.channelFacts(channel);
+    // Its name as Discord has it now, or, while that isn't known (the fetch
+    // failed, or was overtaken on every try), the name it was made with.
     return {
       id: channel.id,
-      name: channel.name,
+      name: this.knownName(channel.id, channel.name) ?? madeAs,
       type: 'text',
       parentId: channel.parentId ?? undefined,
       label: facts ? channelLabelFor(facts) : mcplChannelId(guildId, channel.id),
@@ -2647,7 +2677,17 @@ export class DiscordAdapter {
     }, { dmParty: true });
   }
 
-  /** The public threadListSync event omits channel_ids. Capture its payload during the synchronous action, which emits that event before returning. Raw dispatch precedes application, and packets queued before Ready can run after newer ones. Listed thread ids cannot identify the packet either, since distinct syncs can both list no threads. */
+  /** Keep the payload of the thread sync discord.js is applying, for the
+   *  threadListSync listener: the event carries the threads a sync lists,
+   *  but not the channels it covers (`channel_ids`). discord.js's
+   *  ThreadListSync action applies a sync and emits the event before it
+   *  returns, so the action is wrapped, once, as the client is made. The raw
+   *  packet can't stand in for it: a packet queued before the client is ready
+   *  is applied after newer ones, and two syncs can list the same threads,
+   *  none at all included. A nested application restores the outer one's
+   *  payload as it ends, a throw included. A discord.js without the action
+   *  fails construction, naming what's missing; the lockfile pins one that
+   *  has it. */
   private installThreadSyncScope(): void {
     const action = (this.client as unknown as {
       actions?: { ThreadListSync?: { handle(data: GatewayThreadListSyncDispatchData): unknown } };
@@ -2658,7 +2698,14 @@ export class DiscordAdapter {
     const handle = action.handle;
     action.handle = (data) => {
       const previous = this.applyingThreadSync;
-      this.applyingThreadSync = data;
+      // discord.js drops threads as it applies the sync, so what the client
+      // held, and under which channels, is read first.
+      const held = new Map<string, string | null>();
+      for (const channel of this.client.channels.cache.values()) {
+        if (!channel.isThread() || channel.guildId !== data.guild_id || channel.archived) continue;
+        held.set(channel.id, channel.parentId);
+      }
+      this.applyingThreadSync = { data, held };
       try {
         return handle.call(action, data);
       } finally {
@@ -2785,24 +2832,28 @@ export class DiscordAdapter {
     // Discord synced a guild's threads (onThreadsSynced): the threads it
     // lists are as Discord has them now, as a threadUpdate's thread is.
     this.client.on('threadListSync', (threads, guild) => {
-      const data = this.applyingThreadSync;
-      if (!data || data.guild_id !== guild.id) {
+      const scope = this.applyingThreadSync;
+      if (!scope || scope.data.guild_id !== guild.id) {
         throw new Error('threadListSync emitted outside its matching discord.js action');
       }
-      const covered = data.channel_ids ? new Set(data.channel_ids) : null;
-      const synced = new Set(threads.keys());
-      // discord.js visits each covered parent's thread cache. A partial thread patched later may be held only by the client, so reconcile that cache from the same payload too.
-      for (const channel of [...this.client.channels.cache.values()]) {
-        if (channel.isThread() && channel.guildId === guild.id && !channel.archived && !synced.has(channel.id)
-          && (covered === null || (channel.parentId !== null && covered.has(channel.parentId)))) {
-          this.forgetCached(channel.id);
-        }
+      const covered = scope.data.channel_ids ? new Set(scope.data.channel_ids) : null;
+      const listed = new Set(threads.keys());
+      // The sync drops each live thread the client held under a covered
+      // channel that it doesn't list. discord.js dropped those its channels'
+      // threads caches held; one held outside its channel's, such as a
+      // partial a threadUpdate patched since, is the adapter's to drop.
+      const dropped = new Set<string>();
+      for (const [id, parentId] of scope.held) {
+        if (listed.has(id) || !(covered === null || (parentId !== null && covered.has(parentId)))) continue;
+        dropped.add(id);
+        if (this.client.channels.cache.has(id)) this.forgetCached(id);
       }
+      // What discord.js dropped leaves its mark with nothing cached.
       for (const [id, mark] of this.stale) {
         if (mark.guildId === guild.id && !this.client.channels.cache.has(id)) this.stale.delete(id);
       }
-      for (const id of synced) this.stale.delete(id);
-      this.threadsSyncedHandler?.(guild.id, covered, synced);
+      for (const id of listed) this.stale.delete(id);
+      this.threadsSyncedHandler?.(guild.id, covered, listed, dropped);
     });
 
     this.client.on('guildUpdate', (oldGuild, newGuild) => {
@@ -3114,9 +3165,11 @@ export class DiscordAdapter {
 
   /** Discord says a channel doesn't exist, to any fetch of it: a deletion,
    *  as the gateway reports one. The server forgets it, and the threads
-   *  discord.js holds under it, when the cache placed it in a guild (a
-   *  lookup reports one it didn't, lookUpChannel), and discord.js's caches
-   *  drop them (forgetCached). */
+   *  discord.js holds under it, when the cache placed it in a guild, and
+   *  discord.js's caches drop them (forgetCached). A lookup reports the
+   *  channel it looked up as deleted too (lookUpChannel), whether or not the
+   *  cache placed it: the server forgets a deleted channel the same way
+   *  however often it's told. */
   private channelGone(channelId: string): void {
     const held = this.client.channels.cache.get(channelId) as
       | { guildId?: string | null; threads?: { cache: Map<string, unknown> } }
