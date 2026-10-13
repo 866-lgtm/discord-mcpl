@@ -1897,3 +1897,43 @@ it("a name-addressed send fetches no stale thread, and no channel its server's r
   assert.equal(get.mock.callCount(), 0, 'neither holds a name');
   assert.deepEqual(sent, [P]);
 });
+
+it("a delivery from a stale channel or thread whose lookup fails leaves out the name the cache has for it", { timeout: 5000 }, async (t) => {
+  t.mock.method(console, 'error', () => {});
+  for (const where of [X, TH]) {
+    const f = fixture(t, { channels: [channelData(X, ChannelType.GuildText, 'news')] });
+    // Discord renamed it; an overtaken reply left an older name cached, stale.
+    f.client.channels.cache.get(where).name = 'older-name';
+    (f.adapter as any).stale.set(where, { guildId: G });
+    t.mock.method(f.client.rest, 'get', async () => { throw new Error('Service Unavailable'); });
+    f.client.actions.MessageCreate.handle({
+      id: M, guild_id: G, channel_id: where, type: MessageType.Default, content: `<@${BOT}> hi`, timestamp: new Date(T).toISOString(),
+      author: { id: U, username: 'Bob', discriminator: '0', avatar: null }, mentions: [bot], mention_roles: [], attachments: [], embeds: [], flags: 0,
+    });
+    await until(() => f.pushes().length > 0);
+    assert.equal(f.pushes().length, 1, `${where}: the message is delivered`);
+    assert.equal(f.adapter.isStale(where), true, where);
+    assert.ok(!JSON.stringify(f.pushes()[0]?.params).includes('older-name'), where);
+  }
+});
+
+it("the catch-up's block from a stale thread whose fetch fails leaves out the name the cache has for it", { timeout: 5000 }, async (t) => {
+  t.mock.method(console, 'error', () => {});
+  const f = fixture(t);
+  watermarkFile(t);
+  f.server.subscribedChannels.add(TH);
+  f.server.forwardedWatermark.set(TH, '100');
+  // Discord renamed it; an overtaken reply left an older name cached, stale.
+  f.client.channels.cache.get(TH).name = 'older-name';
+  (f.adapter as any).stale.set(TH, { guildId: G });
+  f.adapter.fetchHistory = async () => [{
+    id: '200', content: 'later', cleanContent: 'later', authorId: U, authorName: 'Bob',
+    timestamp: new Date(T + 1000), mentionsBot: false, attachments: [],
+  }] as any;
+  const get = t.mock.method(f.client.rest, 'get', async () => { throw new Error('Service Unavailable'); });
+  await f.server.runReconnectSweep();
+  assert.equal(get.mock.callCount(), 1, 'the sweep looked it up first');
+  assert.equal(f.adapter.isStale(TH), true);
+  assert.equal(f.pushes().length, 1, 'the block is delivered');
+  assert.ok(!JSON.stringify(f.pushes()[0]?.params).includes('older-name'));
+});

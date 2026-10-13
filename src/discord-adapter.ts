@@ -1623,7 +1623,8 @@ export class DiscordAdapter {
     // mistake an unresolved channel for a DM.
     const isDM = typeof c.isDMBased === 'function' ? c.isDMBased() : guildId ? false : null;
     return {
-      name: typeof c.name === 'string' && c.name.length > 0 ? c.name : null,
+      // A stale channel's name may no longer be Discord's, so it's unknown.
+      name: typeof c.name === 'string' && c.name.length > 0 && !this.isStale(channelId) ? c.name : null,
       guildId,
       guildName: c.guild?.name ?? null,
       isDM,
@@ -1641,13 +1642,14 @@ export class DiscordAdapter {
   private threadPlace(channel: unknown, channelId: string): ThreadPlace {
     const c = channel as { isThread?: () => boolean; name?: string | null; parentId?: string | null } | null | undefined;
     if (!c || typeof c.isThread !== 'function' || !c.isThread()) return {};
-    // A stale channel's name may no longer be Discord's, so it's unknown.
+    // A stale channel's name may no longer be Discord's, so it's unknown,
+    // the thread's own as well as its channel's.
     const parent = c.parentId && !this.isStale(c.parentId)
       ? (this.client.channels.cache.get(c.parentId) as { name?: string } | undefined)
       : undefined;
     return {
       threadId: channelId,
-      ...(typeof c.name === 'string' && c.name.length > 0 ? { threadName: c.name } : {}),
+      ...(typeof c.name === 'string' && c.name.length > 0 && !this.isStale(channelId) ? { threadName: c.name } : {}),
       threadParentName: typeof parent?.name === 'string' && parent.name.length > 0 ? parent.name : null,
     };
   }
@@ -3250,9 +3252,10 @@ export class DiscordAdapter {
     // discord.js exposes channel/guild names directly on the Message object
     // (`message.channel.name`, `message.guild?.name`); they're only undefined
     // for unusual channel kinds (e.g. uncached partials). Fall back to null
-    // so downstream rendering can distinguish "unknown" from "DM".
+    // so downstream rendering can distinguish "unknown" from "DM". A stale
+    // channel's name may no longer be Discord's, so it's unknown too.
     const channel = message.channel as { name?: string } | null;
-    const channelName = channel && typeof channel.name === 'string' && channel.name.length > 0
+    const channelName = channel && typeof channel.name === 'string' && channel.name.length > 0 && !this.isStale(message.channelId)
       ? channel.name
       : null;
     const guildName = message.guild?.name ?? null;

@@ -589,7 +589,9 @@ in the git log and PR descriptions.
     meanwhile; if that fetch fails the channel becomes stale, and if
     Discord says it's gone already the tool says so. A stale channel's
     facts decide no registration and no name, until a fresh fetch or an
-    update of the channel clears its mark. Its current name isn't known,
+    update of the channel clears its mark, and a delivery from it, or from
+    a thread in it, carries no name for it meanwhile. Its current name
+    isn't known,
     so while a server the guild filter admits lists a stale
     channel of a kind a name addresses, no name in that server
     resolves, and no name given without a server resolves anywhere.
