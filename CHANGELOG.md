@@ -599,9 +599,11 @@ in the git log and PR descriptions.
     none of its threads, and a registered thread whose channel is stale
     stays registered until that channel's fresh fetch or update decides.
     The registration listings leave a stale channel out. A name-addressed
-    tool and `refresh_channels` fetch stale channels first, as a delivery
-    from a thread fetches its stale channel first; if that lookup fails,
-    the filters decide the delivery on what the cache holds. A channel
+    tool, `refresh_channels` and `list_channels` first fetch the stale
+    channels a server lists, threads aside, the ones a name or a listing
+    reads, as a delivery from a thread fetches its stale channel first; if
+    that lookup fails, the filters decide the delivery on what the cache
+    holds. A channel
     that Discord moves out of what the channel filters admit is
     forgotten, with the threads admitted through it, as on a server's
     return, and a delivery on its way from it doesn't register it again.
@@ -615,7 +617,8 @@ in the git log and PR descriptions.
   - **`list_channels` reads a server's channels from the gateway's
     cache** instead of fetching them from Discord, so it can't leave older
     facts in the cache than an update brought meanwhile. It lists the same
-    channels as before, threads still excluded, and refuses a server in an
+    channels as before, threads still excluded: a stale channel is fetched
+    first, and left out if that fetch fails. It refuses a server in an
     outage rather than listing what it held before.
   - **A reaction in a server the guild filter leaves out is dropped,** as
     its messages are. It used to pass when the server had no channel

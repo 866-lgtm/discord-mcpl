@@ -1035,15 +1035,23 @@ export class DiscordAdapter {
     return !this.guildIds?.length || this.guildIds.includes(guildId);
   }
 
-  /** Fetch every stale channel again (refetchChannel), before a decision
-   *  that reads names or facts across channels: resolving a channel by
-   *  name, or listing what to register. A fresh fetch clears a mark and
-   *  registers the channel again (onChannelRefreshed); while one stays
-   *  stale, its guild's names don't resolve and it's left out of listing.
-   *  A failed fetch, or one overtaken on every try, leaves its mark. */
+  /** Fetch the stale channels again (refetchChannel) whose facts a decision
+   *  across channels reads, before it: resolving a channel by name, or
+   *  listing channels. Those are the channels a server lists now, threads
+   *  aside. A thread's facts give no name and list nothing, and a channel
+   *  or thread its server no longer lists, such as one a return left out,
+   *  holds no name there (uncertainGuildNames); a message from one of
+   *  those, or a tool's read of it, fetches it first. A fresh fetch clears
+   *  a mark and registers the channel again (onChannelRefreshed); while one
+   *  stays stale, its guild's names don't resolve and it's left out of
+   *  listing. A failed fetch, or one overtaken on every try, leaves its
+   *  mark. */
   async refreshStale(): Promise<void> {
-    if (this.stale.size === 0) return;
-    await Promise.all([...this.stale.keys()].map((id) => this.refetchChannel(id).catch((err: unknown) => {
+    const listed = [...this.stale].filter(([id, { guildId }]) => {
+      const channel = this.client.guilds.cache.get(guildId)?.channels.cache.get(id);
+      return channel !== undefined && !channel.isThread();
+    });
+    await Promise.all(listed.map(([id]) => this.refetchChannel(id).catch((err: unknown) => {
       dbg('stale:refresh-failed', { channelId: id, error: (err as Error).message });
     })));
   }
@@ -1848,8 +1856,13 @@ export class DiscordAdapter {
    *  guild is available, and reading it writes nothing to the cache that a
    *  REST reply could make older (refetchChannel). Threads aren't listed, as
    *  the REST list never had them; categories and forums are. A guild in an
-   *  outage is refused rather than listed from what it held before. */
+   *  outage is refused rather than listed from what it held before. A stale
+   *  channel is fetched first (refreshStale), as for a name, so it's listed
+   *  as Discord has it now; one still stale is left out, as the
+   *  registration listings leave it out (guildPostingChannels), since its
+   *  category and name may be older than Discord's. */
   async listChannels(guildId: string): Promise<DiscordChannelInfo[]> {
+    await this.refreshStale();
     const guild = await this.client.guilds.fetch(guildId);
     if (!guild?.channels) {
       throw new Error(`Guild ${guildId} not found`);
@@ -1861,6 +1874,7 @@ export class DiscordAdapter {
     const result: DiscordChannelInfo[] = [];
     guild.channels.cache.forEach((c: GuildBasedChannel) => {
       if (!c.isThread()) {
+        if (this.isStale(c.id)) return;
         if (!this.channelAllowed(guildId, c.id, c.parentId)) return;
         const facts = this.channelFacts(c, names);
         result.push({

@@ -1860,3 +1860,40 @@ it("a thread lookup out when a sync of its server's threads drops it, which Disc
   assert.ok(f.server.deletedChannels.has(TH), 'remembered as deleted');
   assert.equal(f.server.forwardedWatermark.has(TH), false, 'and its watermark dropped');
 });
+
+it("list_channels fetches a stale channel first, and lists it as Discord has it now", async (t) => {
+  const f = filtered(t);
+  // Discord moved X out of the filters and renamed it; an older reply left
+  // it in C1 with its older name, stale.
+  f.client.channels.cache.get(X).name = 'news-older';
+  (f.adapter as any).stale.set(X, { guildId: G });
+  const get = t.mock.method(f.client.rest, 'get', async () => ({ ...inCategory(C2), name: 'news-newer' }));
+  const listed = await f.adapter.listChannels(G);
+  assert.equal(get.mock.callCount(), 1);
+  assert.equal(f.adapter.isStale(X), false);
+  assert.deepEqual(listed.map((c) => c.id).sort(), [P, C1].sort(), 'Discord has it outside the filters');
+});
+
+it("list_channels leaves out a channel still stale when its fetch fails", async (t) => {
+  const f = filtered(t);
+  (f.adapter as any).stale.set(X, { guildId: G });
+  t.mock.method(f.client.rest, 'get', async () => { throw new Error('Service Unavailable'); });
+  const listed = await f.adapter.listChannels(G);
+  assert.equal(f.adapter.isStale(X), true);
+  assert.deepEqual(listed.map((c) => c.id).sort(), [P, C1].sort());
+});
+
+it("a name-addressed send fetches no stale thread, and no channel its server's return left out, before it resolves", async (t) => {
+  const V = '100000000000000009';
+  const f = fixture(t, { channels: [channelData(V, ChannelType.GuildVoice, 'lounge')] });
+  // The guild comes back with P and the thread: V is left out, stale.
+  f.comesBack([threadData]);
+  assert.ok(f.adapter.isStale(V));
+  (f.adapter as any).stale.set(TH, { guildId: G });
+  const get = t.mock.method(f.client.rest, 'get', async () => threadAt(false, T));
+  const sent: string[] = [];
+  f.adapter.sendMessage = (async (channelId: string) => { sent.push(channelId); return { messageId: '1' }; }) as any;
+  await (f.server as any).handleToolCall('send_message', { channelId: '#before (Guild)', content: 'hi' });
+  assert.equal(get.mock.callCount(), 0, 'neither holds a name');
+  assert.deepEqual(sent, [P]);
+});
