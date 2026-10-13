@@ -1882,6 +1882,22 @@ it("a thread lookup out when a sync of its server's threads drops it, which Disc
   assert.equal(f.server.forwardedWatermark.has(TH), false, 'and its watermark dropped');
 });
 
+it("list_channels fetches no stale channel in another server", async (t) => {
+  const f = fixture(t);
+  f.client.guilds._add(namesake());
+  (f.adapter as any).markStale(W2, G2);
+  const get = t.mock.method(f.client.rest, 'get', async () => ({
+    ...channelData(W2, ChannelType.GuildText, 'before'), guild_id: G2,
+  }));
+
+  const listed = await f.adapter.listChannels(G);
+
+  assert.equal(get.mock.callCount(), 0);
+  assert.ok(listed.some((channel) => channel.id === P));
+  assert.equal(f.adapter.isStale(W2), true, "the other server's mark is unchanged");
+  assert.equal(f.server.channelManager.get('discord:' + G2 + ':' + W2), undefined, 'no foreign refresh registered it');
+});
+
 it("list_channels fetches a stale channel first, and lists it as Discord has it now", async (t) => {
   const f = filtered(t);
   // Discord moved X out of the filters and renamed it; an older reply left

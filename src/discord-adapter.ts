@@ -1046,9 +1046,10 @@ export class DiscordAdapter {
    *  stays stale, its guild's names don't resolve and it's left out of
    *  listing. A failed fetch, or one overtaken on every try, leaves its
    *  mark. */
-  async refreshStale(): Promise<void> {
-    const listed = [...this.stale].filter(([id, { guildId }]) => {
-      const channel = this.client.guilds.cache.get(guildId)?.channels.cache.get(id);
+  async refreshStale(guildId?: string): Promise<void> {
+    const listed = [...this.stale].filter(([id, mark]) => {
+      if (guildId !== undefined && mark.guildId !== guildId) return false;
+      const channel = this.client.guilds.cache.get(mark.guildId)?.channels.cache.get(id);
       return channel !== undefined && !channel.isThread();
     });
     await Promise.all(listed.map(([id]) => this.refetchChannel(id).catch((err: unknown) => {
@@ -1870,7 +1871,7 @@ export class DiscordAdapter {
    *  registration listings leave it out (guildPostingChannels), since its
    *  category and name may be older than Discord's. */
   async listChannels(guildId: string): Promise<DiscordChannelInfo[]> {
-    await this.refreshStale();
+    await this.refreshStale(guildId);
     const guild = await this.client.guilds.fetch(guildId);
     if (!guild?.channels) {
       throw new Error(`Guild ${guildId} not found`);
