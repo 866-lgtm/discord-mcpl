@@ -5,6 +5,8 @@ in the git log and PR descriptions.
 
 ## Unreleased
 
+## 0.2.0 — 2026-10-13
+
 ### Upgrade notes
 
 - **`fetch_history` and `fetch_around` now refuse a channel id that the
@@ -276,6 +278,12 @@ in the git log and PR descriptions.
   issue #16 once fleet inventory shows migrated files.
 
 ### Changed
+
+- **`@animalabs/voice-kit` comes from npm (`^0.1.0`)** instead of a
+  `file:../voice-kit` link, so a deploy no longer needs a voice-kit checkout
+  beside this one, and the package can be installed from npm (#83). A
+  checkout that already links `../voice-kit` keeps working: the link
+  resolves the same code until the next `npm install`.
 
 - **Text attachments now inline into context only up to
   `DISCORD_ATTACHMENT_INLINE_MAX_BYTES` (default 5120 bytes)** — previously
