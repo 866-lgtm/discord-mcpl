@@ -1603,6 +1603,8 @@ export class DiscordAdapter {
       if (!recipientId || (this.dmUsers && !this.dmUsers.has(recipientId))) return null;
       // The username, as an inbound DM's descriptor is labelled.
       const recipient = (channel as DMChannel).recipient ?? (await this.client.users.fetch(recipientId).catch(() => null));
+      // The DM list may have changed while the name was fetched.
+      if (this.dmUsers && !this.dmUsers.has(recipientId)) return null;
       return { kind: 'dm', recipientId, recipientName: recipient?.username ?? recipientId };
     }
     if (!('guildId' in channel) || channel.guildId !== guildSegment) return null;

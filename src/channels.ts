@@ -160,8 +160,9 @@ export type OpenTarget =
   | { kind: 'refused'; code: number; reason: string };
 
 /**
- * Resolve a channels/open request against the registered channels, by MCPL's
- * precedence. Nothing here opens anything.
+ * Resolve a channels/open request against the registered channels: its
+ * channelId first, then its address, then its type alone. Nothing here opens
+ * anything.
  *
  * type is required in MCPL, and every host we know sends it (agent-framework's
  * ChannelsOpenParams makes it a required field, so its exact thread opens
@@ -169,8 +170,10 @@ export type OpenTarget =
  * be of that type; a missing or invalid type is refused, never read as "any".
  *
  * channelId, when given, is the exact selector, and it alone selects: an
- * address beside it isn't read, whatever it says (MCPL prefers channelId, and
- * hosts code against that). Absent or null means no channelId. An empty string
+ * address beside it isn't read, whatever it says. MCPL's SPEC has no channelId
+ * on channels/open; agent-framework's ChannelsOpenParams gives it as "Exact
+ * registered id. Preferred over type/address matching.", and hosts code
+ * against that. Absent or null means no channelId. An empty string
  * or a non-string is refused, since it names nothing.
  *
  * Without a channelId, an address naming a guildId and a channelId (both

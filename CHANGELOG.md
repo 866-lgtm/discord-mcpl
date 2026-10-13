@@ -335,9 +335,10 @@ in the git log and PR descriptions.
 - **`channels/open` opens exactly the channel it was asked for.** A stale or
   unknown `channelId` used to fall through to the first registered channel of
   the same type, so a host could open, subscribe to, and receive history from
-  a different channel than it named. Now the request is read by MCPL's
-  precedence. A `channelId` alone selects, and an `address` beside it isn't
-  read; without a `channelId`, an `address` naming a guildId and a channelId
+  a different channel than it named. Now `channelId` is the exact selector,
+  as agent-framework's `ChannelsOpenParams` has it (MCPL's SPEC gives
+  `channels/open` no `channelId`): a `channelId` alone selects, and an
+  `address` beside it isn't read; without a `channelId`, an `address` naming a guildId and a channelId
   selects. Either names exactly one channel or is refused: an id the registry
   doesn't hold is looked up in Discord, and opened (and registered, by the
   rule every other path registers by) when it's a channel messages are
@@ -359,7 +360,7 @@ in the git log and PR descriptions.
   channel (`-32023`), invalid params (`-32602`), or open failed (`-32024`,
   when the history fetch fails, the channel filters refuse reading its
   history or can't be checked, or a `channels/close` or `mute_channel` for
-  the channel arrives while the open is in progress, which then stands). No
+  the channel arrives while the open is in progress, its lookup included). No
   history is fetched, and nothing is opened or subscribed, before a request
   names its channel, and a channel unregistered while the open is in
   progress isn't opened. `sinceLastSeen` reads the persisted watermark even

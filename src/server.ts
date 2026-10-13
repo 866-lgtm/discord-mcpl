@@ -3435,8 +3435,9 @@ export class DiscordMcplServer {
   }
 
   private async handleChannelOpen(params: ChannelOpenRequest): Promise<ChannelOpenResponse> {
-    // One channel this server serves, by MCPL's precedence, or a refusal with
-    // its code; nothing is fetched, opened or subscribed before this.
+    // One channel this server serves, by its channelId, address or type in
+    // that order (resolveOpenTarget), or a refusal with its code; nothing is
+    // fetched, opened or subscribed before this.
     const target = resolveOpenTarget(params, this.channelManager.getAll());
     if (target.kind === 'refused') throw new RequestRefusal(target.code, target.reason);
     const parsed = parseMcplChannelId(target.kind === 'registered' ? target.channel.id : target.id);
@@ -3512,7 +3513,7 @@ export class DiscordMcplServer {
     if (this.lifecycleEpoch(parsed.channelId) !== lifecycle) {
       throw new RequestRefusal(
         ERR_CHANNEL_OPEN_FAILED,
-        `A channels/close or mute_channel for ${desc.id} arrived while this open was in progress, and it stands. Nothing was opened.`,
+        `A channels/close or mute_channel for ${desc.id} arrived while this open was in progress, so nothing was opened.`,
       );
     }
     const opened = this.channelManager.open(desc.id);

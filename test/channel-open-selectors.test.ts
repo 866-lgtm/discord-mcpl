@@ -1,11 +1,13 @@
 /**
- * channels/open reads its selectors by MCPL's precedence: a channelId alone
+ * channels/open reads its selectors in the order hosts code against
+ * (agent-framework's ChannelsOpenParams prefers channelId): a channelId alone
  * selects; without one, an address does; with neither, the one channel of
  * the request's type. An exact selector names exactly one channel or is
  * refused with its code, and an id the registry doesn't hold is looked up in
  * Discord and opened when this server serves it. Nothing is fetched, opened
  * or subscribed before the channel is named, and a close, a mute or an
- * unregistration that arrives during the history fetch stands over the open.
+ * unregistration that arrives during the lookup or the history fetch stands
+ * over the open.
  */
 import { after, before, describe, it, type TestContext } from 'node:test';
 import * as assert from 'node:assert/strict';
@@ -441,7 +443,7 @@ describe('channels/open: what arrives during the history fetch stands', () => {
     await f.server.executeToolCall('mute_channel', { channelId: 'c1' });
     held.release();
     await assert.rejects(open, (err: Error & { code?: number }) =>
-      err.code === OPEN_FAILED && /^A channels\/close or mute_channel for discord:g1:c1 arrived while this open was in progress, and it stands\./.test(err.message));
+      err.code === OPEN_FAILED && /^A channels\/close or mute_channel for discord:g1:c1 arrived while this open was in progress, so nothing was opened\./.test(err.message));
     assert.equal(f.server.channelManager.isOpen('discord:g1:c1'), false);
     assert.deepEqual(f.subscribed(), []);
     assert.equal(f.server.mutedChannels.has('c1'), true, 'still muted');
@@ -456,6 +458,30 @@ describe('channels/open: what arrives during the history fetch stands', () => {
     held.release();
     await assert.rejects(open, (err: Error & { code?: number }) => err.code === OPEN_FAILED);
     assert.equal(f.server.channelManager.isOpen('discord:g1:c1'), false);
+    assert.deepEqual(f.subscribed(), []);
+  });
+
+  it('opens nothing when a close arrives while its unregistered channel is looked up', async () => {
+    let reached!: () => void;
+    let release!: () => void;
+    const atLookup = new Promise<void>((resolve) => { reached = resolve; });
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const f = fixture([general], {
+      served: async (guild, channel) => {
+        reached();
+        await gate;
+        return guild === 'g1' && channel === 'c9'
+          ? { kind: 'guild', facts: { id: 'c9', guildId: 'g1', guildName: 'Guild', name: 'late', type: 'text' } }
+          : null;
+      },
+    });
+    const open = f.server.handleChannelOpen({ channelId: 'discord:g1:c9', type: 'discord' });
+    await atLookup;
+    f.server.handleChannelClose({ channelId: 'discord:g1:c9' });
+    release();
+    await assert.rejects(open, (err: Error & { code?: number }) =>
+      err.code === OPEN_FAILED && /^A channels\/close or mute_channel for discord:g1:c9 arrived while this open was in progress/.test(err.message));
+    assert.equal(f.server.channelManager.isOpen('discord:g1:c9'), false);
     assert.deepEqual(f.subscribed(), []);
   });
 
@@ -539,6 +565,27 @@ describe('the adapter: which channels an exact open may register', () => {
     assert.equal(await adapter.lookUpServedChannel('dm', 'd2'), null, 'the DM list refuses its recipient');
     assert.equal(await adapter.lookUpServedChannel('g1', 'd1'), null, 'a DM named under a guild');
     assert.equal(await adapter.lookUpServedChannel('dm', 'gone'), null, 'Discord finds nothing');
+  });
+
+  it('serves nothing when its lookup is rejected with something that is not an Error', async (t) => {
+    const { adapter, client } = adapterFixture(t, {});
+    t.mock.method(client.channels, 'fetch', (async () => { throw null; }) as never);
+    assert.equal(await adapter.lookUpServedChannel('dm', 'x'), null);
+  });
+
+  it("serves no DM whose recipient the DM list stops admitting while the recipient's name is fetched", async (t) => {
+    const { adapter, client } = adapterFixture(t, { dmUsers: ['u1'] });
+    t.mock.method(client.channels, 'fetch', (async () => ({ type: ChannelType.DM, recipientId: 'u1', recipient: null })) as never);
+    let reached!: () => void;
+    let release!: () => void;
+    const atFetch = new Promise<void>((resolve) => { reached = resolve; });
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    t.mock.method(client.users, 'fetch', (async () => { reached(); await gate; return { username: 'ra' }; }) as never);
+    const lookup = adapter.lookUpServedChannel('dm', 'd1');
+    await atFetch;
+    adapter.updateFilters({ dmUsers: ['u2'] });
+    release();
+    assert.equal(await lookup, null);
   });
 
   it('serves a channel messages are posted in, or a thread, of its own guild that the filters admit, and nothing else', async (t) => {
