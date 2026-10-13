@@ -1708,3 +1708,107 @@ it("a delivery from a thread whose stale channel can't be looked up leaves that 
     assert.ok(!JSON.stringify(f.pushes()[0]?.params).includes('older'), 'the delivery names no older channel name');
   }
 });
+
+it("a server the guild filter leaves out registers nothing when it comes back from an outage", (t) => {
+  // The same return, in a server the guild filter admits, registers its channel.
+  const control = fixture(t, { guildIds: [G] });
+  control.comesBack();
+  assert.equal(control.label(P), '#before (Guild)');
+  const f = fixture(t, { guildIds: ['100000000000000099'] });
+  f.comesBack();
+  assert.deepEqual(f.server.channelManager.getAll(), []);
+  assert.equal(f.sent.some((x) => x.method === 'channels/changed'), false, 'and the host is told of nothing');
+});
+
+it("list_channels leaves out the channels the channel filter excludes, categories included", async (t) => {
+  const Z = '100000000000000029';
+  const f = fixture(t, { guildChannels: [C1, P], channels: [...categories, inCategory(C1), { ...channelData(Z, ChannelType.GuildText, 'elsewhere'), parent_id: C2 }] });
+  const listed = await f.adapter.listChannels(G);
+  assert.deepEqual(listed.map((c) => c.id).sort(), [P, C1, X].sort());
+});
+
+it("a registered thread marked stale is labelled by its id", (t) => {
+  const f = fixture(t);
+  f.server.registerGuildDelivery(G, TH);
+  assert.equal(f.label(TH), '#before › topic (Guild)');
+  (f.adapter as any).markStale(TH, G);
+  assert.equal(f.label(TH), threadMcplId);
+});
+
+/** Another server, `Other` unless named, holding a text channel named like P. */
+const G2 = '100000000000000027';
+const W2 = '100000000000000028';
+const namesake = (name = 'Other') => ({
+  id: G2, name, owner_id: BOT, roles: [], channels: [{ id: W2, guild_id: G2, type: ChannelType.GuildText, name: 'before', parent_id: null }],
+});
+
+it("a server back from an outage gives a channel in another server of its name its label back", (t) => {
+  const Z = '100000000000000029';
+  const f = fixture(t);
+  f.client.guilds._add({ id: G2, name: 'Guild', owner_id: BOT, roles: [], channels: [{ id: Z, guild_id: G2, type: ChannelType.GuildText, name: 'zed', parent_id: null }] });
+  const zLabel = () => f.server.channelManager.get(`discord:${G2}:${Z}`)?.label;
+  f.server.registerGuildDelivery(G2, Z);
+  assert.equal(zLabel(), '#zed (Guild)');
+  // A stale channel in the other server called Guild: any name given with
+  // that server's name may mean one of its channels.
+  (f.adapter as any).markStale(P, G);
+  assert.equal(zLabel(), `discord:${G2}:${Z}`);
+  // Its server comes back listing P, which is current again.
+  f.comesBack();
+  assert.equal(f.adapter.isStale(P), false);
+  assert.equal(zLabel(), '#zed (Guild)');
+});
+
+it("a tool's read of a stale thread that isn't registered registers nothing", async (t) => {
+  const f = fixture(t);
+  (f.adapter as any).stale.set(TH, { guildId: G });
+  const get = t.mock.method(f.client.rest, 'get', async () => threadAt(false, T));
+  assert.equal(await f.adapter.inspectionRefusal(TH), null);
+  assert.equal(get.mock.callCount(), 1);
+  assert.equal(f.adapter.isStale(TH), false, 'fetched fresh');
+  assert.equal(f.label(TH), undefined, 'a thread waits for a message');
+  assert.equal(f.sent.some((x) => x.method === 'channels/changed'), false);
+});
+
+it("a DM channel the cache knows only partly is fetched before its recipient is read", async (t) => {
+  const D = '100000000000000030';
+  const f = fixture(t);
+  f.client.channels._add({ id: D, type: ChannelType.DM });
+  assert.equal(f.client.channels.cache.get(D)?.partial, true);
+  const get = t.mock.method(f.client.rest, 'get', async () => ({
+    id: D, type: ChannelType.DM, last_message_id: null, recipients: [{ id: U, username: 'Bob', discriminator: '0', avatar: null }],
+  }));
+  assert.deepEqual(await f.adapter.getDmChannelInfo(D), { recipientId: U, recipientName: 'Bob' });
+  assert.equal(get.mock.callCount(), 1);
+});
+
+it("a server joined under a registered channel's server name labels that channel by its id, since the name means two channels then", (t) => {
+  const f = fixture(t);
+  f.server.registerGuildDelivery(G, P);
+  assert.equal(f.label(P), '#before (Guild)');
+  // GUILD_CREATE reports a guild joined only once the client is ready.
+  f.client.ws.status = Status.Ready;
+  dispatch(f.client, 'GUILD_CREATE', guildCreate, {
+    d: { ...namesake('Guild'), member_count: 1, members: [{ user: bot, roles: [] }], threads: [] },
+  });
+  assert.equal(f.server.channelManager.get(`discord:${G2}:${W2}`)?.label, `discord:${G2}:${W2}`, "the joined server's channel is registered by its id");
+  assert.equal(f.label(P), idOf(P));
+});
+
+it("a server the bot leaves gives its name back, to a channel of the same name in a server of the same name", (t) => {
+  const f = fixture(t);
+  f.client.guilds._add(namesake('Guild'));
+  f.server.registerGuildDelivery(G, P);
+  assert.equal(f.label(P), idOf(P), 'two servers called Guild hold a #before');
+  f.client.actions.GuildDelete.handle({ id: G2 });
+  assert.equal(f.label(P), '#before (Guild)');
+});
+
+it("a server renamed to a registered channel's server name labels that channel by its id", (t) => {
+  const f = fixture(t);
+  f.client.guilds._add(namesake());
+  f.server.registerGuildDelivery(G, P);
+  assert.equal(f.label(P), '#before (Guild)');
+  f.client.actions.GuildUpdate.handle({ id: G2, name: 'Guild' });
+  assert.equal(f.label(P), idOf(P));
+});
