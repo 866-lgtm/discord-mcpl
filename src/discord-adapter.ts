@@ -29,6 +29,7 @@ import {
   type User,
   type ChatInputCommandInteraction,
   type ApplicationCommandDataResolvable,
+  type GatewayThreadListSyncDispatchData,
 } from 'discord.js';
 import { existsSync, statSync } from 'node:fs';
 import { basename } from 'node:path';
@@ -706,7 +707,8 @@ export class DiscordAdapter {
   private guildDeleteHandler?: (guildId: string) => void;
   private guildAvailableHandler?: (guildId: string, channels: ChannelFacts[], present: ReadonlySet<string>) => void;
   private guildRenameHandler?: (guildId: string) => void;
-  private threadsSyncedHandler?: (guildId: string, synced: ReadonlySet<string>) => void;
+  private threadsSyncedHandler?: (guildId: string, covered: ReadonlySet<string> | null, synced: ReadonlySet<string>) => void;
+  private applyingThreadSync?: GatewayThreadListSyncDispatchData;
 
   constructor(config: DiscordAdapterConfig) {
     this.token = config.token;
@@ -749,6 +751,7 @@ export class DiscordAdapter {
       partials: [Partials.Channel, Partials.Message, Partials.Reaction, Partials.User],
     });
 
+    this.installThreadSyncScope();
     this.setupEvents();
   }
 
@@ -963,13 +966,10 @@ export class DiscordAdapter {
     this.threadDeleteHandler = handler;
   }
 
-  /** Fired when Discord syncs a guild's threads (discord.js `threadListSync`,
-   *  sent when the bot gains access to a channel), with the ids of the live
-   *  threads the sync lists. discord.js patches those from it, and drops
-   *  the live threads it held under the channels the sync covers that the
-   *  sync doesn't list, without a threadDelete for each: such a thread was
-   *  archived or deleted while the bot couldn't see it. */
-  onThreadsSynced(handler: (guildId: string, synced: ReadonlySet<string>) => void): void {
+  /** Fired when Discord syncs a guild's threads, with the covered parent channel ids (null means the whole guild) and the listed thread ids.
+   * The adapter drops unlisted live cached threads within that coverage, including threads outside their parent's thread cache. Listed threads have fresh facts before the handler runs.
+   * An omitted thread may be archived or deleted, so the sync is not a deletion report. */
+  onThreadsSynced(handler: (guildId: string, covered: ReadonlySet<string> | null, synced: ReadonlySet<string>) => void): void {
     this.threadsSyncedHandler = handler;
   }
 
@@ -2647,6 +2647,26 @@ export class DiscordAdapter {
     }, { dmParty: true });
   }
 
+  /** The public threadListSync event omits channel_ids. Capture its payload during the synchronous action, which emits that event before returning. Raw dispatch precedes application, and packets queued before Ready can run after newer ones. Listed thread ids cannot identify the packet either, since distinct syncs can both list no threads. */
+  private installThreadSyncScope(): void {
+    const action = (this.client as unknown as {
+      actions?: { ThreadListSync?: { handle(data: GatewayThreadListSyncDispatchData): unknown } };
+    }).actions?.ThreadListSync;
+    if (!action || typeof action.handle !== 'function') {
+      throw new Error('discord.js actions.ThreadListSync.handle is missing; thread sync reconciliation requires its payload');
+    }
+    const handle = action.handle;
+    action.handle = (data) => {
+      const previous = this.applyingThreadSync;
+      this.applyingThreadSync = data;
+      try {
+        return handle.call(action, data);
+      } finally {
+        this.applyingThreadSync = previous;
+      }
+    };
+  }
+
   private setupEvents(): void {
     this.watchReports();
     this.client.on('messageCreate', (message: Message) => {
@@ -2765,8 +2785,24 @@ export class DiscordAdapter {
     // Discord synced a guild's threads (onThreadsSynced): the threads it
     // lists are as Discord has them now, as a threadUpdate's thread is.
     this.client.on('threadListSync', (threads, guild) => {
-      for (const id of threads.keys()) this.stale.delete(id);
-      this.threadsSyncedHandler?.(guild.id, new Set(threads.keys()));
+      const data = this.applyingThreadSync;
+      if (!data || data.guild_id !== guild.id) {
+        throw new Error('threadListSync emitted outside its matching discord.js action');
+      }
+      const covered = data.channel_ids ? new Set(data.channel_ids) : null;
+      const synced = new Set(threads.keys());
+      // discord.js visits each covered parent's thread cache. A partial thread patched later may be held only by the client, so reconcile that cache from the same payload too.
+      for (const channel of [...this.client.channels.cache.values()]) {
+        if (channel.isThread() && channel.guildId === guild.id && !channel.archived && !synced.has(channel.id)
+          && (covered === null || (channel.parentId !== null && covered.has(channel.parentId)))) {
+          this.forgetCached(channel.id);
+        }
+      }
+      for (const [id, mark] of this.stale) {
+        if (mark.guildId === guild.id && !this.client.channels.cache.has(id)) this.stale.delete(id);
+      }
+      for (const id of synced) this.stale.delete(id);
+      this.threadsSyncedHandler?.(guild.id, covered, synced);
     });
 
     this.client.on('guildUpdate', (oldGuild, newGuild) => {

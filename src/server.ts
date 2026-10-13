@@ -4085,17 +4085,15 @@ export class DiscordMcplServer {
 
     this.discord.onChannelDelete((guildId, channelId, threadIds) => this.channelDeleted(guildId, channelId, threadIds));
     this.discord.onThreadDelete((guildId, threadId) => this.channelDeleted(guildId, threadId));
-    // Discord synced a guild's threads, and discord.js dropped the live
-    // threads it held that the sync doesn't list (onThreadsSynced). A
-    // registered thread it no longer holds is forgotten, as a guild's return
-    // forgets one, and isn't remembered as deleted, since it may only have
-    // been archived (guildReturned). The registered threads the sync lists
-    // are derived again from what it brought.
-    this.discord.onThreadsSynced((guildId, synced) => {
+    // Forget registered threads omitted within the sync's covered channels, or across the guild for a whole-guild sync. An omitted thread may be archived, so this does not remember a deletion. Listed registered threads derive their facts again.
+    this.discord.onThreadsSynced((guildId, covered, synced) => {
       const channelOf = (d: ChannelDescriptor) => (d.address as { channelId: string }).channelId;
       const threads = this.registeredInGuild(guildId)
         .filter((d) => (d.metadata as { channelType?: string } | undefined)?.channelType === 'thread');
-      this.forgetChannels(threads.filter((d) => !this.discord.getCachedChannelFacts(channelOf(d))).map((d) => d.id));
+      this.forgetChannels(threads.filter((d) => {
+        const parentId = (d.metadata as { parentId?: string } | undefined)?.parentId;
+        return !synced.has(channelOf(d)) && (covered === null || (parentId !== undefined && covered.has(parentId)));
+      }).map((d) => d.id));
       this.rederiveChannels(threads.filter((d) => synced.has(channelOf(d))));
     });
     // A stale channel fetched fresh is taken as an update of it, since what

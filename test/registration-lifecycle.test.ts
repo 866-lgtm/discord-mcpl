@@ -1836,6 +1836,146 @@ it("a server renamed to a registered channel's server name labels that channel b
   assert.equal(f.label(P), idOf(P));
 });
 
+it("a covered sync drops a thread patched outside its parent's thread cache", (t) => {
+  const f = fixture(t, { sparse: true });
+  dispatch(f.client, 'THREAD_UPDATE', threadUpdate, { d: threadAt(false, T) });
+  assert.equal(f.client.channels.cache.get(P).threads.cache.has(TH), false);
+  assert.equal(f.server.registerGuildDelivery(G, TH), threadMcplId);
+
+  dispatch(f.client, 'THREAD_LIST_SYNC', threadListSync, {
+    d: { guild_id: G, channel_ids: [P], threads: [], members: [] },
+  });
+
+  assert.equal(f.client.channels.cache.has(TH), false);
+  assert.equal(f.client.guilds.cache.get(G).channels.cache.has(TH), false);
+  assert.equal(f.label(TH), undefined);
+  assert.ok(f.removed(threadMcplId));
+  assert.equal(f.server.deletedChannels.has(TH), false, 'a sync does not prove deletion');
+});
+
+it("a covered sync leaves an uncached registered thread in an uncovered channel", (t) => {
+  const T2 = '100000000000000031';
+  const f = fixture(t, { channels: [channelData(C1, ChannelType.GuildText, 'other')] });
+  f.client.channels._add({ ...threadAt(false, T), id: T2, parent_id: C1 });
+  f.server.registerGuildDelivery(G, T2);
+  const before = f.server.channelManager.get(idOf(T2));
+  assert.ok(before);
+  (f.adapter as any).forgetCached(T2);
+  assert.equal(f.client.channels.cache.has(T2), false);
+
+  dispatch(f.client, 'THREAD_LIST_SYNC', threadListSync, {
+    d: { guild_id: G, channel_ids: [P], threads: [], members: [] },
+  });
+
+  assert.deepEqual(f.server.channelManager.get(idOf(T2)), before);
+  assert.equal(f.removed(idOf(T2)), false);
+});
+
+it("a whole-guild thread sync leaves registered text channels in place", (t) => {
+  const f = fixture(t);
+  f.server.registerGuildDelivery(G, P);
+
+  dispatch(f.client, 'THREAD_LIST_SYNC', threadListSync, {
+    d: { guild_id: G, threads: [], members: [] },
+  });
+
+  assert.equal(f.client.channels.cache.has(P), true);
+  assert.equal(f.label(P), '#before (Guild)');
+  assert.equal(f.removed(idOf(P)), false);
+  assert.equal(f.client.channels.cache.has(TH), false, 'the whole-guild sync applied');
+});
+
+it("a sync clears the stale mark of a thread discord.js dropped", (t) => {
+  const f = fixture(t);
+  assert.equal(f.client.channels.cache.get(P).threads.cache.has(TH), true);
+  (f.adapter as any).markStale(TH, G);
+  assert.equal(f.adapter.isStale(TH), true);
+
+  dispatch(f.client, 'THREAD_LIST_SYNC', threadListSync, {
+    d: { guild_id: G, channel_ids: [P], threads: [], members: [] },
+  });
+
+  assert.equal(f.client.channels.cache.has(TH), false);
+  assert.equal(f.adapter.isStale(TH), false);
+});
+
+it("queued syncs keep their scopes when a newer equal-list sync runs first", async (t) => {
+  const f = fixture(t, { channels: [channelData(C1, ChannelType.GuildText, 'other')] });
+  f.server.registerGuildDelivery(G, TH);
+  const scopes: Array<string[] | null> = [];
+  const reconcile = (f.adapter as any).threadsSyncedHandler;
+  f.adapter.onThreadsSynced((guildId, covered, listed) => {
+    scopes.push(covered === null ? null : [...covered]);
+    reconcile(guildId, covered, listed);
+  });
+  const packet = (parentId: string) => ({
+    t: 'THREAD_LIST_SYNC', d: { guild_id: G, channel_ids: [parentId], threads: [], members: [] },
+  });
+  assert.notEqual(f.client.ws.status, Status.Ready);
+  for (const queued of [packet(P), packet(C1)]) {
+    f.client.ws.emit(queued.t, queued.d);
+    assert.equal(f.client.ws.handlePacket(queued, { id: 0 }), false);
+  }
+  assert.equal(scopes.length, 0);
+  f.client.ws.status = Status.Ready;
+  const newer = packet(C1);
+  f.client.ws.emit(newer.t, newer.d);
+  f.client.ws.handlePacket(newer, { id: 0 });
+  assert.deepEqual(scopes, [[C1]]);
+  assert.equal(f.client.channels.cache.has(TH), true);
+  assert.equal(f.label(TH), '#before › topic (Guild)', "the newer sync did not cover this thread's channel");
+  // A delivery can register the still-cached thread between applications.
+  f.server.registerGuildDelivery(G, TH);
+  await until(() => scopes.length === 3);
+  assert.deepEqual(scopes, [[C1], [P], [C1]]);
+  assert.equal(f.client.channels.cache.has(TH), false);
+  assert.equal(f.label(TH), undefined);
+});
+
+it("thread sync scope survives nested actions and clears after completion or error", (t) => {
+  const f = fixture(t, { channels: [channelData(C1, ChannelType.GuildText, 'other')] });
+  const outer = { guild_id: G, channel_ids: [C1], threads: [], members: [] };
+  const inner = { guild_id: G, channel_ids: [P], threads: [], members: [] };
+  const scopes: string[][] = [];
+  let nested = false;
+  f.adapter.onThreadsSynced((_guildId, covered) => {
+    assert.ok(covered);
+    scopes.push([...covered]);
+    if (!nested) {
+      nested = true;
+      f.client.actions.ThreadListSync.handle(inner);
+      assert.equal((f.adapter as any).applyingThreadSync, outer, 'the outer payload is restored');
+    }
+  });
+  f.client.actions.ThreadListSync.handle(outer);
+  assert.deepEqual(scopes, [[C1], [P]]);
+  assert.equal((f.adapter as any).applyingThreadSync, undefined);
+
+  const failure = new Error('sync listener failure');
+  f.adapter.onThreadsSynced(() => { throw failure; });
+  assert.throws(() => f.client.actions.ThreadListSync.handle(outer), failure);
+  assert.equal((f.adapter as any).applyingThreadSync, undefined);
+});
+
+it("construction refuses a discord.js client without the thread sync action", async (t) => {
+  const ActionsManager = require(resolve(discordJs, 'client/actions/ActionsManager.js'));
+  const load = ActionsManager.prototype.load;
+  let client: any;
+  t.mock.method(ActionsManager.prototype, 'load', function (this: any, Action: { name: string }) {
+    client = this.client;
+    return Action.name === 'ThreadListSyncAction' ? undefined : load.call(this, Action);
+  });
+  let adapter: DiscordAdapter | undefined;
+  try {
+    assert.throws(() => {
+      adapter = new DiscordAdapter({ token: 'unused' });
+    }, /discord\.js actions\.ThreadListSync\.handle is missing/);
+  } finally {
+    await adapter?.disconnect();
+    await client?.destroy();
+  }
+});
+
 for (const covered of ['its channel', 'every channel'] as const) {
   it(`a sync of a server's threads that covers ${covered} forgets a registered thread it drops, and derives the ones it lists again`, (t) => {
     const T2 = '100000000000000031';
