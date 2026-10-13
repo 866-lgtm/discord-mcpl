@@ -1890,21 +1890,23 @@ export class DiscordAdapter {
    *  guild is available, and reading it writes nothing to the cache that a
    *  REST reply could make older (refetchChannel). Threads aren't listed, as
    *  the REST list never had them; categories and forums are. A guild in an
-   *  outage is refused, before anything is fetched for it, rather than
-   *  listed from what it held before. A stale channel of the guild is
-   *  fetched first (refreshStale), through the freshness rule, as for a
-   *  name, so it's listed as Discord has it now; one still stale is left
-   *  out, as the registration listings leave it out (guildPostingChannels),
-   *  since its category and name may be older than Discord's. */
+   *  outage is refused rather than listed from what it held before, before
+   *  anything is fetched for it, and again after, since an outage can begin
+   *  meanwhile. A stale channel of the guild is fetched first (refreshStale),
+   *  through the freshness rule, as for a name, so it's listed as Discord
+   *  has it now; one still stale is left out, as the registration listings
+   *  leave it out (guildPostingChannels), since its category and name may be
+   *  older than Discord's. */
   async listChannels(guildId: string): Promise<DiscordChannelInfo[]> {
     const guild = await this.client.guilds.fetch(guildId);
     if (!guild?.channels) {
       throw new Error(`Guild ${guildId} not found`);
     }
-    if (!guild.available) {
-      throw new Error(`Guild ${guildId} is unavailable (a Discord outage); its channels can't be listed until it's back`);
-    }
+    const unavailable = () => new Error(`Guild ${guildId} is unavailable (a Discord outage); its channels can't be listed until it's back`);
+    if (!guild.available) throw unavailable();
     await this.refreshStale(guildId);
+    // An outage can begin while those fetches are out.
+    if (!guild.available) throw unavailable();
     const names = this.nameView();
     const result: DiscordChannelInfo[] = [];
     guild.channels.cache.forEach((c: GuildBasedChannel) => {
@@ -2832,18 +2834,25 @@ export class DiscordAdapter {
     // Discord synced a guild's threads (onThreadsSynced): the threads it
     // lists are as Discord has them now, as a threadUpdate's thread is.
     this.client.on('threadListSync', (threads, guild) => {
-      const scope = this.applyingThreadSync;
-      if (!scope || scope.data.guild_id !== guild.id) {
-        throw new Error('threadListSync emitted outside its matching discord.js action');
+      const applying = this.applyingThreadSync;
+      const scope = applying?.data.guild_id === guild.id ? applying : undefined;
+      // Only discord.js's ThreadListSync action gives the sync's payload
+      // (installThreadSyncScope). A discord.js that emitted the event
+      // elsewhere would leave the channels it covers unknown, so it covers
+      // none here: the threads it lists are taken as reported, and nothing
+      // it omits is forgotten. That's logged rather than thrown: a throw
+      // would end the process from inside the gateway's packet handling.
+      if (!scope) {
+        console.error(`[discord-mcpl] A sync of server ${guild.id}'s threads came outside discord.js's ThreadListSync action, so the channels it covers aren't known; nothing it omits is forgotten.`);
       }
-      const covered = scope.data.channel_ids ? new Set(scope.data.channel_ids) : null;
+      const covered = scope ? (scope.data.channel_ids ? new Set(scope.data.channel_ids) : null) : new Set<string>();
       const listed = new Set(threads.keys());
       // The sync drops each live thread the client held under a covered
       // channel that it doesn't list. discord.js dropped those its channels'
       // threads caches held; one held outside its channel's, such as a
       // partial a threadUpdate patched since, is the adapter's to drop.
       const dropped = new Set<string>();
-      for (const [id, parentId] of scope.held) {
+      for (const [id, parentId] of scope?.held ?? []) {
         if (listed.has(id) || !(covered === null || (parentId !== null && covered.has(parentId)))) continue;
         dropped.add(id);
         if (this.client.channels.cache.has(id)) this.forgetCached(id);

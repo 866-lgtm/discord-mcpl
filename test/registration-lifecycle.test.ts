@@ -2084,6 +2084,18 @@ it("thread sync scope survives nested actions and clears after completion or err
   assert.equal((f.adapter as any).applyingThreadSync, undefined);
 });
 
+it("a sync that comes outside discord.js's action is logged, and forgets nothing it omits", (t) => {
+  const f = fixture(t);
+  f.server.registerGuildDelivery(G, TH);
+  const logged = t.mock.method(console, 'error', () => {});
+  // A discord.js that emitted the event itself, with no payload to read:
+  // which channels the sync covers isn't known.
+  assert.doesNotThrow(() => f.client.emit('threadListSync', new Map(), f.client.guilds.cache.get(G)));
+  assert.ok(logged.mock.calls.some((call) => String(call.arguments[0]).includes("outside discord.js's ThreadListSync action")));
+  assert.ok(f.server.channelManager.get(threadMcplId), 'the thread it omits stays registered');
+  assert.equal(f.removed(threadMcplId), false);
+});
+
 it("construction refuses a discord.js client without the thread sync action", async (t) => {
   const ActionsManager = require(resolve(discordJs, 'client/actions/ActionsManager.js'));
   const load = ActionsManager.prototype.load;
@@ -2184,6 +2196,23 @@ it("list_channels fetches a stale channel first, and lists it as Discord has it 
   assert.equal(f.adapter.isStale(P), false);
   assert.deepEqual(listed.map((c) => c.id).sort(), [P, C1].sort(), 'Discord has X outside the filters');
   assert.equal(listed.find((c) => c.id === P)?.name, 'after');
+});
+
+it("list_channels refuses a server whose outage begins while its stale channels are fetched", async (t) => {
+  const f = fixture(t);
+  (f.adapter as any).markStale(P, G);
+  const { held, release } = holder(t);
+  const get = t.mock.method(f.client.rest, 'get', async () => {
+    await held;
+    return parentData(ChannelType.GuildText);
+  });
+  const listing = f.adapter.listChannels(G);
+  await until(() => get.mock.callCount() === 1);
+  assert.equal(get.mock.callCount(), 1, "the stale channel's fetch is out");
+  f.client.actions.GuildDelete.handle({ id: G, unavailable: true });
+  assert.equal(f.client.guilds.cache.get(G).available, false);
+  release();
+  await assert.rejects(listing, /unavailable/);
 });
 
 it("list_channels leaves out a channel still stale when its fetch fails", async (t) => {
