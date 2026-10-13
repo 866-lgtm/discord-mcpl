@@ -1431,20 +1431,23 @@ it("create_text_channel whose fetch afterwards is overtaken on every try reports
   assert.equal(created.label, idOf(X));
 });
 
-it("a stale channel's registration keeps what it was registered with, however often it's derived again", (t) => {
-  const f = filtered(t);
-  const meta = () => f.server.channelManager.get(idOf(X))?.metadata;
-  (f.adapter as any).markStale(X, G);
-  assert.equal(f.label(X), idOf(X));
-  // An older reply moved it to the other category, and renamed it.
-  const cached = f.client.channels.cache.get(X);
-  cached.parentId = C2;
-  cached.name = 'renamed';
-  // Another channel going stale derives every named registration again.
-  (f.adapter as any).markStale(P, G);
-  assert.equal(f.label(X), idOf(X));
-  assert.equal(meta()?.parentId, C1);
-  assert.equal(meta()?.channelName, 'news');
+it("a thread registered before its channel was known keeps its registration while it's stale, whatever its cache shows", async (t) => {
+  // Known only from a message, and registered by its id, with no channel.
+  const f = fixture(t, { sparse: true });
+  assert.equal(f.server.registerGuildDelivery(G, TH), threadMcplId);
+  const meta = () => f.server.channelManager.get(threadMcplId)?.metadata;
+  assert.equal(meta()?.parentId, undefined);
+  // Every reply of its fetch lands after a report on it: the cache takes in
+  // the reply's channel, but the thread is stale, so that decides nothing.
+  t.mock.method(f.client.rest, 'get', async () => {
+    (f.adapter as any).overtake(TH);
+    return threadAt(false, T);
+  });
+  await (f.adapter as any).refetchChannel(TH);
+  assert.equal(f.adapter.isStale(TH), true);
+  assert.equal(f.client.channels.cache.get(TH).parentId, P);
+  assert.equal(meta()?.parentId, undefined);
+  assert.equal(f.label(TH), threadMcplId);
 });
 
 it("a fresh fetch that gives a channel a name re-derives the channels that held or hold it", async (t) => {

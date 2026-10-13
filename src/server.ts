@@ -4081,10 +4081,11 @@ export class DiscordMcplServer {
 
     // A fetch left a channel stale: its current name isn't known, so no
     // name in its guild resolves (resolveChannelRef), and the labels of the
-    // channels a name addresses there are derived again, by id, its own
-    // registration's too. A registered thread's label, display only, keeps
-    // the names it was registered with (knowsLessThan). Its fresh fetch
-    // derives them again by name (onChannelRefreshed).
+    // channels a name addresses there are derived again, by id, as is its
+    // own registration's, a thread's included. A registered thread under it
+    // that isn't stale itself keeps its display-only label, with the names
+    // it was registered with (knowsLessThan). Its fresh fetch derives them
+    // again by name (onChannelRefreshed).
     this.discord.onChannelStale((channelId) => {
       const registered = this.channelManager.getAll()
         .filter((d) => (d.address as { channelId?: string } | undefined)?.channelId === channelId);

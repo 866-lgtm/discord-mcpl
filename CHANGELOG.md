@@ -594,8 +594,9 @@ in the git log and PR descriptions.
     or name until a fresh fetch or an update clears its mark, or, for a
     thread, a sync that lists it. Meanwhile a delivery from a stale channel,
     or from a thread in it, carries no name for that channel in its fields,
-    and its label is the registered one: a stale channel's is its id, while a
-    registered thread's display-only label keeps the names it was registered
+    and its label is the registered one: a stale channel's or thread's is its
+    id, while a registered thread that isn't stale itself, under a stale
+    channel, keeps its display-only label, with the names it was registered
     with. Its current name isn't known, so while a server the guild filter
     admits lists a stale channel of a kind a name addresses, no name in that
     server resolves, and no name given without a server resolves anywhere.
