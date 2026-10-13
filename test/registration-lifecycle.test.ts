@@ -1871,9 +1871,15 @@ it("a covered sync leaves an uncached registered thread in an uncovered channel"
   assert.equal(f.removed(idOf(T2)), false);
 });
 
-it("a whole-guild thread sync leaves registered text channels in place", (t) => {
+it("a whole-guild thread sync preserves text channels and other guilds' threads", (t) => {
+  const foreignThread = '100000000000000032';
+  const foreignId = 'discord:' + G2 + ':' + foreignThread;
   const f = fixture(t);
+  f.client.guilds._add(namesake());
+  f.client.channels._add({ ...threadAt(false, T), id: foreignThread, guild_id: G2, parent_id: W2 });
   f.server.registerGuildDelivery(G, P);
+  f.server.registerGuildDelivery(G2, foreignThread);
+  assert.ok(f.server.channelManager.get(foreignId));
 
   dispatch(f.client, 'THREAD_LIST_SYNC', threadListSync, {
     d: { guild_id: G, threads: [], members: [] },
@@ -1883,6 +1889,9 @@ it("a whole-guild thread sync leaves registered text channels in place", (t) => 
   assert.equal(f.label(P), '#before (Guild)');
   assert.equal(f.removed(idOf(P)), false);
   assert.equal(f.client.channels.cache.has(TH), false, 'the whole-guild sync applied');
+  assert.equal(f.client.channels.cache.has(foreignThread), true);
+  assert.ok(f.server.channelManager.get(foreignId));
+  assert.equal(f.removed(foreignId), false);
 });
 
 it("a sync clears the stale mark of a thread discord.js dropped", (t) => {
@@ -2012,11 +2021,13 @@ it("a thread lookup out when a sync of its server's threads drops it, which Disc
   const get = t.mock.method(f.client.rest, 'get', async () => { await held; throw unknownChannel(); });
   f.gatewayCreate(T);
   await until(() => get.mock.callCount() === 1);
+  assert.equal(get.mock.callCount(), 1, 'the lookup entered before the sync');
   dispatch(f.client, 'THREAD_LIST_SYNC', threadListSync, { d: { guild_id: G, channel_ids: [P], threads: [], members: [] } });
   assert.equal(f.client.channels.cache.has(TH), false, 'discord.js dropped the thread');
   assert.equal(f.label(TH), undefined);
   release();
   await until(() => f.pushes().length > 0);
+  assert.equal(f.pushes().length, 1, 'the pending message was delivered');
   assert.equal(f.pushes()[0]?.params.origin.mcplChannelId, undefined);
   assert.ok(f.server.deletedChannels.has(TH), 'remembered as deleted');
   assert.equal(f.server.forwardedWatermark.has(TH), false, 'and its watermark dropped');
