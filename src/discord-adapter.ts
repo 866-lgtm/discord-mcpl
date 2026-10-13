@@ -2852,15 +2852,12 @@ export class DiscordAdapter {
       // channel that it doesn't list. discord.js dropped those its channels'
       // threads caches held; one held outside its channel's, such as a
       // partial a threadUpdate patched since, is the adapter's to drop.
+      // forgetCached also clears each one's stale mark, cached or not.
       const dropped = new Set<string>();
       for (const [id, parentId] of scope?.held ?? []) {
         if (listed.has(id) || !(covered === null || (parentId !== null && covered.has(parentId)))) continue;
         dropped.add(id);
         this.forgetCached(id);
-      }
-      // What discord.js dropped leaves its mark with nothing cached.
-      for (const [id, mark] of this.stale) {
-        if (mark.guildId === guild.id && !this.client.channels.cache.has(id)) this.stale.delete(id);
       }
       for (const id of listed) this.stale.delete(id);
       this.threadsSyncedHandler?.(guild.id, covered, listed, dropped);
