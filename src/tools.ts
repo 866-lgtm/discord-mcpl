@@ -100,7 +100,7 @@ export const toolDefinitions: ToolDefinition[] = [
       type: 'object',
       properties: {
         userId: { type: 'string', description: 'Discord @username / display name (of a member in a shared server or someone who has DMed the bot), or a numeric user ID (snowflake)' },
-        content: { type: 'string', description: 'Message content (optional if files are attached)' },
+        content: { type: 'string', description: 'The message text. Required unless files are attached — a call with only userId is rejected as empty.' },
         files: FILES_PROP,
       },
       required: ['userId'],

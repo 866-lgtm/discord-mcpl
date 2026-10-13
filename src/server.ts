@@ -3946,8 +3946,10 @@ export class DiscordMcplServer {
       // affordance on the first message from a person.
       blocks.push(
         `<system>Direct message from @${msg.authorName} (user id ${msg.authorId}). ` +
-          `To reply, use send_dm("${msg.authorName}") — or send_dm("${msg.authorId}") if the ` +
-          `name is ambiguous. DMs always reach you; there is nothing to subscribe to.</system>`,
+          `To reply, use send_dm("${msg.authorName}", content="your message") — or ` +
+          `send_dm("${msg.authorId}", content="your message") if the name is ambiguous. ` +
+          `The message text always travels in the "content" parameter; a send_dm with ` +
+          `only userId sends nothing. DMs always reach you; there is nothing to subscribe to.</system>`,
       );
       if (backscrollMsgs.length > 0) {
         const attrs: string[] = [];
