@@ -2,7 +2,8 @@
  * The registry follows a channel's life as discord.js tells it, including
  * the removals it makes without an event for each channel: a deleted channel
  * takes its threads with it, a guild the bot leaves takes all of its
- * channels, a channel Discord answers with Unknown Channel is deleted, and a
+ * channels, a channel Discord answers with Unknown Channel is deleted, a sync
+ * of a guild's threads drops the live threads it doesn't list, and a
  * guild back from an outage is reconciled with what it has now, what it no
  * longer lists held as stale until Discord reports it again. A delivery
  * that set out before such a removal, or before an
@@ -35,6 +36,7 @@ const discordJs = dirname(require.resolve('discord.js'));
 const channelUpdate = require(resolve(discordJs, 'client/websocket/handlers/CHANNEL_UPDATE.js'));
 const guildCreate = require(resolve(discordJs, 'client/websocket/handlers/GUILD_CREATE.js'));
 const threadUpdate = require(resolve(discordJs, 'client/websocket/handlers/THREAD_UPDATE.js'));
+const threadListSync = require(resolve(discordJs, 'client/websocket/handlers/THREAD_LIST_SYNC.js'));
 const Status = require(resolve(discordJs, 'util/Status.js'));
 
 const G = '100000000000000001';
@@ -1811,4 +1813,50 @@ it("a server renamed to a registered channel's server name labels that channel b
   assert.equal(f.label(P), '#before (Guild)');
   f.client.actions.GuildUpdate.handle({ id: G2, name: 'Guild' });
   assert.equal(f.label(P), idOf(P));
+});
+
+for (const covered of ['its channel', 'every channel'] as const) {
+  it(`a sync of a server's threads that covers ${covered} forgets a registered thread it drops, and derives the ones it lists again`, (t) => {
+    const T2 = '100000000000000031';
+    const f = fixture(t);
+    const second = { ...threadAt(false, T), id: T2, name: 'second' };
+    f.client.channels._add(second);
+    f.server.registerGuildDelivery(G, TH);
+    f.server.registerGuildDelivery(G, T2);
+    assert.equal(f.label(T2), '#before › second (Guild)');
+    // An overtaken lookup left the other thread stale, labelled by its id.
+    (f.adapter as any).markStale(T2, G);
+    assert.equal(f.label(T2), idOf(T2));
+    // Discord syncs P's threads when the bot can see P again: TH was
+    // archived while it couldn't, and the other thread renamed.
+    dispatch(f.client, 'THREAD_LIST_SYNC', threadListSync, {
+      d: { guild_id: G, ...(covered === 'its channel' ? { channel_ids: [P] } : {}), threads: [{ ...second, name: 'renamed' }], members: [] },
+    });
+    assert.equal(f.client.channels.cache.has(TH), false, 'discord.js dropped the thread');
+    assert.equal(f.label(TH), undefined);
+    assert.ok(f.removed(threadMcplId), 'and the host is told');
+    assert.equal(f.server.deletedChannels.has(TH), false, 'it may only have been archived');
+    assert.equal(f.adapter.isStale(T2), false, 'the sync reports the other as Discord has it now');
+    assert.equal(f.label(T2), '#before › renamed (Guild)');
+  });
+}
+
+it("a thread lookup out when a sync of its server's threads drops it, which Discord then answers Unknown Channel for, handles the thread as deleted", { timeout: 5000 }, async (t) => {
+  const f = fixture(t);
+  watermarkFile(t);
+  f.server.registerGuildDelivery(G, TH);
+  f.server.forwardedWatermark.set(TH, '100');
+  (f.adapter as any).stale.set(TH, { guildId: G });
+  const { held, release } = holder(t);
+  const get = t.mock.method(f.client.rest, 'get', async () => { await held; throw unknownChannel(); });
+  f.gatewayCreate(T);
+  await until(() => get.mock.callCount() === 1);
+  dispatch(f.client, 'THREAD_LIST_SYNC', threadListSync, { d: { guild_id: G, channel_ids: [P], threads: [], members: [] } });
+  assert.equal(f.client.channels.cache.has(TH), false, 'discord.js dropped the thread');
+  assert.equal(f.label(TH), undefined);
+  release();
+  await until(() => f.pushes().length > 0);
+  assert.equal(f.pushes()[0]?.params.origin.mcplChannelId, undefined);
+  assert.ok(f.server.deletedChannels.has(TH), 'remembered as deleted');
+  assert.equal(f.server.forwardedWatermark.has(TH), false, 'and its watermark dropped');
 });

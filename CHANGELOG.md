@@ -567,7 +567,11 @@ in the git log and PR descriptions.
     a server back from one, or from a gap in the gateway connection, is
     reconciled with what it has then: what was deleted, or a thread
     archived, meanwhile is forgotten, and a new or renamed channel is
-    registered or re-derived. What the server no longer lists, on its
+    registered or re-derived. So are a channel's threads when Discord syncs
+    them, as it does when the bot can see the channel again: a registered
+    thread the sync leaves out, archived or deleted while the bot couldn't
+    see it, is forgotten, and those it lists are re-derived. What the
+    server no longer lists, on its
     return or when the bot joins it again, may have changed unseen: a
     message, edit, deletion or reaction from it, a tool, or the reconnect
     sweep, looks it up from Discord again before deciding, and a delivery

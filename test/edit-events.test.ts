@@ -66,7 +66,7 @@ describe('edit/delete push events', () => {
       botUserId: 'bot',
       onMessage: noop, onReaction: noop,
       onChannelCreate: noop, onChannelUpdate: noop, onChannelDelete: noop, onGuildCreate: noop,
-      onGuildRename: noop, onThreadUpdate: noop, onThreadDelete: noop, onGuildDelete: noop, onGuildAvailable: noop,
+      onGuildRename: noop, onThreadUpdate: noop, onThreadDelete: noop, onThreadsSynced: noop, onGuildDelete: noop, onGuildAvailable: noop,
       onChannelRefreshed: noop,
       onChannelStale: noop,
       refreshStale: async () => {},

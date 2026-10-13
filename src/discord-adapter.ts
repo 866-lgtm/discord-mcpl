@@ -706,6 +706,7 @@ export class DiscordAdapter {
   private guildDeleteHandler?: (guildId: string) => void;
   private guildAvailableHandler?: (guildId: string, channels: ChannelFacts[], present: ReadonlySet<string>) => void;
   private guildRenameHandler?: (guildId: string) => void;
+  private threadsSyncedHandler?: (guildId: string, synced: ReadonlySet<string>) => void;
 
   constructor(config: DiscordAdapterConfig) {
     this.token = config.token;
@@ -960,6 +961,16 @@ export class DiscordAdapter {
    *  an archived one is swept from the cache four hours after archiving. */
   onThreadDelete(handler: (guildId: string, threadId: string) => void): void {
     this.threadDeleteHandler = handler;
+  }
+
+  /** Fired when Discord syncs a guild's threads (discord.js `threadListSync`,
+   *  sent when the bot gains access to a channel), with the ids of the live
+   *  threads the sync lists. discord.js patches those from it, and drops
+   *  the live threads it held under the channels the sync covers that the
+   *  sync doesn't list, without a threadDelete for each: such a thread was
+   *  archived or deleted while the bot couldn't see it. */
+  onThreadsSynced(handler: (guildId: string, synced: ReadonlySet<string>) => void): void {
+    this.threadsSyncedHandler = handler;
   }
 
   /** A stale channel was fetched fresh (refetchChannel): what's registered
@@ -2726,6 +2737,13 @@ export class DiscordAdapter {
     this.client.on('threadDelete', (thread) => {
       this.stale.delete(thread.id);
       if (thread.guildId) this.threadDeleteHandler?.(thread.guildId, thread.id);
+    });
+
+    // Discord synced a guild's threads (onThreadsSynced): the threads it
+    // lists are as Discord has them now, as a threadUpdate's thread is.
+    this.client.on('threadListSync', (threads, guild) => {
+      for (const id of threads.keys()) this.stale.delete(id);
+      this.threadsSyncedHandler?.(guild.id, new Set(threads.keys()));
     });
 
     this.client.on('guildUpdate', (oldGuild, newGuild) => {

@@ -100,6 +100,7 @@ class MockDiscordAdapter {
   }
   onGuildDelete(): void {}
   onGuildAvailable(): void {}
+  onThreadsSynced(): void {}
   /** No guild here comes back from an outage. */
   isStale(): boolean {
     return false;

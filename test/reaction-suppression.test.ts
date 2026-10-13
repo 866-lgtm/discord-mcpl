@@ -867,7 +867,7 @@ describe('server integration', () => {
     s.discord = {
       onMessage: noop, onMessageEdit: noop, onMessageDelete: noop,
       onChannelCreate: noop, onChannelUpdate: noop, onChannelDelete: noop, onGuildCreate: noop,
-      onGuildRename: noop, onThreadUpdate: noop, onThreadDelete: noop, onGuildDelete: noop, onGuildAvailable: noop,
+      onGuildRename: noop, onThreadUpdate: noop, onThreadDelete: noop, onThreadsSynced: noop, onGuildDelete: noop, onGuildAvailable: noop,
       onChannelRefreshed: noop,
       onChannelStale: noop,
       refreshStale: async () => {},
