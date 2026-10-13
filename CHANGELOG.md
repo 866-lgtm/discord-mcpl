@@ -309,14 +309,16 @@ in the git log and PR descriptions.
 ### Fixed
 
 - **With `--tcp`, the server serves one client at a time and keeps serving
-  through what it can survive.** An error the TCP server emits (an accept
-  that fails, say) is logged whenever it comes, whether a client is being
-  served or not; before, one that came while no client was served ended the
-  process. A client that connects while another is served is refused at
-  once; before, it was left connected and never read, holding its
-  connection open until the process exited, and a reset on it ended the
-  process. A client whose serving fails ends only its own connection, and
-  the next client is served.
+  through what it can survive.** An error the TCP server emits once it's
+  listening (an accept that fails, say) is logged whenever it comes, whether
+  a client is being served or not; before, one that came while no client was
+  served ended the process. A failure to listen still ends it. A client that
+  connects while another is served is refused at once; before, it was left
+  connected and never read, holding its connection open until the process
+  exited, and a reset on it ended the process. A client whose serving fails
+  ends only its own connection, and the next client is served. A read error
+  on the served client's own socket, such as a reset, still ends the process,
+  through mcpl-core's readline interface, which has no listener for it.
 - **A refused DM's deletion no longer reaches the agent.** With a DM
   allowlist set, a refused sender's DM was never forwarded, but its deletion
   was: discord.js caches every DM it receives, so the tombstone carried the
