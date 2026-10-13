@@ -1571,17 +1571,18 @@ export class DiscordAdapter {
    * channel list admit (a thread through its channel); or a DM whose
    * recipient the DM list admits. Anything else is null: a category or
    * forum, which hold no messages, a kind this server doesn't know, another
-   * guild, a channel the filters refuse, and a lookup that fails or finds
-   * nothing. A guild channel comes back as the facts its descriptor is made
-   * from.
+   * guild, a channel the filters refuse, an id Discord refuses, and a lookup
+   * that finds nothing. A guild channel comes back as the facts its
+   * descriptor is made from.
    *
    * The channel is read as the tools read one (channelById): from the cache
    * when it holds the channel whole and current, else from Discord by the
    * freshness rule, so Unknown Channel there is a deletion (channelGone). A
    * thread's stale channel is looked up first, as a delivery's is, since its
    * category may be what admits the thread. A channel that is still stale
-   * then, or a thread whose channel is, comes back as `uncertain`: its facts
-   * decide no registration until a fresh fetch.
+   * then, or a thread whose channel is, comes back as `uncertain`, and so
+   * does a lookup Discord gives no answer to: its facts decide no
+   * registration until a fresh fetch.
    */
   async lookUpServedChannel(guildSegment: string, channelId: string): Promise<
     | { kind: 'guild'; facts: ChannelFacts }
@@ -1593,8 +1594,16 @@ export class DiscordAdapter {
     try {
       channel = await this.channelById(channelId);
     } catch (err) {
-      dbg('lookUpServedChannel:failed', { channelId, error: err instanceof Error ? err.message : String(err) });
-      return null;
+      // Discord refusing the id (a 4xx: Unknown Channel, Missing Access, a
+      // malformed id's Invalid Form Body) means this server doesn't serve
+      // it. No answer (a 5xx, a timeout, a dropped connection, or a
+      // rejection that isn't Discord's) leaves its facts unknown, and
+      // another open fetches it again.
+      const status = (err as { status?: unknown } | null)?.status;
+      const refused = (err as { code?: unknown } | null)?.code === UNKNOWN_CHANNEL
+        || (typeof status === 'number' && status >= 400 && status < 500);
+      dbg('lookUpServedChannel:failed', { channelId, refused, error: err instanceof Error ? err.message : String(err) });
+      return refused ? null : { kind: 'uncertain' };
     }
     if (!channel) return null;
     if (guildSegment === 'dm') {

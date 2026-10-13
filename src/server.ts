@@ -3520,7 +3520,7 @@ export class DiscordMcplServer {
     if (!opened) {
       throw new RequestRefusal(
         ERR_UNKNOWN_CHANNEL,
-        `${desc.id} was unregistered while this open was in progress (deleted, or no longer admitted by the filters). Nothing was opened.`,
+        `${desc.id} was unregistered while this open was in progress (deleted, archived, or no longer admitted by the filters). Nothing was opened.`,
       );
     }
     result.channel = opened;
@@ -3534,8 +3534,9 @@ export class DiscordMcplServer {
    *  (guildDescriptor), so a DM, thread or channel no traffic has registered
    *  since a restart still opens. Anything else is refused as unknown,
    *  lately deleted channels and their threads included, and channels of a
-   *  guild the bot has left, and a channel of another type as bad params. A channel whose current facts aren't known
-   *  (`uncertain`: a stale channel, or a thread of one) is refused as an
+   *  guild the bot has left, and a channel of another type as bad params. A
+   *  channel whose current facts aren't known (`uncertain`: a stale channel,
+   *  a thread of one, or a lookup Discord gave no answer to) is refused as an
    *  open that failed, since its facts decide no registration and another
    *  open fetches it again. An archived thread opens too, since the host
    *  named it, though the registry otherwise holds only live threads

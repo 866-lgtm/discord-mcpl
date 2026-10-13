@@ -335,40 +335,43 @@ in the git log and PR descriptions.
 - **`channels/open` opens exactly the channel it was asked for.** A stale or
   unknown `channelId` used to fall through to the first registered channel of
   the same type, so a host could open, subscribe to, and receive history from
-  a different channel than it named. Now `channelId` is the exact selector,
-  as agent-framework's `ChannelsOpenParams` has it (MCPL's SPEC gives
-  `channels/open` no `channelId`): a `channelId` alone selects, and an
-  `address` beside it isn't read; without a `channelId`, an `address` naming a guildId and a channelId
-  selects. Either names exactly one channel or is refused: an id the registry
-  doesn't hold is looked up in Discord, and opened (and registered, by the
-  rule every other path registers by) when it's a channel messages are
-  posted in (text, announcement, voice or stage), a thread, or a DM, that
-  the filters admit, so a DM or thread after a restart still opens. An
-  archived thread opens too, since the host named it. Any other id is
-  refused, a lately deleted channel, a thread of one, and a channel of a
-  guild the bot has left included, whatever an address beside it says. A
-  channel outlives its deleted category. A request with no selector
-  (`channelId` absent or
-  null, and `address` absent, null or `{}`) opens the one registered channel
-  of its type, DMs and threads counted, and is refused when there are none or
-  several; a refusal over several lists the first ten and points to
-  `channels/list` for the rest. `type`, which MCPL requires, must be a
-  non-empty string on every request and must match the channel opened, so a
-  registered `channelId` with a different `type` is refused too. Unlike
-  `main`, an empty-string `channelId` is refused rather than read as absent,
+  a different channel than it named. Now `channelId` is the exact selector.
+  agent-framework's `ChannelsOpenParams` gives it as the exact registered id,
+  preferred over type and address matching (MCPL's SPEC gives `channels/open`
+  no `channelId`), and this server reads it strictly: a `channelId` alone
+  selects, and an `address` beside it isn't read; without a `channelId`, an
+  `address` naming a guildId and a channelId selects. Either names exactly one
+  channel or is refused: an id the registry doesn't hold is looked up in
+  Discord, and opened (and registered, by the rule every other path registers
+  by) when it's a channel messages are posted in (text, announcement, voice or
+  stage), a thread, or a DM, that the filters admit, so a DM or thread after a
+  restart still opens. An archived thread opens too, since the host named it.
+  Any other id is refused, a lately deleted channel, a thread of one, and a
+  channel of a guild the bot has left included, whatever an address beside it
+  says. A channel outlives its deleted category. A request with no selector
+  (`channelId` absent or null, and `address` absent, null or `{}`) opens the
+  one registered channel of its type, DMs and threads counted, and is refused
+  when there are none or several; a refusal over several lists the first ten
+  and points to `channels/list` for the rest. `type`, which MCPL requires,
+  must be a non-empty string on every request and must match the channel
+  opened, so a registered `channelId` with a different `type` is refused too.
+  An empty-string `channelId`, which used to be read as absent, is refused,
   and address ids must be strings. Refusals carry MCPL's codes: unknown
   channel (`-32023`), invalid params (`-32602`), or open failed (`-32024`,
-  when the history fetch fails, the channel filters refuse reading its
-  history or can't be checked, or a `channels/close` or `mute_channel` for
-  the channel arrives while the open is in progress, its lookup included). No
-  history is fetched, and nothing is opened or subscribed, before a request
-  names its channel, and a channel unregistered while the open is in
-  progress isn't opened. `sinceLastSeen` reads the persisted watermark even
-  when it's the first thing to. An id the registry doesn't hold is looked up
-  as every fetch past the cache is: Discord's Unknown Channel there is a
-  deletion, and an id whose current facts can't be had (every try overtaken by
-  a change, or a thread whose stale channel can't be fetched fresh) is refused
-  as an open that failed (`-32024`).
+  when the lookup can't get the channel's current facts, the history fetch
+  fails, the channel filters refuse reading its history or can't be checked,
+  or a `channels/close` or `mute_channel` for the channel arrives while the
+  open is in progress, its lookup included). No history is fetched, and
+  nothing is opened or subscribed, before a request names its channel, and a
+  channel unregistered while the open is in progress isn't opened.
+  `sinceLastSeen` reads the persisted watermark even on the first open after a
+  restart, before anything else has loaded it. An id the registry doesn't hold
+  is looked up as every fetch past the cache is: Discord's Unknown Channel
+  there is a deletion, and an id Discord refuses (Missing Access, or a
+  malformed id) is unknown. An id whose current facts can't be had (Discord
+  gives no answer, every try is overtaken by a change, or a thread's stale
+  channel can't be fetched fresh) is refused as an open that failed, and
+  another open looks it up again.
 - **A refused DM's deletion no longer reaches the agent.** With a DM
   allowlist set, a refused sender's DM was never forwarded, but its deletion
   was: discord.js caches every DM it receives, so the tombstone carried the

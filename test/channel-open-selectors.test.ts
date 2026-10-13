@@ -5,9 +5,10 @@
  * the request's type. An exact selector names exactly one channel or is
  * refused with its code, and an id the registry doesn't hold is looked up in
  * Discord and opened when this server serves it. Nothing is fetched, opened
- * or subscribed before the channel is named, and a close, a mute or an
- * unregistration that arrives during the lookup or the history fetch stands
- * over the open.
+ * or subscribed before the channel is named. A close or a mute that arrives
+ * during the lookup or the history fetch stands over the open, a deletion or
+ * the bot leaving the guild during the lookup refuses it as unknown, and a
+ * channel unregistered during the history fetch isn't opened.
  */
 import { after, before, describe, it, type TestContext } from 'node:test';
 import * as assert from 'node:assert/strict';
@@ -329,7 +330,7 @@ describe("channels/open: an id the registry doesn't hold", () => {
     }
   });
 
-  it('refuses a channel deleted lately, and a thread of one, though Discord still answers for them', async () => {
+  it('refuses a channel deleted lately or while it is looked up, and a thread of one, though Discord still answers for them', async () => {
     const facts: Record<string, ChannelFacts> = {
       c5: { id: 'c5', guildId: 'g1', guildName: 'Guild', type: 'text', name: 'gone' },
       th7: { id: 'th7', guildId: 'g1', guildName: 'Guild', type: 'thread', name: 'orphan', parentId: 'c6', parentName: 'also-gone' },
@@ -345,6 +346,16 @@ describe("channels/open: an id the registry doesn't hold", () => {
       assert.equal(f.server.channelManager.get(`discord:g1:${id}`), undefined, `${id} isn't registered`);
     }
     f.nothingOpened();
+    // The channel is deleted while the lookup is out.
+    const g = fixture([general], {
+      served: async (guild, channel) => {
+        (g.server as unknown as { channelDeleted(guildId: string, channelId: string): void }).channelDeleted('g1', channel);
+        return guild === 'g1' && facts[channel] ? { kind: 'guild', facts: facts[channel] } : null;
+      },
+    });
+    await g.refused({ channelId: 'discord:g1:c5', type: 'discord', history: { limit: 5 } }, UNKNOWN_CHANNEL, /^No channel this server serves matches/);
+    assert.equal(g.server.channelManager.get('discord:g1:c5'), undefined, "c5 isn't registered");
+    g.nothingOpened();
   });
 
   it('opens and registers a text channel the registry does not hold yet, by id or by address', async () => {
@@ -422,7 +433,7 @@ describe("channels/open: an id the registry doesn't hold", () => {
   });
 });
 
-describe('channels/open: what arrives during the history fetch stands', () => {
+describe('channels/open: what arrives during the lookup or the history fetch stands', () => {
   it('opens nothing when the channel is unregistered meanwhile', async () => {
     const held = heldHistory();
     const f = fixture([general], { history: held.history });
@@ -567,10 +578,30 @@ describe('the adapter: which channels an exact open may register', () => {
     assert.equal(await adapter.lookUpServedChannel('dm', 'gone'), null, 'Discord finds nothing');
   });
 
-  it('serves nothing when its lookup is rejected with something that is not an Error', async (t) => {
+  it('comes back uncertain when Discord gives its lookup no answer, a rejection that is not an Error included', async (t) => {
     const { adapter, client } = adapterFixture(t, {});
-    t.mock.method(client.channels, 'fetch', (async () => { throw null; }) as never);
-    assert.equal(await adapter.lookUpServedChannel('dm', 'x'), null);
+    const failures: unknown[] = [
+      Object.assign(new Error('Service Unavailable'), { status: 503 }),
+      new TypeError('fetch failed'),
+      null,
+    ];
+    let failure: unknown;
+    const fetch = t.mock.method(client.channels, 'fetch', (async () => { throw failure; }) as never);
+    for (const [i, f] of failures.entries()) {
+      failure = f;
+      assert.deepEqual(await adapter.lookUpServedChannel('dm', 'x'), { kind: 'uncertain' }, String(f));
+      assert.equal(fetch.mock.callCount(), i + 1, `${String(f)}: the lookup asked Discord`);
+    }
+  });
+
+  it('serves nothing when Discord refuses its lookup', async (t) => {
+    const { adapter, client } = adapterFixture(t, {});
+    let failure: unknown;
+    t.mock.method(client.channels, 'fetch', (async () => { throw failure; }) as never);
+    failure = Object.assign(new Error('Missing Access'), { status: 403, code: 50001 });
+    assert.equal(await adapter.lookUpServedChannel('g1', 'hidden'), null, 'no access');
+    failure = Object.assign(new Error('Invalid Form Body'), { status: 400, code: 50035 });
+    assert.equal(await adapter.lookUpServedChannel('dm', 'not-a-snowflake'), null, 'a malformed id');
   });
 
   it("serves no DM whose recipient the DM list stops admitting while the recipient's name is fetched", async (t) => {
@@ -634,7 +665,7 @@ describe('the adapter: which channels an exact open may register', () => {
     assert.equal((await adapter.lookUpServedChannel('g2', 'listed'))?.kind, 'guild');
     assert.equal((await adapter.lookUpServedChannel('g2', 'listedThread'))?.kind, 'guild', 'a thread of a listed channel');
     assert.equal(await adapter.lookUpServedChannel('g2', 'unlistedThread'), null, "a thread of a channel the list leaves out");
-    assert.equal(await adapter.lookUpServedChannel('g1', 'broken'), null, 'a lookup that fails');
+    assert.deepEqual(await adapter.lookUpServedChannel('g1', 'broken'), { kind: 'uncertain' }, 'a lookup Discord gives no answer to');
   });
 
   it('looks a channel up by the freshness rule: overtaken on every try, it comes back uncertain, and looked up again it is fetched fresh', { timeout: 5000 }, async (t) => {
