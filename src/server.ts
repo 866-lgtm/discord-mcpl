@@ -2724,19 +2724,26 @@ export class DiscordMcplServer {
 
       const newestId = msgs[msgs.length - 1].id;
 
-      // Cache first. A lookup when the cache doesn't hold the channel, or
-      // holds a thread whose parent channel it can't name, which may be one
-      // the client knows only partly, as the live path looks those up (a
-      // thread whose parent just isn't cached is read from the cache again).
-      // A failed lookup leaves a trace instead of silently shipping a
-      // name-less block (issue #28), and what the cache knew stands. Resolved
-      // before anything is delivered, because the ingress decision below
-      // needs the channel's identity.
+      // Cache first. The channel is looked up when the cache doesn't hold it
+      // (the sweep starts from the channels it saved, not from an event, so
+      // the cache may not have seen one, such as a DM), or when it holds a
+      // thread whose parent channel it can't name. Of those threads, only one
+      // the client knows only partly is fetched past the cache, as the live
+      // path fetches it; for a thread whose parent just isn't cached, the
+      // lookup reads the cache again. A failed lookup is logged (issue #28),
+      // and what the cache knew stands. Resolved before anything is
+      // delivered, because the ingress decision below needs the channel's
+      // identity.
       let meta = this.discord.getCachedChannelMeta(channelId);
       if (!meta || (meta.threadId && meta.threadParentName === null)) {
         const cached = meta;
         meta = (await this.discord.getChannelMeta(channelId).catch((err) => {
-          dbg('sweep:channel-meta-failed', { channelId, error: errorText(err) });
+          const error = errorText(err);
+          dbg('sweep:channel-meta-failed', { channelId, error });
+          console.error(
+            `[discord-mcpl] Catch-up couldn't look up channel ${channelId} (${error}). ` +
+              'Its missed messages are placed and filtered by what the cache knew of it, and may go out without its names.',
+          );
           return null;
         })) ?? cached;
       }
@@ -2841,9 +2848,11 @@ export class DiscordMcplServer {
       // channel it hangs off and the thread itself.
       const thread: ThreadPlace = meta ?? {};
       const place = messagePlace(meta?.name, thread);
-      // Names are escaped with the live location's quoting (quotedValue), so
-      // a bidi control or line separator in one can't reorder or split the
-      // header.
+      // Each name is an attribute's value, so it is always quoted, with
+      // quotedValue's escaping, which the live location uses too: a bidi
+      // control or line separator in one can't reorder or split the header.
+      // (The live location writes a channel or guild name bare where the
+      // header rule allows, and always quotes a thread's.)
       const attrs: string[] = [];
       if (place.channel) attrs.push(`channel=${quotedValue(`#${place.channel}`)}`);
       if (place.thread) attrs.push(`thread=${quotedValue(place.thread)}`);
@@ -3267,17 +3276,21 @@ export class DiscordMcplServer {
 
   // ── Discord Event Forwarding ──
 
-  /** Push-event origin for an edit/delete. Carries the guild (and the composite
-   *  channel id) so the host places the event in the right channel — without
-   *  it a guild channel's edit was reconstructed as `discord:dm:<channelId>` —
-   *  the thread's fields when the message is in one, as its create carried
-   *  them, plus the message and author ids when the adapter knows them. */
+  /** Push-event origin for an edit/delete. Carries the guild and the composite
+   *  channel id so the host places the event in the right channel — without
+   *  them a guild channel's edit was reconstructed as `discord:dm:<channelId>`
+   *  — the thread's fields when the message is in one, as its create carried
+   *  them, plus the message and author ids when the adapter knows them. The
+   *  adapter places a message in no guild only when its channel is a DM, so
+   *  then the id is the DM's, as its create's is; with no info at all it is
+   *  left out. */
   private messageEventOrigin(channelId: string, messageId: string, info?: MessageEventInfo): Record<string, unknown> {
     const guildId = info?.guildId ?? null;
     return {
       source: 'discord',
       channelId,
-      ...(guildId ? { guildId, mcplChannelId: mcplChannelId(guildId, channelId) } : {}),
+      ...(guildId ? { guildId } : {}),
+      ...(info ? { mcplChannelId: mcplChannelId(guildId ?? 'dm', channelId) } : {}),
       ...threadFields(info ?? {}),
       messageId,
       ...(info?.authorId ? { authorId: info.authorId } : {}),
@@ -3607,6 +3620,9 @@ export class DiscordMcplServer {
           channelId: ev.channelId,
           messageId: ev.messageId,
           guildId: ev.guildId,
+          // The composite id the host registers and routes by, as the
+          // origin of the message's own push carries it.
+          mcplChannelId: mcplChannelId(ev.guildId ?? 'dm', ev.channelId),
           reactorId: ev.userId,
           reactorName: ev.userName,
           emoji: ev.emoji,

@@ -2537,16 +2537,17 @@ export class DiscordAdapter {
     }
   }
 
-  /** Fetch a thread so the cache holds its channel (threadChannelUnknown).
-   *  Forced, since discord.js would otherwise return the cached partial. The
-   *  REST client's own timeout and retries bound each attempt (15 s a try,
-   *  three retries, by default), though a rate limit's Retry-After waits can
-   *  hold events waiting behind it longer. If the fetch fails, the thread
-   *  stays as it was, and the filters decide on what's known: where a
-   *  guild's channel list applies, a thread whose channel is unknown is
-   *  admitted only if it's listed itself. That failure is logged, since the
-   *  thread's messages may then be
-   *  filtered out though its channel is admitted, and go unnamed. */
+  /** Fetch a thread the client knows only partly (threadChannelUnknown), so
+   *  the cache learns the thread's parent channel. Forced, since discord.js
+   *  would otherwise return the cached partial. The REST client's own
+   *  timeout and retries bound each attempt (15 s a try, three retries, by
+   *  default), though a rate limit's Retry-After waits can hold events
+   *  waiting behind it longer. If the fetch fails, the thread stays as it
+   *  was, and the filters decide on what's known: where a guild's channel
+   *  list applies, a thread whose parent channel is unknown is admitted only
+   *  if it's listed itself. That failure is logged, since the thread's
+   *  messages may then be filtered out though its parent channel is
+   *  admitted, and go unnamed. */
   private async lookUpThread(channelId: string): Promise<void> {
     try {
       await this.client.channels.fetch(channelId, { force: true });

@@ -206,13 +206,21 @@ describe('edit/delete push events', () => {
     assert.equal(origin.authorName, 'niston');
   });
 
-  it('a DM edit carries no guild, so the host still composes discord:dm:<id>', () => {
+  it("a DM edit carries no guild, and the DM's composite channel id, as its create does", () => {
     const { edit, sent } = wire();
     edit('dmchan', 'm2', 'zz hola', true, { guildId: null, authorId: 'u2', authorName: '_reim0n' });
     const { origin, payload } = sent[0]!.params;
     assert.equal(payload.content[0].text, '[message edited] _reim0n: zz hola');
     assert.equal(origin.guildId, undefined);
-    assert.equal(origin.mcplChannelId, undefined);
+    assert.equal(origin.mcplChannelId, 'discord:dm:dmchan');
+  });
+
+  it("a DM delete carries the DM's composite channel id", () => {
+    const { del, sent } = wire();
+    del('dmchan', 'm5', true, { guildId: null });
+    const { origin } = sent[0]!.params;
+    assert.equal(origin.guildId, undefined);
+    assert.equal(origin.mcplChannelId, 'discord:dm:dmchan');
   });
 
   it('an edit without author info keeps the old text shape', () => {

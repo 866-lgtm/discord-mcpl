@@ -920,8 +920,21 @@ describe('server integration', () => {
     assert.equal(inThread.origin.threadName, 'design-chat');
     assert.equal(inThread.origin.threadParentName, 'general');
     assert.equal('threadId' in inThread.origin, false, 'a Discord thread is named by its channel id');
+    assert.equal(inThread.origin.mcplChannelId, 'discord:g1:chan1', "the thread's own channel");
     assert.deepEqual(inChannel.tags, ['chat:reaction']);
     assert.equal('threadName' in inChannel.origin, false, 'a channel message has no thread fields');
+    assert.equal(inChannel.origin.mcplChannelId, 'discord:g1:chan1');
+  });
+
+  it("a reaction in a DM carries the DM's composite channel id, as the DM's messages do", () => {
+    const server = makeServer();
+    server.filtersState.applyParsed(withKey());
+    const { handler, sent } = wireReactionHandler(server);
+    ((server as unknown as Record<string, unknown>).reactionChannels as Set<string>).add('dm1');
+    handler({ ...baseEvent, channelId: 'dm1', guildId: null, emoji: HARMLESS, emojiId: null, token: HARMLESS });
+    const { origin } = (sent[0] as { params: { origin: Record<string, unknown> } }).params;
+    assert.equal(origin.guildId, null);
+    assert.equal(origin.mcplChannelId, 'discord:dm:dm1');
   });
 
   it('withhold-everything posture drops every live reaction event', () => {

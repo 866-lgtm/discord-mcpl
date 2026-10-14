@@ -55,11 +55,18 @@ in the git log and PR descriptions.
   the thread were a channel of its own name, and pushed without tags. The
   header now reads `<missed channel="#<parent>" thread="<name>" …>`, or
   `thread="<name>"` alone when the parent isn't known, with the thread's id
-  for a name it lacks, and escapes each name with the live location's
-  quoting. The push carries `chat:thread` and the thread's fields, a thread
-  the client knew only partly is looked up first, and every sweep push, a
-  DM's included, now carries the `mcplChannelId` a live push's origin
-  carries.
+  for a name it lacks. Each name is quoted and escaped by `quotedValue`, as
+  the live location escapes a name it quotes. The push carries `chat:thread`
+  and the thread's fields, a thread the client knew only partly is looked up
+  first, and every sweep push, a DM's included, now carries the
+  `mcplChannelId` a live push's origin carries. The sweep's failed lookup of
+  any channel now reaches stderr, where before only the debug log had it.
+- **Every live push's origin names its channel by its composite id.** A
+  reaction's origin, and a DM edit's or deletion's, now carry `mcplChannelId`
+  (`discord:<guild>:<channel>`, or `discord:dm:<channel>` in a DM), as a
+  message's own origin and a guild channel's edits and deletions already
+  did, so a host can place each one under the id it registered the channel
+  by.
 
 ## 0.2.0 — 2026-10-13
 
