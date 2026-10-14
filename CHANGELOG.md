@@ -7,19 +7,6 @@ in the git log and PR descriptions.
 
 ### Upgrade notes
 
-- **`fetch_history` and `fetch_around` now refuse a channel id that the
-  configured channel list (`guildChannels`) excludes, and so does a host's
-  `channels/open` that asks for backscroll from such a channel.** An open
-  without backscroll still opens it, since it reads nothing. A resident
-  that reads such a channel by its numeric id today (following a pasted
-  message link, say) will get a refusal naming the channel filters, and
-  nothing is read. The refusal is deliberate: it is the boundary
-  `list_channels` and `list_channel_members` already apply (see the
-  `fetch_history` entry under Fixed). To let a residence read the channel,
-  admit it in `guildChannels`, directly or through its parent (a thread's
-  channel, a channel's category). The same list bounds delivery, so that
-  admits it for delivery too. Guilds without a `guildChannels` entry, and
-  DMs, are unaffected.
 - **`chat:thread` now marks messages posted in a thread, and no longer marks
   a message that started one.** A host gate or filter rule keyed on the tag
   will match different messages after this upgrade: messages inside threads
@@ -35,6 +22,62 @@ in the git log and PR descriptions.
   other messages. This change doesn't move what a host filed before the
   upgrade. A message posted in a thread was already filed under the
   thread's own channel id and stays there.
+
+### Fixed
+
+- **Thread fields name the thread a message was posted in.** They were read
+  from discord.js `message.thread`, which is the thread a message *started*,
+  so a message that had spawned a thread was tagged `chat:thread`, rendered
+  as `thread "…"`, and sent to the host with that thread's id as its MCPL
+  `threadId`, while messages actually posted in a thread carried none. Now a
+  message posted in a thread is tagged `chat:thread` and located as
+  `[#parent thread "name" …]`, and a message that started a thread, in a
+  text or announcement channel, carries no thread fields. A forum post's
+  first message is posted in the post itself, which is a thread, so it is
+  marked as in that thread like the replies under it. MCPL `threadId` (a
+  thread *within* a channel) is no longer sent: a Discord thread is its own
+  channel, already named by `channelId`, so a host keying conversations by
+  thread no longer splits one channel in two. Instead a thread message
+  carries `threadName` (the thread's name) and `threadParentName` (the
+  channel it hangs off, new), each left out when it isn't known: in the
+  `channels/incoming` metadata, in a push's origin, and in the origins of
+  its edits and deletions, which are tagged `chat:thread` too, and of
+  reactions to it, which keep their own tags only, so a gate rule keyed on
+  `chat:thread` doesn't start matching them. A thread the client knew only
+  partly is looked up first, past discord.js's cache, so its messages, and
+  their edits, deletions and reactions, are named as any other thread's;
+  each waits for that lookup before it is delivered, as a create already
+  did. If the lookup fails, the channel filters decide on what is known,
+  and what they let through goes unnamed (a message or an edit or deletion
+  still tagged `chat:thread`).
+- **The reconnect sweep names a thread as the live path does.** A thread's
+  missed messages were headed `<missed channel="#<thread name>" …>`, as if
+  the thread were a channel of its own name, and pushed without tags. The
+  header now reads `<missed channel="#<parent>" thread="<name>" …>`, or
+  `thread="<name>"` alone when the parent isn't known, with the thread's id
+  for a name it lacks, and escapes each name with the live location's
+  quoting. The push carries `chat:thread` and the thread's fields, a thread
+  the client knew only partly is looked up first, and every sweep push, a
+  DM's included, now carries the `mcplChannelId` a live push's origin
+  carries.
+
+## 0.2.0 — 2026-10-13
+
+### Upgrade notes
+
+- **`fetch_history` and `fetch_around` now refuse a channel id that the
+  configured channel list (`guildChannels`) excludes, and so does a host's
+  `channels/open` that asks for backscroll from such a channel.** An open
+  without backscroll still opens it, since it reads nothing. A resident
+  that reads such a channel by its numeric id today (following a pasted
+  message link, say) will get a refusal naming the channel filters, and
+  nothing is read. The refusal is deliberate: it is the boundary
+  `list_channels` and `list_channel_members` already apply (see the
+  `fetch_history` entry under Fixed). To let a residence read the channel,
+  admit it in `guildChannels`, directly or through its parent (a thread's
+  channel, a channel's category). The same list bounds delivery, so that
+  admits it for delivery too. Guilds without a `guildChannels` entry, and
+  DMs, are unaffected.
 
 ### Added
 
@@ -292,6 +335,12 @@ in the git log and PR descriptions.
 
 ### Changed
 
+- **`@animalabs/voice-kit` comes from npm (`^0.1.0`)** instead of a
+  `file:../voice-kit` link, so a deploy no longer needs a voice-kit checkout
+  beside this one, and the package can be installed from npm (#83). A
+  checkout that already links `../voice-kit` keeps working: the link
+  resolves the same code until the next `npm install`.
+
 - **Text attachments now inline into context only up to
   `DISCORD_ATTACHMENT_INLINE_MAX_BYTES` (default 5120 bytes)** — previously
   live delivery inlined text attachments up to 256KiB. Over the cap, the
@@ -323,6 +372,17 @@ in the git log and PR descriptions.
 
 ### Fixed
 
+- **With `--tcp`, the server serves one client at a time and keeps serving
+  through what it can survive.** An error the TCP server emits once it's
+  listening (an accept that fails, say) is logged whenever it comes, whether
+  a client is being served or not; before, one that came while no client was
+  served ended the process. A failure to listen still ends it. A client that
+  connects while another is served is refused at once; before, it was left
+  connected and never read, holding its connection open until the process
+  exited, and a reset on it ended the process. A client whose serving fails
+  ends only its own connection, and the next client is served. A read error
+  on the served client's own socket, such as a reset, still ends the process,
+  through mcpl-core's readline interface, which has no listener for it.
 - **A refused DM's deletion no longer reaches the agent.** With a DM
   allowlist set, a refused sender's DM was never forwarded, but its deletion
   was: discord.js caches every DM it receives, so the tombstone carried the
@@ -492,41 +552,6 @@ in the git log and PR descriptions.
   fetch and arrive in order. Before, such a thread was dropped even under a
   listed channel. A thread whose channel isn't cached stays excluded, as
   before.
-- **Thread fields name the thread a message was posted in.** They were read
-  from discord.js `message.thread`, which is the thread a message *started*,
-  so a message that had spawned a thread was tagged `chat:thread`, rendered
-  as `thread "…"`, and sent to the host with that thread's id as its MCPL
-  `threadId`, while messages actually posted in a thread carried none. Now a
-  message posted in a thread is tagged `chat:thread` and located as
-  `[#parent thread "name" …]`, and a message that started a thread, in a
-  text or announcement channel, carries no thread fields. A forum post's
-  first message is posted in the post itself, which is a thread, so it is
-  marked as in that thread like the replies under it. MCPL `threadId` (a
-  thread *within* a channel) is no longer sent: a Discord thread is its own
-  channel, already named by `channelId`, so a host keying conversations by
-  thread no longer splits one channel in two. Instead a thread message
-  carries `threadName` (the thread's name) and `threadParentName` (the
-  channel it hangs off, new), each left out when it isn't known: in the
-  `channels/incoming` metadata, in a push's origin, and in the origins of
-  its edits and deletions, which are tagged `chat:thread` too, and of
-  reactions to it, which keep their own tags only, so a gate rule keyed on
-  `chat:thread` doesn't start matching them. A thread the client knew only
-  partly is looked up first, past discord.js's cache, so its messages, and
-  their edits, deletions and reactions, are named as any other thread's;
-  each waits for that lookup before it is delivered, as a create already
-  did. If the lookup fails, the channel filters decide on what is known,
-  and what they let through goes unnamed (a message or an edit or deletion
-  still tagged `chat:thread`).
-- **The reconnect sweep names a thread as the live path does.** A thread's
-  missed messages were headed `<missed channel="#<thread name>" …>`, as if
-  the thread were a channel of its own name, and pushed without tags. The
-  header now reads `<missed channel="#<parent>" thread="<name>" …>`, or
-  `thread="<name>"` alone when the parent isn't known, with the thread's id
-  for a name it lacks, and escapes each name with the live location's
-  quoting. The push carries `chat:thread` and the thread's fields, a thread
-  the client knew only partly is looked up first, and every sweep push, a
-  DM's included, now carries the `mcplChannelId` a live push's origin
-  carries.
 - **DM whitelist fails closed on edits.** With `DISCORD_DM_USERS` set, a DM
   edit whose author is unknown (uncached message) was forwarded because the
   check required an author; it is now dropped, like creates.

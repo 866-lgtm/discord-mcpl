@@ -1,6 +1,6 @@
 {
   "name": "@animalabs/discord-mcpl",
-  "version": "0.1.4",
+  "version": "0.2.0",
   "type": "module",
   "main": "./dist/src/index.js",
   "types": "./dist/src/index.d.ts",
@@ -16,7 +16,7 @@
   },
   "dependencies": {
     "@animalabs/mcpl-core": "^0.2.1",
-    "@animalabs/voice-kit": "file:../voice-kit",
+    "@animalabs/voice-kit": "^0.1.0",
     "@discordjs/voice": "^0.19.2",
     "@snazzah/davey": "^0.1.12",
     "discord.js": "^14.16.0",
