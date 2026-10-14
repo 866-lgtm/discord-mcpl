@@ -414,7 +414,7 @@ export const toolDefinitions: ToolDefinition[] = [
   },
   {
     name: 'list_subscriptions',
-    description: "Inspect ambient-message subscriptions and the recorded missed-message backlog for unsubscribed channels. This does not enumerate all Discord channels; use list_channels for that.",
+    description: "Inspect ambient-message subscriptions and the recorded missed-message backlog for unsubscribed channels. For channel discovery, use list_guilds to find servers, then list_channels with a guildId to see channels allowed by its configured filters.",
     inputSchema: {
       type: 'object',
       properties: {},

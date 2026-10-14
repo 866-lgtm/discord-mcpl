@@ -5,6 +5,8 @@ in the git log and PR descriptions.
 
 ## Unreleased
 
+## 0.2.0 — 2026-10-13
+
 ### Upgrade notes
 
 - **`fetch_history` and `fetch_around` now refuse a channel id that the
@@ -301,6 +303,12 @@ in the git log and PR descriptions.
 
 ### Changed
 
+- **`@animalabs/voice-kit` comes from npm (`^0.1.0`)** instead of a
+  `file:../voice-kit` link, so a deploy no longer needs a voice-kit checkout
+  beside this one, and the package can be installed from npm (#83). A
+  checkout that already links `../voice-kit` keeps working: the link
+  resolves the same code until the next `npm install`.
+
 - **Text attachments now inline into context only up to
   `DISCORD_ATTACHMENT_INLINE_MAX_BYTES` (default 5120 bytes)** — previously
   live delivery inlined text attachments up to 256KiB. Over the cap, the
@@ -332,6 +340,17 @@ in the git log and PR descriptions.
 
 ### Fixed
 
+- **With `--tcp`, the server serves one client at a time and keeps serving
+  through what it can survive.** An error the TCP server emits once it's
+  listening (an accept that fails, say) is logged whenever it comes, whether
+  a client is being served or not; before, one that came while no client was
+  served ended the process. A failure to listen still ends it. A client that
+  connects while another is served is refused at once; before, it was left
+  connected and never read, holding its connection open until the process
+  exited, and a reset on it ended the process. A client whose serving fails
+  ends only its own connection, and the next client is served. A read error
+  on the served client's own socket, such as a reset, still ends the process,
+  through mcpl-core's readline interface, which has no listener for it.
 - **A refused DM's deletion no longer reaches the agent.** With a DM
   allowlist set, a refused sender's DM was never forwarded, but its deletion
   was: discord.js caches every DM it receives, so the tombstone carried the
