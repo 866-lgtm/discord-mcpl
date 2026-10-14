@@ -1909,6 +1909,24 @@ it("a covered sync leaves an uncached registered thread in an uncovered channel"
   assert.equal(f.removed(idOf(T2)), false);
 });
 
+it("a covered sync forgets an uncached registered thread in a covered channel", (t) => {
+  const T2 = '100000000000000031';
+  const f = fixture(t, { channels: [channelData(C1, ChannelType.GuildText, 'other')] });
+  f.client.channels._add({ ...threadAt(false, T), id: T2, parent_id: C1 });
+  f.server.registerGuildDelivery(G, T2);
+  assert.equal(f.server.channelManager.get(idOf(T2))?.metadata.parentId, C1, 'its registration places it under C1');
+  (f.adapter as any).forgetCached(T2);
+  assert.equal(f.client.channels.cache.has(T2), false);
+
+  dispatch(f.client, 'THREAD_LIST_SYNC', threadListSync, {
+    d: { guild_id: G, channel_ids: [C1], threads: [], members: [] },
+  });
+
+  assert.equal(f.server.channelManager.get(idOf(T2)), undefined);
+  assert.ok(f.removed(idOf(T2)));
+  assert.equal(f.server.deletedChannels.has(T2), false, 'a sync does not prove deletion');
+});
+
 it("a whole-guild thread sync preserves text channels and other guilds' threads", (t) => {
   const foreignThread = '100000000000000032';
   const foreignId = 'discord:' + G2 + ':' + foreignThread;
@@ -2009,6 +2027,18 @@ it("a sync's marks cleanup leaves another server's uncached channel stale", (t) 
     d: { guild_id: G, channel_ids: [P], threads: [], members: [] },
   });
   assert.equal(f.adapter.isStale(W2), true);
+});
+
+it("a sync's marks cleanup leaves an uncached channel of the synced server stale", (t) => {
+  const f = fixture(t, { channels: [channelData(C1, ChannelType.GuildText, 'other')] });
+  // A mark with nothing cached behind it, in the server the sync is for.
+  (f.adapter as any).forgetCached(C1);
+  (f.adapter as any).stale.set(C1, { guildId: G });
+
+  dispatch(f.client, 'THREAD_LIST_SYNC', threadListSync, {
+    d: { guild_id: G, channel_ids: [P], threads: [], members: [] },
+  });
+  assert.equal(f.adapter.isStale(C1), true);
 });
 
 it("a sync that lists a registered thread the filters no longer admit forgets it, as an update would", (t) => {
