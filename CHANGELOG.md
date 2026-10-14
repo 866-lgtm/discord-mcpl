@@ -7,7 +7,15 @@ in the git log and PR descriptions.
 
 ### Fixed
 
-- Inlined image and text attachment markers now include the original attachment URL, so agents can fetch the original bytes even when the content is already in context. Discord's signed CDN URLs still expire.
+- **An inlined image or text attachment's marker now carries the file's URL,
+  as the markers of files that aren't inlined already do.** An inlined image
+  may be resized or re-encoded, and inlined text is decoded as UTF-8, so the
+  URL is the way to the exact bytes. It's Discord's signed CDN URL, which
+  stops working about a day after discord-mcpl receives it. After that,
+  `fetch_history` or `fetch_around` returns the message again, with a fresh
+  URL for each attachment. A forwarded attachment that can't be fetched is
+  now marked `(forwarded)` too, as every other marker of a forwarded
+  attachment is.
 
 ## 0.2.0 — 2026-10-13
 

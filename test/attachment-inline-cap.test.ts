@@ -19,6 +19,12 @@ import type { DiscordAdapter, DiscordAttachment } from '../src/discord-adapter.j
 
 const ENV_KEY = 'DISCORD_ATTACHMENT_INLINE_MAX_BYTES';
 
+/** A 1x1 transparent PNG: real bytes, so the sharp normalization path runs. */
+const PNG = Buffer.from(
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
+  'base64',
+);
+
 type Block = { type: string; text?: string };
 
 function makeAttachment(over: Partial<DiscordAttachment> = {}): DiscordAttachment {
@@ -82,21 +88,95 @@ describe('attachment inline cap (issue #30)', () => {
   });
 
   it('keeps the original URL beside an inlined forwarded image', async () => {
-    const png = Buffer.from(
-      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
-      'base64',
-    );
     const url = 'https://cdn.discordapp.example/a1/pixel.png?ex=abc&is=def&hm=456';
-    stubFetch(png);
+    stubFetch(PNG);
     const blocks = await buildBlocks([
       makeAttachment({
-        name: 'pixel.png', url, contentType: 'image/png', size: png.length,
+        name: 'pixel.png', url, contentType: 'image/png', size: PNG.length,
         forwardedSnapshotIndex: 1,
       }),
     ]);
     assert.deepEqual(fetchCalls, [url]);
     assert.deepEqual(blocks.map((block) => block.type), ['image', 'text']);
     assert.equal(blocks[1].text, `[image attachment: pixel.png (forwarded) — ${url}]`);
+  });
+
+  it('keeps the original URL beside an inlined image that was posted, not forwarded', async () => {
+    const url = 'https://cdn.discordapp.example/a1/pixel.png?ex=abc&is=def&hm=789';
+    stubFetch(PNG);
+    const blocks = await buildBlocks([
+      makeAttachment({ name: 'pixel.png', url, contentType: 'image/png', size: PNG.length }),
+    ]);
+    assert.deepEqual(blocks.map((block) => block.type), ['image', 'text']);
+    assert.equal(blocks[1].text, `[image attachment: pixel.png — ${url}]`);
+  });
+
+  it('marks inlined forwarded text with its URL, numbering the snapshot when there are several', async () => {
+    const body = 'hello\n';
+    const first = 'https://cdn.discordapp.example/a1/one.txt?ex=abc&is=def&hm=1';
+    const second = 'https://cdn.discordapp.example/a2/two.txt?ex=abc&is=def&hm=2';
+    stubFetch(body);
+    const single = await buildBlocks([
+      makeAttachment({ name: 'one.txt', url: first, size: 6, forwardedSnapshotIndex: 1 }),
+    ]);
+    assert.deepEqual(single, [
+      { type: 'text', text: `[attachment: one.txt (forwarded) (6B) — ${first}]\n${body}` },
+    ]);
+    const several = await buildBlocks([
+      makeAttachment({ id: 'a1', name: 'one.txt', url: first, size: 6, forwardedSnapshotIndex: 1 }),
+      makeAttachment({ id: 'a2', name: 'two.txt', url: second, size: 6, forwardedSnapshotIndex: 2 }),
+    ]);
+    assert.deepEqual(several, [
+      { type: 'text', text: `[attachment: one.txt (forwarded #1) (6B) — ${first}]\n${body}` },
+      { type: 'text', text: `[attachment: two.txt (forwarded #2) (6B) — ${second}]\n${body}` },
+    ]);
+  });
+
+  it('gives each attachment of one message its own URL', async () => {
+    const imageUrl = 'https://cdn.discordapp.example/a1/pixel.png?ex=abc&is=def&hm=3';
+    const textUrl = 'https://cdn.discordapp.example/a2/notes.txt?ex=abc&is=def&hm=4';
+    globalThis.fetch = (async (url: string | URL | Request) => {
+      fetchCalls.push(String(url));
+      return new Response(String(url) === imageUrl ? PNG : 'note\n');
+    }) as typeof fetch;
+    const blocks = await buildBlocks([
+      makeAttachment({ id: 'a1', name: 'pixel.png', url: imageUrl, contentType: 'image/png', size: PNG.length }),
+      makeAttachment({ id: 'a2', name: 'notes.txt', url: textUrl, size: 5 }),
+    ]);
+    assert.deepEqual(fetchCalls, [imageUrl, textUrl]);
+    assert.deepEqual(blocks.map((block) => block.type), ['image', 'text', 'text']);
+    assert.equal(blocks[1].text, `[image attachment: pixel.png — ${imageUrl}]`);
+    assert.equal(blocks[2].text, `[attachment: notes.txt (5B) — ${textUrl}]\nnote\n`);
+  });
+
+  it('keeps the URL on the marker of an attachment that could not be fetched', async () => {
+    const url = 'https://cdn.discordapp.example/a1/notes.txt?ex=abc&is=def&hm=5';
+    globalThis.fetch = (async () => new Response('gone', { status: 404 })) as typeof fetch;
+    const blocks = await buildBlocks([makeAttachment({ url, size: 4 })]);
+    assert.deepEqual(blocks, [
+      { type: 'text', text: `[attachment: notes.txt — could not fetch (HTTP 404); ${url}]` },
+    ]);
+  });
+
+  it('marks a forwarded attachment that could not be fetched as forwarded', async () => {
+    const url = 'https://cdn.discordapp.example/a1/notes.txt?ex=abc&is=def&hm=6';
+    globalThis.fetch = (async () => new Response('gone', { status: 404 })) as typeof fetch;
+    const blocks = await buildBlocks([makeAttachment({ url, size: 4, forwardedSnapshotIndex: 1 })]);
+    assert.deepEqual(blocks, [
+      { type: 'text', text: `[attachment: notes.txt (forwarded) — could not fetch (HTTP 404); ${url}]` },
+    ]);
+  });
+
+  it('keeps the URL on the note of an attachment past the message budget', async () => {
+    const url = 'https://cdn.discordapp.example/a1/huge.png?ex=abc&is=def&hm=7';
+    stubFetch('should never be requested');
+    const blocks = await buildBlocks([
+      makeAttachment({ name: 'huge.png', url, contentType: 'image/png', size: 41 * 1024 * 1024 }),
+    ]);
+    assert.equal(fetchCalls.length, 0, 'an attachment past the budget is not fetched');
+    assert.deepEqual(blocks, [
+      { type: 'text', text: `[attachment: huge.png (41.0MB) not inlined — message attachment budget exhausted: ${url}]` },
+    ]);
   });
 
   it('inlines a text attachment exactly at the cap boundary', async () => {
@@ -127,6 +207,7 @@ describe('attachment inline cap (issue #30)', () => {
     assert.ok(!text.includes('yyyy'), 'over-cap bytes must never become a text block');
     assert.ok(text.includes('inline cap'), text);
     assert.ok(text.includes('declared 100B'), 'note names the misdeclared size');
+    assert.ok(text.includes('https://cdn.discordapp.example/a1/notes.txt'), 'note keeps the URL');
   });
 
   it('carries the forwarded provenance marker on over-cap notes', async () => {
@@ -221,14 +302,9 @@ describe('attachment inline cap (issue #30)', () => {
 
   it('images are unaffected by the cap: a zero cap still yields an image block', async () => {
     process.env[ENV_KEY] = '0';
-    // 1x1 transparent PNG — real bytes so the sharp normalization path runs.
-    const png = Buffer.from(
-      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
-      'base64',
-    );
-    stubFetch(png);
+    stubFetch(PNG);
     const blocks = await buildBlocks([
-      makeAttachment({ name: 'pixel.png', contentType: 'image/png', size: png.length }),
+      makeAttachment({ name: 'pixel.png', contentType: 'image/png', size: PNG.length }),
     ]);
     assert.equal(fetchCalls.length, 1, 'image is fetched despite cap 0');
     assert.ok(

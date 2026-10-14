@@ -3784,7 +3784,7 @@ export class DiscordMcplServer {
           kind: isImage ? 'image' : isText ? 'text' : 'other',
         });
       } catch (err) {
-        blocks.push(textContent(`[attachment: ${att.name} — could not fetch (${(err as Error).message}); ${att.url}]`));
+        blocks.push(textContent(`[attachment: ${att.name}${fwd(att)} — could not fetch (${(err as Error).message}); ${att.url}]`));
         dbg('attachment:failed', { name: att.name, error: (err as Error).message });
       }
     }

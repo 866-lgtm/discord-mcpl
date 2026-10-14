@@ -2696,10 +2696,12 @@ function mapAttachments(message: { attachments?: { values?(): IterableIterator<u
 
 /** A message's own attachments plus any carried by forwarded snapshots.
  *  Snapshot attachments keep their original CDN URLs (signed like any other),
- *  so merging them here sends a forward's media through the same delivery
- *  path as a native upload — images inlined as blocks, text files inlined,
- *  everything else a name+URL note — on the live path AND both history
- *  paths. The forwarded line's "[N attachments]" count note stays: it tells
+ *  so merging them here gives a forward's media the same handling as a native
+ *  upload. On the live path, images are inlined as blocks, text files are
+ *  inlined, and everything else is a name+URL note. The history paths inline
+ *  nothing: backscroll and the catch-up list attachments by name, and
+ *  fetch_history, fetch_around and channels/open history carry each one with
+ *  its URL. The forwarded line's "[N attachments]" count note stays: it tells
  *  the agent which message the media rode in on. */
 export function mapAllAttachments(m: {
   attachments?: { values?(): IterableIterator<unknown> };
