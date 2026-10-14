@@ -1,5 +1,5 @@
 /**
- * Tests for the text-attachment inline cap (issue #30).
+ * Tests for the text-attachment inline cap (issue #30) and inlined attachment URLs.
  *
  * The invariant under test: no more than DISCORD_ATTACHMENT_INLINE_MAX_BYTES
  * of attachment text ever becomes a context block, and the bound holds on
@@ -67,6 +67,37 @@ describe('attachment inline cap (issue #30)', () => {
       return new Response(body);
     }) as typeof fetch;
   }
+
+  it('keeps the original URL beside inlined text', async () => {
+    const body = 'const value = 42;\n';
+    const url = 'https://cdn.discordapp.example/a1/code.ts?ex=abc&is=def&hm=123';
+    stubFetch(body);
+    const blocks = await buildBlocks([
+      makeAttachment({ name: 'code.ts', url, size: Buffer.byteLength(body) }),
+    ]);
+    assert.deepEqual(fetchCalls, [url]);
+    assert.deepEqual(blocks, [
+      { type: 'text', text: `[attachment: code.ts (18B) — ${url}]\n${body}` },
+    ]);
+  });
+
+  it('keeps the original URL beside an inlined forwarded image', async () => {
+    const png = Buffer.from(
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
+      'base64',
+    );
+    const url = 'https://cdn.discordapp.example/a1/pixel.png?ex=abc&is=def&hm=456';
+    stubFetch(png);
+    const blocks = await buildBlocks([
+      makeAttachment({
+        name: 'pixel.png', url, contentType: 'image/png', size: png.length,
+        forwardedSnapshotIndex: 1,
+      }),
+    ]);
+    assert.deepEqual(fetchCalls, [url]);
+    assert.deepEqual(blocks.map((block) => block.type), ['image', 'text']);
+    assert.equal(blocks[1].text, `[image attachment: pixel.png (forwarded) — ${url}]`);
+  });
 
   it('inlines a text attachment exactly at the cap boundary', async () => {
     const body = 'x'.repeat(5120);

@@ -5,6 +5,10 @@ in the git log and PR descriptions.
 
 ## Unreleased
 
+### Fixed
+
+- Inlined image and text attachment markers now include the original attachment URL, so agents can fetch the original bytes even when the content is already in context. Discord's signed CDN URLs still expire.
+
 ## 0.2.0 — 2026-10-13
 
 ### Upgrade notes

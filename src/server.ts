@@ -3748,7 +3748,7 @@ export class DiscordMcplServer {
             const norm = await normalizeImageForInference(raw, att.contentType);
             if (norm) {
               blocks.push({ type: 'image', data: norm.data, mimeType: norm.mimeType } as ContentBlock);
-              blocks.push(textContent(`[image attachment: ${att.name}${fwd(att)}]`));
+              blocks.push(textContent(`[image attachment: ${att.name}${fwd(att)} — ${att.url}]`));
             } else {
               blocks.push(textContent(`[image attachment "${att.name}"${fwd(att)} (${fmt(att.size)}) could not be inlined — ${att.url}]`));
             }
@@ -3772,7 +3772,7 @@ export class DiscordMcplServer {
               misdeclared: true,
             });
           } else {
-            blocks.push(textContent(`[attachment: ${att.name}${fwd(att)} (${fmt(att.size)})]\n${text}`));
+            blocks.push(textContent(`[attachment: ${att.name}${fwd(att)} (${fmt(att.size)}) — ${att.url}]\n${text}`));
           }
         } else {
           blocks.push(textContent(`[attachment: ${att.name}${fwd(att)} (${ct || 'unknown type'}, ${fmt(att.size)}) — not inlined: ${att.url}]`));
