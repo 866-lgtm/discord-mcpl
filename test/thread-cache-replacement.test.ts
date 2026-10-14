@@ -130,8 +130,12 @@ for (const { name, guildChannels } of admissions) {
       user_id: author.id, message_id: message.id, channel_id: threadId, guild_id: guildId,
       emoji: { name: '👍', id: null }, member: { user: author, roles: [] },
     });
-    // The handler's lookup starts once the reaction has resolved itself.
-    while (lookups.count === 0) await new Promise((r) => setImmediate(r));
+    // The handler's lookup starts once the reaction has resolved itself. The
+    // wait is bounded, so a lane that never looks the thread up fails here
+    // rather than keeping the run alive.
+    for (const until = Date.now() + 2000; lookups.count === 0 && Date.now() < until;) {
+      await new Promise((r) => setImmediate(r));
+    }
     assert.equal(lookups.count, 1, 'the reaction waits for its lookup');
     replaceGuild(before);
     release();

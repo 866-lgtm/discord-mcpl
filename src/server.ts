@@ -2735,15 +2735,12 @@ export class DiscordMcplServer {
       // delivered, because the ingress decision below needs the channel's
       // identity.
       let meta = this.discord.getCachedChannelMeta(channelId);
+      let lookupFailure = null as string | null;
       if (!meta || (meta.threadId && meta.threadParentName === null)) {
         const cached = meta;
         meta = (await this.discord.getChannelMeta(channelId).catch((err) => {
-          const error = errorText(err);
-          dbg('sweep:channel-meta-failed', { channelId, error });
-          console.error(
-            `[discord-mcpl] Catch-up couldn't look up channel ${channelId} (${error}). ` +
-              'Its missed messages are placed and filtered by what the cache knew of it, and may go out without its names.',
-          );
+          lookupFailure = errorText(err);
+          dbg('sweep:channel-meta-failed', { channelId, error: lookupFailure });
           return null;
         })) ?? cached;
       }
@@ -2752,17 +2749,25 @@ export class DiscordMcplServer {
       // read as "no guild, so a DM"; the channel is held back, its watermark
       // untouched. The sweep runs once per process, so it's tried again at
       // the next start, unless a message forwarded live in it first moves
-      // its watermark past what was held.
+      // its watermark past what was held. A failed lookup reaches stderr in
+      // whichever line says what became of the channel.
       const isDM = this.dmChannelIds.has(channelId) || meta?.isDM === true;
       const guildId = isDM ? null : (meta?.guildId ?? null);
       if (!isDM && !guildId) {
         dbg('sweep:identity-unresolved', { channelId });
         console.error(
           `[discord-mcpl] Catch-up held back channel ${channelId}: neither its guild nor DM identity could be ` +
-            'resolved, so its missed messages were not delivered. It is tried again at the next start, unless a ' +
-            'message forwarded live in it before then moves its watermark past them.',
+            `resolved${lookupFailure ? ` (its lookup failed: ${lookupFailure})` : ''}, so its missed messages ` +
+            'were not delivered. It is tried again at the next start, unless a message forwarded live in it ' +
+            'before then moves its watermark past them.',
         );
         continue;
+      }
+      if (lookupFailure) {
+        console.error(
+          `[discord-mcpl] Catch-up couldn't look up channel ${channelId} (${lookupFailure}). ` +
+            'Its missed messages are placed and filtered by what the cache knew of it, and may go out without its names.',
+        );
       }
 
       // The live ingress decision (guild, channel and thread parent, DM

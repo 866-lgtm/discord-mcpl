@@ -228,6 +228,9 @@ describe('edit/delete push events', () => {
     edit('chan1', 'm3', 'zz text', false);
     assert.equal(sent[0]!.params.payload.content[0].text, '[message edited] zz text');
     assert.equal(sent[0]!.params.origin.guildId, undefined);
+    // With no info there's no telling a guild channel from a DM, so no
+    // composite id is guessed.
+    assert.equal('mcplChannelId' in sent[0]!.params.origin, false);
   });
 
   it('a guild delete carries the guild + composite channel id', () => {
