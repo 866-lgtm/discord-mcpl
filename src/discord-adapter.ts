@@ -29,8 +29,8 @@ import {
   type ChatInputCommandInteraction,
   type ApplicationCommandDataResolvable,
 } from 'discord.js';
-import { existsSync, statSync } from 'node:fs';
-import { basename } from 'node:path';
+import { accessSync, constants as fsConstants, statSync } from 'node:fs';
+import { basename, resolve as resolvePath } from 'node:path';
 import { dbg } from './debug-log.js';
 
 import {
@@ -65,29 +65,61 @@ export interface OutgoingFile {
 }
 
 /**
- * Turn `OutgoingFile[]` specs into discord.js `AttachmentBuilder`s, validating
- * each path up front so a bad path yields a clear error rather than an opaque
- * discord.js failure mid-send. discord.js reads the path lazily at send time.
+ * Turn `OutgoingFile[]` specs into discord.js `AttachmentBuilder`s, checking
+ * every file before any part of the message is sent. discord.js reads each
+ * path lazily, at send time, so a file it can't read would fail after the
+ * parts before it posted. Tool arguments aren't checked against their
+ * schema, so `files` may arrive as anything. Paths are read on the machine
+ * running discord-mcpl, a relative one against its working directory.
  */
-function buildAttachments(files?: OutgoingFile[]): AttachmentBuilder[] {
-  if (!files || files.length === 0) return [];
-  if (files.length > MAX_DISCORD_ATTACHMENTS) {
+function buildAttachments(files?: unknown): AttachmentBuilder[] {
+  if (files === undefined || files === null) return [];
+  if (!Array.isArray(files)) {
     throw new Error(
-      `Too many files: ${files.length} (Discord allows up to ${MAX_DISCORD_ATTACHMENTS} per message)`,
+      `Nothing was sent: "files" must be a list of files, each as {"path": "<its path>"}, and this call gave ` +
+        `${typeof files === 'object' ? 'an object' : `a ${typeof files}`}.`,
     );
   }
-  return files.map((f) => {
-    if (!f || typeof f.path !== 'string' || !f.path.trim()) {
-      throw new Error('Each file must have a non-empty string "path"');
+  if (files.length > MAX_DISCORD_ATTACHMENTS) {
+    throw new Error(
+      `Nothing was sent: this call gave ${files.length} files, and Discord takes at most ${MAX_DISCORD_ATTACHMENTS} ` +
+        `in one message. Send ${MAX_DISCORD_ATTACHMENTS} or fewer, and the rest in another message.`,
+    );
+  }
+  return files.map((f: unknown, i) => {
+    const file = (f && typeof f === 'object' ? f : {}) as Partial<OutgoingFile>;
+    if (typeof file.path !== 'string' || !file.path.trim()) {
+      throw new Error(
+        `Nothing was sent: files[${i}] needs "path", the path of a file on the machine running discord-mcpl, as a ` +
+          `non-empty string${typeof f === 'string' ? `: give it as {"path": ${JSON.stringify(f)}}` : ''}.`,
+      );
     }
-    if (!existsSync(f.path) || !statSync(f.path).isFile()) {
-      throw new Error(`File not found (or not a regular file): ${f.path}`);
+    const read = resolvePath(file.path);
+    const problem = unattachable(read);
+    if (problem) {
+      throw new Error(
+        `Nothing was sent: ${JSON.stringify(file.path)}${read === file.path ? '' : ` (read as ${read})`} ${problem} ` +
+          'on the machine running discord-mcpl. Give the path of a file there that it can read.',
+      );
     }
-    const name = f.name && f.name.trim() ? f.name : basename(f.path);
-    const attachment = new AttachmentBuilder(f.path, { name });
-    if (f.description) attachment.setDescription(f.description);
+    const name = file.name && file.name.trim() ? file.name : basename(file.path);
+    const attachment = new AttachmentBuilder(file.path, { name });
+    if (file.description) attachment.setDescription(file.description);
     return attachment;
   });
+}
+
+/** Why a path can't be attached, or null when it can: it must be a regular
+ *  file this process can read. */
+function unattachable(path: string): string | null {
+  try {
+    if (!statSync(path).isFile()) return "isn't a file";
+    accessSync(path, fsConstants.R_OK);
+    return null;
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    return code === 'ENOENT' || code === 'ENOTDIR' ? "doesn't exist" : `can't be read (${code ?? (err as Error).message})`;
+  }
 }
 
 // ── Public Types ──

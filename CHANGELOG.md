@@ -34,7 +34,49 @@ in the git log and PR descriptions.
   carries `expiresAt` beside its `url`, and both tools' descriptions say
   what it means. A URL without a readable `ex` gets neither.
 
+### Changed
+
+- **These refusals, each given before its tool does anything, now say what
+  didn't happen and what the agent can do.** Anything matching one of the
+  old texts, quoted here, needs the new one:
+  - A tool whose feature set the host disabled ("Feature set '<set>' is
+    not enabled") names the tool and the feature set, says that the call
+    didn't run and that calling it again won't change that, and points to
+    whoever runs the host.
+  - `set_reaction_visibility`, `mute_channel`, `unmute_channel` and
+    `channel_missed` ("channelId is required"), and `fetch_history` and
+    `fetch_around` ("<tool> needs channelId as a channel id string, such
+    as …"), without a usable `channelId`: each says that nothing was done,
+    or read, and what was wrong with the value given, and that the id goes
+    in quotes. It names the channels a #name reaches (text, announcement
+    and voice channels), and says that `list_channels` takes a server's id
+    and lists the channels there that the configured filters allow.
+  - An unknown tool name ("Unknown tool: <name>") says that nothing ran.
+  - The retired `subscribe_channel` and `unsubscribe_channel` ("<tool> is
+    retired. …") now begin by saying that nothing was done.
+  - A send with neither content nor files ("Provide "content", "files", or
+    both — a message cannot be empty.") says that nothing was sent.
+  - `filters_update`'s `setDmNotice` check ("setDmNotice must be true or
+    false.") adds that nothing was changed.
+  - The attachment checks ("Too many files: <n> (Discord allows up to 10
+    per message)", "Each file must have a non-empty string "path"" and
+    "File not found (or not a regular file): <path>") say that nothing was
+    sent, name the file by its place in the list or by its path as read on
+    the machine running discord-mcpl, and say what to send instead.
+
 ### Fixed
+
+- **A channel tool given a blank `channelId`, or a send given unusable
+  `files`, no longer goes ahead.** `set_reaction_visibility`,
+  `mute_channel`, `unmute_channel` and `channel_missed` read `channelId`
+  trimmed, as the tool chokepoint does: a whitespace-only id, which
+  `mute_channel` saved as a muted channel, is refused, and a padded id is
+  used without its padding. `channel_missed` checks its `channelId` before
+  it loads anything, so a refused call no longer sets aside and rewrites
+  an unusable watermarks file. A `files` value that isn't a list is refused,
+  where it failed with a raw TypeError or as too many files. A file this
+  process can't read is refused before any part of the message is sent:
+  it failed at send time, after the parts before it had posted.
 
 - **Thread fields name the thread a message was posted in.** They were read
   from discord.js `message.thread`, which is the thread a message *started*,

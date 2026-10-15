@@ -439,12 +439,20 @@ describe('the watermark store and the tools', () => {
 
   it('refuses a channelId that is not an id, so no store saves one', async (t) => {
     const s = server(t);
-    for (const channelId of [undefined, 42, '']) {
+    for (const channelId of [undefined, 42, '', '   ']) {
       for (const tool of ['set_reaction_visibility', 'mute_channel', 'unmute_channel']) {
-        await assert.rejects(s.executeToolCall(tool, { channelId, visible: true }), /channelId is required/, `${tool} ${String(channelId)}`);
+        await assert.rejects(s.executeToolCall(tool, { channelId, visible: true }), new RegExp(`Nothing was done: ${tool} needs channelId`), `${tool} ${String(channelId)}`);
       }
     }
     assert.deepEqual(readdirSync(dir), [], 'nothing was saved');
+  });
+
+  it('reads a padded channelId trimmed, so a store saves the id itself', async (t) => {
+    const s = server(t);
+    await s.executeToolCall('mute_channel', { channelId: ' chan-new ' });
+    await s.executeToolCall('set_reaction_visibility', { channelId: '\tchan-shown\n', visible: true });
+    assert.deepEqual(json('muted.json'), ['chan-new']);
+    assert.deepEqual(json('reactions.json'), ['chan-shown']);
   });
 
   it("saves the muted list when a call changes it or its file may not hold it, and says so only then", async (t) => {
