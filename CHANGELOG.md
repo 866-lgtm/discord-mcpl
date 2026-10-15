@@ -5,6 +5,24 @@ in the git log and PR descriptions.
 
 ## Unreleased
 
+### Upgrade notes
+
+- **`chat:thread` now marks messages posted in a thread, and no longer marks
+  a message that started one.** A host gate or filter rule keyed on the tag
+  will match different messages after this upgrade: messages inside threads
+  now carry it, forum posts included (a forum post is a thread), and so do
+  their edits, their deletions and the reconnect sweep's blocks of them,
+  while a channel message that spawned a thread no longer does. The old
+  matches were the wrong ones (see "Thread fields name the thread a message
+  was posted in" under Fixed), but a rule tuned to them is worth checking.
+- **A message that started a thread no longer carries that thread's id as
+  its MCPL `threadId`, and no message carries one now.** A host that keys
+  conversations by channel and thread filed such a message under the thread
+  it started; it now files it under its channel alone, with the channel's
+  other messages. This change doesn't move what a host filed before the
+  upgrade. A message posted in a thread was already filed under the
+  thread's own channel id and stays there.
+
 ### Added
 
 - **An attachment's URL says when it stops working.** Discord signs each CDN
@@ -18,6 +36,48 @@ in the git log and PR descriptions.
 
 ### Fixed
 
+- **Thread fields name the thread a message was posted in.** They were read
+  from discord.js `message.thread`, which is the thread a message *started*,
+  so a message that had spawned a thread was tagged `chat:thread`, rendered
+  as `thread "…"`, and sent to the host with that thread's id as its MCPL
+  `threadId`, while messages actually posted in a thread carried none. Now a
+  message posted in a thread is tagged `chat:thread` and located as
+  `[#parent thread "name" …]`, and a message that started a thread, in a
+  text or announcement channel, carries no thread fields. A forum post's
+  first message is posted in the post itself, which is a thread, so it is
+  marked as in that thread like the replies under it. MCPL `threadId` (a
+  thread *within* a channel) is no longer sent: a Discord thread is its own
+  channel, already named by `channelId`, so a host keying conversations by
+  thread no longer splits one channel in two. Instead a thread message
+  carries `threadName` (the thread's name) and `threadParentName` (the
+  channel it hangs off, new), each left out when it isn't known: in the
+  `channels/incoming` metadata, in a push's origin, and in the origins of
+  its edits and deletions, which are tagged `chat:thread` too, and of
+  reactions to it, which keep their own tags only, so a gate rule keyed on
+  `chat:thread` doesn't start matching them. A thread the client knew only
+  partly is looked up first, past discord.js's cache, so its messages, and
+  their edits, deletions and reactions, are named as any other thread's;
+  each waits for that lookup before it is delivered, as a create already
+  did. If the lookup fails, the channel filters decide on what is known,
+  and what they let through goes unnamed (a message or an edit or deletion
+  still tagged `chat:thread`).
+- **The reconnect sweep names a thread as the live path does.** A thread's
+  missed messages were headed `<missed channel="#<thread name>" …>`, as if
+  the thread were a channel of its own name, and pushed without tags. The
+  header now reads `<missed channel="#<parent>" thread="<name>" …>`, or
+  `thread="<name>"` alone when the parent isn't known, with the thread's id
+  for a name it lacks. Each name is quoted and escaped by `quotedValue`, as
+  the live location escapes a name it quotes. The push carries `chat:thread`
+  and the thread's fields, a thread the client knew only partly is looked up
+  first, and every sweep push, a DM's included, now carries the
+  `mcplChannelId` a live push's origin carries. The sweep's failed lookup of
+  any channel now reaches stderr, where before only the debug log had it.
+- **Every live push's origin names its channel by its composite id.** A
+  reaction's origin, and a DM edit's or deletion's, now carry `mcplChannelId`
+  (`discord:<guild>:<channel>`, or `discord:dm:<channel>` in a DM), as a
+  message's own origin and a guild channel's edits and deletions already
+  did, so a host can place each one under the id it registered the channel
+  by.
 - **An inlined image or text attachment's marker now carries the file's URL,
   as the markers of files that aren't inlined already do.** An inlined image
   may be resized or re-encoded, and inlined text is decoded as UTF-8, so the
