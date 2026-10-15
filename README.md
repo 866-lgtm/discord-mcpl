@@ -44,7 +44,7 @@ In MCPL mode, the host decides which feature sets are enabled. discord-mcpl refu
 
 ### 2. Install
 
-discord-mcpl needs Node.js 20 or later. Voice uses `@discordjs/voice`, which declares Node.js 22.12 or later.
+discord-mcpl needs Node.js 22.12.0 or later.
 
 npm has the tagged releases:
 
@@ -72,7 +72,7 @@ DISCORD_TOKEN=... npx @animalabs/discord-mcpl --stdio
 DISCORD_TOKEN=... npx @animalabs/discord-mcpl --tcp 9040
 ```
 
-From a source checkout, run `node dist/src/index.js` with the same flags. `npm start -- --stdio` runs the TypeScript source through tsx without a build, and needs Node.js 20.6 or later, as `npm test` does, since both load tsx through `node --import`.
+From a source checkout, run `node dist/src/index.js` with the same flags. `npm start -- --stdio` runs the TypeScript source through tsx without a build.
 
 - With `--stdio`, a host starts discord-mcpl and talks to it over stdin and stdout. discord-mcpl exits when the host closes the connection.
 - With `--tcp <port>`, discord-mcpl listens on 127.0.0.1 only and serves one host at a time, refusing any other that connects meanwhile. It stays logged in to Discord between hosts but doesn't queue messages for the next host. A message that arrives while no host is connected is dropped, and only a later read of history, such as the catch-up after the first host connects, can bring it back.
@@ -210,7 +210,7 @@ npm run build
 node --test dist/test/server.test.js  # the built server
 ```
 
-CI runs these on Node 24. It builds on Ubuntu and macOS, and runs the tests on Ubuntu.
+CI runs these on Ubuntu with Node 22.12.0, 24 and the newest release, and builds on macOS with Node 22.12.0 and the newest release.
 
 `scripts/voice-smoke.ts` tries voice output in a live voice channel without a host. With `DISCORD_TOKEN`, `ELEVENLABS_API_KEY` and `DISCORD_VOICE_REGISTRY_FILE` set, `npx tsx scripts/voice-smoke.ts --guild <serverId> --vc <voiceChannelId> --voice <registry name>` speaks each line you type, and you can talk over it to see it stop. `--list` prints the servers and channels the bot can see.
 
