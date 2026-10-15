@@ -43,7 +43,7 @@ function adapterWith(t: TestContext, config: Partial<DiscordAdapterConfig>) {
   t.after(() => client.destroy());
   // channelAllowed reads a thread's channel from the cache to find its
   // category (#73), as the gateway leaves it there for a guild's channels.
-  client.channels.cache.set(UNDER_CATEGORY, { id: UNDER_CATEGORY, parentId: CATEGORY } as never);
+  client.channels.cache.set(UNDER_CATEGORY, { id: UNDER_CATEGORY, isDMBased: () => false, ...channels[UNDER_CATEGORY], parentId: CATEGORY } as never);
   (client.channels as unknown as { fetch: unknown }).fetch = async (id: string) => {
     if (id === DM) return { id, isDMBased: () => true };
     // As discord.js's DiscordAPIError carries it: Discord's JSON code.
@@ -213,7 +213,7 @@ describe('channels/open backscroll', () => {
     } as const;
     for (const [id, type] of Object.entries(kinds)) {
       const name = `${type}-${id.slice(-1)}`;
-      server.channelManager.register(toDescriptor(G1, 'Guild', { id, name, type, label: `#${name} (Guild)` }));
+      server.channelManager.register(toDescriptor({ id, guildId: G1, guildName: 'Guild', type, name }));
     }
     const opened = (id: string) =>
       server.channelManager.isOpen(mcplChannelId(G1, id)) || server.subscribedChannels.has(id);
@@ -320,7 +320,7 @@ describe('attachment links in history results', () => {
 
   it('keeps it in the metadata of channels/open history', async (t) => {
     const server = serverWith(t);
-    server.channelManager.register(toDescriptor(G1, 'Guild', { id: ALLOWED, name: 'text-1', type: 'text', label: '#text-1 (Guild)' }));
+    server.channelManager.register(toDescriptor({ id: ALLOWED, guildId: G1, guildName: 'Guild', type: 'text', name: 'text-1' }));
     const result = await server.handleChannelOpen({ channelId: mcplChannelId(G1, ALLOWED), type: 'discord', history: { limit: 20 } });
     assert.equal(result.history?.[0]?.metadata.attachments[0]?.expiresAt, '2026-10-16T01:12:00.000Z');
   });
