@@ -65,12 +65,27 @@ describe('edit/delete push events', () => {
     s.discord = {
       botUserId: 'bot',
       onMessage: noop, onReaction: noop,
-      onChannelCreate: noop, onChannelDelete: noop, onGuildCreate: noop, onChannelAvailable: noop,
+      onChannelCreate: noop, onChannelUpdate: noop, onChannelDelete: noop, onGuildCreate: noop,
+      onGuildRename: noop, onThreadUpdate: noop, onThreadDelete: noop, onThreadsSynced: noop, onGuildDelete: noop, onGuildAvailable: noop,
+      onChannelRefreshed: noop,
+      onChannelStale: noop,
+      refreshStale: async () => {},
+      // The cache holds chan1, as it holds a channel an edit or delete comes
+      // from, and nothing else.
+      getCachedChannelFacts: (id: string) =>
+        id === 'chan1' ? { id, guildId: 'g1', guildName: 'Guild', type: 'text', name: 'general' } : null,
+      getCachedChannelFactsFor: () => new Map(),
+      isStale: () => false,
+      hasGuild: () => true,
+      channelAdmitted: () => true,
       onMessageEdit: (h: EditHandler) => { edit = h; },
       onMessageDelete: (h: DeleteHandler) => { del = h; },
     };
     const sent: Array<{ method: string; params: any }> = [];
-    s.conn = { sendRequest: (method: string, params: unknown) => { sent.push({ method, params }); return Promise.resolve({}); } };
+    s.conn = {
+      sendRequest: (method: string, params: unknown) => { sent.push({ method, params }); return Promise.resolve({}); },
+      sendNotification: noop,
+    };
     s.mcplEnabled = true;
     (s.enabledFeatureSets as Set<string>).add('discord.messaging');
     (s.ensureSubscriptionsLoaded as () => void).call(server);
@@ -82,7 +97,7 @@ describe('edit/delete push events', () => {
 
   function open(server: DiscordMcplServer): ChannelManager {
     const manager = (server as any).channelManager as ChannelManager;
-    manager.register(toDescriptor('g1', 'Guild', { id: 'chan1', name: 'general', type: 'text', label: '#general (Guild)' }));
+    manager.register(toDescriptor({ id: 'chan1', guildId: 'g1', guildName: 'Guild', type: 'text', name: 'general' }));
     manager.open('discord:g1:chan1');
     return manager;
   }
@@ -206,21 +221,26 @@ describe('edit/delete push events', () => {
     assert.equal(origin.authorName, 'niston');
   });
 
-  it("a DM edit carries no guild, and the DM's composite channel id, as its create does", () => {
-    const { edit, sent } = wire();
+  it('a DM edit carries no guild, and names its DM, registered under its author', () => {
+    const { server, edit, sent } = wire();
     edit('dmchan', 'm2', 'zz hola', true, { guildId: null, authorId: 'u2', authorName: '_reim0n' });
     const { origin, payload } = sent[0]!.params;
     assert.equal(payload.content[0].text, '[message edited] _reim0n: zz hola');
     assert.equal(origin.guildId, undefined);
     assert.equal(origin.mcplChannelId, 'discord:dm:dmchan');
+    assert.equal(((server as any).channelManager as ChannelManager).get('discord:dm:dmchan')?.label, 'DM: _reim0n');
   });
 
-  it("a DM delete carries the DM's composite channel id", () => {
-    const { del, sent } = wire();
+  it('a DM delete names its DM once the DM is registered', () => {
+    const { edit, del, sent } = wire();
     del('dmchan', 'm5', true, { guildId: null });
-    const { origin } = sent[0]!.params;
-    assert.equal(origin.guildId, undefined);
-    assert.equal(origin.mcplChannelId, 'discord:dm:dmchan');
+    assert.equal(sent[0]!.params.origin.guildId, undefined);
+    // Its other party unknown, a DM not registered yet goes unnamed.
+    assert.equal('mcplChannelId' in sent[0]!.params.origin, false);
+    edit('dmchan', 'm6', 'zz hola', true, { guildId: null, authorId: 'u2', authorName: '_reim0n' });
+    del('dmchan', 'm6', true, { guildId: null });
+    assert.equal(sent.length, 3);
+    assert.equal(sent[2]!.params.origin.mcplChannelId, 'discord:dm:dmchan');
   });
 
   it('an edit without author info keeps the old text shape', () => {

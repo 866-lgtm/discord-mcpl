@@ -15,6 +15,15 @@ in the git log and PR descriptions.
   while a channel message that spawned a thread no longer does. The old
   matches were the wrong ones (see "Thread fields name the thread a message
   was posted in" under Fixed), but a rule tuned to them is worth checking.
+- **The host's channel list now follows Discord's.** Voice and stage
+  channels (their text chat), and each thread a message comes from, are
+  registered beside text and announcement channels. An archived thread
+  leaves the list until a message brings it back, and a renamed channel,
+  thread or server is announced as `updated`. A host rule keyed on the
+  list, or on a label's `#name (Guild)` shape, is worth checking: a channel
+  whose name doesn't resolve back to it is labelled by its id,
+  `discord:<guild>:<channel>` (see "Every channel messages are posted in is
+  registered" under Fixed).
 - **A message that started a thread no longer carries that thread's id as
   its MCPL `threadId`, and no message carries one now.** A host that keys
   conversations by channel and thread filed such a message under the thread
@@ -72,12 +81,159 @@ in the git log and PR descriptions.
   first, and every sweep push, a DM's included, now carries the
   `mcplChannelId` a live push's origin carries. The sweep's failed lookup of
   any channel now reaches stderr, where before only the debug log had it.
-- **Every live push's origin names its channel by its composite id.** A
-  reaction's origin, and a DM edit's or deletion's, now carry `mcplChannelId`
-  (`discord:<guild>:<channel>`, or `discord:dm:<channel>` in a DM), as a
-  message's own origin and a guild channel's edits and deletions already
-  did, so a host can place each one under the id it registered the channel
-  by.
+- **Every channel messages are posted in is registered, threads included,
+  by one rule, and the host is told of each change.** Boot and channel
+  events registered guild text channels only: never a thread (a Discord
+  thread is its own channel), an announcement channel or a voice channel's
+  text chat. Such a channel couldn't be opened, and a host that routes
+  speech by a channel's declaration (MCPL RFC-011) held a resident's
+  plain-speech replies in it as drafts.
+  - **Listing** (boot, a channel's creation or change, a server joined,
+    `refresh_channels`) registers the text, announcement, voice and stage
+    channels the filters admit; never a category or forum, which hold no
+    messages of their own. A stage channel, which had no kind of its own, is
+    now `stage`: its text chat takes messages, and a name resolves to it as
+    to a voice channel.
+  - **A thread is registered by its messages:** before its first message
+    reaches the host, live or caught up by the reconnect sweep, or before an
+    edit or deletion there does. discord.js delivers no edit or deletion
+    from a thread its cache doesn't hold, such as one archived before a
+    restart, as before. An archived thread is forgotten, and a
+    message posted after the archive, which unarchives it, registers it
+    again, so the host holds the live threads. A message posted before the
+    archive, still on its way when the archive came, doesn't.
+  - **Removals are followed.** A deleted thread is forgotten, and so is a
+    deleted channel with the threads it's known to hold, registered or
+    cached. So is a channel Discord answers with Unknown Channel, when a
+    thread is looked up or the reconnect sweep fetches it. Every channel of a
+    server the bot leaves or is removed from is forgotten too; if the bot
+    rejoins, the server's channels are registered again, as at boot, and its
+    threads by their messages. An outage removes nothing while it lasts, and
+    a server back from one, or from a gap in the gateway connection, is
+    reconciled with what it has then: what was deleted, or a thread archived,
+    meanwhile is forgotten, and a new or renamed channel is registered or
+    re-derived. A sync of a server's threads, which Discord sends when the
+    bot gains access to a channel, covers the channels in its `channel_ids`,
+    or the whole server when it has none. A registered thread under a covered
+    channel that the sync doesn't list is forgotten, since it's archived,
+    deleted or no longer visible to the bot, and so is one the sync drops
+    from discord.js's cache. A thread whose channel neither the cache nor its
+    registration knows, such as one registered from a message whose lookup
+    failed, is under no covered channel, so only a sync of the whole server
+    forgets it. A registered thread the sync lists counts as updated, so one
+    whose channel is stale stays as it is until that channel's fresh fetch or
+    update. What the server no longer lists, on its return or when the bot
+    joins it again, may have changed unseen: a message, edit, deletion or
+    reaction from it, a tool, or the reconnect sweep, looks it up from
+    Discord again before deciding, and a delivery that decided on facts from
+    before the return doesn't register it. A lookup that Discord overtook
+    with a report on its channel, such as an archive or a rename, is made
+    again, so what a delivery waiting on it registers is no older than that
+    report. The fresh facts count as an update of the channel, so what was
+    registered from the older ones meanwhile is registered again, or
+    forgotten when they show a thread archived or a channel outside the
+    filters. A guild channel the cache holds that Discord says doesn't exist,
+    to a lookup or to a tool, is handled as deleted, and dropped from
+    discord.js's cache with its threads. A channel that `create_text_channel`
+    makes is fetched again after the POST, so the cache keeps what the
+    gateway reported of it meanwhile; if that fetch fails, or every try is
+    overtaken, the channel becomes stale and the tool reports the name it
+    made it with, and if Discord says it's gone already the tool says so. A
+    stale channel's facts decide no registration or name until a fresh fetch
+    or an update clears its mark, or, for a thread, a sync that lists it.
+    Meanwhile a delivery from a stale channel, or from a thread in it,
+    carries no name for that channel in its fields, and its label is the
+    registered one: a stale channel's or thread's is its id, while a
+    registered thread that isn't stale itself, under a stale channel, keeps
+    its display-only label, with the names it was registered with. Its
+    current name isn't known, so while a server the guild filter admits lists
+    a stale channel of a kind a name addresses, no name in that server
+    resolves, and no name given without a server resolves anywhere. The label
+    of every channel a name addresses there is its id meanwhile, as is a
+    stale thread's; a thread that isn't stale keeps its display-only label. A
+    stale channel's threads aren't admitted through its category, and a
+    registered thread whose channel is stale stays registered, as far as the
+    filters go, until that channel's fresh fetch or update decides. The
+    registration listings leave a stale channel out. Before a name-addressed
+    tool resolves a name, and before `refresh_channels` lists, the stale
+    channels their servers still list are fetched again, threads aside, in
+    every server; `list_channels` fetches those of the server it lists. A
+    delivery from a thread fetches its stale channel first. If that lookup
+    fails, the filters decide the delivery on what the cache holds. A channel
+    that Discord moves out of what the channel filters admit is forgotten,
+    with the threads admitted through it, as on a server's return, and a
+    delivery on its way from it doesn't register it again. Editing the
+    filters, through the file or `filters_update`, registers the channels of
+    a server they newly admit; a channel newly listed in a server already
+    admitted is registered by its next message or `refresh_channels`. Neither
+    edit forgets what the filters stop admitting: that goes at a restart, at
+    its server's return, or when an update, a fresh fetch or a sync that
+    lists it shows it outside them. Only what was registered is announced as
+    removed.
+  - **`list_channels` reads a server's channels from the gateway's cache**
+    instead of fetching them from Discord, so it can't leave older facts in
+    the cache than an update brought meanwhile. It lists the same channels as
+    before, threads still excluded. It refuses a server in an outage rather
+    than listing what it held before: before fetching anything for it, and
+    again after, since an outage can begin while its stale channels are
+    fetched. Otherwise it fetches that server's stale channels first, and
+    leaves out one still stale, whether its fetch failed or every try was
+    overtaken.
+  - **A reaction in a server the guild filter leaves out is dropped,** as
+    its messages are. It used to pass when the server had no channel
+    filter of its own.
+  - **A channel's label, its address, is made one way on every path,**
+    `list_channels`, `create_text_channel` and send receipts included. A
+    channel's is its address, `#name (Guild)`. A
+    thread's is `#parent › thread (Guild)`, or `› thread (Guild)` when its
+    channel's name isn't known, display-only either way, since
+    `#thread (Guild)` would paste back as a same-named channel; a tool given
+    one refuses it, even where a voice channel has that name. Where a name
+    isn't known (a server the client hasn't cached), or wouldn't resolve
+    back to the channel, the label is the channel's id,
+    `discord:<guild>:<channel>`, never a bare `#name` that another channel
+    could answer to. A name doesn't resolve back for a kind no name resolves
+    to, a channel named like a thread label, a voice or stage channel
+    beside a same-named text channel (Discord's stock "General" pair, where
+    the name reaches the text channel), and two channels of one name and
+    kind. A rename of a channel (hidden from the bot or not, and a forum or
+    media channel's, whose posts are threads), a thread or a server, a name
+    learned since, or a channel taking or freeing a name, re-derives the
+    labels it's in, announced as `updated`.
+  - **Every host connection is given the whole registry,** whatever was
+    registered while another host, or none, was connected, and is told of
+    the channels removed while no host was connected. A restart starts
+    afresh: threads and DMs come back as they're active. Nothing announces
+    the removal of a thread deleted or archived while discord-mcpl was
+    down, so a host that keeps a Discord server's channels across a
+    reconnect keeps such a thread.
+  - **A push names its channel (`mcplChannelId`) once it's registered,**
+    which is every channel a message is delivered from except a thread
+    archived since its missed messages (the sweep delivers them without
+    it), and a channel deleted, a thread archived, a channel left out when
+    its server came back or moved out of what the channel filters admit,
+    or one in a server the bot left, while the message was on its way. A
+    stale channel, whose lookup failed while it was stale or whose every
+    try was overtaken, and one discord.js doesn't hold, are delivered
+    without it too, unless they're registered already. A DM's edit or
+    deletion names its DM too, registered under its other party's name
+    when that's known; one whose other party isn't known, in a DM not
+    registered yet, goes without it.
+  - **A deleted channel's watermark and missed tally go,** with those of the
+    threads it's known to hold, as do those of a channel the reconnect sweep
+    finds Discord no longer knows (deleted while discord-mcpl was down,
+    say), so later starts stop fetching it. A message
+    or catch-up delivered from a channel after its deletion doesn't bring
+    the watermark back. A server the bot leaves keeps its channels'
+    watermarks, since they still exist.
+- **Every live push's origin names its registered channel by its composite
+  id.** A reaction's origin, and a DM edit's or deletion's, now carry
+  `mcplChannelId` (`discord:<guild>:<channel>`, or `discord:dm:<channel>` in
+  a DM) when the channel is registered, as a message's own origin and a
+  guild channel's edits and deletions already did, so a host can place each
+  one under the id it registered the channel by. "A push names its channel
+  (`mcplChannelId`) once it's registered", above, says which channels that
+  leaves out.
 - **An inlined image or text attachment's marker now carries the file's URL,
   as the markers of files that aren't inlined already do.** An inlined image
   may be resized or re-encoded, and inlined text is decoded as UTF-8, so the
@@ -99,20 +255,20 @@ in the git log and PR descriptions.
   that nothing here can read it or send to it, and a kind the adapter
   doesn't name is named by its type number as one this adapter can't read or
   send to, which only an operator updating the adapter can change. A `#name`
-  reaches only text, announcement and voice channels. When none of those
-  that the filters allow had the name, the `#name` was answered "No visible
-  channel named #…", or "No channel #… in a guild named …", though a
-  category or a forum may have it, and `list_channels` labels such a channel
-  with it. The answer now says that no text, announcement or voice channel
-  the filters allow has the name and that a `#name` reaches only those, and
-  that `list_channels` shows a server's channels with their ids, by which a
-  channel of any other kind, such as a category or a forum, is given
-  instead. A channel discord.js returns nothing for, which Discord answered
-  for but discord.js can't build, was reported as not found too, by the same
-  calls and by `list_channel_members` and `delete_channel`. Each now says
-  that the channel exists but this adapter can't use it, and names both
-  causes: a kind this version of the adapter can't handle, which only an
-  operator updating the adapter changes, or a server still loading on this
+  reaches only text, announcement, voice and stage channels. When none of
+  those that the filters allow had the name, the `#name` was answered "No
+  visible channel named #…", or "No channel #… in a guild named …", though a
+  category or a forum may have it. The answer now says that no text,
+  announcement, voice or stage channel the filters allow has the name and
+  that a `#name` reaches only those, and that `list_channels` shows a
+  server's channels with their ids, by which a channel of any other kind,
+  such as a category or a forum, is given instead. A channel discord.js
+  returns nothing for, which Discord answered for but discord.js can't
+  build, was reported as not found too, by the same calls and by
+  `list_channel_members` and `delete_channel`. Each now says that the
+  channel exists but this adapter can't use it, and names both causes: a
+  kind this version of the adapter can't handle, which only an operator
+  updating the adapter changes, or a server still loading on this
   connection, in which case the same call may work in a moment. The
   automatic DM notice's failure, in the operator log, now names the
   channel's kind, or says that this version can't handle it, where it said

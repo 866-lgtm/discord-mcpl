@@ -8,9 +8,9 @@
  * the first alone. A channel that holds no messages of its own (a category,
  * a forum, a media or a directory channel), given by id, is named for what
  * it is, with what didn't happen and where its messages are, or that nothing
- * here can use it. A #name reaches only text, announcement and voice
- * channels: one that none of those has is refused with what a #name
- * reaches, and how a category or a forum is given instead.
+ * here can use it. A #name reaches only text, announcement, voice and
+ * stage channels: one that none of those has is refused with what a #name
+ * reaches, and how a channel of any other kind is given instead.
  *
  * Run: node --import tsx --test test/channel-lookup-errors.test.ts
  */
@@ -158,7 +158,7 @@ describe('a channel that holds no messages', () => {
   });
 });
 
-describe('a #name that no text, announcement or voice channel has', () => {
+describe('a #name that no text, announcement, voice or stage channel has', () => {
   const TEXT = '420000000000000001';
   const HIDDEN = '420000000000000005';
   const channels: Array<[string, string, number]> = [
@@ -182,7 +182,7 @@ describe('a #name that no text, announcement or voice channel has', () => {
     return { adapter, lookups };
   }
   const notFound = (named: string) =>
-    `No text, announcement or voice channel that the configured channel filters allow is named ${named}, and a #name ` +
+    `No text, announcement, voice or stage channel that the configured channel filters allow is named ${named}, and a #name ` +
     "reaches only those. list_channels shows a server's channels with their ids, and a channel of any other kind, such as " +
     'a category or a forum, is given by its id instead.';
 
