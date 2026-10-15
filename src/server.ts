@@ -2776,20 +2776,23 @@ export class DiscordMcplServer {
 
       const newestId = msgs[msgs.length - 1].id;
 
-      // Cache first. A lookup when the cache doesn't hold the channel, holds
-      // a thread whose parent channel it can't name, which may be one the
-      // client knows only partly, or holds facts that may be older than
-      // Discord's (isStale), as the live path looks those up (a thread whose
-      // parent just isn't cached is read from the cache again).
-      // A failed lookup leaves a trace instead of silently shipping a
-      // name-less block (issue #28), and what the cache knew stands. Resolved
-      // before anything is delivered, because the ingress decision below
-      // needs the channel's identity.
+      // Cache first. The channel is looked up when the cache doesn't hold it
+      // (the sweep starts from the channels it saved, not from an event, so
+      // the cache may not have seen one, such as a DM), when it holds a
+      // thread whose parent channel it can't name, or when its facts may be
+      // older than Discord's (isStale). The lookup fetches from Discord what
+      // the cache doesn't hold whole and current, as the live path does; for
+      // a thread whose parent just isn't cached, it reads the cache again. A
+      // failed lookup is logged (issue #28), and what the cache knew stands.
+      // Resolved before anything is delivered, because the ingress decision
+      // below needs the channel's identity.
       let meta = this.discord.getCachedChannelMeta(channelId);
+      let lookupFailure = null as string | null;
       if (!meta || (meta.threadId && meta.threadParentName === null) || this.discord.isStale(channelId)) {
         const cached = meta;
         meta = (await this.discord.getChannelMeta(channelId).catch((err) => {
-          dbg('sweep:channel-meta-failed', { channelId, error: errorText(err) });
+          lookupFailure = errorText(err);
+          dbg('sweep:channel-meta-failed', { channelId, error: lookupFailure });
           return null;
         })) ?? cached;
       }
@@ -2798,17 +2801,25 @@ export class DiscordMcplServer {
       // read as "no guild, so a DM"; the channel is held back, its watermark
       // untouched. The sweep runs once per process, so it's tried again at
       // the next start, unless a message forwarded live in it first moves
-      // its watermark past what was held.
+      // its watermark past what was held. A failed lookup reaches stderr in
+      // whichever line says what became of the channel.
       const isDM = this.dmChannelIds.has(channelId) || meta?.isDM === true;
       const guildId = isDM ? null : (meta?.guildId ?? null);
       if (!isDM && !guildId) {
         dbg('sweep:identity-unresolved', { channelId });
         console.error(
           `[discord-mcpl] Catch-up held back channel ${channelId}: neither its guild nor DM identity could be ` +
-            'resolved, so its missed messages were not delivered. It is tried again at the next start, unless a ' +
-            'message forwarded live in it before then moves its watermark past them.',
+            `resolved${lookupFailure ? ` (its lookup failed: ${lookupFailure})` : ''}, so its missed messages ` +
+            'were not delivered. It is tried again at the next start, unless a message forwarded live in it ' +
+            'before then moves its watermark past them.',
         );
         continue;
+      }
+      if (lookupFailure) {
+        console.error(
+          `[discord-mcpl] Catch-up couldn't look up channel ${channelId} (${lookupFailure}). ` +
+            'Its missed messages are placed and filtered by what the cache knew of it, and may go out without its names.',
+        );
       }
 
       // The live ingress decision (guild, channel and thread parent, DM
@@ -2897,9 +2908,11 @@ export class DiscordMcplServer {
       // channel it hangs off and the thread itself.
       const thread: ThreadPlace = meta ?? {};
       const place = messagePlace(meta?.name, thread);
-      // Names are escaped with the live location's quoting (quotedValue), so
-      // a bidi control or line separator in one can't reorder or split the
-      // header.
+      // Each name is an attribute's value, so it is always quoted, with
+      // quotedValue's escaping, which the live location uses too: a bidi
+      // control or line separator in one can't reorder or split the header.
+      // (The live location writes a channel or guild name bare where the
+      // header rule allows, and always quotes a thread's.)
       const attrs: string[] = [];
       if (place.channel) attrs.push(`channel=${quotedValue(`#${place.channel}`)}`);
       if (place.thread) attrs.push(`thread=${quotedValue(place.thread)}`);
@@ -3987,6 +4000,7 @@ export class DiscordMcplServer {
       // message id is meaningless to the agent (it can't look messages up).
       const quoted = ev.messageSnippet ? ` — "${ev.messageSnippet}"` : '';
       const line = `[reaction] @${ev.userName} ${verb} ${ev.emoji} on ${target}${quoted}`;
+      const reactionChannelId = mcplChannelId(ev.guildId ?? 'dm', ev.channelId);
       this.conn.sendRequest(method.PUSH_EVENT, {
         featureSet: 'discord.messaging',
         eventId: `discord_reaction_${ev.action}_${ev.messageId}_${ev.emojiId ?? ev.emoji}_${ev.userId}_${ev.timestamp.getTime()}`,
@@ -3996,6 +4010,10 @@ export class DiscordMcplServer {
           channelId: ev.channelId,
           messageId: ev.messageId,
           guildId: ev.guildId,
+          // The composite id the host registers and routes by, when the
+          // channel is registered, as the origins of the message's own
+          // pushes carry it.
+          ...(this.channelManager.get(reactionChannelId) ? { mcplChannelId: reactionChannelId } : {}),
           reactorId: ev.userId,
           reactorName: ev.userName,
           emoji: ev.emoji,

@@ -3079,17 +3079,17 @@ export class DiscordAdapter {
 
   /** Fetch a channel an event comes from past the cache, so the cache holds
    *  what Discord has now: a thread known only partly (threadChannelUnknown),
-   *  whose channel the cache lacks, or a channel whose cached facts may be
-   *  older than Discord's (isStale). Forced, since discord.js would otherwise
-   *  return the cached object. The REST client's own timeout and retries
-   *  bound each attempt (15 s a try, three retries, by default), though a
-   *  rate limit's Retry-After waits can hold events waiting behind it longer.
-   *  A fetch Discord answers with Unknown Channel reports the channel
-   *  deleted. If the fetch fails otherwise, the channel stays as it was, and
-   *  the filters decide on what's known: where a guild's channel list
-   *  applies, a thread whose channel is unknown is admitted only if it's
-   *  listed itself, and a stale channel's events go unnamed unless it's
-   *  registered. That failure is logged. */
+   *  whose parent channel the cache lacks, or a channel whose cached facts
+   *  may be older than Discord's (isStale). Forced, since discord.js would
+   *  otherwise return the cached object. The REST client's own timeout and
+   *  retries bound each attempt (15 s a try, three retries, by default),
+   *  though a rate limit's Retry-After waits can hold events waiting behind
+   *  it longer. A fetch Discord answers with Unknown Channel reports the
+   *  channel deleted. If the fetch fails otherwise, the channel stays as it
+   *  was, and the filters decide on what's known: where a guild's channel
+   *  list applies, a thread whose parent channel is unknown is admitted only
+   *  if it's listed itself, and a stale channel's events go unnamed unless
+   *  it's registered. That failure is logged. */
   private async lookUpChannel(guildId: string, channelId: string): Promise<void> {
     try {
       await this.refetchChannel(channelId);
@@ -3108,7 +3108,7 @@ export class DiscordAdapter {
       dbg('gateway:channel-lookup-failed', { channelId, error });
       console.error(
         `[discord-mcpl] Couldn't look up channel ${channelId} past the cache (${error}). ` +
-          "Its events are decided on what the cache holds: where its guild has a channel list, a thread whose channel isn't known passes only if it's listed itself, and they go unnamed unless it's registered.",
+          "Its events are decided on what the cache holds: where its guild has a channel list, a thread whose parent channel isn't known passes only if it's listed itself, and they go unnamed unless it's registered.",
       );
     }
   }

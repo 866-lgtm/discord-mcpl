@@ -231,11 +231,26 @@ describe('edit/delete push events', () => {
     assert.equal(((server as any).channelManager as ChannelManager).get('discord:dm:dmchan')?.label, 'DM: _reim0n');
   });
 
+  it('a DM delete names its DM once the DM is registered', () => {
+    const { edit, del, sent } = wire();
+    del('dmchan', 'm5', true, { guildId: null });
+    assert.equal(sent[0]!.params.origin.guildId, undefined);
+    // Its other party unknown, a DM not registered yet goes unnamed.
+    assert.equal('mcplChannelId' in sent[0]!.params.origin, false);
+    edit('dmchan', 'm6', 'zz hola', true, { guildId: null, authorId: 'u2', authorName: '_reim0n' });
+    del('dmchan', 'm6', true, { guildId: null });
+    assert.equal(sent.length, 3);
+    assert.equal(sent[2]!.params.origin.mcplChannelId, 'discord:dm:dmchan');
+  });
+
   it('an edit without author info keeps the old text shape', () => {
     const { edit, sent } = wire();
     edit('chan1', 'm3', 'zz text', false);
     assert.equal(sent[0]!.params.payload.content[0].text, '[message edited] zz text');
     assert.equal(sent[0]!.params.origin.guildId, undefined);
+    // With no info there's no telling a guild channel from a DM, so no
+    // composite id is guessed.
+    assert.equal('mcplChannelId' in sent[0]!.params.origin, false);
   });
 
   it('a guild delete carries the guild + composite channel id', () => {

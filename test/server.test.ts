@@ -2090,7 +2090,7 @@ describe('DiscordMcplServer', () => {
     assert.ok(header.startsWith('<missed channel="#gen\\u202eeral" thread="plan\\u202eend" channelId="th-bidi" guild="Test\\u0085Guild"'), JSON.stringify(header));
   });
 
-  it("the reconnect sweep looks up a cached thread whose channel isn't named, and keeps what the cache knew if that fails", async () => {
+  it("the reconnect sweep looks up a cached thread whose channel isn't named, and keeps what the cache knew if that fails", async (t) => {
     // As the cache holds a thread the client knows only partly: no name, no channel.
     const partly: ChannelMeta = { name: null, guildId: 'g1', guildName: 'Test Guild', isDM: false, threadId: 'th3', threadParentName: null };
     const looked = await sweepOne('th3', partly, {
@@ -2100,10 +2100,14 @@ describe('DiscordMcplServer', () => {
     const lookedText = (looked.payload.content[0] as { text: string }).text;
     assert.ok(lookedText.startsWith('<missed channel="#general" thread="late-thread" channelId="th3"'), lookedText);
     assert.equal((looked.origin as Record<string, unknown>).threadParentName, 'general');
+    const errors = t.mock.method(console, 'error', () => {});
     const failed = await sweepOne('th3', partly, new Error('Missing Access'));
     const failedText = (failed.payload.content[0] as { text: string }).text;
     assert.ok(failedText.startsWith('<missed thread="th3" channelId="th3" guild="Test Guild"'), failedText);
     assert.deepEqual(failed.tags, ['chat:thread'], 'still a thread');
+    // The failure reaches stderr, not only the debug log.
+    const lines = errors.mock.calls.map((c) => String(c.arguments[0]));
+    assert.ok(lines.some((l) => l.includes("couldn't look up channel th3") && l.includes('Missing Access')), lines.join('\n'));
   });
 
   it("the reconnect sweep's header names a thread without its channel, or by its id, when either isn't known", async () => {
