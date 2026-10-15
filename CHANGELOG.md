@@ -84,6 +84,39 @@ in the git log and PR descriptions.
   URL is the way to the exact bytes. A forwarded attachment that can't be
   fetched is now marked as forwarded too, as the live path's other markers
   of a forwarded attachment are.
+- **A channel a tool can't use is no longer reported as not found.** A
+  channel that exists but holds no messages of its own (a category, a
+  directory channel, a forum or a media channel) was reported as not found
+  by `send_message`, `reply_message`, `edit_message`, `delete_message`,
+  `add_reaction`, `remove_reaction`, `fetch_history` and `fetch_around`, by
+  a reply's or a reaction's `latestFrom`, and to a host by
+  `channels/publish`, `channels/acknowledge` and a `channels/open` that asks
+  for backscroll. Each now names the channel's kind and says what didn't
+  happen, then where its messages are: for a category, the `list_channels`
+  call that shows the channels in it; for a forum or a media channel, that
+  its posts are threads, which no tool lists, so a post's id comes from a
+  message posted in it or a link to it. A directory channel's error says
+  that nothing here can read it or send to it, and a kind the adapter
+  doesn't name is named by its type number as one this adapter can't read or
+  send to, which only an operator updating the adapter can change. A `#name`
+  reaches only text, announcement and voice channels. When none of those
+  that the filters allow had the name, the `#name` was answered "No visible
+  channel named #…", or "No channel #… in a guild named …", though a
+  category or a forum may have it, and `list_channels` labels such a channel
+  with it. The answer now says that no text, announcement or voice channel
+  the filters allow has the name and that a `#name` reaches only those, and
+  that `list_channels` shows a server's channels with their ids, by which a
+  channel of any other kind, such as a category or a forum, is given
+  instead. A channel discord.js returns nothing for, which Discord answered
+  for but discord.js can't build, was reported as not found too, by the same
+  calls and by `list_channel_members` and `delete_channel`. Each now says
+  that the channel exists but this adapter can't use it, and names both
+  causes: a kind this version of the adapter can't handle, which only an
+  operator updating the adapter changes, or a server still loading on this
+  connection, in which case the same call may work in a moment. The
+  automatic DM notice's failure, in the operator log, now names the
+  channel's kind, or says that this version can't handle it, where it said
+  `not found or not a text channel`.
 
 ## 0.2.0 — 2026-10-13
 

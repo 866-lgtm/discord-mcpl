@@ -195,6 +195,15 @@ export function resolveChannelName(
   if (matches.length === 1) return { ok: true, id: matches[0].id, matched: matches[0] };
 
   if (matches.length === 0) {
+    // Candidates are only the SENDABLE kinds, so a channel of another kind,
+    // such as a category or a forum, may well have this name, and
+    // list_channels prints its label as a #name too. The text says what a
+    // #name reaches, and how any other channel is given.
+    const none = (where: string) =>
+      `No text, announcement or voice channel that the configured channel filters allow is named #${ref.name}${where}, ` +
+      'and a #name reaches only those.';
+    const byId = "list_channels shows a server's channels with their ids, and a channel of any other kind, such as a " +
+      'category or a forum, is given by its id instead.';
     const near = candidates.filter((c) => c.name.toLowerCase() === wantName);
     if (wantGuild && near.length) {
       // The name exists, but not in the guild asked for. Say so precisely —
@@ -204,17 +213,14 @@ export function resolveChannelName(
         ok: false,
         reason: 'not-found',
         message:
-          `No channel #${ref.name} in a guild named "${ref.guild}". ` +
-          `That name exists elsewhere: ${near.map(channelLabel).join(', ')}`,
+          `${none(` in a guild named "${ref.guild}"`)} ` +
+          `That name exists elsewhere: ${near.map(channelLabel).join(', ')}. ${byId}`,
       };
     }
     return {
       ok: false,
       reason: 'not-found',
-      message:
-        `No visible channel named #${ref.name}` +
-        (ref.guild ? ` in "${ref.guild}"` : '') +
-        `. Use list_channels to see what is addressable.`,
+      message: `${none(ref.guild ? ` in "${ref.guild}"` : '')} ${byId}`,
     };
   }
 
