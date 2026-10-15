@@ -9,7 +9,7 @@
 import { describe, it, type TestContext } from 'node:test';
 import * as assert from 'node:assert/strict';
 import type { Client } from 'discord.js';
-import { DiscordAdapter, type DiscordAdapterConfig } from '../src/discord-adapter.js';
+import { DiscordAdapter, mapAllAttachments, type DiscordAdapterConfig } from '../src/discord-adapter.js';
 import { DiscordMcplServer } from '../src/server.js';
 import { mcplChannelId, toDescriptor } from '../src/channels.js';
 
@@ -274,5 +274,54 @@ describe('channels/open backscroll', () => {
     assert.equal(opened(EXCLUDED), true);
     assert.equal(opened(THREAD_OF_EXCLUDED), true);
     assert.deepEqual(reads, []);
+  });
+});
+
+describe('attachment links in history results', () => {
+  const signed = 'https://cdn.discordapp.example/1/2/notes.txt?ex=6ad179e0&is=6ad02860&hm=1';
+  function serverWith(t: TestContext) {
+    const { adapter } = adapterWith(t, {});
+    const message = {
+      id: '420000000000000001', authorId: 'u1', authorName: 'Alice', isBot: false, content: 'see the file',
+      cleanContent: 'see the file', mentionsBot: false, timestamp: new Date(), reactions: [],
+      attachments: mapAllAttachments({
+        attachments: new Map([['a1', { id: 'a1', name: 'notes.txt', url: signed, contentType: 'text/plain', size: 3 }]]),
+      }),
+    };
+    const a = adapter as unknown as Record<string, unknown>;
+    a.fetchHistory = async () => [message];
+    a.fetchAround = async () => [message];
+    const server = new DiscordMcplServer(adapter) as unknown as {
+      channelManager: { register(d: unknown): void };
+      handleToolCall(name: string, args: Record<string, unknown>): Promise<{ content: Array<{ text: string }>; isError?: boolean }>;
+      handleChannelOpen(params: { channelId: string; type: string; history?: { limit: number } }): Promise<{
+        history?: Array<{ metadata: { attachments: Array<{ url: string; expiresAt?: string }> } }>;
+      }>;
+    };
+    return server;
+  }
+
+  it('gives each attachment its expiresAt beside its url in fetch_history and fetch_around results', async (t) => {
+    const server = serverWith(t);
+    for (const [tool, args] of [
+      ['fetch_history', { channelId: ALLOWED }],
+      ['fetch_around', { channelId: ALLOWED, messageId: '420000000000000001' }],
+    ] as const) {
+      const res = await server.handleToolCall(tool, args);
+      assert.ok(!res.isError, res.content[0].text);
+      const [message] = JSON.parse(res.content[0].text) as Array<{ attachments: Array<{ url: string; expiresAt?: string }> }>;
+      assert.deepEqual(
+        [message.attachments[0].url, message.attachments[0].expiresAt],
+        [signed, '2026-10-16T01:12:00.000Z'],
+        tool,
+      );
+    }
+  });
+
+  it('keeps it in the metadata of channels/open history', async (t) => {
+    const server = serverWith(t);
+    server.channelManager.register(toDescriptor(G1, 'Guild', { id: ALLOWED, name: 'text-1', type: 'text', label: '#text-1 (Guild)' }));
+    const result = await server.handleChannelOpen({ channelId: mcplChannelId(G1, ALLOWED), type: 'discord', history: { limit: 20 } });
+    assert.equal(result.history?.[0]?.metadata.attachments[0]?.expiresAt, '2026-10-16T01:12:00.000Z');
   });
 });

@@ -17,6 +17,7 @@ import * as assert from 'node:assert/strict';
 import { DiscordMcplServer } from '../src/server.js';
 import type { DiscordAdapter, DiscordAttachment } from '../src/discord-adapter.js';
 import { mapAllAttachments } from '../src/discord-adapter.js';
+import { toolDefinitions } from '../src/tools.js';
 
 const ENV_KEY = 'DISCORD_ATTACHMENT_INLINE_MAX_BYTES';
 
@@ -33,7 +34,7 @@ const EX = (Date.UTC(2026, 9, 16, 1, 12) / 1000).toString(16);
 const EXPIRES = '(link expires 2026-10-16 01:12 UTC)';
 const LINKS_NOTE: Block = {
   type: 'text',
-  text: '[Attachment links expire as marked; fetch_history or fetch_around returns the message with fresh links.]',
+  text: '[Attachment links expire as marked; fetching the message again gives fresh links.]',
 };
 
 function makeAttachment(over: Partial<DiscordAttachment> = {}): DiscordAttachment {
@@ -402,15 +403,53 @@ describe('attachment inline cap (issue #30)', () => {
     }
   });
 
-  it('gives history results each attachment\'s expiry beside its url', () => {
+  it('truncates the expiry to its minute, so the marker never says a link lasts longer than it does', async () => {
+    const ex = (Date.UTC(2026, 9, 16, 1, 12, 59) / 1000).toString(16);
+    const url = `https://cdn.discordapp.example/a1/notes.txt?ex=${ex}&is=def&hm=1`;
+    stubFetch('ok\n');
+    const blocks = await buildBlocks([makeAttachment({ url, size: 3 })]);
+    assert.equal(blocks[0].text, `[attachment: notes.txt (3B) — ${url} (link expires 2026-10-16 01:12 UTC)]\nok\n`);
+  });
+
+  it('adds the refresh line when any marker of a message has an expiry, and dates only those', async () => {
+    const signed = `https://cdn.discordapp.example/a1/one.txt?ex=${EX}&is=def&hm=1`;
+    const unsigned = 'https://cdn.discordapp.example/a2/two.txt';
+    stubFetch('ok\n');
+    for (const order of [[signed, unsigned], [unsigned, signed]]) {
+      const blocks = await buildBlocks(order.map((url, i) => makeAttachment({ id: `a${i}`, name: url.includes('one') ? 'one.txt' : 'two.txt', url, size: 3 })));
+      assert.deepEqual(blocks.map((block) => block.text), [
+        ...order.map((url) => url === signed
+          ? `[attachment: one.txt (3B) — ${signed} ${EXPIRES}]\nok\n`
+          : `[attachment: two.txt (3B) — ${unsigned}]\nok\n`),
+        LINKS_NOTE.text,
+      ], order.join(' then '));
+    }
+  });
+
+  it('gives history results each attachment\'s expiry beside its url, forwarded ones too', () => {
     const signed = `https://cdn.discordapp.example/a1/notes.txt?ex=${EX}&is=def&hm=1`;
     const unsigned = 'https://cdn.discordapp.example/a2/old.txt';
+    const forwarded = `https://cdn.discordapp.example/a3/fwd.txt?ex=${EX}&is=def&hm=3`;
     const attachments = new Map([
       ['a1', { id: 'a1', name: 'notes.txt', url: signed, contentType: 'text/plain', size: 3 }],
       ['a2', { id: 'a2', name: 'old.txt', url: unsigned, contentType: 'text/plain', size: 3 }],
     ]);
-    const mapped = mapAllAttachments({ attachments });
+    const snapshot = { attachments: new Map([['a3', { id: 'a3', name: 'fwd.txt', url: forwarded, contentType: 'text/plain', size: 3 }]]) };
+    const mapped = mapAllAttachments({ attachments, messageSnapshots: new Map([['s1', snapshot]]) as never });
     assert.equal(mapped[0].expiresAt, '2026-10-16T01:12:00.000Z');
     assert.equal('expiresAt' in mapped[1], false, 'no readable ex, no expiresAt');
+    assert.equal(mapped[2].forwardedSnapshotIndex, 1);
+    assert.equal(mapped[2].expiresAt, '2026-10-16T01:12:00.000Z');
+  });
+
+  it('tells the agent in both history tools what expiresAt means', () => {
+    for (const name of ['fetch_history', 'fetch_around']) {
+      const tool = toolDefinitions.find((t) => t.name === name);
+      assert.ok(tool, name);
+      assert.ok(
+        tool.description.includes("An attachment's url is signed by Discord and stops working at its expiresAt, when it has one; fetching the message again returns a fresh one."),
+        `${name}: ${tool.description}`,
+      );
+    }
   });
 });

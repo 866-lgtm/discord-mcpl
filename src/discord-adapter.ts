@@ -2721,9 +2721,10 @@ export function attachmentUrlExpiry(url: string): Date | null {
  *  so merging them here gives a forward's media the same handling as a native
  *  upload. On the live path, images are inlined as blocks, text files are
  *  inlined, and everything else is a name+URL note. The history paths inline
- *  nothing: backscroll and the catch-up list attachments by name, and
- *  fetch_history, fetch_around and channels/open history carry each one with
- *  its URL. The forwarded line's "[N attachments]" count note stays: it tells
+ *  nothing: the backscroll block before a live message and the catch-up list
+ *  attachments by name, and fetch_history, fetch_around and channels/open
+ *  history carry each one with its URL, and its expiresAt when the URL has
+ *  one. The forwarded line's "[N attachments]" count note stays: it tells
  *  the agent which message the media rode in on. */
 export function mapAllAttachments(m: {
   attachments?: { values?(): IterableIterator<unknown> };

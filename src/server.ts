@@ -3799,7 +3799,7 @@ export class DiscordMcplServer {
       }
     }
     if (linksExpire) {
-      blocks.push(textContent('[Attachment links expire as marked; fetch_history or fetch_around returns the message with fresh links.]'));
+      blocks.push(textContent('[Attachment links expire as marked; fetching the message again gives fresh links.]'));
     }
     return blocks;
   }

@@ -54,8 +54,8 @@ const HISTORY_PROVENANCE =
   'authoritative when a label differs.';
 
 const ATTACHMENT_LINKS =
-  " An attachment's url is signed by Discord and stops working at its expiresAt; fetching the " +
-  'message again returns a fresh one.';
+  " An attachment's url is signed by Discord and stops working at its expiresAt, when it has one; " +
+  'fetching the message again returns a fresh one.';
 
 const TARGET_RULE =
   'Give exactly one of messageId or latestFrom; the other may be omitted or null. ';
