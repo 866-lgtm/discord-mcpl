@@ -31,6 +31,7 @@ import {
   type DiscordFilters,
 } from '../src/filters.js';
 import { DiscordMcplServer } from '../src/server.js';
+import { toDmDescriptor } from '../src/channels.js';
 import type { DiscordAdapter, ReactionSummary } from '../src/discord-adapter.js';
 
 const SUPPRESSED_UNICODE = '🛑';
@@ -866,8 +867,11 @@ describe('server integration', () => {
     const noop = () => {};
     s.discord = {
       onMessage: noop, onMessageEdit: noop, onMessageDelete: noop,
-      onChannelCreate: noop, onChannelDelete: noop, onGuildCreate: noop,
-      onChannelAvailable: noop,
+      onChannelCreate: noop, onChannelUpdate: noop, onChannelDelete: noop, onGuildCreate: noop,
+      onGuildRename: noop, onThreadUpdate: noop, onThreadDelete: noop, onThreadsSynced: noop, onGuildDelete: noop, onGuildAvailable: noop,
+      onChannelRefreshed: noop,
+      onChannelStale: noop,
+      refreshStale: async () => {},
       onReaction: (h: (ev: Record<string, unknown>) => void) => { reactionHandler = h; },
     };
     const sent: unknown[] = [];
@@ -879,6 +883,11 @@ describe('server integration', () => {
     (s.setupDiscordForwarding as () => void).call(server);
     assert.ok(reactionHandler, 'reaction handler registered');
     return { handler: reactionHandler!, sent };
+  }
+
+  /** Register a channel with the server, as a message from it would. */
+  function registerChannel(server: DiscordMcplServer, descriptor: unknown): void {
+    (server as unknown as { channelManager: { register(d: unknown): void } }).channelManager.register(descriptor);
   }
 
   const baseEvent = {
@@ -910,6 +919,7 @@ describe('server integration', () => {
     const server = makeServer();
     server.filtersState.applyParsed(withKey());
     const { handler, sent } = wireReactionHandler(server);
+    registerChannel(server, { id: 'discord:g1:chan1', type: 'discord', label: '#chan1', address: { guildId: 'g1', channelId: 'chan1' } });
     const reaction = { ...baseEvent, emoji: HARMLESS, emojiId: null, token: HARMLESS };
     handler({ ...reaction, threadId: 'chan1', threadName: 'design-chat', threadParentName: 'general' });
     handler(reaction);
@@ -926,15 +936,29 @@ describe('server integration', () => {
     assert.equal(inChannel.origin.mcplChannelId, 'discord:g1:chan1');
   });
 
-  it("a reaction in a DM carries the DM's composite channel id, as the DM's messages do", () => {
+  it("a reaction in a registered DM carries the DM's composite channel id, as the DM's messages do", () => {
     const server = makeServer();
     server.filtersState.applyParsed(withKey());
     const { handler, sent } = wireReactionHandler(server);
     ((server as unknown as Record<string, unknown>).reactionChannels as Set<string>).add('dm1');
+    registerChannel(server, toDmDescriptor('dm1', 'alice'));
     handler({ ...baseEvent, channelId: 'dm1', guildId: null, emoji: HARMLESS, emojiId: null, token: HARMLESS });
     const { origin } = (sent[0] as { params: { origin: Record<string, unknown> } }).params;
     assert.equal(origin.guildId, null);
     assert.equal(origin.mcplChannelId, 'discord:dm:dm1');
+  });
+
+  it('a reaction in a channel not registered names no channel, as the origins of its messages do', () => {
+    const server = makeServer();
+    server.filtersState.applyParsed(withKey());
+    const { handler, sent } = wireReactionHandler(server);
+    ((server as unknown as Record<string, unknown>).reactionChannels as Set<string>).add('dm1');
+    handler({ ...baseEvent, emoji: HARMLESS, emojiId: null, token: HARMLESS });
+    handler({ ...baseEvent, channelId: 'dm1', guildId: null, emoji: HARMLESS, emojiId: null, token: HARMLESS });
+    assert.equal(sent.length, 2);
+    for (const s of sent) {
+      assert.equal('mcplChannelId' in (s as { params: { origin: Record<string, unknown> } }).params.origin, false);
+    }
   });
 
   it('withhold-everything posture drops every live reaction event', () => {

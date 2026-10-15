@@ -20,9 +20,7 @@ function fixture(t: TestContext) {
   server.enabledFeatureSets.add('discord.messaging');
   server.subscriptionsLoaded = true;
   server.mutedLoaded = true;
-  server.channelManager.register(toDescriptor('g1', 'Guild', {
-    id: 'chan1', name: 'general', type: 'text', label: '#general (Guild)',
-  }));
+  server.channelManager.register(toDescriptor({ id: 'chan1', guildId: 'g1', guildName: 'Guild', type: 'text', name: 'general' }));
   server.channelManager.open('discord:g1:chan1');
   server.setupDiscordForwarding();
   const resolveChannels: Array<(channel: any) => void> = [];

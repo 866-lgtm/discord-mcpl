@@ -224,8 +224,8 @@ describe('thread fields', () => {
     };
     assert.deepEqual(f.adapter.getCachedChannelMeta('thread-1'), expected, 'from the cache');
     const fetched = t.mock.method(f.client.channels, 'fetch', async () => f.cache.get('thread-1'));
-    assert.deepEqual(await f.adapter.getChannelMeta('thread-1'), expected, 'from Discord');
-    assert.equal((fetched.mock.calls[0]!.arguments[1] as { force?: boolean }).force, false, 'a complete thread is read through the cache');
+    assert.deepEqual(await f.adapter.getChannelMeta('thread-1'), expected, 'through getChannelMeta');
+    assert.equal(fetched.mock.callCount(), 0, 'a complete thread is read from the cache');
     const channel = f.adapter.getCachedChannelMeta('chan-1');
     assert.ok(channel, 'the channel is cached');
     assert.equal('threadId' in channel, false, 'a channel is no thread');
