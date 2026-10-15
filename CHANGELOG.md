@@ -32,6 +32,17 @@ in the git log and PR descriptions.
   upgrade. A message posted in a thread was already filed under the
   thread's own channel id and stays there.
 
+### Added
+
+- **An attachment's URL says when it stops working.** Discord signs each CDN
+  URL with the time it stops working, in the URL's `ex` parameter. An
+  attachment marker whose URL has one now follows it with `(link expires
+  <date> <time> UTC)`, and a message with such markers adds one line saying
+  that fetching the message again gives fresh links. In `fetch_history` and
+  `fetch_around` results, and in `channels/open` history, such an attachment
+  carries `expiresAt` beside its `url`, and both tools' descriptions say
+  what it means. A URL without a readable `ex` gets neither.
+
 ### Fixed
 
 - **Thread fields name the thread a message was posted in.** They were read
@@ -223,6 +234,12 @@ in the git log and PR descriptions.
   one under the id it registered the channel by. "A push names its channel
   (`mcplChannelId`) once it's registered", above, says which channels that
   leaves out.
+- **An inlined image or text attachment's marker now carries the file's URL,
+  as the markers of files that aren't inlined already do.** An inlined image
+  may be resized or re-encoded, and inlined text is decoded as UTF-8, so the
+  URL is the way to the exact bytes. A forwarded attachment that can't be
+  fetched is now marked as forwarded too, as the live path's other markers
+  of a forwarded attachment are.
 
 ## 0.2.0 — 2026-10-13
 
