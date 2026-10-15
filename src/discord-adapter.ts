@@ -133,6 +133,10 @@ export interface DiscordAttachment {
   name: string;
   /** Discord CDN URL (signed; expires after a while). */
   url: string;
+  /** When `url` stops working, as ISO 8601 UTC, read from its signed `ex`
+   *  parameter. Absent when the URL carries no readable one. Fetching the
+   *  message again gives a freshly signed URL. */
+  expiresAt?: string;
   /** MIME type Discord reports, e.g. "image/png", "text/plain; charset=utf-8".
    *  Null when Discord doesn't classify it. */
   contentType: string | null;
@@ -2737,10 +2741,12 @@ function mapAttachments(message: { attachments?: { values?(): IterableIterator<u
   for (const a of coll.values() as IterableIterator<{
     id: string; name: string | null; url: string; contentType: string | null; size: number;
   }>) {
+    const expiry = attachmentUrlExpiry(a.url);
     out.push({
       id: a.id,
       name: a.name ?? a.id,
       url: a.url,
+      ...(expiry ? { expiresAt: expiry.toISOString() } : {}),
       contentType: a.contentType ?? null,
       size: typeof a.size === 'number' ? a.size : 0,
     });
@@ -2748,12 +2754,31 @@ function mapAttachments(message: { attachments?: { values?(): IterableIterator<u
   return out;
 }
 
+/** When a Discord CDN URL stops working: its signed `ex` parameter, Unix
+ *  seconds in hex. Null for a URL without a readable one, so nothing is
+ *  guessed. */
+export function attachmentUrlExpiry(url: string): Date | null {
+  let ex: string | null;
+  try {
+    ex = new URL(url).searchParams.get('ex');
+  } catch {
+    return null;
+  }
+  // Whole hex only: parseInt would read a valid prefix of anything else.
+  if (!ex || !/^[0-9a-f]+$/i.test(ex)) return null;
+  const expiry = new Date(Number.parseInt(ex, 16) * 1000);
+  return Number.isFinite(expiry.getTime()) ? expiry : null;
+}
+
 /** A message's own attachments plus any carried by forwarded snapshots.
  *  Snapshot attachments keep their original CDN URLs (signed like any other),
- *  so merging them here sends a forward's media through the same delivery
- *  path as a native upload — images inlined as blocks, text files inlined,
- *  everything else a name+URL note — on the live path AND both history
- *  paths. The forwarded line's "[N attachments]" count note stays: it tells
+ *  so merging them here gives a forward's media the same handling as a native
+ *  upload. On the live path, images are inlined as blocks, text files are
+ *  inlined, and everything else is a name+URL note. The history paths inline
+ *  nothing: the backscroll block before a live message and the catch-up list
+ *  attachments by name, and fetch_history, fetch_around and channels/open
+ *  history carry each one with its URL, and its expiresAt when the URL has
+ *  one. The forwarded line's "[N attachments]" count note stays: it tells
  *  the agent which message the media rode in on. */
 export function mapAllAttachments(m: {
   attachments?: { values?(): IterableIterator<unknown> };
