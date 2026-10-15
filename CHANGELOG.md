@@ -10,12 +10,18 @@ in the git log and PR descriptions.
 - **An inlined image or text attachment's marker now carries the file's URL,
   as the markers of files that aren't inlined already do.** An inlined image
   may be resized or re-encoded, and inlined text is decoded as UTF-8, so the
-  URL is the way to the exact bytes. It's Discord's signed CDN URL, which
-  stops working about a day after discord-mcpl receives it. After that,
-  `fetch_history` or `fetch_around` returns the message again, with a fresh
-  URL for each attachment. A forwarded attachment that can't be fetched is
-  now marked `(forwarded)` too, as every other marker of a forwarded
-  attachment is.
+  URL is the way to the exact bytes. A forwarded attachment that can't be
+  fetched is now marked `(forwarded)` too, as every other marker of a
+  forwarded attachment is.
+- **An attachment's URL says when it stops working.** Discord signs each CDN
+  URL with the time it stops working. Every attachment marker that carries a
+  URL now follows it with `(link expires <date> <time> UTC)`, read from the
+  URL's own `ex` parameter, and a message whose markers do adds one line
+  saying that `fetch_history` or `fetch_around` returns the message with
+  fresh links. In those tools' results, and in `channels/open` history, each
+  attachment carries `expiresAt` beside its `url`, and both tools'
+  descriptions say what it means. A URL without a readable expiry gets
+  neither.
 
 ## 0.2.0 — 2026-10-13
 

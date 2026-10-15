@@ -48,7 +48,7 @@ import type {
 } from '@animalabs/mcpl-core';
 
 import type { DiscordAdapter, DiscordMessageData, DiscordAttachment, OutgoingFile, ReactionSummary, MessageEventInfo, DmRefusal, DmSendFailure } from './discord-adapter.js';
-import { LATEST_FROM_WINDOW } from './discord-adapter.js';
+import { LATEST_FROM_WINDOW, attachmentUrlExpiry } from './discord-adapter.js';
 import { DM_NOTICE_TEXT, DmNoticeState, resolveDmNoticesPath, type DmNoticeDecision } from './dm-notices.js';
 
 /** How much of a latestFrom target's text its receipt echoes. */
@@ -3712,6 +3712,16 @@ export class DiscordMcplServer {
         ? ''
         : multiSnapshot ? ` (forwarded #${att.forwardedSnapshotIndex})` : ' (forwarded)';
 
+    // A Discord CDN URL is signed and stops working at its `ex` time, so each
+    // marker says when, and the message says once how to get a fresh one.
+    let linksExpire = false;
+    const link = (att: DiscordAttachment) => {
+      const expiry = attachmentUrlExpiry(att.url);
+      if (!expiry) return att.url;
+      linksExpire = true;
+      return `${att.url} (link expires ${expiry.toISOString().slice(0, 16).replace('T', ' ')} UTC)`;
+    };
+
     const inlineCap = this.attachmentInlineMaxBytes;
     const blocks: ContentBlock[] = [];
     for (const att of attachments) {
@@ -3726,17 +3736,17 @@ export class DiscordMcplServer {
           // Declared size is already over the cap — no fetch at all. (A
           // misdeclared small size still gets caught below on actual bytes.)
           blocks.push(textContent(
-            `[attachment: ${att.name}${fwd(att)} (${fmt(att.size)}) over the ${fmt(inlineCap)} inline cap — not inlined: ${att.url}]`,
+            `[attachment: ${att.name}${fwd(att)} (${fmt(att.size)}) over the ${fmt(inlineCap)} inline cap — not inlined: ${link(att)}]`,
           ));
           dbg('attachment:over-inline-cap', { name: att.name, declaredSize: att.size, cap: inlineCap });
         } else if ((isImage || isText) && att.size > fetchBudgetLeft) {
           blocks.push(textContent(
-            `[attachment: ${att.name}${fwd(att)} (${fmt(att.size)}) not inlined — message attachment budget exhausted: ${att.url}]`,
+            `[attachment: ${att.name}${fwd(att)} (${fmt(att.size)}) not inlined — message attachment budget exhausted: ${link(att)}]`,
           ));
           dbg('attachment:budget-exhausted', { name: att.name, size: att.size, budgetLeft: fetchBudgetLeft });
         } else if (isImage) {
           if (att.size > IMAGE_FETCH_CEILING) {
-            blocks.push(textContent(`[image attachment "${att.name}"${fwd(att)} (${fmt(att.size)}) too large to fetch — ${att.url}]`));
+            blocks.push(textContent(`[image attachment "${att.name}"${fwd(att)} (${fmt(att.size)}) too large to fetch — ${link(att)}]`));
           } else {
             fetchBudgetLeft -= att.size;
             const res = await fetchWithTimeout(att.url);
@@ -3748,9 +3758,9 @@ export class DiscordMcplServer {
             const norm = await normalizeImageForInference(raw, att.contentType);
             if (norm) {
               blocks.push({ type: 'image', data: norm.data, mimeType: norm.mimeType } as ContentBlock);
-              blocks.push(textContent(`[image attachment: ${att.name}${fwd(att)} — ${att.url}]`));
+              blocks.push(textContent(`[image attachment: ${att.name}${fwd(att)} — ${link(att)}]`));
             } else {
-              blocks.push(textContent(`[image attachment "${att.name}"${fwd(att)} (${fmt(att.size)}) could not be inlined — ${att.url}]`));
+              blocks.push(textContent(`[image attachment "${att.name}"${fwd(att)} (${fmt(att.size)}) could not be inlined — ${link(att)}]`));
             }
           }
         } else if (isText) {
@@ -3763,7 +3773,7 @@ export class DiscordMcplServer {
             // Declared size said it fit; the wire said otherwise. The cap is
             // a bound on actual bytes, so this degrades to a note too.
             blocks.push(textContent(
-              `[attachment: ${att.name}${fwd(att)} (over the ${fmt(inlineCap)} inline cap; declared ${fmt(att.size)}) — not inlined: ${att.url}]`,
+              `[attachment: ${att.name}${fwd(att)} (over the ${fmt(inlineCap)} inline cap; declared ${fmt(att.size)}) — not inlined: ${link(att)}]`,
             ));
             dbg('attachment:over-inline-cap', {
               name: att.name,
@@ -3772,10 +3782,10 @@ export class DiscordMcplServer {
               misdeclared: true,
             });
           } else {
-            blocks.push(textContent(`[attachment: ${att.name}${fwd(att)} (${fmt(att.size)}) — ${att.url}]\n${text}`));
+            blocks.push(textContent(`[attachment: ${att.name}${fwd(att)} (${fmt(att.size)}) — ${link(att)}]\n${text}`));
           }
         } else {
-          blocks.push(textContent(`[attachment: ${att.name}${fwd(att)} (${ct || 'unknown type'}, ${fmt(att.size)}) — not inlined: ${att.url}]`));
+          blocks.push(textContent(`[attachment: ${att.name}${fwd(att)} (${ct || 'unknown type'}, ${fmt(att.size)}) — not inlined: ${link(att)}]`));
         }
         dbg('attachment', {
           name: att.name,
@@ -3784,9 +3794,12 @@ export class DiscordMcplServer {
           kind: isImage ? 'image' : isText ? 'text' : 'other',
         });
       } catch (err) {
-        blocks.push(textContent(`[attachment: ${att.name}${fwd(att)} — could not fetch (${(err as Error).message}); ${att.url}]`));
+        blocks.push(textContent(`[attachment: ${att.name}${fwd(att)} — could not fetch (${(err as Error).message}); ${link(att)}]`));
         dbg('attachment:failed', { name: att.name, error: (err as Error).message });
       }
+    }
+    if (linksExpire) {
+      blocks.push(textContent('[Attachment links expire as marked; fetch_history or fetch_around returns the message with fresh links.]'));
     }
     return blocks;
   }

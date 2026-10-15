@@ -16,6 +16,7 @@ import * as assert from 'node:assert/strict';
 
 import { DiscordMcplServer } from '../src/server.js';
 import type { DiscordAdapter, DiscordAttachment } from '../src/discord-adapter.js';
+import { mapAllAttachments } from '../src/discord-adapter.js';
 
 const ENV_KEY = 'DISCORD_ATTACHMENT_INLINE_MAX_BYTES';
 
@@ -26,6 +27,14 @@ const PNG = Buffer.from(
 );
 
 type Block = { type: string; text?: string };
+
+/** A signed CDN URL's expiry, as Discord writes it in `ex`: Unix seconds in hex. */
+const EX = (Date.UTC(2026, 9, 16, 1, 12) / 1000).toString(16);
+const EXPIRES = '(link expires 2026-10-16 01:12 UTC)';
+const LINKS_NOTE: Block = {
+  type: 'text',
+  text: '[Attachment links expire as marked; fetch_history or fetch_around returns the message with fresh links.]',
+};
 
 function makeAttachment(over: Partial<DiscordAttachment> = {}): DiscordAttachment {
   return {
@@ -76,19 +85,20 @@ describe('attachment inline cap (issue #30)', () => {
 
   it('keeps the original URL beside inlined text', async () => {
     const body = 'const value = 42;\n';
-    const url = 'https://cdn.discordapp.example/a1/code.ts?ex=abc&is=def&hm=123';
+    const url = `https://cdn.discordapp.example/a1/code.ts?ex=${EX}&is=def&hm=123`;
     stubFetch(body);
     const blocks = await buildBlocks([
       makeAttachment({ name: 'code.ts', url, size: Buffer.byteLength(body) }),
     ]);
     assert.deepEqual(fetchCalls, [url]);
     assert.deepEqual(blocks, [
-      { type: 'text', text: `[attachment: code.ts (18B) — ${url}]\n${body}` },
+      { type: 'text', text: `[attachment: code.ts (18B) — ${url} ${EXPIRES}]\n${body}` },
+      LINKS_NOTE,
     ]);
   });
 
   it('keeps the original URL beside an inlined forwarded image', async () => {
-    const url = 'https://cdn.discordapp.example/a1/pixel.png?ex=abc&is=def&hm=456';
+    const url = `https://cdn.discordapp.example/a1/pixel.png?ex=${EX}&is=def&hm=456`;
     stubFetch(PNG);
     const blocks = await buildBlocks([
       makeAttachment({
@@ -97,44 +107,48 @@ describe('attachment inline cap (issue #30)', () => {
       }),
     ]);
     assert.deepEqual(fetchCalls, [url]);
-    assert.deepEqual(blocks.map((block) => block.type), ['image', 'text']);
-    assert.equal(blocks[1].text, `[image attachment: pixel.png (forwarded) — ${url}]`);
+    assert.deepEqual(blocks.map((block) => block.type), ['image', 'text', 'text']);
+    assert.equal(blocks[1].text, `[image attachment: pixel.png (forwarded) — ${url} ${EXPIRES}]`);
+    assert.deepEqual(blocks[2], LINKS_NOTE);
   });
 
   it('keeps the original URL beside an inlined image that was posted, not forwarded', async () => {
-    const url = 'https://cdn.discordapp.example/a1/pixel.png?ex=abc&is=def&hm=789';
+    const url = `https://cdn.discordapp.example/a1/pixel.png?ex=${EX}&is=def&hm=789`;
     stubFetch(PNG);
     const blocks = await buildBlocks([
       makeAttachment({ name: 'pixel.png', url, contentType: 'image/png', size: PNG.length }),
     ]);
-    assert.deepEqual(blocks.map((block) => block.type), ['image', 'text']);
-    assert.equal(blocks[1].text, `[image attachment: pixel.png — ${url}]`);
+    assert.deepEqual(blocks.map((block) => block.type), ['image', 'text', 'text']);
+    assert.equal(blocks[1].text, `[image attachment: pixel.png — ${url} ${EXPIRES}]`);
+    assert.deepEqual(blocks[2], LINKS_NOTE);
   });
 
   it('marks inlined forwarded text with its URL, numbering the snapshot when there are several', async () => {
     const body = 'hello\n';
-    const first = 'https://cdn.discordapp.example/a1/one.txt?ex=abc&is=def&hm=1';
-    const second = 'https://cdn.discordapp.example/a2/two.txt?ex=abc&is=def&hm=2';
+    const first = `https://cdn.discordapp.example/a1/one.txt?ex=${EX}&is=def&hm=1`;
+    const second = `https://cdn.discordapp.example/a2/two.txt?ex=${EX}&is=def&hm=2`;
     stubFetch(body);
     const single = await buildBlocks([
       makeAttachment({ name: 'one.txt', url: first, size: 6, forwardedSnapshotIndex: 1 }),
     ]);
     assert.deepEqual(single, [
-      { type: 'text', text: `[attachment: one.txt (forwarded) (6B) — ${first}]\n${body}` },
+      { type: 'text', text: `[attachment: one.txt (forwarded) (6B) — ${first} ${EXPIRES}]\n${body}` },
+      LINKS_NOTE,
     ]);
     const several = await buildBlocks([
       makeAttachment({ id: 'a1', name: 'one.txt', url: first, size: 6, forwardedSnapshotIndex: 1 }),
       makeAttachment({ id: 'a2', name: 'two.txt', url: second, size: 6, forwardedSnapshotIndex: 2 }),
     ]);
     assert.deepEqual(several, [
-      { type: 'text', text: `[attachment: one.txt (forwarded #1) (6B) — ${first}]\n${body}` },
-      { type: 'text', text: `[attachment: two.txt (forwarded #2) (6B) — ${second}]\n${body}` },
+      { type: 'text', text: `[attachment: one.txt (forwarded #1) (6B) — ${first} ${EXPIRES}]\n${body}` },
+      { type: 'text', text: `[attachment: two.txt (forwarded #2) (6B) — ${second} ${EXPIRES}]\n${body}` },
+      LINKS_NOTE,
     ]);
   });
 
   it('gives each attachment of one message its own URL', async () => {
-    const imageUrl = 'https://cdn.discordapp.example/a1/pixel.png?ex=abc&is=def&hm=3';
-    const textUrl = 'https://cdn.discordapp.example/a2/notes.txt?ex=abc&is=def&hm=4';
+    const imageUrl = `https://cdn.discordapp.example/a1/pixel.png?ex=${EX}&is=def&hm=3`;
+    const textUrl = `https://cdn.discordapp.example/a2/notes.txt?ex=${EX}&is=def&hm=4`;
     globalThis.fetch = (async (url: string | URL | Request) => {
       fetchCalls.push(String(url));
       return new Response(String(url) === imageUrl ? PNG : 'note\n');
@@ -144,38 +158,43 @@ describe('attachment inline cap (issue #30)', () => {
       makeAttachment({ id: 'a2', name: 'notes.txt', url: textUrl, size: 5 }),
     ]);
     assert.deepEqual(fetchCalls, [imageUrl, textUrl]);
-    assert.deepEqual(blocks.map((block) => block.type), ['image', 'text', 'text']);
-    assert.equal(blocks[1].text, `[image attachment: pixel.png — ${imageUrl}]`);
-    assert.equal(blocks[2].text, `[attachment: notes.txt (5B) — ${textUrl}]\nnote\n`);
+    // One note for the message, after all of its markers.
+    assert.deepEqual(blocks.map((block) => block.type), ['image', 'text', 'text', 'text']);
+    assert.equal(blocks[1].text, `[image attachment: pixel.png — ${imageUrl} ${EXPIRES}]`);
+    assert.equal(blocks[2].text, `[attachment: notes.txt (5B) — ${textUrl} ${EXPIRES}]\nnote\n`);
+    assert.deepEqual(blocks[3], LINKS_NOTE);
   });
 
   it('keeps the URL on the marker of an attachment that could not be fetched', async () => {
-    const url = 'https://cdn.discordapp.example/a1/notes.txt?ex=abc&is=def&hm=5';
+    const url = `https://cdn.discordapp.example/a1/notes.txt?ex=${EX}&is=def&hm=5`;
     globalThis.fetch = (async () => new Response('gone', { status: 404 })) as typeof fetch;
     const blocks = await buildBlocks([makeAttachment({ url, size: 4 })]);
     assert.deepEqual(blocks, [
-      { type: 'text', text: `[attachment: notes.txt — could not fetch (HTTP 404); ${url}]` },
+      { type: 'text', text: `[attachment: notes.txt — could not fetch (HTTP 404); ${url} ${EXPIRES}]` },
+      LINKS_NOTE,
     ]);
   });
 
   it('marks a forwarded attachment that could not be fetched as forwarded', async () => {
-    const url = 'https://cdn.discordapp.example/a1/notes.txt?ex=abc&is=def&hm=6';
+    const url = `https://cdn.discordapp.example/a1/notes.txt?ex=${EX}&is=def&hm=6`;
     globalThis.fetch = (async () => new Response('gone', { status: 404 })) as typeof fetch;
     const blocks = await buildBlocks([makeAttachment({ url, size: 4, forwardedSnapshotIndex: 1 })]);
     assert.deepEqual(blocks, [
-      { type: 'text', text: `[attachment: notes.txt (forwarded) — could not fetch (HTTP 404); ${url}]` },
+      { type: 'text', text: `[attachment: notes.txt (forwarded) — could not fetch (HTTP 404); ${url} ${EXPIRES}]` },
+      LINKS_NOTE,
     ]);
   });
 
   it('keeps the URL on the note of an attachment past the message budget', async () => {
-    const url = 'https://cdn.discordapp.example/a1/huge.png?ex=abc&is=def&hm=7';
+    const url = `https://cdn.discordapp.example/a1/huge.png?ex=${EX}&is=def&hm=7`;
     stubFetch('should never be requested');
     const blocks = await buildBlocks([
       makeAttachment({ name: 'huge.png', url, contentType: 'image/png', size: 41 * 1024 * 1024 }),
     ]);
     assert.equal(fetchCalls.length, 0, 'an attachment past the budget is not fetched');
     assert.deepEqual(blocks, [
-      { type: 'text', text: `[attachment: huge.png (41.0MB) not inlined — message attachment budget exhausted: ${url}]` },
+      { type: 'text', text: `[attachment: huge.png (41.0MB) not inlined — message attachment budget exhausted: ${url} ${EXPIRES}]` },
+      LINKS_NOTE,
     ]);
   });
 
@@ -320,5 +339,78 @@ describe('attachment inline cap (issue #30)', () => {
     ]);
     assert.equal(fetchCalls.length, 0);
     assert.ok(allText(blocks).includes('not inlined'));
+  });
+
+  it("says when each marker's link expires, in every marker form, and how to refresh once", async () => {
+    const at = (name: string) => `https://cdn.discordapp.example/${name}?ex=${EX}&is=def&hm=9`;
+    const responses: Record<string, Response> = {
+      [at('pixel.png')]: new Response(PNG),
+      [at('broken.png')]: new Response('not an image'),
+      [at('gone.png')]: new Response('gone', { status: 404 }),
+      [at('liar.txt')]: new Response('z'.repeat(6000)),
+      [at('small.txt')]: new Response('ok\n'),
+    };
+    globalThis.fetch = (async (url: string | URL | Request) => {
+      fetchCalls.push(String(url));
+      return responses[String(url)] ?? new Response('unexpected', { status: 500 });
+    }) as typeof fetch;
+    const blocks = await buildBlocks([
+      makeAttachment({ id: 'b1', name: 'big.txt', url: at('big.txt'), size: 9000 }),
+      makeAttachment({ id: 'b2', name: 'huge.png', url: at('huge.png'), contentType: 'image/png', size: 41 * 1024 * 1024 }),
+      makeAttachment({ id: 'b3', name: 'large.png', url: at('large.png'), contentType: 'image/png', size: 30 * 1024 * 1024 }),
+      makeAttachment({ id: 'b4', name: 'pixel.png', url: at('pixel.png'), contentType: 'image/png', size: PNG.length }),
+      makeAttachment({ id: 'b5', name: 'broken.png', url: at('broken.png'), contentType: 'image/png', size: 12 }),
+      makeAttachment({ id: 'b6', name: 'liar.txt', url: at('liar.txt'), size: 100 }),
+      makeAttachment({ id: 'b7', name: 'small.txt', url: at('small.txt'), size: 3 }),
+      makeAttachment({ id: 'b8', name: 'song.flac', url: at('song.flac'), contentType: 'audio/flac', size: 4_000_000 }),
+      makeAttachment({ id: 'b9', name: 'gone.png', url: at('gone.png'), contentType: 'image/png', size: 10 }),
+    ]);
+    const markers = blocks.filter((block) => block.type === 'text').map((block) => block.text ?? '');
+    const forms = [
+      ['big.txt', 'over the 5KB inline cap'],
+      ['huge.png', 'budget exhausted'],
+      ['large.png', 'too large to fetch'],
+      ['pixel.png', 'image attachment: pixel.png'],
+      ['broken.png', 'could not be inlined'],
+      ['liar.txt', 'declared 100B'],
+      ['small.txt', 'small.txt (3B)'],
+      ['song.flac', 'audio/flac'],
+      ['gone.png', 'could not fetch'],
+    ];
+    for (const [name, form] of forms) {
+      const marker = markers.find((text) => text.includes(at(name)) && text.includes(form));
+      assert.ok(marker, `no marker for ${name} (${form}): ${markers.join(' | ')}`);
+      assert.ok(marker.includes(`${at(name)} ${EXPIRES}]`), marker);
+    }
+    // The refresh note comes once, last, after every marker.
+    assert.deepEqual(blocks.filter((block) => block.text === LINKS_NOTE.text).length, 1);
+    assert.deepEqual(blocks[blocks.length - 1], LINKS_NOTE);
+  });
+
+  it('says nothing about expiry when a URL has no readable ex', async () => {
+    stubFetch('ok\n');
+    for (const url of [
+      'https://cdn.discordapp.example/a1/notes.txt',
+      'https://cdn.discordapp.example/a1/notes.txt?ex=&is=def',
+      'https://cdn.discordapp.example/a1/notes.txt?ex=nothex&is=def',
+      `https://cdn.discordapp.example/a1/notes.txt?ex=${EX}zz&is=def`,
+      'https://cdn.discordapp.example/a1/notes.txt?ex=1234567890abcdef&is=def',
+      'not a url at all',
+    ]) {
+      const blocks = await buildBlocks([makeAttachment({ url, size: 3 })]);
+      assert.deepEqual(blocks, [{ type: 'text', text: `[attachment: notes.txt (3B) — ${url}]\nok\n` }], url);
+    }
+  });
+
+  it('gives history results each attachment\'s expiry beside its url', () => {
+    const signed = `https://cdn.discordapp.example/a1/notes.txt?ex=${EX}&is=def&hm=1`;
+    const unsigned = 'https://cdn.discordapp.example/a2/old.txt';
+    const attachments = new Map([
+      ['a1', { id: 'a1', name: 'notes.txt', url: signed, contentType: 'text/plain', size: 3 }],
+      ['a2', { id: 'a2', name: 'old.txt', url: unsigned, contentType: 'text/plain', size: 3 }],
+    ]);
+    const mapped = mapAllAttachments({ attachments });
+    assert.equal(mapped[0].expiresAt, '2026-10-16T01:12:00.000Z');
+    assert.equal('expiresAt' in mapped[1], false, 'no readable ex, no expiresAt');
   });
 });
