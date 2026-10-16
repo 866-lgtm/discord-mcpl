@@ -3471,9 +3471,10 @@ export class DiscordMcplServer {
     // A close or mute of this channel from here on, during the lookup or the
     // history fetch, stands over this open.
     const lifecycle = this.lifecycleEpoch(parsed.channelId);
-    const desc = target.kind === 'registered' ? target.channel : await this.registerServedChannel(target, params.type);
-    const result: ChannelOpenResponse = { channel: desc };
+    const lookedUp = target.kind === 'registered' ? null : await this.lookUpServedTarget(target, params.type);
+    const desc = target.kind === 'registered' ? target.channel : lookedUp!.desc;
     const requested = params.history?.limit ?? 0;
+    let backscroll: { messages: Awaited<ReturnType<DiscordAdapter['fetchHistory']>>; truncated: boolean } | null = null;
     if (requested > 0) {
       // Backscroll is a deliberate read, so it respects the channel filters'
       // inspection boundary as fetch_history does. A channel registered
@@ -3513,23 +3514,7 @@ export class DiscordMcplServer {
         );
       }
       messages.sort((a, b) => a.timestamp.getTime() - b.timestamp.getTime());
-      result.history = this.projectHistoryReactions(messages).map((message) => ({
-        channelId: desc.id,
-        // The label at fetch, for the host's header when its registry lacks one.
-        channelLabel: desc.label,
-        messageId: message.id,
-        author: { id: message.authorId, name: message.authorName },
-        timestamp: message.timestamp.toISOString(),
-        content: [textContent(`${message.authorName}: ${message.cleanContent}`)],
-        metadata: {
-          isBot: message.isBot,
-          attachments: message.attachments,
-          reactions: message.reactions ?? [],
-          backscroll: true,
-          ...(message.reactionsUnavailable ? { reactionsUnavailable: true } : {}),
-        },
-      }));
-      result.historyTruncated = requested > limit;
+      backscroll = { messages, truncated: requested > limit };
     }
 
     // Commit the lifecycle only now, after the lookup and any history fetch,
@@ -3542,6 +3527,20 @@ export class DiscordMcplServer {
         `A channels/close or mute_channel for ${desc.id} arrived while this open was in progress, so nothing was opened.`,
       );
     }
+    // A looked-up channel is registered, and announced, only here, so an
+    // open refused before this leaves nothing for the host to act on. One
+    // deleted, or of a guild the bot left, while its history was fetched
+    // isn't served now; one traffic registered meanwhile keeps that
+    // registration.
+    if (lookedUp) {
+      if (this.notServed(parsed.channelId, lookedUp.facts)) {
+        throw new RequestRefusal(
+          ERR_UNKNOWN_CHANNEL,
+          `${desc.id} was deleted, or the bot left its server, while this open was in progress. Nothing was opened.`,
+        );
+      }
+      if (!this.channelManager.get(desc.id)) this.registerChannels([desc]);
+    }
     const opened = this.channelManager.open(desc.id);
     if (!opened) {
       throw new RequestRefusal(
@@ -3549,38 +3548,56 @@ export class DiscordMcplServer {
         `${desc.id} was unregistered while this open was in progress (deleted, archived, or no longer admitted by the filters). Nothing was opened.`,
       );
     }
-    result.channel = opened;
+    const result: ChannelOpenResponse = { channel: opened };
+    if (backscroll) {
+      result.history = this.projectHistoryReactions(backscroll.messages).map((message) => ({
+        channelId: opened.id,
+        // The label the open commits to, for the host's header when its
+        // registry lacks one.
+        channelLabel: opened.label,
+        messageId: message.id,
+        author: { id: message.authorId, name: message.authorName },
+        timestamp: message.timestamp.toISOString(),
+        content: [textContent(`${message.authorName}: ${message.cleanContent}`)],
+        metadata: {
+          isBot: message.isBot,
+          attachments: message.attachments,
+          reactions: message.reactions ?? [],
+          backscroll: true,
+          ...(message.reactionsUnavailable ? { reactionsUnavailable: true } : {}),
+        },
+      }));
+      result.historyTruncated = backscroll.truncated;
+    }
     this.subscribeRawChannel(parsed.channelId);
     return result;
   }
 
   /** An exact id or address the registry doesn't hold (resolveOpenTarget's
-   *  `unregistered`), looked up in Discord. A channel this server serves is
-   *  registered, and announced, now, by the rule every path registers by
-   *  (guildDescriptor), so a DM, thread or channel no traffic has registered
-   *  since a restart still opens. Anything else is refused as unknown,
-   *  lately deleted channels and their threads included, and channels of a
-   *  guild the bot has left, and a channel of another type as bad params. A
-   *  channel whose current facts aren't known (`uncertain`: a stale channel,
-   *  a thread of one, or a lookup Discord gave no answer to) is refused as an
-   *  open that failed, since its facts decide no registration and another
-   *  open fetches it again. An archived thread opens too, since the host
-   *  named it, though the registry otherwise holds only live threads
-   *  (registerGuildDelivery): it stays registered until it's deleted, or
-   *  archived again once a message revives it. */
-  private async registerServedChannel(target: { id: string; via: string }, type: unknown): Promise<ChannelDescriptor> {
+   *  `unregistered`), looked up in Discord. A channel this server serves
+   *  comes back as the descriptor every path registers by (guildDescriptor),
+   *  so a DM, thread or channel no traffic has registered since a restart
+   *  still opens; the open registers it when it commits. Anything else is
+   *  refused as unknown, lately deleted channels and their threads included,
+   *  and channels of a guild the bot has left, and a channel of another type
+   *  as bad params. A channel whose current facts aren't known (`uncertain`:
+   *  a stale channel, a thread of one, or a lookup Discord gave no answer to)
+   *  is refused as an open that failed, since its facts decide no
+   *  registration and another open fetches it again. An archived thread
+   *  opens too, since the host named it, though the registry otherwise holds
+   *  only live threads (registerGuildDelivery). It is forgotten as any
+   *  archived thread is: when it's reported archived again, as a thread
+   *  update or a fetch after it went stale can, or when a sync of its
+   *  channel's threads doesn't list it. */
+  private async lookUpServedTarget(
+    target: { id: string; via: string },
+    type: unknown,
+  ): Promise<{ desc: ChannelDescriptor; facts: ChannelFacts | null }> {
     const parsed = parseMcplChannelId(target.id)!; // resolveOpenTarget hands back only ids that parse
     const found = await this.discord.lookUpServedChannel(parsed.guildId, parsed.channelId);
     // Read after the lookup's waits, as a delivery's registration reads it
-    // (registerGuildDelivery). The bot may have left the guild meanwhile, and
-    // discord.js keeps a channel the guild had stopped listing past the leave.
-    // A thread went with its channel when that was deleted lately, but a
-    // channel outlives its deleted category (deletedLately).
-    const left = found?.kind === 'guild' && !this.discord.hasGuild(found.facts.guildId);
-    const deleted = this.deletedChannels.has(parsed.channelId)
-      || (found?.kind === 'guild' && found.facts.type === 'thread' && !!found.facts.parentId
-        && this.deletedChannels.has(found.facts.parentId));
-    if (!found || left || deleted) {
+    // (registerGuildDelivery).
+    if (!found || this.notServed(parsed.channelId, found.kind === 'guild' ? found.facts : null)) {
       throw new RequestRefusal(
         ERR_UNKNOWN_CHANNEL,
         `No channel this server serves matches ${target.via}: Discord doesn't know it, or it isn't a channel messages ` +
@@ -3597,11 +3614,29 @@ export class DiscordMcplServer {
     const desc = found.kind === 'dm'
       ? toDmDescriptor(parsed.channelId, found.recipientName, false, this.backscrollLimitFor(parsed.channelId), found.recipientId)
       : this.guildDescriptor(found.facts);
+    // The channel opened is the one named, whatever the lookup handed back.
+    if (desc.id !== target.id) {
+      throw new RequestRefusal(
+        ERR_UNKNOWN_CHANNEL,
+        `No channel this server serves matches ${target.via}: looking it up found another channel, ${desc.id}. Nothing was opened.`,
+      );
+    }
     if (desc.type !== type) {
       throw new RequestRefusal(INVALID_PARAMS, `${target.via} is a ${desc.type} channel, not ${typeName(String(type))}. Nothing was opened.`);
     }
-    this.registerChannels([desc]);
-    return desc;
+    return { desc, facts: found.kind === 'guild' ? found.facts : null };
+  }
+
+  /** Whether a channel found by an exact open's lookup isn't one this server
+   *  serves now: deleted lately, a thread of a channel deleted lately, or in
+   *  a guild the bot has left. The bot may leave a guild during the lookup,
+   *  and discord.js keeps a channel the guild had stopped listing past the
+   *  leave. A channel outlives its deleted category (deletedLately). */
+  private notServed(channelId: string, facts: ChannelFacts | null): boolean {
+    if (this.deletedChannels.has(channelId)) return true;
+    if (!facts) return false;
+    return !this.discord.hasGuild(facts.guildId)
+      || (facts.type === 'thread' && !!facts.parentId && this.deletedChannels.has(facts.parentId));
   }
 
   /** How many closes and mutes a Discord channel has had in this process

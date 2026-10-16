@@ -433,6 +433,108 @@ describe("channels/open: an id the registry doesn't hold", () => {
   });
 });
 
+describe("channels/open: a looked-up channel is registered only when the open commits", () => {
+  const late: ChannelFacts = { id: 'c9', guildId: 'g1', guildName: 'Guild', name: 'late', type: 'text' };
+  const lateServed = (guild: string, channel: string): Served | null =>
+    (guild === 'g1' && channel === 'c9' ? { kind: 'guild', facts: late } : null);
+  /** The host's side of the connection, so what's announced can be read. */
+  function announcing(server: unknown) {
+    const sent: Array<{ method: string; params: { added?: Array<{ id: string }> } }> = [];
+    Object.assign(server as object, {
+      mcplEnabled: true,
+      conn: { isClosed: false, sendNotification: (method: string, params: never) => { sent.push({ method, params }); } },
+    });
+    return () => sent.filter((x) => x.method === 'channels/changed').flatMap((x) => x.params.added ?? []).map((d) => d.id);
+  }
+
+  it('registers and announces nothing when its open is refused after the lookup', async () => {
+    // The history fetch fails.
+    const f = fixture([general], { served: lateServed, history: async () => { throw new Error('Service Unavailable'); } });
+    const added = announcing(f.server);
+    await f.refused({ channelId: 'discord:g1:c9', type: 'discord', history: { limit: 5 } }, OPEN_FAILED,
+      /^discord:g1:c9's history couldn't be fetched, so nothing was opened: Service Unavailable$/);
+    assert.equal(f.server.channelManager.get('discord:g1:c9'), undefined, "it isn't registered");
+    assert.deepEqual(added(), [], 'nothing was announced');
+    // A close, or a mute, arrives during the history fetch.
+    for (const during of ['close', 'mute'] as const) {
+      const held = heldHistory();
+      const g = fixture([general], { served: lateServed, history: held.history });
+      const gAdded = announcing(g.server);
+      const open = g.server.handleChannelOpen({ channelId: 'discord:g1:c9', type: 'discord', history: { limit: 5 } });
+      await held.atFetch;
+      if (during === 'close') g.server.handleChannelClose({ channelId: 'discord:g1:c9' });
+      else await g.server.executeToolCall('mute_channel', { channelId: 'c9' });
+      held.release();
+      await assert.rejects(open, (err: Error & { code?: number }) => err.code === OPEN_FAILED, during);
+      assert.equal(g.server.channelManager.get('discord:g1:c9'), undefined, `${during}: it isn't registered`);
+      assert.deepEqual(gAdded(), [], `${during}: nothing was announced`);
+      assert.deepEqual(g.subscribed(), [], `${during}: nothing was subscribed`);
+    }
+  });
+
+  it('registers and announces it once the open commits', async () => {
+    const f = fixture([general], { served: lateServed });
+    const added = announcing(f.server);
+    const res = await f.server.handleChannelOpen({ channelId: 'discord:g1:c9', type: 'discord', history: { limit: 5 } });
+    assert.equal(res.channel.label, '#late (Guild)');
+    assert.deepEqual(added(), ['discord:g1:c9']);
+    assert.equal(f.server.channelManager.isOpen('discord:g1:c9'), true);
+  });
+
+  it('refuses one deleted, or whose server the bot leaves, while its history is fetched, and registers nothing', async () => {
+    for (const during of ['deleted', 'left'] as const) {
+      const held = heldHistory();
+      const f = fixture([general], { served: lateServed, history: held.history });
+      const open = f.server.handleChannelOpen({ channelId: 'discord:g1:c9', type: 'discord', history: { limit: 5 } });
+      await held.atFetch;
+      if (during === 'deleted') (f.server as unknown as { channelDeleted(guildId: string, channelId: string): void }).channelDeleted('g1', 'c9');
+      else f.left.add('g1');
+      held.release();
+      await assert.rejects(open, (err: Error & { code?: number }) =>
+        err.code === UNKNOWN_CHANNEL
+          && err.message === 'discord:g1:c9 was deleted, or the bot left its server, while this open was in progress. Nothing was opened.', during);
+      assert.equal(f.server.channelManager.get('discord:g1:c9'), undefined, `${during}: it isn't registered`);
+      assert.deepEqual(f.subscribed(), [], `${during}: nothing was subscribed`);
+    }
+  });
+
+  it('keeps a registration traffic made during the history fetch, and labels the history by what it commits to', async () => {
+    const held = heldHistory();
+    const f = fixture([general], { served: lateServed, history: held.history });
+    const open = f.server.handleChannelOpen({ channelId: 'discord:g1:c9', type: 'discord', history: { limit: 5 } });
+    await held.atFetch;
+    // A message registers it meanwhile, under the name it has now.
+    f.server.channelManager.register(toDescriptor({ id: 'c9', guildId: 'g1', guildName: 'Guild', name: 'renamed', type: 'text' }));
+    held.release();
+    const res = await open as OpenResult & { history?: Array<{ channelLabel?: string }> };
+    assert.equal(res.channel.label, '#renamed (Guild)');
+    assert.equal(f.server.channelManager.get('discord:g1:c9')?.label, '#renamed (Guild)', 'the registration traffic made stands');
+    assert.equal(res.history?.[0].channelLabel, '#renamed (Guild)');
+  });
+
+  it('labels a registered channel\'s history by its label at commit, when it is relabelled during the fetch', async () => {
+    const held = heldHistory();
+    const f = fixture([general], { history: held.history });
+    const open = f.server.handleChannelOpen({ channelId: 'discord:g1:c1', type: 'discord', history: { limit: 5 } });
+    await held.atFetch;
+    f.server.channelManager.register(toDescriptor({ id: 'c1', guildId: 'g1', guildName: 'Guild', name: 'general-2', type: 'text' }));
+    held.release();
+    const res = await open as OpenResult & { history?: Array<{ channelLabel?: string }> };
+    assert.equal(res.channel.label, '#general-2 (Guild)');
+    assert.equal(res.history?.[0].channelLabel, '#general-2 (Guild)');
+  });
+
+  it("refuses as unknown a lookup that hands back another channel's facts, and registers neither", async () => {
+    const other: ChannelFacts = { id: 'c8', guildId: 'g1', guildName: 'Guild', name: 'other', type: 'text' };
+    const f = fixture([general], { served: (guild, channel) => (channel === 'c9' ? { kind: 'guild', facts: other } : null) });
+    await f.refused({ channelId: 'discord:g1:c9', type: 'discord', history: { limit: 5 } }, UNKNOWN_CHANNEL,
+      /^No channel this server serves matches channelId "discord:g1:c9": looking it up found another channel, discord:g1:c8\. Nothing was opened\.$/);
+    assert.equal(f.server.channelManager.get('discord:g1:c9'), undefined);
+    assert.equal(f.server.channelManager.get('discord:g1:c8'), undefined);
+    f.nothingOpened();
+  });
+});
+
 describe('channels/open: what arrives during the lookup or the history fetch stands', () => {
   it('opens nothing when the channel is unregistered meanwhile', async () => {
     const held = heldHistory();
@@ -602,6 +704,21 @@ describe('the adapter: which channels an exact open may register', () => {
     assert.equal(await adapter.lookUpServedChannel('g1', 'hidden'), null, 'no access');
     failure = Object.assign(new Error('Invalid Form Body'), { status: 400, code: 50035 });
     assert.equal(await adapter.lookUpServedChannel('dm', 'not-a-snowflake'), null, 'a malformed id');
+  });
+
+  it("comes back uncertain for a refusal that isn't about the id, a 401 included, and serves nothing for any 403 or 404", async (t) => {
+    const { adapter, client } = adapterFixture(t, {});
+    let failure: unknown;
+    t.mock.method(client.channels, 'fetch', (async () => { throw failure; }) as never);
+    // The bot's token was revoked or rotated: nothing here says the id is unknown.
+    failure = Object.assign(new Error('401: Unauthorized'), { status: 401, code: 0 });
+    assert.deepEqual(await adapter.lookUpServedChannel('g1', 'c1'), { kind: 'uncertain' }, 'a 401');
+    failure = Object.assign(new Error('Bad Request'), { status: 400, code: 0 });
+    assert.deepEqual(await adapter.lookUpServedChannel('g1', 'c1'), { kind: 'uncertain' }, 'a 400 without Invalid Form Body');
+    failure = Object.assign(new Error('Forbidden'), { status: 403 });
+    assert.equal(await adapter.lookUpServedChannel('g1', 'c1'), null, 'a 403 without a code');
+    failure = Object.assign(new Error('Not Found'), { status: 404 });
+    assert.equal(await adapter.lookUpServedChannel('g1', 'c1'), null, 'a 404 without a code');
   });
 
   it("serves no DM whose recipient the DM list stops admitting while the recipient's name is fetched", async (t) => {

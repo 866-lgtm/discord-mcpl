@@ -46,7 +46,7 @@ import {
   type ResolveResult,
 } from './channel-names.js';
 import { channelLabelFor, mcplChannelId } from './channels.js';
-import { UNKNOWN_CHANNEL } from './discord-errors.js';
+import { INVALID_FORM_BODY, MISSING_ACCESS, UNKNOWN_CHANNEL } from './discord-errors.js';
 
 /** The channels a name resolves among (nameView), with the guilds where
  *  no name resolves while a channel there is stale (uncertainGuildNames),
@@ -1643,14 +1643,16 @@ export class DiscordAdapter {
     try {
       channel = await this.channelById(channelId);
     } catch (err) {
-      // Discord refusing the id (a 4xx: Unknown Channel, Missing Access, a
-      // malformed id's Invalid Form Body) means this server doesn't serve
-      // it. No answer (a 5xx, a timeout, a dropped connection, or a
-      // rejection that isn't Discord's) leaves its facts unknown, and
-      // another open fetches it again.
+      // Discord refusing the id means this server doesn't serve it: Unknown
+      // Channel, Missing Access, a malformed id's Invalid Form Body, or any
+      // other 403 or 404. Anything else leaves its facts unknown, and another
+      // open fetches it again: no answer (a 5xx, a timeout, a dropped
+      // connection, or a rejection that isn't Discord's), and a refusal that
+      // isn't about the id, such as a 401 after the bot's token changed.
       const status = (err as { status?: unknown } | null)?.status;
-      const refused = (err as { code?: unknown } | null)?.code === UNKNOWN_CHANNEL
-        || (typeof status === 'number' && status >= 400 && status < 500);
+      const code = (err as { code?: unknown } | null)?.code;
+      const refused = code === UNKNOWN_CHANNEL || code === MISSING_ACCESS || code === INVALID_FORM_BODY
+        || status === 403 || status === 404;
       dbg('lookUpServedChannel:failed', { channelId, refused, error: err instanceof Error ? err.message : String(err) });
       return refused ? null : { kind: 'uncertain' };
     }
