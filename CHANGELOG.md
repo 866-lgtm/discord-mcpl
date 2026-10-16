@@ -7,6 +7,16 @@ in the git log and PR descriptions.
 
 ### Upgrade notes
 
+- **discord-mcpl now needs Node.js 22.12.0 or later.** If you run it on
+  Node 20, 21, or 22 before 22.12, upgrade Node first. Its `engines` said
+  `>=20.0.0`, but `@discordjs/voice` 0.19, a dependency since #28 and first
+  released in discord-mcpl 0.2.0, declares `>=22.12.0`, so those versions
+  have been outside what that dependency supports since then, and Node 20
+  reached end of life on 2026-04-30. Apart from the Node version it needs,
+  this change alters nothing about the server. On an older Node, npm warns
+  with `EBADENGINE` and installs anyway; with `engine-strict` set, it
+  refuses to install. CI builds on Node 22.12.0 and the newest release on
+  Linux and macOS, and on Node 24 on Linux, and runs the tests on Linux.
 - **`chat:thread` now marks messages posted in a thread, and no longer marks
   a message that started one.** A host gate or filter rule keyed on the tag
   will match different messages after this upgrade: messages inside threads
