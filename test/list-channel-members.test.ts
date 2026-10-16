@@ -83,7 +83,9 @@ function makeAdapter(
   internals.client.destroy();
   internals.client = {
     destroy() {},
-    channels: { fetch: async (id: string) => channels[id] ?? null },
+    // As discord.js's client does: guild channels are in the cache too
+    // (the channel allowlist reads a thread's channel from it).
+    channels: { fetch: async (id: string) => channels[id] ?? null, cache: new Map(Object.entries(channels)) },
     users: { fetch: async () => null },
     user: { id: 'bot_1', username: 'bot', displayName: 'Bot', bot: true },
   } as never;
@@ -92,6 +94,39 @@ function makeAdapter(
 }
 
 // ── Tests ──
+
+describe('listChannelMembers: channel-name freshness', () => {
+  for (const kind of ['guild-channel', 'thread-joined'] as const) {
+    it('omits a stale ' + kind + " name when every channel fetch is overtaken", async () => {
+      const alice = member('u1', 'Alice');
+      const guild = fakeGuild([alice]);
+      const channel = kind === 'guild-channel'
+        ? guildChannel('c1', guild, [alice])
+        : thread('c1', guild, ['u1'], 'parent');
+      const adapter = makeAdapter({ c1: channel, parent: guildChannel('parent', guild, [alice]) });
+      const internals = adapter as unknown as {
+        client: { channels: { fetch(id: string): Promise<unknown> } };
+        overtake(id: string): void;
+        markStale(id: string, guildId: string): void;
+      };
+      internals.markStale('c1', guild.id);
+      let fetches = 0;
+      internals.client.channels.fetch = async (id) => {
+        fetches++;
+        internals.overtake(id);
+        return channel;
+      };
+
+      const result = await adapter.listChannelMembers('c1');
+
+      assert.ok(fetches > 1, 'the lookup retried the overtaken fetch');
+      assert.equal(adapter.isStale('c1'), true);
+      assert.equal(result.channelName, null);
+      assert.equal(result.scope, kind);
+      assert.equal(result.members.length, 1);
+    });
+  }
+});
 
 describe('listChannelMembers: guild channels', () => {
   it('returns the permission-computed viewer list after a successful cache warm', async () => {
@@ -155,6 +190,28 @@ describe('listChannelMembers: channel filters bound inspection', () => {
     const ok = await adapter.listChannelMembers('t_ok');
     assert.equal(ok.scope, 'thread-joined');
     await assert.rejects(adapter.listChannelMembers('t_no'), /channel filters/);
+  });
+
+  it('allows a thread whose channel is admitted only through its listed category; rejects one whose category is not listed', async () => {
+    const alice = member('u1', 'Alice');
+    const g = fakeGuild([alice]);
+    // Only a category is listed. Neither thread's channel is, nor is either
+    // thread, so admission has to come from the channel's own category, read
+    // from the client's channel cache (makeAdapter caches every fixture
+    // channel).
+    const adapter = makeAdapter(
+      {
+        c_in_cat: guildChannel('c_in_cat', g, [alice], 'cat_allowed'),
+        t_in_cat: thread('t_in_cat', g, ['u1'], 'c_in_cat'),
+        c_other_cat: guildChannel('c_other_cat', g, [alice], 'cat_other'),
+        t_other_cat: thread('t_other_cat', g, ['u1'], 'c_other_cat'),
+      },
+      { guildChannels: { g1: ['cat_allowed'] } },
+    );
+    const ok = await adapter.listChannelMembers('t_in_cat');
+    assert.equal(ok.scope, 'thread-joined');
+    assert.deepEqual(ok.members.map((m) => m.displayName), ['Alice']);
+    await assert.rejects(adapter.listChannelMembers('t_other_cat'), /channel filters/);
   });
 });
 

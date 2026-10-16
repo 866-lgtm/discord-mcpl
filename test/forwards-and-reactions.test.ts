@@ -312,6 +312,7 @@ describe('mapAllAttachments (forwarded media rides the normal delivery path)', (
     const mapped = mapAllAttachments(m as never);
     assert.equal(mapped.length, 1);
     assert.equal(mapped[0].name, 'real.png');
+    assert.equal(mapped[0].url, 'https://cdn.discordapp.example/real.png', "the snapshot attachment's own URL");
     assert.equal(mapped[0].contentType, 'image/png');
     assert.equal(mapped[0].forwardedSnapshotIndex, 1);
   });

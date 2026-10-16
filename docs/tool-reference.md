@@ -17,6 +17,8 @@ Discord tools accept Discord channel names/IDs as described above. Framework cha
 
 For Discord message operations, copy the numeric messageId from incoming messages or fetched history and supply its channelId too. Do not guess message IDs.
 
+To reply or react to someone's latest message without copying its ID, reply_message, add_reaction and remove_reaction accept `latestFrom` instead of `messageId`: the author's @username, display name, or numeric user ID (bots included). It targets their newest message (never a system notice such as a pin) among the 100 most recent in that channel, resolved once when the call runs. An ambiguous name returns choices, a name that can't be checked against the channel's members is refused (use the numeric ID), no match in that window is refused, and the result echoes the chosen message (ID, author, time, excerpt). Give exactly one of the two; the other may be omitted or null.
+
 ## Attachments
 
 Discord send/reply/DM tools accept up to 10 local files through their files array. Each item needs an absolute filesystem path on the host, not a workspace mount-prefixed path and not inline base64. Optional name changes the displayed filename; optional description supplies accessibility text. Discord enforces upload-size limits.
@@ -26,3 +28,9 @@ Workspace mount-prefixed paths must first be resolved to the corresponding host 
 The separate portal interface uses inline base64 attachments; that is not the format used by these Discord tools.
 
 Deployments can expose this document through their resident's file-reading tool. Tool definitions do not assume a particular documentation mount exists.
+
+## Channel filters and deliberate reads
+
+The per-guild channel list bounds these reads as well as delivery. `list_channels` leaves a channel outside it out of its listing, and `list_channel_members`, `fetch_history` and `fetch_around` refuse such a channel given by numeric ID, as does a host's `channels/open` that asks for backscroll (it opens the channel without backscroll, which reads nothing). Channel names resolve only among the channels it admits, so an excluded channel isn't found by name either. A thread follows its parent channel. Other tools that take a channel aren't bounded by it; sends aren't.
+
+The other two filters don't restrict deliberate reads. The guild filter decides which guilds' channels are registered, resolvable by name, and delivered. The DM contact list filters incoming DMs.
