@@ -16,6 +16,7 @@ import {
   ChannelType,
   MessageType,
   AttachmentBuilder,
+  SnowflakeUtil,
   type Message,
   type PartialMessage,
   type Channel,
@@ -1178,6 +1179,13 @@ export class DiscordAdapter {
           ? { messageReference: options.replyTo, ...(options.requireReplyTarget ? { failIfNotExists: true } : {}) }
           : undefined,
         files: isLast && attachments.length > 0 ? attachments : undefined,
+        // Each part carries a nonce of its own that Discord enforces: the REST
+        // client sends a part again after a 5xx, a timeout or a reset
+        // connection, and if the first attempt posted, Discord answers a
+        // repeat sent within a few minutes with that message instead of
+        // posting another.
+        nonce: SnowflakeUtil.generate().toString(),
+        enforceNonce: true,
       });
       lastId = sent.id;
     }
@@ -1267,6 +1275,9 @@ export class DiscordAdapter {
         const sent = await user.send({
           content: chunks[i] || undefined,
           files: isLast && attachments.length > 0 ? attachments : undefined,
+          // An enforced nonce for each part, as sendMessage gives.
+          nonce: SnowflakeUtil.generate().toString(),
+          enforceNonce: true,
         });
         lastId = sent.id;
       }

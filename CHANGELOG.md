@@ -250,6 +250,13 @@ in the git log and PR descriptions.
   URL is the way to the exact bytes. A forwarded attachment that can't be
   fetched is now marked as forwarded too, as the live path's other markers
   of a forwarded attachment are.
+- **A message the REST client sends again no longer posts twice.** The REST
+  client sends a request again after a 5xx, a timeout or a reset connection,
+  so a message whose first attempt posted, and whose answer was lost, could
+  post a second copy. Each message sent by `send_message`, `reply_message`,
+  `send_dm` or a host's `channels/publish`, and each part of one sent in
+  parts, now carries a nonce of its own, which Discord enforces: it answers
+  a repeat sent within a few minutes with the message it already made.
 
 ## 0.2.0 — 2026-10-13
 
