@@ -306,13 +306,8 @@ test('VoiceOutput ends a failed utterance, stops its synthesis and reports it as
 
 test('an item refused before clearance bills nothing and reports how long it was queued', (t) => {
   // The test drives Date, so the queued time is exact rather than a real
-  // wait read back on the wall clock. node:test mocks Date from Node 20.11.
-  try {
-    t.mock.timers.enable({ apis: ['Date'], now: 1_700_000_000_000 });
-  } catch {
-    t.skip("node:test's mock timers can't mock Date before Node 20.11");
-    return;
-  }
+  // wait read back on the wall clock.
+  t.mock.timers.enable({ apis: ['Date'], now: 1_700_000_000_000 });
   const provider = new FakeProvider();
   const sink = new FakeSink();
   const out = new VoiceOutput({ textChannels: null }, provider, { voiceId: 'v1' }, sink, () => {});

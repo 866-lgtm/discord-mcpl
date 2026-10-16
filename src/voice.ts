@@ -803,8 +803,8 @@ export class DiscordVoiceSink implements PcmSink {
   }
 
   /** A signal that fires after `ms`, or when `yielded` does, whichever is
-   *  first. (AbortSignal.any would say this, but it arrived in Node 20.3, and
-   *  the engines floor is 20.0.) Call `done` once the wait is over. */
+   *  first. Call `done` once the wait is over: it clears the timer and the
+   *  listener. */
   private static waitSignal(ms: number, yielded: AbortSignal): { signal: AbortSignal; done: () => void } {
     const deadline = new AbortController();
     const onYield = () => deadline.abort();

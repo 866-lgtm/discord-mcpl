@@ -7,7 +7,7 @@
 import { describe, it } from 'node:test';
 import * as assert from 'node:assert/strict';
 import { ChannelType, type Client } from 'discord.js';
-import { DiscordAdapter, type DmSendFailure } from '../src/discord-adapter.js';
+import { DiscordAdapter, type ChannelFacts, type DmSendFailure } from '../src/discord-adapter.js';
 import { DiscordMcplServer } from '../src/server.js';
 import { toDescriptor, toDmDescriptor } from '../src/channels.js';
 import { toolDefinitions } from '../src/tools.js';
@@ -21,17 +21,30 @@ type Meta = { name: string | null; guildId: string | null; guildName: string | n
 
 function fixture(opts: {
   cached?: Record<string, Meta>;
+  /** What the cache knows of a channel, where a test says; otherwise a
+   *  cached guild channel is a text channel by its cached names. */
+  facts?: Record<string, ChannelFacts | null>;
   names?: Record<string, string>;
   dmRecipients?: Record<string, string>;
 } = {}) {
+  const cachedFacts = (id: string): ChannelFacts | null => {
+    if (opts.facts && id in opts.facts) return opts.facts[id];
+    const m = opts.cached?.[id];
+    return m?.guildId ? { id, guildId: m.guildId, guildName: m.guildName, type: 'text', name: m.name, parentId: null, parentName: null, archived: false } : null;
+  };
   const sent: Array<{ channelId: string; options?: unknown }> = [];
   const adapter = {
     botUserId: 'bot',
+    refreshStale: async () => {},
     resolveChannelRef: (given: string) => {
       const id = opts.names?.[given];
       return id ? { ok: true, id } : { ok: false, message: `unknown ${given}` };
     },
     getCachedChannelMeta: (id: string) => opts.cached?.[id] ?? null,
+    getCachedChannelFacts: cachedFacts,
+    isStale: () => false,
+    getCachedChannelFactsFor: (ids: Iterable<string>) =>
+      new Map([...ids].flatMap((id) => { const f = cachedFacts(id); return f ? [[id, f] as const] : []; })),
     getCachedDmRecipientName: (id: string) => opts.dmRecipients?.[id] ?? null,
     // #65's read gate: no channel filters are configured here.
     async inspectionRefusal() { return null; },
@@ -71,7 +84,7 @@ function fixture(opts: {
 describe('fetched history names its channel on every item', () => {
   it('stamps each message, consecutive ones included, with the registry label', async () => {
     const f = fixture({ cached: { '110000000000000001': { name: 'general', guildId: 'g1', guildName: 'Guild One', isDM: false } } });
-    f.server.channelManager.register(toDescriptor('g1', 'Guild One', { id: '110000000000000001', name: 'general', type: 'text', label: '#general (Guild One)' }));
+    f.server.channelManager.register(toDescriptor({ id: '110000000000000001', guildId: 'g1', guildName: 'Guild One', type: 'text', name: 'general' }));
     const items = await f.call('fetch_history', { channelId: '110000000000000001' });
     assert.equal(items.length, 2);
     for (const m of items) {
@@ -112,30 +125,35 @@ describe('fetched history names its channel on every item', () => {
   });
 });
 
-describe('a thread is named by its own name, in its guild', () => {
-  it('stamps history and a send receipt from the adapter\'s metadata for a cached thread', async (t) => {
+describe('an unregistered thread is labelled as a thread, never by a channel\'s address', () => {
+  it('stamps history and a send receipt with its display label, from what the cache holds', async (t) => {
     const real = new DiscordAdapter({ token: 'unused' });
     const client = (real as unknown as { client: Client }).client;
     t.after(() => client.destroy());
     const THREAD = '145000000000000045';
-    (client.channels.cache as unknown as Map<string, unknown>).set(THREAD, {
+    const cache = client.channels.cache as unknown as Map<string, unknown>;
+    cache.set('110000000000000001', { id: '110000000000000001', type: ChannelType.GuildText, name: 'general', guildId: 'g1' });
+    cache.set(THREAD, {
       id: THREAD, type: ChannelType.PublicThread, name: 'standup', guildId: 'g1', parentId: '110000000000000001',
       guild: { name: 'Guild One' },
     });
+    (client.guilds.cache as unknown as Map<string, unknown>).set('g1', { id: 'g1', name: 'Guild One' });
     const meta = real.getCachedChannelMeta(THREAD);
-    assert.deepEqual(meta, { name: 'standup', guildId: 'g1', guildName: 'Guild One', isDM: false });
-    const f = fixture({ cached: { [THREAD]: meta as Meta } });
+    const f = fixture({ cached: { [THREAD]: meta as Meta }, facts: { [THREAD]: real.getCachedChannelFacts(THREAD) } });
     const items = await f.call('fetch_history', { channelId: THREAD });
-    assert.equal(items[0].source, `[source: discord:g1:${THREAD} · #standup (Guild One)]`);
+    // Not `#standup (Guild One)`: that is a channel's address, and would
+    // paste back as a same-named channel.
+    assert.equal(items[0].channelLabel, '#general › standup (Guild One)');
+    assert.equal(items[0].source, `[source: discord:g1:${THREAD} · #general › standup (Guild One)]`);
     const send = await f.call('send_message', { channelId: THREAD, content: 'hi' });
-    assert.deepEqual(send, { messageId: '700', channelId: `discord:g1:${THREAD}`, discordChannelId: THREAD, channelLabel: '#standup (Guild One)' });
+    assert.deepEqual(send, { messageId: '700', channelId: `discord:g1:${THREAD}`, discordChannelId: THREAD, channelLabel: '#general › standup (Guild One)' });
   });
 });
 
 describe('the registry label wins over one built from cached names', () => {
   it('labels a guild channel with its registered label when the two differ, as the host labels its inbound messages', async () => {
     const f = fixture({ cached: { '110000000000000001': { name: 'general-renamed', guildId: 'g1', guildName: 'Guild One', isDM: false } } });
-    f.server.channelManager.register(toDescriptor('g1', 'Guild One', { id: '110000000000000001', name: 'general', type: 'text', label: '#general (Guild One)' }));
+    f.server.channelManager.register(toDescriptor({ id: '110000000000000001', guildId: 'g1', guildName: 'Guild One', type: 'text', name: 'general' }));
     const items = await f.call('fetch_history', { channelId: '110000000000000001' });
     assert.equal(items[0].channelLabel, '#general (Guild One)');
     assert.equal(items[0].source, '[source: discord:g1:110000000000000001 · #general (Guild One)]');
@@ -390,7 +408,7 @@ describe('a failed or uncertain send still names where it was aimed', () => {
 describe('channels/open backscroll items carry their label for the host header', () => {
   it('adds channelLabel beside the canonical channelId, with no header text in the body', async () => {
     const f = fixture();
-    f.server.channelManager.register(toDescriptor('g1', 'Guild One', { id: '110000000000000001', name: 'general', type: 'text', label: '#general (Guild One)' }));
+    f.server.channelManager.register(toDescriptor({ id: '110000000000000001', guildId: 'g1', guildName: 'Guild One', type: 'text', name: 'general' }));
     const res = await f.server.handleChannelOpen({ channelId: 'discord:g1:110000000000000001', type: 'discord', history: { limit: 5 } });
     assert.equal(res.history?.[0].channelId, 'discord:g1:110000000000000001');
     assert.equal(res.history?.[0].channelLabel, '#general (Guild One)');
