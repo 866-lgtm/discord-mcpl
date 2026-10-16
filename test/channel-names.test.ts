@@ -22,6 +22,8 @@ const SEPARATRIX_GENERAL = ch('100000000000000001', 'general', 'g1', 'Separatrix
 const ANIMA_GENERAL = ch('100000000000000002', 'general', 'g2', 'Anima Mundi');
 const KITCHEN = ch('100000000000000003', 'kitchen-table', 'g1', 'Separatrix');
 const CANDIDATES = [SEPARATRIX_GENERAL, ANIMA_GENERAL, KITCHEN];
+const BY_ID = "list_channels shows a server's channels with their ids, and a channel of any other kind, such as a " +
+  'category or a forum, is given by its id instead.';
 
 describe('isSnowflake', () => {
   it('accepts 17-20 digit ids', () => {
@@ -124,16 +126,30 @@ describe('resolveChannelName', () => {
 
   it('distinguishes wrong-guild from no-such-channel', () => {
     const r = resolveChannelName({ name: 'general', guild: 'Nowhere' }, CANDIDATES);
-    assert.ok(!r.ok);
-    assert.equal(r.reason, 'not-found');
-    assert.match(r.message, /exists elsewhere/);
-    assert.match(r.message, /Separatrix/);
+    assert.deepEqual(r, {
+      ok: false,
+      reason: 'not-found',
+      message: 'No text, announcement, voice or stage channel that the configured channel filters allow is named #general ' +
+        'in a guild named "Nowhere", and a #name reaches only those. That name exists elsewhere: ' +
+        `#general (Separatrix), #general (Anima Mundi). ${BY_ID}`,
+    });
   });
 
-  it('reports not-found for an unknown name', () => {
-    const r = resolveChannelName({ name: 'no-such-room' }, CANDIDATES);
-    assert.ok(!r.ok);
-    assert.equal(r.reason, 'not-found');
+  it('reports not-found for an unknown name, saying what a #name reaches and how other channels are given', () => {
+    // A typo, and a name in a guild that has none by it, among the
+    // candidates, which are only channels a #name reaches.
+    assert.deepEqual(resolveChannelName({ name: 'genral' }, CANDIDATES), {
+      ok: false,
+      reason: 'not-found',
+      message: 'No text, announcement, voice or stage channel that the configured channel filters allow is named #genral, ' +
+        `and a #name reaches only those. ${BY_ID}`,
+    });
+    assert.deepEqual(resolveChannelName({ name: 'plans', guild: 'Separatrix' }, CANDIDATES), {
+      ok: false,
+      reason: 'not-found',
+      message: 'No text, announcement, voice or stage channel that the configured channel filters allow is named #plans ' +
+        `in "Separatrix", and a #name reaches only those. ${BY_ID}`,
+    });
   });
 
   it('does no fuzzy matching', () => {
