@@ -3480,18 +3480,23 @@ export class DiscordMcplServer {
       // inspection boundary as fetch_history does. A channel registered
       // before the filters narrowed stays registered until restart, so the
       // registry alone doesn't keep it out. A refusal fails the open before
-      // anything is read or subscribed.
+      // anything is read or subscribed, and again after the fetch: the
+      // filters file is reloaded on a timer, so the filters can narrow while
+      // the history is fetched, and nothing they no longer admit is returned
+      // (as resolveLatestFrom checks again after its reads).
       // Both answers say the open couldn't go ahead (MCPL's open failed),
       // as a failed history fetch does.
-      let refusal: string | null;
-      try {
-        refusal = await this.discord.inspectionRefusal(parsed.channelId);
-      } catch (err) {
-        throw new RequestRefusal(
-          ERR_CHANNEL_OPEN_FAILED,
-          `${desc.id} couldn't be checked against the channel filters, so nothing was opened: ${errorText(err)}`,
-        );
-      }
+      const filtersRefusal = async (): Promise<string | null> => {
+        try {
+          return await this.discord.inspectionRefusal(parsed.channelId);
+        } catch (err) {
+          throw new RequestRefusal(
+            ERR_CHANNEL_OPEN_FAILED,
+            `${desc.id} couldn't be checked against the channel filters, so nothing was opened: ${errorText(err)}`,
+          );
+        }
+      };
+      const refusal = await filtersRefusal();
       if (refusal) {
         dbg('channel-open:inspection-refused', { channelId: desc.id });
         throw new RequestRefusal(ERR_CHANNEL_OPEN_FAILED, `${refusal} Nothing was opened.`);
@@ -3511,6 +3516,13 @@ export class DiscordMcplServer {
         throw new RequestRefusal(
           ERR_CHANNEL_OPEN_FAILED,
           `${desc.id}'s history couldn't be fetched, so nothing was opened: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+      if (await filtersRefusal()) {
+        dbg('channel-open:inspection-refused-after-fetch', { channelId: desc.id });
+        throw new RequestRefusal(
+          ERR_CHANNEL_OPEN_FAILED,
+          `The channel filters stopped admitting ${desc.id} while its history was fetched, so none of it is returned. Nothing was opened.`,
         );
       }
       messages.sort((a, b) => a.timestamp.getTime() - b.timestamp.getTime());

@@ -217,7 +217,7 @@ describe('channels/open backscroll', () => {
     }
     const opened = (id: string) =>
       server.channelManager.isOpen(mcplChannelId(G1, id)) || server.subscribedChannels.has(id);
-    return { server, reads, opened };
+    return { server, adapter, reads, opened };
   }
 
   it('refuses backscroll from an excluded channel, and a thread under one, before anything is read, opened or changed', async (t) => {
@@ -245,6 +245,33 @@ describe('channels/open backscroll', () => {
       assert.equal(server.forwardedWatermark.get(id), '1', `${id}: the watermark is unchanged`);
     }
     assert.deepEqual(reads, [], 'no history was read');
+  });
+
+  it('refuses backscroll from a channel the filters stop admitting while its history is fetched, and opens nothing', async (t) => {
+    const { server, adapter, opened } = serverWith(t);
+    const a = adapter as unknown as {
+      fetchHistory(channelId: string): Promise<unknown[]>;
+      updateFilters(filters: { guildChannels?: Record<string, string[]> }): unknown;
+    };
+    const fetch = a.fetchHistory;
+    a.fetchHistory = async (channelId: string) => {
+      const messages = await fetch(channelId);
+      // The filters file is reloaded meanwhile, without the channel.
+      a.updateFilters({ guildChannels: { [G1]: [CATEGORY] } });
+      return messages;
+    };
+    await assert.rejects(
+      server.handleChannelOpen({ channelId: mcplChannelId(G1, ALLOWED), type: 'discord', history: { limit: 20 } }),
+      (err: Error & { code?: unknown }) => {
+        assert.equal(err.code, -32024);
+        assert.equal(
+          err.message,
+          `The channel filters stopped admitting ${mcplChannelId(G1, ALLOWED)} while its history was fetched, so none of it is returned. Nothing was opened.`,
+        );
+        return true;
+      },
+    );
+    assert.equal(opened(ALLOWED), false, 'neither open nor subscribed');
   });
 
   it('fails the open with a failed channel lookup, before anything is read or opened', async (t) => {

@@ -102,6 +102,12 @@ in the git log and PR descriptions.
   a 401 after the bot's token changed; every try is overtaken by a change; or
   a thread's stale channel can't be fetched fresh) is refused as an open that
   failed, and another open looks it up again.
+- **`channels/open` returns no backscroll from a channel the filters stop
+  admitting while its history is fetched (#94).** The filters file is
+  reloaded on a timer, so it can narrow during the fetch. The open checked the
+  filters only before fetching, and returned what it fetched. It now checks
+  them again after the fetch and refuses as an open that failed (`-32024`),
+  with nothing returned, opened or subscribed.
 - **Thread fields name the thread a message was posted in.** They were read
   from discord.js `message.thread`, which is the thread a message *started*,
   so a message that had spawned a thread was tagged `chat:thread`, rendered
