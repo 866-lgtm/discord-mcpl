@@ -283,22 +283,15 @@ test('socket died while queued: flush reopens a fresh stream and resends the ban
   assert.deepEqual(provider.streams[1]!.sent, ['resent text']);
 });
 
-/** Drive setTimeout and Date together from a fixed epoch, or skip: node:test
- *  mocks Date from Node 20.11, and the package allows Node 20.0. On the real
- *  clock the hold timer runs on the event loop's cached time, in whole
+/** Drive setTimeout and Date together from a fixed epoch. On the real clock
+ *  the hold timer runs on the event loop's cached time, in whole
  *  milliseconds, so it can fire before Date.now() has moved by its delay. */
-function mockClock(t: TestContext): boolean {
-  try {
-    t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 1_700_000_000_000 });
-    return true;
-  } catch {
-    t.skip("node:test's mock timers can't mock Date before Node 20.11");
-    return false;
-  }
+function mockClock(t: TestContext): void {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 1_700_000_000_000 });
 }
 
 test('maxHold expiry: dropped unspoken with an expired receipt, zero billed', (t) => {
-  if (!mockClock(t)) return;
+  mockClock(t);
   const provider = new FakeProvider();
   const sink = new FakeSink();
   const out = new VoiceOutput({ textChannels: null, maxHoldMs: 20 }, provider, VOICE, sink, () => {});
@@ -329,7 +322,7 @@ test('maxHold expiry: dropped unspoken with an expired receipt, zero billed', (t
 });
 
 test('an expiry the event loop runs late reports the time the utterance actually waited', (t) => {
-  if (!mockClock(t)) return;
+  mockClock(t);
   const provider = new FakeProvider();
   const sink = new FakeSink();
   const out = new VoiceOutput({ textChannels: null, maxHoldMs: 20 }, provider, VOICE, sink, () => {});
