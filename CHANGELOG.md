@@ -7,19 +7,16 @@ in the git log and PR descriptions.
 
 ### Upgrade notes
 
-- **`fetch_history` and `fetch_around` now refuse a channel id that the
-  configured channel list (`guildChannels`) excludes, and so does a host's
-  `channels/open` that asks for backscroll from such a channel.** An open
-  without backscroll still opens it, since it reads nothing. A resident
-  that reads such a channel by its numeric id today (following a pasted
-  message link, say) will get a refusal naming the channel filters, and
-  nothing is read. The refusal is deliberate: it is the boundary
-  `list_channels` and `list_channel_members` already apply (see the
-  `fetch_history` entry under Fixed). To let a residence read the channel,
-  admit it in `guildChannels`, directly or through its parent (a thread's
-  channel, a channel's category). The same list bounds delivery, so that
-  admits it for delivery too. Guilds without a `guildChannels` entry, and
-  DMs, are unaffected.
+- **discord-mcpl now needs Node.js 22.12.0 or later.** If you run it on
+  Node 20, 21, or 22 before 22.12, upgrade Node first. Its `engines` said
+  `>=20.0.0`, but `@discordjs/voice` 0.19, a dependency since #28 and first
+  released in discord-mcpl 0.2.0, declares `>=22.12.0`, so those versions
+  have been outside what that dependency supports since then, and Node 20
+  reached end of life on 2026-04-30. Apart from the Node version it needs,
+  this change alters nothing about the server. On an older Node, npm warns
+  with `EBADENGINE` and installs anyway; with `engine-strict` set, it
+  refuses to install. CI builds on Node 22.12.0 and the newest release on
+  Linux and macOS, and on Node 24 on Linux, and runs the tests on Linux.
 - **`chat:thread` now marks messages posted in a thread, and no longer marks
   a message that started one.** A host gate or filter rule keyed on the tag
   will match different messages after this upgrade: messages inside threads
@@ -44,6 +41,273 @@ in the git log and PR descriptions.
   other messages. This change doesn't move what a host filed before the
   upgrade. A message posted in a thread was already filed under the
   thread's own channel id and stays there.
+
+### Added
+
+- **An attachment's URL says when it stops working.** Discord signs each CDN
+  URL with the time it stops working, in the URL's `ex` parameter. An
+  attachment marker whose URL has one now follows it with `(link expires
+  <date> <time> UTC)`, and a message with such markers adds one line saying
+  that fetching the message again gives fresh links. In `fetch_history` and
+  `fetch_around` results, and in `channels/open` history, such an attachment
+  carries `expiresAt` beside its `url`, and both tools' descriptions say
+  what it means. A URL without a readable `ex` gets neither.
+
+### Fixed
+
+- **`channels/open` opens exactly the channel it was asked for.** A stale or
+  unknown `channelId` used to fall through to the first registered channel of
+  the same type, so a host could open, subscribe to, and receive history from
+  a different channel than it named. Now `channelId` is the exact selector.
+  agent-framework's `ChannelsOpenParams` gives it as the exact registered id,
+  preferred over type and address matching (MCPL's SPEC gives `channels/open`
+  no `channelId`), and this server reads it strictly: a `channelId` alone
+  selects, and an `address` beside it isn't read; without a `channelId`, an
+  `address` naming a guildId and a channelId selects. Either names exactly one
+  channel or is refused: an id the registry doesn't hold is looked up in
+  Discord, and opened (and registered, by the rule every other path registers
+  by) when it's a channel messages are posted in (text, announcement, voice or
+  stage), a thread, or a DM, that the filters admit, so a DM or thread after a
+  restart still opens. An archived thread opens too, since the host named it.
+  Any other id is refused, a lately deleted channel, a thread of one, and a
+  channel of a guild the bot has left included, whatever an address beside it
+  says. A channel outlives its deleted category. A request with no selector
+  (`channelId` absent or null, and `address` absent, null or `{}`) opens the
+  one registered channel of its type, DMs and threads counted, and is refused
+  when there are none or several; a refusal over several lists the first ten
+  and points to `channels/list` for the rest. `type`, which MCPL requires,
+  must be a non-empty string on every request and must match the channel
+  opened, so a registered `channelId` with a different `type` is refused too.
+  An empty-string `channelId`, which used to be read as absent, is refused,
+  and address ids must be strings. Refusals carry MCPL's codes: unknown
+  channel (`-32023`), invalid params (`-32602`), or open failed (`-32024`,
+  when the lookup can't get the channel's current facts, the history fetch
+  fails, the channel filters refuse reading its history or can't be checked,
+  or a `channels/close` or `mute_channel` for the channel arrives while the
+  open is in progress, its lookup included). No history is fetched, and
+  nothing is opened or subscribed, before a request names its channel, and a
+  channel unregistered while the open is in progress isn't opened.
+  `sinceLastSeen` reads the persisted watermark even on the first open after a
+  restart, before anything else has loaded it. An id the registry doesn't hold
+  is looked up as every fetch past the cache is: Discord's Unknown Channel
+  there is a deletion, and an id Discord refuses (Missing Access, or a
+  malformed id) is unknown. An id whose current facts can't be had (Discord
+  gives no answer, every try is overtaken by a change, or a thread's stale
+  channel can't be fetched fresh) is refused as an open that failed, and
+  another open looks it up again.
+- **Thread fields name the thread a message was posted in.** They were read
+  from discord.js `message.thread`, which is the thread a message *started*,
+  so a message that had spawned a thread was tagged `chat:thread`, rendered
+  as `thread "…"`, and sent to the host with that thread's id as its MCPL
+  `threadId`, while messages actually posted in a thread carried none. Now a
+  message posted in a thread is tagged `chat:thread` and located as
+  `[#parent thread "name" …]`, and a message that started a thread, in a
+  text or announcement channel, carries no thread fields. A forum post's
+  first message is posted in the post itself, which is a thread, so it is
+  marked as in that thread like the replies under it. MCPL `threadId` (a
+  thread *within* a channel) is no longer sent: a Discord thread is its own
+  channel, already named by `channelId`, so a host keying conversations by
+  thread no longer splits one channel in two. Instead a thread message
+  carries `threadName` (the thread's name) and `threadParentName` (the
+  channel it hangs off, new), each left out when it isn't known: in the
+  `channels/incoming` metadata, in a push's origin, and in the origins of
+  its edits and deletions, which are tagged `chat:thread` too, and of
+  reactions to it, which keep their own tags only, so a gate rule keyed on
+  `chat:thread` doesn't start matching them. A thread the client knew only
+  partly is looked up first, past discord.js's cache, so its messages, and
+  their edits, deletions and reactions, are named as any other thread's;
+  each waits for that lookup before it is delivered, as a create already
+  did. If the lookup fails, the channel filters decide on what is known,
+  and what they let through goes unnamed (a message or an edit or deletion
+  still tagged `chat:thread`).
+- **The reconnect sweep names a thread as the live path does.** A thread's
+  missed messages were headed `<missed channel="#<thread name>" …>`, as if
+  the thread were a channel of its own name, and pushed without tags. The
+  header now reads `<missed channel="#<parent>" thread="<name>" …>`, or
+  `thread="<name>"` alone when the parent isn't known, with the thread's id
+  for a name it lacks. Each name is quoted and escaped by `quotedValue`, as
+  the live location escapes a name it quotes. The push carries `chat:thread`
+  and the thread's fields, a thread the client knew only partly is looked up
+  first, and every sweep push, a DM's included, now carries the
+  `mcplChannelId` a live push's origin carries. The sweep's failed lookup of
+  any channel now reaches stderr, where before only the debug log had it.
+- **Every channel messages are posted in is registered, threads included,
+  by one rule, and the host is told of each change.** Boot and channel
+  events registered guild text channels only: never a thread (a Discord
+  thread is its own channel), an announcement channel or a voice channel's
+  text chat. Such a channel couldn't be opened, and a host that routes
+  speech by a channel's declaration (MCPL RFC-011) held a resident's
+  plain-speech replies in it as drafts.
+  - **Listing** (boot, a channel's creation or change, a server joined,
+    `refresh_channels`) registers the text, announcement, voice and stage
+    channels the filters admit; never a category or forum, which hold no
+    messages of their own. A stage channel, which had no kind of its own, is
+    now `stage`: its text chat takes messages, and a name resolves to it as
+    to a voice channel.
+  - **A thread is registered by its messages:** before its first message
+    reaches the host, live or caught up by the reconnect sweep, or before an
+    edit or deletion there does. discord.js delivers no edit or deletion
+    from a thread its cache doesn't hold, such as one archived before a
+    restart, as before. An archived thread is forgotten, and a
+    message posted after the archive, which unarchives it, registers it
+    again, so the host holds the live threads. A message posted before the
+    archive, still on its way when the archive came, doesn't.
+  - **Removals are followed.** A deleted thread is forgotten, and so is a
+    deleted channel with the threads it's known to hold, registered or
+    cached. So is a channel Discord answers with Unknown Channel, when a
+    thread is looked up or the reconnect sweep fetches it. Every channel of a
+    server the bot leaves or is removed from is forgotten too; if the bot
+    rejoins, the server's channels are registered again, as at boot, and its
+    threads by their messages. An outage removes nothing while it lasts, and
+    a server back from one, or from a gap in the gateway connection, is
+    reconciled with what it has then: what was deleted, or a thread archived,
+    meanwhile is forgotten, and a new or renamed channel is registered or
+    re-derived. A sync of a server's threads, which Discord sends when the
+    bot gains access to a channel, covers the channels in its `channel_ids`,
+    or the whole server when it has none. A registered thread under a covered
+    channel that the sync doesn't list is forgotten, since it's archived,
+    deleted or no longer visible to the bot, and so is one the sync drops
+    from discord.js's cache. A thread whose channel neither the cache nor its
+    registration knows, such as one registered from a message whose lookup
+    failed, is under no covered channel, so only a sync of the whole server
+    forgets it. A registered thread the sync lists counts as updated, so one
+    whose channel is stale stays as it is until that channel's fresh fetch or
+    update. What the server no longer lists, on its return or when the bot
+    joins it again, may have changed unseen: a message, edit, deletion or
+    reaction from it, a tool, or the reconnect sweep, looks it up from
+    Discord again before deciding, and a delivery that decided on facts from
+    before the return doesn't register it. A lookup that Discord overtook
+    with a report on its channel, such as an archive or a rename, is made
+    again, so what a delivery waiting on it registers is no older than that
+    report. The fresh facts count as an update of the channel, so what was
+    registered from the older ones meanwhile is registered again, or
+    forgotten when they show a thread archived or a channel outside the
+    filters. A guild channel the cache holds that Discord says doesn't exist,
+    to a lookup or to a tool, is handled as deleted, and dropped from
+    discord.js's cache with its threads. A channel that `create_text_channel`
+    makes is fetched again after the POST, so the cache keeps what the
+    gateway reported of it meanwhile; if that fetch fails, or every try is
+    overtaken, the channel becomes stale and the tool reports the name it
+    made it with, and if Discord says it's gone already the tool says so. A
+    stale channel's facts decide no registration or name until a fresh fetch
+    or an update clears its mark, or, for a thread, a sync that lists it.
+    Meanwhile a delivery from a stale channel, or from a thread in it,
+    carries no name for that channel in its fields, and its label is the
+    registered one: a stale channel's or thread's is its id, while a
+    registered thread that isn't stale itself, under a stale channel, keeps
+    its display-only label, with the names it was registered with. Its
+    current name isn't known, so while a server the guild filter admits lists
+    a stale channel of a kind a name addresses, no name in that server
+    resolves, and no name given without a server resolves anywhere. The label
+    of every channel a name addresses there is its id meanwhile, as is a
+    stale thread's; a thread that isn't stale keeps its display-only label. A
+    stale channel's threads aren't admitted through its category, and a
+    registered thread whose channel is stale stays registered, as far as the
+    filters go, until that channel's fresh fetch or update decides. The
+    registration listings leave a stale channel out. Before a name-addressed
+    tool resolves a name, and before `refresh_channels` lists, the stale
+    channels their servers still list are fetched again, threads aside, in
+    every server; `list_channels` fetches those of the server it lists. A
+    delivery from a thread fetches its stale channel first. If that lookup
+    fails, the filters decide the delivery on what the cache holds. A channel
+    that Discord moves out of what the channel filters admit is forgotten,
+    with the threads admitted through it, as on a server's return, and a
+    delivery on its way from it doesn't register it again. Editing the
+    filters, through the file or `filters_update`, registers the channels of
+    a server they newly admit; a channel newly listed in a server already
+    admitted is registered by its next message or `refresh_channels`. Neither
+    edit forgets what the filters stop admitting: that goes at a restart, at
+    its server's return, or when an update, a fresh fetch or a sync that
+    lists it shows it outside them. Only what was registered is announced as
+    removed.
+  - **`list_channels` reads a server's channels from the gateway's cache**
+    instead of fetching them from Discord, so it can't leave older facts in
+    the cache than an update brought meanwhile. It lists the same channels as
+    before, threads still excluded. It refuses a server in an outage rather
+    than listing what it held before: before fetching anything for it, and
+    again after, since an outage can begin while its stale channels are
+    fetched. Otherwise it fetches that server's stale channels first, and
+    leaves out one still stale, whether its fetch failed or every try was
+    overtaken.
+  - **A reaction in a server the guild filter leaves out is dropped,** as
+    its messages are. It used to pass when the server had no channel
+    filter of its own.
+  - **A channel's label, its address, is made one way on every path,**
+    `list_channels`, `create_text_channel` and send receipts included. A
+    channel's is its address, `#name (Guild)`. A
+    thread's is `#parent › thread (Guild)`, or `› thread (Guild)` when its
+    channel's name isn't known, display-only either way, since
+    `#thread (Guild)` would paste back as a same-named channel; a tool given
+    one refuses it, even where a voice channel has that name. Where a name
+    isn't known (a server the client hasn't cached), or wouldn't resolve
+    back to the channel, the label is the channel's id,
+    `discord:<guild>:<channel>`, never a bare `#name` that another channel
+    could answer to. A name doesn't resolve back for a kind no name resolves
+    to, a channel named like a thread label, a voice or stage channel
+    beside a same-named text channel (Discord's stock "General" pair, where
+    the name reaches the text channel), and two channels of one name and
+    kind. A rename of a channel (hidden from the bot or not, and a forum or
+    media channel's, whose posts are threads), a thread or a server, a name
+    learned since, or a channel taking or freeing a name, re-derives the
+    labels it's in, announced as `updated`.
+  - **Every host connection is given the whole registry,** whatever was
+    registered while another host, or none, was connected, and is told of
+    the channels removed while no host was connected. A restart starts
+    afresh: threads and DMs come back as they're active. Nothing announces
+    the removal of a thread deleted or archived while discord-mcpl was
+    down, so a host that keeps a Discord server's channels across a
+    reconnect keeps such a thread.
+  - **A push names its channel (`mcplChannelId`) once it's registered,**
+    which is every channel a message is delivered from except a thread
+    archived since its missed messages (the sweep delivers them without
+    it), and a channel deleted, a thread archived, a channel left out when
+    its server came back or moved out of what the channel filters admit,
+    or one in a server the bot left, while the message was on its way. A
+    stale channel, whose lookup failed while it was stale or whose every
+    try was overtaken, and one discord.js doesn't hold, are delivered
+    without it too, unless they're registered already. A DM's edit or
+    deletion names its DM too, registered under its other party's name
+    when that's known; one whose other party isn't known, in a DM not
+    registered yet, goes without it.
+  - **A deleted channel's watermark and missed tally go,** with those of the
+    threads it's known to hold, as do those of a channel the reconnect sweep
+    finds Discord no longer knows (deleted while discord-mcpl was down,
+    say), so later starts stop fetching it. A message
+    or catch-up delivered from a channel after its deletion doesn't bring
+    the watermark back. A server the bot leaves keeps its channels'
+    watermarks, since they still exist.
+- **Every live push's origin names its registered channel by its composite
+  id.** A reaction's origin, and a DM edit's or deletion's, now carry
+  `mcplChannelId` (`discord:<guild>:<channel>`, or `discord:dm:<channel>` in
+  a DM) when the channel is registered, as a message's own origin and a
+  guild channel's edits and deletions already did, so a host can place each
+  one under the id it registered the channel by. "A push names its channel
+  (`mcplChannelId`) once it's registered", above, says which channels that
+  leaves out.
+- **An inlined image or text attachment's marker now carries the file's URL,
+  as the markers of files that aren't inlined already do.** An inlined image
+  may be resized or re-encoded, and inlined text is decoded as UTF-8, so the
+  URL is the way to the exact bytes. A forwarded attachment that can't be
+  fetched is now marked as forwarded too, as the live path's other markers
+  of a forwarded attachment are.
+
+## 0.2.0 — 2026-10-13
+
+### Upgrade notes
+
+- **`fetch_history` and `fetch_around` now refuse a channel id that the
+  configured channel list (`guildChannels`) excludes, and so does a host's
+  `channels/open` that asks for backscroll from such a channel.** An open
+  without backscroll still opens it, since it reads nothing. A resident
+  that reads such a channel by its numeric id today (following a pasted
+  message link, say) will get a refusal naming the channel filters, and
+  nothing is read. The refusal is deliberate: it is the boundary
+  `list_channels` and `list_channel_members` already apply (see the
+  `fetch_history` entry under Fixed). To let a residence read the channel,
+  admit it in `guildChannels`, directly or through its parent (a thread's
+  channel, a channel's category). The same list bounds delivery, so that
+  admits it for delivery too. Guilds without a `guildChannels` entry, and
+  DMs, are unaffected.
 
 ### Added
 
@@ -301,6 +565,12 @@ in the git log and PR descriptions.
 
 ### Changed
 
+- **`@animalabs/voice-kit` comes from npm (`^0.1.0`)** instead of a
+  `file:../voice-kit` link, so a deploy no longer needs a voice-kit checkout
+  beside this one, and the package can be installed from npm (#83). A
+  checkout that already links `../voice-kit` keeps working: the link
+  resolves the same code until the next `npm install`.
+
 - **Text attachments now inline into context only up to
   `DISCORD_ATTACHMENT_INLINE_MAX_BYTES` (default 5120 bytes)** — previously
   live delivery inlined text attachments up to 256KiB. Over the cap, the
@@ -332,46 +602,17 @@ in the git log and PR descriptions.
 
 ### Fixed
 
-- **`channels/open` opens exactly the channel it was asked for.** A stale or
-  unknown `channelId` used to fall through to the first registered channel of
-  the same type, so a host could open, subscribe to, and receive history from
-  a different channel than it named. Now `channelId` is the exact selector.
-  agent-framework's `ChannelsOpenParams` gives it as the exact registered id,
-  preferred over type and address matching (MCPL's SPEC gives `channels/open`
-  no `channelId`), and this server reads it strictly: a `channelId` alone
-  selects, and an `address` beside it isn't read; without a `channelId`, an
-  `address` naming a guildId and a channelId selects. Either names exactly one
-  channel or is refused: an id the registry doesn't hold is looked up in
-  Discord, and opened (and registered, by the rule every other path registers
-  by) when it's a channel messages are posted in (text, announcement, voice or
-  stage), a thread, or a DM, that the filters admit, so a DM or thread after a
-  restart still opens. An archived thread opens too, since the host named it.
-  Any other id is refused, a lately deleted channel, a thread of one, and a
-  channel of a guild the bot has left included, whatever an address beside it
-  says. A channel outlives its deleted category. A request with no selector
-  (`channelId` absent or null, and `address` absent, null or `{}`) opens the
-  one registered channel of its type, DMs and threads counted, and is refused
-  when there are none or several; a refusal over several lists the first ten
-  and points to `channels/list` for the rest. `type`, which MCPL requires,
-  must be a non-empty string on every request and must match the channel
-  opened, so a registered `channelId` with a different `type` is refused too.
-  An empty-string `channelId`, which used to be read as absent, is refused,
-  and address ids must be strings. Refusals carry MCPL's codes: unknown
-  channel (`-32023`), invalid params (`-32602`), or open failed (`-32024`,
-  when the lookup can't get the channel's current facts, the history fetch
-  fails, the channel filters refuse reading its history or can't be checked,
-  or a `channels/close` or `mute_channel` for the channel arrives while the
-  open is in progress, its lookup included). No history is fetched, and
-  nothing is opened or subscribed, before a request names its channel, and a
-  channel unregistered while the open is in progress isn't opened.
-  `sinceLastSeen` reads the persisted watermark even on the first open after a
-  restart, before anything else has loaded it. An id the registry doesn't hold
-  is looked up as every fetch past the cache is: Discord's Unknown Channel
-  there is a deletion, and an id Discord refuses (Missing Access, or a
-  malformed id) is unknown. An id whose current facts can't be had (Discord
-  gives no answer, every try is overtaken by a change, or a thread's stale
-  channel can't be fetched fresh) is refused as an open that failed, and
-  another open looks it up again.
+- **With `--tcp`, the server serves one client at a time and keeps serving
+  through what it can survive.** An error the TCP server emits once it's
+  listening (an accept that fails, say) is logged whenever it comes, whether
+  a client is being served or not; before, one that came while no client was
+  served ended the process. A failure to listen still ends it. A client that
+  connects while another is served is refused at once; before, it was left
+  connected and never read, holding its connection open until the process
+  exited, and a reset on it ended the process. A client whose serving fails
+  ends only its own connection, and the next client is served. A read error
+  on the served client's own socket, such as a reset, still ends the process,
+  through mcpl-core's readline interface, which has no listener for it.
 - **A refused DM's deletion no longer reaches the agent.** With a DM
   allowlist set, a refused sender's DM was never forwarded, but its deletion
   was: discord.js caches every DM it receives, so the tombstone carried the
@@ -541,165 +782,6 @@ in the git log and PR descriptions.
   fetch and arrive in order. Before, such a thread was dropped even under a
   listed channel. A thread whose channel isn't cached stays excluded, as
   before.
-- **Thread fields name the thread a message was posted in.** They were read
-  from discord.js `message.thread`, which is the thread a message *started*,
-  so a message that had spawned a thread was tagged `chat:thread`, rendered
-  as `thread "…"`, and sent to the host with that thread's id as its MCPL
-  `threadId`, while messages actually posted in a thread carried none. Now a
-  message posted in a thread is tagged `chat:thread` and located as
-  `[#parent thread "name" …]`, and a message that started a thread, in a
-  text or announcement channel, carries no thread fields. A forum post's
-  first message is posted in the post itself, which is a thread, so it is
-  marked as in that thread like the replies under it. MCPL `threadId` (a
-  thread *within* a channel) is no longer sent: a Discord thread is its own
-  channel, already named by `channelId`, so a host keying conversations by
-  thread no longer splits one channel in two. Instead a thread message
-  carries `threadName` (the thread's name) and `threadParentName` (the
-  channel it hangs off, new), each left out when it isn't known: in the
-  `channels/incoming` metadata, in a push's origin, and in the origins of
-  its edits and deletions, which are tagged `chat:thread` too, and of
-  reactions to it, which keep their own tags only, so a gate rule keyed on
-  `chat:thread` doesn't start matching them. A thread the client knew only
-  partly is looked up first, past discord.js's cache, so its messages, and
-  their edits, deletions and reactions, are named as any other thread's;
-  each waits for that lookup before it is delivered, as a create already
-  did. If the lookup fails, the channel filters decide on what is known,
-  and what they let through goes unnamed (a message or an edit or deletion
-  still tagged `chat:thread`).
-- **The reconnect sweep names a thread as the live path does.** A thread's
-  missed messages were headed `<missed channel="#<thread name>" …>`, as if
-  the thread were a channel of its own name, and pushed without tags. The
-  header now reads `<missed channel="#<parent>" thread="<name>" …>`, or
-  `thread="<name>"` alone when the parent isn't known, with the thread's id
-  for a name it lacks, and escapes each name with the live location's
-  quoting. The push carries `chat:thread` and the thread's fields, a thread
-  the client knew only partly is looked up first, and a sweep push, a DM's
-  included, now names its channel (`mcplChannelId`) as a live push's
-  origin does.
-- **Every channel messages are posted in is registered, threads included,
-  by one rule, and the host is told of each change.** Boot and channel
-  events registered guild text channels only: never a thread (a Discord
-  thread is its own channel), an announcement channel or a voice channel's
-  text chat. Such a channel couldn't be opened, and a host that routes
-  speech by a channel's declaration (MCPL RFC-011) held a resident's
-  plain-speech replies in it as drafts.
-  - **Listing** (boot, a channel's creation or change, a server joined,
-    `refresh_channels`) registers the text, announcement, voice and stage
-    channels the filters admit; never a category or forum, which hold no
-    messages of their own. A stage channel, which had no kind of its own, is
-    now `stage`: its text chat takes messages, and a name resolves to it as
-    to a voice channel.
-  - **A thread is registered by its messages:** before its first message
-    reaches the host, live or caught up by the reconnect sweep, or before an
-    edit or deletion there does. discord.js delivers no edit or deletion
-    from a thread its cache doesn't hold, such as one archived before a
-    restart, as before. An archived thread is forgotten, and a
-    message posted after the archive, which unarchives it, registers it
-    again, so the host holds the live threads. A message posted before the
-    archive, still on its way when the archive came, doesn't.
-  - **Removals are followed.** A deleted thread is forgotten, and so is a
-    deleted channel with the threads it's known to hold, registered or
-    cached. So is a channel Discord answers with Unknown Channel, when a
-    thread is looked up or the reconnect sweep fetches it. Every channel of
-    a server the bot leaves or is removed from is forgotten too; if the bot
-    rejoins, the server's channels are registered again, as at boot, and its
-    threads by their messages. An outage removes nothing while it lasts, and
-    a server back from one, or from a gap in the gateway connection, is
-    reconciled with what it has then: what was deleted, or a thread
-    archived, meanwhile is forgotten, and a new or renamed channel is
-    registered or re-derived. What the server no longer lists, on its
-    return or when the bot joins it again, may have changed unseen: a
-    message, edit, deletion or reaction from it, a tool, or the reconnect
-    sweep, looks it up from Discord again before deciding, and a delivery
-    that decided on facts from before the return doesn't register it. A
-    lookup that Discord overtook with a report on its channel, such as an
-    archive or a rename, is made again, so what a delivery waiting on it
-    registers is no older than that report. The fresh facts count as an
-    update of the channel, so what was registered from the older ones
-    meanwhile is registered again, or forgotten when they show a thread
-    archived or a channel outside the filters. A guild channel the cache
-    holds that Discord says doesn't exist, to a lookup or to a tool, is
-    handled as deleted, and dropped from discord.js's cache with its
-    threads. A channel that `create_text_channel` makes is fetched again
-    after the POST, so the cache keeps what the gateway reported of it
-    meanwhile; if that fetch fails the channel becomes stale, and if
-    Discord says it's gone already the tool says so. A stale channel's
-    facts decide no registration and no name, until a fresh fetch or an
-    update of the channel clears its mark. Its current name isn't known,
-    so while a server the guild filter admits lists a stale
-    channel of a kind a name addresses, no name in that server
-    resolves, and no name given without a server resolves anywhere.
-    The label of every channel a name addresses there
-    is its id meanwhile, as is a stale thread's; a thread that isn't
-    stale keeps its display-only label. A stale channel's category admits
-    none of its threads, and a registered thread whose channel is stale
-    stays registered until that channel's fresh fetch or update decides.
-    The registration listings leave a stale channel out. A name-addressed
-    tool and `refresh_channels` fetch stale channels first, as a delivery
-    from a thread fetches its stale channel first; if that lookup fails,
-    the filters decide the delivery on what the cache holds. A channel
-    that Discord moves out of what the channel filters admit is
-    forgotten, with the threads admitted through it, as on a server's
-    return, and a delivery on its way from it doesn't register it again.
-    Editing the filters, through the file or `filters_update`, registers
-    the channels of a server they newly admit; a channel newly listed in
-    a server already admitted is registered by its next message or
-    `refresh_channels`. Neither edit forgets what the filters stop
-    admitting: that goes at a restart, at its server's return, or when
-    an update or fresh fetch shows it outside them. Only what was
-    registered is announced as removed.
-  - **`list_channels` reads a server's channels from the gateway's
-    cache** instead of fetching them from Discord, so it can't leave older
-    facts in the cache than an update brought meanwhile. It lists the same
-    channels as before, threads still excluded, and refuses a server in an
-    outage rather than listing what it held before.
-  - **A reaction in a server the guild filter leaves out is dropped,** as
-    its messages are. It used to pass when the server had no channel
-    filter of its own.
-  - **A channel's label, its address, is made one way on every path,**
-    `list_channels`, `create_text_channel` and send receipts included. A
-    channel's is its address, `#name (Guild)`. A
-    thread's is `#parent › thread (Guild)`, or `› thread (Guild)` when its
-    channel's name isn't known, display-only either way, since
-    `#thread (Guild)` would paste back as a same-named channel; a tool given
-    one refuses it, even where a voice channel has that name. Where a name
-    isn't known (a server the client hasn't cached), or wouldn't resolve
-    back to the channel, the label is the channel's id,
-    `discord:<guild>:<channel>`, never a bare `#name` that another channel
-    could answer to. A name doesn't resolve back for a kind no name resolves
-    to, a channel named like a thread label, a voice or stage channel
-    beside a same-named text channel (Discord's stock "General" pair, where
-    the name reaches the text channel), and two channels of one name and
-    kind. A rename of a channel (hidden from the bot or not, and a forum or
-    media channel's, whose posts are threads), a thread or a server, a name
-    learned since, or a channel taking or freeing a name, re-derives the
-    labels it's in, announced as `updated`.
-  - **Every host connection is given the whole registry,** whatever was
-    registered while another host, or none, was connected, and is told of
-    the channels removed while no host was connected. A restart starts
-    afresh: threads and DMs come back as they're active. Nothing announces
-    the removal of a thread deleted or archived while discord-mcpl was
-    down, so a host that keeps a Discord server's channels across a
-    reconnect keeps such a thread.
-  - **A push names its channel (`mcplChannelId`) once it's registered,**
-    which is every channel a message is delivered from except a thread
-    archived since its missed messages (the sweep delivers them without
-    it), and a channel deleted, a thread archived, a channel left out when
-    its server came back or moved out of what the channel filters admit,
-    or one in a server the bot left, while the message was on its way. A
-    stale channel, whose lookup failed while it was stale or whose every
-    try was overtaken, and one discord.js doesn't hold, are delivered
-    without it too, unless they're registered already. A DM's edit or
-    deletion names its DM too, registered under its other party's name
-    when that's known; one whose other party isn't known, in a DM not
-    registered yet, goes without it.
-  - **A deleted channel's watermark and missed tally go,** with those of the
-    threads it's known to hold, as do those of a channel the reconnect sweep
-    finds Discord no longer knows (deleted while discord-mcpl was down,
-    say), so later starts stop fetching it. A message
-    or catch-up delivered from a channel after its deletion doesn't bring
-    the watermark back. A server the bot leaves keeps its channels'
-    watermarks, since they still exist.
 - **DM whitelist fails closed on edits.** With `DISCORD_DM_USERS` set, a DM
   edit whose author is unknown (uncached message) was forwarded because the
   check required an author; it is now dropped, like creates.

@@ -56,7 +56,7 @@
 import * as net from 'node:net';
 import { McplConnection } from '@animalabs/mcpl-core';
 import { DiscordAdapter } from './discord-adapter.js';
-import { DiscordMcplServer, serveStdio } from './server.js';
+import { DiscordMcplServer, serveStdio, serveTcp } from './server.js';
 import {
   resolveStartupFilters,
   loadFiltersFile,
@@ -215,15 +215,13 @@ async function main(): Promise<void> {
     const tcpServer = net.createServer();
     tcpServer.listen(tcpPort, '127.0.0.1');
 
+    // A failure to listen (the port taken) emits 'error' with no listener
+    // yet, which ends the process, as it should. serveTcp's own listener
+    // goes on only once it's listening.
     await new Promise<void>((resolve) => tcpServer.once('listening', resolve));
 
-    // Accept and serve one connection at a time
-    while (true) {
-      const conn = await McplConnection.acceptTcp(tcpServer);
-      console.error('[discord-mcpl] Client connected');
-      await server.serve(conn);
-      console.error('[discord-mcpl] Client disconnected, waiting for next...');
-    }
+    // One client at a time, for as long as the process runs.
+    serveTcp(tcpServer, (conn) => server.serve(conn));
   }
 }
 

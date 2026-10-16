@@ -53,6 +53,10 @@ const HISTORY_PROVENANCE =
   'place has channelId null and a header id of discord:?:<channel>. The canonical id is ' +
   'authoritative when a label differs.';
 
+const ATTACHMENT_LINKS =
+  " An attachment's url is signed by Discord and stops working at its expiresAt, when it has one; " +
+  'fetching the message again returns a fresh one.';
+
 const TARGET_RULE =
   'Give exactly one of messageId or latestFrom; the other may be omitted or null. ';
 
@@ -291,7 +295,7 @@ export const toolDefinitions: ToolDefinition[] = [
   },
   {
     name: 'fetch_history',
-    description: "Read past messages from a Discord channel, including message IDs. Use before/after message IDs and limit to select history; configured backscroll limits may reduce the amount. Use list_channel_members for people rather than messages." + HISTORY_PROVENANCE,
+    description: "Read past messages from a Discord channel, including message IDs. Use before/after message IDs and limit to select history; configured backscroll limits may reduce the amount. Use list_channel_members for people rather than messages." + ATTACHMENT_LINKS + HISTORY_PROVENANCE,
     inputSchema: {
       type: 'object',
       properties: {
@@ -318,7 +322,7 @@ export const toolDefinitions: ToolDefinition[] = [
     description:
       'Scroll to a specific message and fetch the surrounding context. Returns a ' +
       'window of messages centred on `messageId` (the message itself plus roughly ' +
-      'half the window on either side). Single request, so `limit` is capped at 100.' + HISTORY_PROVENANCE,
+      'half the window on either side). Single request, so `limit` is capped at 100.' + ATTACHMENT_LINKS + HISTORY_PROVENANCE,
     inputSchema: {
       type: 'object',
       properties: {
@@ -414,7 +418,7 @@ export const toolDefinitions: ToolDefinition[] = [
   },
   {
     name: 'list_subscriptions',
-    description: "Inspect ambient-message subscriptions and the recorded missed-message backlog for unsubscribed channels. This does not enumerate all Discord channels; use list_channels for that.",
+    description: "Inspect ambient-message subscriptions and the recorded missed-message backlog for unsubscribed channels. For channel discovery, use list_guilds to find servers, then list_channels with a guildId to see channels allowed by its configured filters.",
     inputSchema: {
       type: 'object',
       properties: {},

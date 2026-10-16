@@ -7,6 +7,7 @@
  * Follows the pattern from zero-k/game-manager/src/mcpl_server.rs.
  */
 
+import type * as net from 'node:net';
 import {
   McplConnection,
   textContent,
@@ -48,7 +49,7 @@ import type {
 } from '@animalabs/mcpl-core';
 
 import type { ChannelFacts, DiscordAdapter, DiscordMessageData, DiscordAttachment, OutgoingFile, ReactionSummary, MessageEventInfo, DmRefusal, DmSendFailure, ThreadPlace } from './discord-adapter.js';
-import { LATEST_FROM_WINDOW, holdsNoMessages, isListedKind } from './discord-adapter.js';
+import { LATEST_FROM_WINDOW, attachmentUrlExpiry, holdsNoMessages, isListedKind } from './discord-adapter.js';
 import { DM_NOTICE_TEXT, DmNoticeState, resolveDmNoticesPath, type DmNoticeDecision } from './dm-notices.js';
 
 /** How much of a latestFrom target's text its receipt echoes. */
@@ -2795,20 +2796,23 @@ export class DiscordMcplServer {
 
       const newestId = msgs[msgs.length - 1].id;
 
-      // Cache first. A lookup when the cache doesn't hold the channel, holds
-      // a thread whose parent channel it can't name, which may be one the
-      // client knows only partly, or holds facts that may be older than
-      // Discord's (isStale), as the live path looks those up (a thread whose
-      // parent just isn't cached is read from the cache again).
-      // A failed lookup leaves a trace instead of silently shipping a
-      // name-less block (issue #28), and what the cache knew stands. Resolved
-      // before anything is delivered, because the ingress decision below
-      // needs the channel's identity.
+      // Cache first. The channel is looked up when the cache doesn't hold it
+      // (the sweep starts from the channels it saved, not from an event, so
+      // the cache may not have seen one, such as a DM), when it holds a
+      // thread whose parent channel it can't name, or when its facts may be
+      // older than Discord's (isStale). The lookup fetches from Discord what
+      // the cache doesn't hold whole and current, as the live path does; for
+      // a thread whose parent just isn't cached, it reads the cache again. A
+      // failed lookup is logged (issue #28), and what the cache knew stands.
+      // Resolved before anything is delivered, because the ingress decision
+      // below needs the channel's identity.
       let meta = this.discord.getCachedChannelMeta(channelId);
+      let lookupFailure = null as string | null;
       if (!meta || (meta.threadId && meta.threadParentName === null) || this.discord.isStale(channelId)) {
         const cached = meta;
         meta = (await this.discord.getChannelMeta(channelId).catch((err) => {
-          dbg('sweep:channel-meta-failed', { channelId, error: errorText(err) });
+          lookupFailure = errorText(err);
+          dbg('sweep:channel-meta-failed', { channelId, error: lookupFailure });
           return null;
         })) ?? cached;
       }
@@ -2817,17 +2821,25 @@ export class DiscordMcplServer {
       // read as "no guild, so a DM"; the channel is held back, its watermark
       // untouched. The sweep runs once per process, so it's tried again at
       // the next start, unless a message forwarded live in it first moves
-      // its watermark past what was held.
+      // its watermark past what was held. A failed lookup reaches stderr in
+      // whichever line says what became of the channel.
       const isDM = this.dmChannelIds.has(channelId) || meta?.isDM === true;
       const guildId = isDM ? null : (meta?.guildId ?? null);
       if (!isDM && !guildId) {
         dbg('sweep:identity-unresolved', { channelId });
         console.error(
           `[discord-mcpl] Catch-up held back channel ${channelId}: neither its guild nor DM identity could be ` +
-            'resolved, so its missed messages were not delivered. It is tried again at the next start, unless a ' +
-            'message forwarded live in it before then moves its watermark past them.',
+            `resolved${lookupFailure ? ` (its lookup failed: ${lookupFailure})` : ''}, so its missed messages ` +
+            'were not delivered. It is tried again at the next start, unless a message forwarded live in it ' +
+            'before then moves its watermark past them.',
         );
         continue;
+      }
+      if (lookupFailure) {
+        console.error(
+          `[discord-mcpl] Catch-up couldn't look up channel ${channelId} (${lookupFailure}). ` +
+            'Its missed messages are placed and filtered by what the cache knew of it, and may go out without its names.',
+        );
       }
 
       // The live ingress decision (guild, channel and thread parent, DM
@@ -2916,9 +2928,11 @@ export class DiscordMcplServer {
       // channel it hangs off and the thread itself.
       const thread: ThreadPlace = meta ?? {};
       const place = messagePlace(meta?.name, thread);
-      // Names are escaped with the live location's quoting (quotedValue), so
-      // a bidi control or line separator in one can't reorder or split the
-      // header.
+      // Each name is an attribute's value, so it is always quoted, with
+      // quotedValue's escaping, which the live location uses too: a bidi
+      // control or line separator in one can't reorder or split the header.
+      // (The live location writes a channel or guild name bare where the
+      // header rule allows, and always quotes a thread's.)
       const attrs: string[] = [];
       if (place.channel) attrs.push(`channel=${quotedValue(`#${place.channel}`)}`);
       if (place.thread) attrs.push(`thread=${quotedValue(place.thread)}`);
@@ -3189,6 +3203,18 @@ export class DiscordMcplServer {
    *  until that channel's fresh fetch or update decides it. */
   private threadAdmissionKnown(thread: { parentId?: string | null }): boolean {
     return !thread.parentId || !this.discord.isStale(thread.parentId);
+  }
+
+  /** A thread Discord reported on, by an update, a fresh fetch, or a sync
+   *  that lists it, when it's registered: forgotten when it's archived, and
+   *  otherwise registered again or forgotten as the filters decide, once
+   *  their answer is known (threadAdmissionKnown). One that isn't registered
+   *  is left to its next message. */
+  private threadReported(thread: ChannelFacts): void {
+    const id = mcplChannelId(thread.guildId, thread.id);
+    if (!this.channelManager.get(id)) return;
+    if (thread.archived) this.forgetChannels([id]);
+    else if (this.threadAdmissionKnown(thread)) this.registerOrForgetThread(thread);
   }
 
   /** A registered thread's facts, as an update brings them: registered
@@ -4084,6 +4110,7 @@ export class DiscordMcplServer {
       // message id is meaningless to the agent (it can't look messages up).
       const quoted = ev.messageSnippet ? ` — "${ev.messageSnippet}"` : '';
       const line = `[reaction] @${ev.userName} ${verb} ${ev.emoji} on ${target}${quoted}`;
+      const reactionChannelId = mcplChannelId(ev.guildId ?? 'dm', ev.channelId);
       this.conn.sendRequest(method.PUSH_EVENT, {
         featureSet: 'discord.messaging',
         eventId: `discord_reaction_${ev.action}_${ev.messageId}_${ev.emojiId ?? ev.emoji}_${ev.userId}_${ev.timestamp.getTime()}`,
@@ -4093,6 +4120,10 @@ export class DiscordMcplServer {
           channelId: ev.channelId,
           messageId: ev.messageId,
           guildId: ev.guildId,
+          // The composite id the host registers and routes by, when the
+          // channel is registered, as the origins of the message's own
+          // pushes carry it.
+          ...(this.channelManager.get(reactionChannelId) ? { mcplChannelId: reactionChannelId } : {}),
           reactorId: ev.userId,
           reactorName: ev.userName,
           emoji: ev.emoji,
@@ -4175,17 +4206,15 @@ export class DiscordMcplServer {
     // unarchives it, registers it again. Its watermark stays, since it can
     // come back. A registered thread otherwise changed (renamed, locked) is
     // re-derived. An unregistered one waits for a message.
-    this.discord.onThreadUpdate((thread) => {
-      const id = mcplChannelId(thread.guildId, thread.id);
-      if (!this.channelManager.get(id)) return;
-      if (thread.archived) this.forgetChannels([id]);
-      else if (this.threadAdmissionKnown(thread)) this.registerOrForgetThread(thread);
-    });
+    this.discord.onThreadUpdate((thread) => this.threadReported(thread));
 
     // A fetch left a channel stale: its current name isn't known, so no
-    // name in its guild resolves (resolveChannelRef), and the labels there
-    // are derived again, by id. Its fresh fetch derives them again by name
-    // (onChannelRefreshed).
+    // name in its guild resolves (resolveChannelRef), and the labels of the
+    // channels a name addresses there are derived again, by id, as is its
+    // own registration's, a thread's included. A registered thread under it
+    // that isn't stale itself keeps its display-only label, with the names
+    // it was registered with (knowsLessThan). Its fresh fetch derives them
+    // again by name (onChannelRefreshed).
     this.discord.onChannelStale((channelId) => {
       const registered = this.channelManager.getAll()
         .filter((d) => (d.address as { channelId?: string } | undefined)?.channelId === channelId);
@@ -4195,6 +4224,29 @@ export class DiscordMcplServer {
 
     this.discord.onChannelDelete((guildId, channelId, threadIds) => this.channelDeleted(guildId, channelId, threadIds));
     this.discord.onThreadDelete((guildId, threadId) => this.channelDeleted(guildId, threadId));
+    // Discord synced a guild's threads (onThreadsSynced). A registered
+    // thread it doesn't list is forgotten when its registration places it
+    // under a channel the sync covers (any, for a whole-guild sync), or the
+    // sync dropped it from the cache, which places a thread by the channel
+    // the cache knew for it. It isn't remembered as deleted, since it may
+    // only have been archived. A thread whose channel neither knows is under
+    // none. A registered thread the sync lists is taken as updated.
+    this.discord.onThreadsSynced((guildId, covered, listed, dropped) => {
+      const channelOf = (d: ChannelDescriptor) => (d.address as { channelId: string }).channelId;
+      const threads = this.registeredInGuild(guildId)
+        .filter((d) => (d.metadata as { channelType?: string } | undefined)?.channelType === 'thread');
+      const omitted = (d: ChannelDescriptor): boolean => {
+        if (listed.has(channelOf(d))) return false;
+        const parentId = (d.metadata as { parentId?: string } | undefined)?.parentId;
+        return covered === null || dropped.has(channelOf(d)) || (parentId !== undefined && covered.has(parentId));
+      };
+      this.forgetChannels(threads.filter(omitted).map((d) => d.id));
+      for (const d of threads) {
+        if (!listed.has(channelOf(d))) continue;
+        const facts = this.discord.getCachedChannelFacts(channelOf(d));
+        if (facts) this.threadReported(facts);
+      }
+    });
     // A stale channel fetched fresh is taken as an update of it, since what
     // was derived from its older facts may be wrong in any of them: a thread
     // the fetch shows archived, or a channel it shows outside the filters,
@@ -4207,9 +4259,7 @@ export class DiscordMcplServer {
       const id = mcplChannelId(facts.guildId, channelId);
       const admitted = this.discord.channelAdmitted(facts.guildId, channelId, facts.parentId ?? null);
       if (facts.type === 'thread') {
-        if (!this.channelManager.get(id)) return;
-        if (facts.archived) this.forgetChannels([id]);
-        else if (this.threadAdmissionKnown(facts)) this.registerOrForgetThread(facts);
+        this.threadReported(facts);
         return;
       }
       if (!admitted) {
@@ -4316,6 +4366,16 @@ export class DiscordMcplServer {
         ? ''
         : multiSnapshot ? ` (forwarded #${att.forwardedSnapshotIndex})` : ' (forwarded)';
 
+    // A Discord CDN URL is signed and stops working at its `ex` time, so each
+    // marker says when, and the message says once how to get a fresh one.
+    let linksExpire = false;
+    const link = (att: DiscordAttachment) => {
+      const expiry = attachmentUrlExpiry(att.url);
+      if (!expiry) return att.url;
+      linksExpire = true;
+      return `${att.url} (link expires ${expiry.toISOString().slice(0, 16).replace('T', ' ')} UTC)`;
+    };
+
     const inlineCap = this.attachmentInlineMaxBytes;
     const blocks: ContentBlock[] = [];
     for (const att of attachments) {
@@ -4330,17 +4390,17 @@ export class DiscordMcplServer {
           // Declared size is already over the cap — no fetch at all. (A
           // misdeclared small size still gets caught below on actual bytes.)
           blocks.push(textContent(
-            `[attachment: ${att.name}${fwd(att)} (${fmt(att.size)}) over the ${fmt(inlineCap)} inline cap — not inlined: ${att.url}]`,
+            `[attachment: ${att.name}${fwd(att)} (${fmt(att.size)}) over the ${fmt(inlineCap)} inline cap — not inlined: ${link(att)}]`,
           ));
           dbg('attachment:over-inline-cap', { name: att.name, declaredSize: att.size, cap: inlineCap });
         } else if ((isImage || isText) && att.size > fetchBudgetLeft) {
           blocks.push(textContent(
-            `[attachment: ${att.name}${fwd(att)} (${fmt(att.size)}) not inlined — message attachment budget exhausted: ${att.url}]`,
+            `[attachment: ${att.name}${fwd(att)} (${fmt(att.size)}) not inlined — message attachment budget exhausted: ${link(att)}]`,
           ));
           dbg('attachment:budget-exhausted', { name: att.name, size: att.size, budgetLeft: fetchBudgetLeft });
         } else if (isImage) {
           if (att.size > IMAGE_FETCH_CEILING) {
-            blocks.push(textContent(`[image attachment "${att.name}"${fwd(att)} (${fmt(att.size)}) too large to fetch — ${att.url}]`));
+            blocks.push(textContent(`[image attachment "${att.name}"${fwd(att)} (${fmt(att.size)}) too large to fetch — ${link(att)}]`));
           } else {
             fetchBudgetLeft -= att.size;
             const res = await fetchWithTimeout(att.url);
@@ -4352,9 +4412,9 @@ export class DiscordMcplServer {
             const norm = await normalizeImageForInference(raw, att.contentType);
             if (norm) {
               blocks.push({ type: 'image', data: norm.data, mimeType: norm.mimeType } as ContentBlock);
-              blocks.push(textContent(`[image attachment: ${att.name}${fwd(att)}]`));
+              blocks.push(textContent(`[image attachment: ${att.name}${fwd(att)} — ${link(att)}]`));
             } else {
-              blocks.push(textContent(`[image attachment "${att.name}"${fwd(att)} (${fmt(att.size)}) could not be inlined — ${att.url}]`));
+              blocks.push(textContent(`[image attachment "${att.name}"${fwd(att)} (${fmt(att.size)}) could not be inlined — ${link(att)}]`));
             }
           }
         } else if (isText) {
@@ -4367,7 +4427,7 @@ export class DiscordMcplServer {
             // Declared size said it fit; the wire said otherwise. The cap is
             // a bound on actual bytes, so this degrades to a note too.
             blocks.push(textContent(
-              `[attachment: ${att.name}${fwd(att)} (over the ${fmt(inlineCap)} inline cap; declared ${fmt(att.size)}) — not inlined: ${att.url}]`,
+              `[attachment: ${att.name}${fwd(att)} (over the ${fmt(inlineCap)} inline cap; declared ${fmt(att.size)}) — not inlined: ${link(att)}]`,
             ));
             dbg('attachment:over-inline-cap', {
               name: att.name,
@@ -4376,10 +4436,10 @@ export class DiscordMcplServer {
               misdeclared: true,
             });
           } else {
-            blocks.push(textContent(`[attachment: ${att.name}${fwd(att)} (${fmt(att.size)})]\n${text}`));
+            blocks.push(textContent(`[attachment: ${att.name}${fwd(att)} (${fmt(att.size)}) — ${link(att)}]\n${text}`));
           }
         } else {
-          blocks.push(textContent(`[attachment: ${att.name}${fwd(att)} (${ct || 'unknown type'}, ${fmt(att.size)}) — not inlined: ${att.url}]`));
+          blocks.push(textContent(`[attachment: ${att.name}${fwd(att)} (${ct || 'unknown type'}, ${fmt(att.size)}) — not inlined: ${link(att)}]`));
         }
         dbg('attachment', {
           name: att.name,
@@ -4388,9 +4448,12 @@ export class DiscordMcplServer {
           kind: isImage ? 'image' : isText ? 'text' : 'other',
         });
       } catch (err) {
-        blocks.push(textContent(`[attachment: ${att.name} — could not fetch (${(err as Error).message}); ${att.url}]`));
+        blocks.push(textContent(`[attachment: ${att.name}${fwd(att)} — could not fetch (${(err as Error).message}); ${link(att)}]`));
         dbg('attachment:failed', { name: att.name, error: (err as Error).message });
       }
+    }
+    if (linksExpire) {
+      blocks.push(textContent('[Attachment links expire as marked; fetching the message again gives fresh links.]'));
     }
     return blocks;
   }
@@ -4828,4 +4891,65 @@ export async function serveStdio(
   await server.serve(conn);
   console.error('[discord-mcpl] stdio connection ended; exiting');
   exit(0);
+}
+
+/**
+ * Serve MCPL clients on a listening TCP server, one at a time, for as long as
+ * the process runs. It owns the server's 'connection' and 'error' events for
+ * the server's life, which a one-at-a-time server needs: mcpl-core's
+ * `acceptTcp` takes a single connection, and leaves no listener that logs
+ * the server's errors.
+ *
+ * - A client that connects while none is served is served: `serve` runs with
+ *   its connection, and once `serve` settles, whether it resolves, rejects
+ *   or throws, the connection is closed and the next client can be served.
+ *   A rejection or a throw is logged. A client counts as served until then,
+ *   after its socket has closed too.
+ * - A client that connects while another is served is refused: its socket
+ *   is destroyed at once, and the refusal logged. Its 'error' listener goes
+ *   on first, so nothing that socket reports can go unheard.
+ * - An 'error' the server emits (an accept that fails, say) is logged
+ *   whenever it comes, and serving goes on: Node's server keeps listening.
+ *
+ * A read error on the served client's own socket (a reset, say) still ends
+ * the process: it also reaches mcpl-core's readline interface, which listens
+ * for none (see serve()).
+ *
+ * The server must be listening already, or this throws: a failure to listen
+ * (a port already taken) belongs to the caller, and with the 'error'
+ * listener added here it would only be logged, and the caller would wait for
+ * a 'listening' that never comes.
+ */
+export function serveTcp(
+  tcpServer: net.Server,
+  serve: (conn: McplConnection) => Promise<void>,
+  log: (...args: unknown[]) => void = console.error,
+): void {
+  if (!tcpServer.listening) {
+    throw new Error("serveTcp needs a listening server: call it once the server has emitted 'listening'");
+  }
+  tcpServer.on('error', (err) => log('[discord-mcpl] TCP server error:', errorText(err)));
+  // Set before anything awaits, so two clients connecting in the same tick
+  // can't both be served.
+  let serving = false;
+  tcpServer.on('connection', (socket) => {
+    if (serving) {
+      socket.on('error', (err) => log('[discord-mcpl] Refused client socket error:', errorText(err)));
+      socket.destroy();
+      log('[discord-mcpl] Refused a client: one client is served at a time');
+      return;
+    }
+    serving = true;
+    // fromTcp listens for the socket's errors before this handler returns.
+    const conn = McplConnection.fromTcp(socket);
+    log('[discord-mcpl] Client connected');
+    void Promise.resolve()
+      .then(() => serve(conn))
+      .catch((err) => log('[discord-mcpl] Serving a client failed:', errorText(err)))
+      .finally(() => {
+        conn.close();
+        serving = false;
+        log('[discord-mcpl] Client disconnected, waiting for next...');
+      });
+  });
 }

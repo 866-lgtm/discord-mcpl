@@ -4,3 +4,11 @@ dist/
 .env
 .DS_Store
 .env.voice-test
+
+# package-lock.json is the only lockfile: CI installs it with npm ci and
+# publishing with npm install. Make dependency changes with npm, so that
+# package-lock.json changes with package.json. Where there's no bun.lock,
+# bun seeds one from package-lock.json, then keeps using its own, so after
+# package-lock.json changes, delete bun.lock before installing with bun.
+bun.lock
+bun.lockb

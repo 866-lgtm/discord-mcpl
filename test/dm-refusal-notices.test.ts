@@ -526,6 +526,23 @@ describe('the reconnect catch-up sweep applies the live ingress decision', () =>
       'visible outside the debug log');
   });
 
+  it('with the real metadata helpers, a channel whose lookup fails and that the cache never held is held back, and its log line says so alone', async (t) => {
+    const h = await harness(t, {
+      dmUsers: ['friend'],
+      watermarks: { 'gone-chan': '400' },
+      history: async () => [historyMessage(freshId(1), 'friend', '@bot ping', true)],
+      realMeta: true,
+    });
+    t.mock.method(h.client.channels, 'fetch', async () => { throw new Error('Missing Access'); });
+    await h.server.runReconnectSweep();
+    assert.deepEqual(h.pushes, []);
+    assert.equal(h.server.forwardedWatermark.get('gone-chan'), '400');
+    assert.ok(h.logs.some((l) => /Catch-up held back channel gone-chan: neither its guild nor DM identity could be resolved \(its lookup failed: Missing Access\), so its missed messages were not delivered/.test(l)),
+      h.logs.join('\n'));
+    // Nothing went out, so no line says its messages may.
+    assert.ok(!h.logs.some((l) => l.includes('may go out')), h.logs.join('\n'));
+  });
+
   it('says outside the debug log when it withholds guild messages the filters refuse', async (t) => {
     const h = await harness(t, {
       guildIds: ['kept-guild'],
