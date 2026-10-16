@@ -1188,6 +1188,7 @@ export class DiscordAdapter {
     // Files-only message (no text): still send one message carrying the files.
     if (chunks.length === 0 && attachments.length > 0) chunks.push('');
     let lastId = '';
+    const posted: string[] = [];
     for (let i = 0; i < chunks.length; i++) {
       // Attach files to the LAST chunk so they render after the full text.
       const isLast = i === chunks.length - 1;
@@ -1210,7 +1211,10 @@ export class DiscordAdapter {
         // posting another.
         nonce: SnowflakeUtil.generate().toString(),
         enforceNonce: true,
+      }).catch((err: unknown) => {
+        throw withPostedParts(err, posted, chunks, attachments.length > 0, Boolean(options?.replyTo));
       });
+      posted.push(sent.id);
       lastId = sent.id;
     }
     return { messageId: lastId };
@@ -1294,6 +1298,7 @@ export class DiscordAdapter {
       const chunks = this.splitForDiscord(resolved);
       if (chunks.length === 0 && attachments.length > 0) chunks.push('');
       let lastId = '';
+      const posted: string[] = [];
       for (let i = 0; i < chunks.length; i++) {
         const isLast = i === chunks.length - 1;
         const sent = await user.send({
@@ -1302,7 +1307,10 @@ export class DiscordAdapter {
           // An enforced nonce for each part, as sendMessage gives.
           nonce: SnowflakeUtil.generate().toString(),
           enforceNonce: true,
+        }).catch((err: unknown) => {
+          throw withPostedParts(err, posted, chunks, attachments.length > 0, false);
         });
+        posted.push(sent.id);
         lastId = sent.id;
       }
       return { messageId: lastId, channelId: dm.id, recipientName };
@@ -3330,6 +3338,22 @@ export class DiscordAdapter {
     );
   }
 
+  /** Whether Discord would show this bot a channel's messages: a DM's
+   *  always, and a server channel's, a thread's included, when discord.js's
+   *  cached permissions give this bot Read Message History there (a
+   *  thread's are its parent's). Without it Discord answers a read of the
+   *  channel's messages with none, not a refusal. A channel discord.js
+   *  returns nothing for, or a bot member the cache doesn't hold, counts as
+   *  not shown. */
+  async readsMessageHistory(channelId: string): Promise<boolean> {
+    const channel = await this.channelById(channelId);
+    if (!channel) return false;
+    if (channel.isDMBased()) return true;
+    const me = channel.guild.members.me;
+    return me !== null && (channel as GuildBasedChannel & { permissionsFor(m: GuildMember): Readonly<PermissionsBitField> | null })
+      .permissionsFor(me)?.has(PermissionsBitField.Flags.ReadMessageHistory) === true;
+  }
+
   private messageFilterReason(message: Message): string | null {
     const parentId =
       message.channel && 'parentId' in message.channel
@@ -3510,6 +3534,51 @@ export function attachmentUrlExpiry(url: string): Date | null {
   if (!ex || !/^[0-9a-f]+$/i.test(ex)) return null;
   const expiry = new Date(Number.parseInt(ex, 16) * 1000);
   return Number.isFinite(expiry.getTime()) ? expiry : null;
+}
+
+/** Where a message stood when the send of one of its parts failed, a
+ *  message sent in one part included, carried on the error so the send
+ *  tools can say so: the agent would otherwise read the failure as nothing
+ *  sent, and sending the whole message again could post parts twice. The
+ *  parts' texts are as sent, after mentions are rewritten, so the agent
+ *  finds where the rest begins by its words, not by a position it would
+ *  have to count to. */
+export interface PostedParts {
+  /** The ids of the parts that posted, in order: none when the first failed. */
+  ids: string[];
+  /** How many parts the message was split into. */
+  of: number;
+  /** The text of the part that failed: '' for a message of files alone. */
+  failed: string;
+  /** The text of the part after it, unless it was the last. */
+  next?: string;
+  /** Whether the message carried files, which go with its last part. */
+  files: boolean;
+  /** Whether the message replied to one, which its first part carries. */
+  reply: boolean;
+}
+
+/** Carries what a failed send posted, on any send's error, a message sent
+ *  in one part included: whether that part posted is as unknown as a later
+ *  part's when Discord didn't refuse it. Attached only here, where
+ *  sendMessage or sendDM's post of a part throws, so it also says that post
+ *  was the request that failed. The DM notice's post (sendDmNotice) attaches
+ *  none: its errors stay with the notice's own outcome. */
+function withPostedParts(err: unknown, posted: string[], chunks: string[], files: boolean, reply: boolean): unknown {
+  if (err && typeof err === 'object') {
+    const k = posted.length;
+    Object.assign(err, {
+      postedParts: {
+        ids: [...posted],
+        of: chunks.length,
+        failed: chunks[k],
+        ...(k + 1 < chunks.length ? { next: chunks[k + 1] } : {}),
+        files,
+        reply,
+      } satisfies PostedParts,
+    });
+  }
+  return err;
 }
 
 /** A message's own attachments plus any carried by forwarded snapshots.
