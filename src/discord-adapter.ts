@@ -3421,6 +3421,13 @@ export class DiscordAdapter {
     return !!this.dmUsers && (!userId || !this.dmUsers.has(userId));
   }
 
+  /** Whether the DM list admits this user as a DM's other party, as it
+   *  stands now: a channels/open that looked a DM up checks again at its
+   *  commit, since the filters file can be reloaded during the open. */
+  dmUserAdmitted(userId: string): boolean {
+    return !this.dmUserRefused(userId);
+  }
+
   /** Ingress decision for a message fetched from history (the catch-up
    *  sweep), resolving a thread's parent from the channel cache. */
   historyIngressReason(channelId: string, guildId: string | null, authorId: string): string | null {

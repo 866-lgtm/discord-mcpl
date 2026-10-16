@@ -91,7 +91,10 @@ in the git log and PR descriptions.
   while the open is in progress, its lookup included). No history is fetched,
   and nothing is opened or subscribed, before a request names its channel. A
   channel unregistered while the open is in progress isn't opened, and neither
-  is one looked up that's deleted, or whose server the bot leaves, meanwhile.
+  is one looked up that's deleted, or whose server the bot leaves, meanwhile,
+  or a DM looked up whose recipient the DM list stops admitting meanwhile. A
+  channel gone meanwhile is refused as unknown (`-32023`), even when the
+  filters check after the history fetch can't find it.
   History items carry the label the open commits to. `sinceLastSeen` reads the
   persisted watermark even on the first open after a restart, before anything
   else has loaded it. An id the registry doesn't hold is looked up as every

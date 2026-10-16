@@ -269,7 +269,8 @@ describe('channels/open backscroll', () => {
         assert.equal(err.code, -32024);
         assert.equal(
           err.message,
-          `The channel filters stopped admitting ${mcplChannelId(G1, ALLOWED)} while its history was fetched, so none of it is returned. Nothing was opened.`,
+          `The channel filters stopped admitting ${mcplChannelId(G1, ALLOWED)} while its history was fetched, so none of it is returned. ` +
+            'Nothing was opened. Asking again with history is refused while the filters leave it out.',
         );
         return true;
       },

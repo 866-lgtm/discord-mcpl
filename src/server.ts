@@ -3473,6 +3473,31 @@ export class DiscordMcplServer {
     const lifecycle = this.lifecycleEpoch(parsed.channelId);
     const lookedUp = target.kind === 'registered' ? null : await this.lookUpServedTarget(target, params.type);
     const desc = target.kind === 'registered' ? target.channel : lookedUp!.desc;
+    // What arrived during the lookup or the history fetch that takes the
+    // channel out of service: one looked up that's deleted, or of a guild the
+    // bot left, or a DM whose recipient the DM list stopped admitting; or a
+    // registered one unregistered.
+    const unregistered = () => new RequestRefusal(
+      ERR_UNKNOWN_CHANNEL,
+      `${desc.id} was unregistered while this open was in progress (deleted, archived, in a server the bot left, ` +
+        'or no longer admitted by the filters). Nothing was opened.',
+    );
+    const goneMeanwhile = (): RequestRefusal | null => {
+      if (!lookedUp) return this.channelManager.get(desc.id) ? null : unregistered();
+      if (this.notServed(parsed.channelId, lookedUp.facts)) {
+        return new RequestRefusal(
+          ERR_UNKNOWN_CHANNEL,
+          `${desc.id} was deleted, or the bot left its server, while this open was in progress. Nothing was opened.`,
+        );
+      }
+      if (lookedUp.dmRecipientId !== undefined && !this.discord.dmUserAdmitted(lookedUp.dmRecipientId)) {
+        return new RequestRefusal(
+          ERR_UNKNOWN_CHANNEL,
+          `The DM list stopped admitting ${desc.id}'s recipient while this open was in progress. Nothing was opened.`,
+        );
+      }
+      return null;
+    };
     const requested = params.history?.limit ?? 0;
     let backscroll: { messages: Awaited<ReturnType<DiscordAdapter['fetchHistory']>>; truncated: boolean } | null = null;
     if (requested > 0) {
@@ -3485,11 +3510,15 @@ export class DiscordMcplServer {
       // the history is fetched, and nothing they no longer admit is returned
       // (as resolveLatestFrom checks again after its reads).
       // Both answers say the open couldn't go ahead (MCPL's open failed),
-      // as a failed history fetch does.
+      // as a failed history fetch does. A channel gone meanwhile fails its
+      // check too, since it can't be found, and is refused as the commit
+      // would refuse it.
       const filtersRefusal = async (): Promise<string | null> => {
         try {
           return await this.discord.inspectionRefusal(parsed.channelId);
         } catch (err) {
+          const gone = goneMeanwhile();
+          if (gone) throw gone;
           throw new RequestRefusal(
             ERR_CHANNEL_OPEN_FAILED,
             `${desc.id} couldn't be checked against the channel filters, so nothing was opened: ${errorText(err)}`,
@@ -3522,7 +3551,8 @@ export class DiscordMcplServer {
         dbg('channel-open:inspection-refused-after-fetch', { channelId: desc.id });
         throw new RequestRefusal(
           ERR_CHANNEL_OPEN_FAILED,
-          `The channel filters stopped admitting ${desc.id} while its history was fetched, so none of it is returned. Nothing was opened.`,
+          `The channel filters stopped admitting ${desc.id} while its history was fetched, so none of it is returned. ` +
+            'Nothing was opened. Asking again with history is refused while the filters leave it out.',
         );
       }
       messages.sort((a, b) => a.timestamp.getTime() - b.timestamp.getTime());
@@ -3542,24 +3572,15 @@ export class DiscordMcplServer {
     // A looked-up channel is registered, and announced, only here, so an
     // open refused before this leaves nothing for the host to act on. One
     // deleted, or of a guild the bot left, while its history was fetched
-    // isn't served now; one traffic registered meanwhile keeps that
-    // registration.
+    // isn't served now, nor a DM whose recipient the DM list stopped
+    // admitting; one traffic registered meanwhile keeps that registration.
     if (lookedUp) {
-      if (this.notServed(parsed.channelId, lookedUp.facts)) {
-        throw new RequestRefusal(
-          ERR_UNKNOWN_CHANNEL,
-          `${desc.id} was deleted, or the bot left its server, while this open was in progress. Nothing was opened.`,
-        );
-      }
+      const gone = goneMeanwhile();
+      if (gone) throw gone;
       if (!this.channelManager.get(desc.id)) this.registerChannels([desc]);
     }
     const opened = this.channelManager.open(desc.id);
-    if (!opened) {
-      throw new RequestRefusal(
-        ERR_UNKNOWN_CHANNEL,
-        `${desc.id} was unregistered while this open was in progress (deleted, archived, or no longer admitted by the filters). Nothing was opened.`,
-      );
-    }
+    if (!opened) throw unregistered();
     const result: ChannelOpenResponse = { channel: opened };
     if (backscroll) {
       result.history = this.projectHistoryReactions(backscroll.messages).map((message) => ({
@@ -3604,7 +3625,7 @@ export class DiscordMcplServer {
   private async lookUpServedTarget(
     target: { id: string; via: string },
     type: unknown,
-  ): Promise<{ desc: ChannelDescriptor; facts: ChannelFacts | null }> {
+  ): Promise<{ desc: ChannelDescriptor; facts: ChannelFacts | null; dmRecipientId?: string }> {
     const parsed = parseMcplChannelId(target.id)!; // resolveOpenTarget hands back only ids that parse
     const found = await this.discord.lookUpServedChannel(parsed.guildId, parsed.channelId);
     // Read after the lookup's waits, as a delivery's registration reads it
@@ -3612,8 +3633,10 @@ export class DiscordMcplServer {
     if (!found || this.notServed(parsed.channelId, found.kind === 'guild' ? found.facts : null)) {
       throw new RequestRefusal(
         ERR_UNKNOWN_CHANNEL,
-        `No channel this server serves matches ${target.via}: Discord doesn't know it, or it isn't a channel messages ` +
-          'are posted in, a thread, or a DM, that the filters admit. Nothing was opened.',
+        `No channel this server serves matches ${target.via}: Discord doesn't know it or won't show it to this bot, ` +
+          'it was deleted lately or is in a server the bot left, or it isn\'t a channel messages are posted in, a ' +
+          'thread or a DM that the filters admit. Nothing was opened. list_channels with a server\'s id lists the ' +
+          'channels this server serves there.',
       );
     }
     if (found.kind === 'uncertain') {
@@ -3636,7 +3659,7 @@ export class DiscordMcplServer {
     if (desc.type !== type) {
       throw new RequestRefusal(INVALID_PARAMS, `${target.via} is a ${desc.type} channel, not ${typeName(String(type))}. Nothing was opened.`);
     }
-    return { desc, facts: found.kind === 'guild' ? found.facts : null };
+    return found.kind === 'guild' ? { desc, facts: found.facts } : { desc, facts: null, dmRecipientId: found.recipientId };
   }
 
   /** Whether a channel found by an exact open's lookup isn't one this server
