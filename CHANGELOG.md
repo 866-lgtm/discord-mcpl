@@ -257,6 +257,17 @@ in the git log and PR descriptions.
   `send_dm` or a host's `channels/publish`, and each part of one sent in
   parts, now carries a nonce of its own, which Discord enforces: it answers
   a repeat sent within a few minutes with the message it already made.
+- **A message sent in parts is no longer hard-cut inside a character.** A
+  message longer than 1,900 UTF-16 code units is sent in parts, each cut at
+  a line break or a space late enough in its first 1,900 units, or else
+  hard, at the last character boundary at or before 1,900 units, so the
+  character begins the next part. The hard cut used to fall at 1,900 itself,
+  which could be inside a character: between the two halves of one outside
+  the Basic Multilingual Plane, such as most emoji, or between the code
+  points of what a reader sees as one character, such as an emoji's ZWJ
+  sequence, a flag's two regional indicators, or a letter and its combining
+  marks. A single character longer than 1,900 units is still cut inside,
+  never between the halves of a surrogate pair.
 
 ## 0.2.0 — 2026-10-13
 

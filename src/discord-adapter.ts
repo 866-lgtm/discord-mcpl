@@ -95,6 +95,28 @@ export type ThreadsSyncedHandler = (
 /** Maximum attachments Discord accepts on a single message. */
 const MAX_DISCORD_ATTACHMENTS = 10;
 
+/** Graphemes: what a reader takes as one character, such as an emoji's ZWJ
+ *  sequence, a flag's two regional indicators, or a letter and its combining
+ *  marks. */
+const GRAPHEMES = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
+
+/** Where to cut `text` hard at `limit` UTF-16 units: the last grapheme
+ *  boundary at or before it, so this cut parts no character between two
+ *  parts. splitForDiscord's line-break and space cuts don't look at
+ *  graphemes. When a single grapheme runs past the limit from the start,
+ *  there's no such boundary, so the cut falls inside it, moved back one unit
+ *  if it would part a surrogate pair. */
+function hardCut(text: string, limit: number): number {
+  let cut = 0;
+  for (const { index } of GRAPHEMES.segment(text)) {
+    if (index > limit) break;
+    cut = index;
+  }
+  if (cut > 0) return cut;
+  const unit = text.charCodeAt(limit - 1);
+  return unit >= 0xd800 && unit <= 0xdbff ? limit - 1 : limit;
+}
+
 /** What a sendDM failure carries once its DM channel was resolved. */
 export interface DmSendFailure {
   dmChannel?: { id: string; recipientName: string };
@@ -1105,9 +1127,11 @@ export class DiscordAdapter {
 
   // ── Operations ──
 
-  /** Split text into Discord-safe chunks (<=1900 chars), preferring newline then
-   *  space boundaries; hard-splits over-long runs. Discord rejects content over
-   *  the per-message limit (DiscordAPIError 50035). */
+  /** Split text into Discord-safe chunks (<=1900 UTF-16 units), preferring
+   *  newline then space boundaries; hard-splits over-long runs at a character
+   *  boundary, unless one character is itself longer than the limit
+   *  (hardCut). Discord rejects content over the per-message limit
+   *  (DiscordAPIError 50035). */
   private splitForDiscord(text: string, limit = 1900): string[] {
     if (!text) return [];
     if (text.length <= limit) return [text];
@@ -1116,7 +1140,7 @@ export class DiscordAdapter {
     while (rest.length > limit) {
       let cut = rest.lastIndexOf('\n', limit);
       if (cut < limit * 0.5) cut = rest.lastIndexOf(' ', limit);
-      if (cut < limit * 0.5) cut = limit;
+      if (cut < limit * 0.5) cut = hardCut(rest, limit);
       chunks.push(rest.slice(0, cut));
       rest = rest.slice(cut).replace(/^\s+/, '');
     }
