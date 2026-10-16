@@ -13,6 +13,8 @@ function fixture(t: TestContext) {
   });
   const client = adapter.rawClient;
   t.after(() => client.destroy());
+  // The bot is in the guild these deletions come from.
+  (client.guilds as any)._add({ id: 'g1', name: 'Guild' });
   const server = new DiscordMcplServer(adapter);
   const s = server as any;
   const sent: Array<{ method: string; params: any }> = [];
@@ -29,9 +31,7 @@ function fixture(t: TestContext) {
   s.setupDiscordForwarding();
 
   function open(channelId: string) {
-    const descriptor = toDescriptor('g1', 'Guild', {
-      id: channelId, name: channelId, type: 'text', label: '#' + channelId,
-    });
+    const descriptor = toDescriptor({ id: channelId, guildId: 'g1', guildName: 'Guild', type: 'text', name: channelId });
     s.channelManager.register(descriptor);
     s.channelManager.open(descriptor.id);
   }
