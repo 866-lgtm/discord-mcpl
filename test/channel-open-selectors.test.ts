@@ -88,8 +88,10 @@ function fixture(
     async inspectionRefusal(channelId: string) {
       return opts.inspection ? opts.inspection(channelId) : null;
     },
-    dmUserAdmitted(userId: string) {
-      return !offDmList.has(userId);
+    // As the adapter answers whenever a DM list is set: a user it isn't
+    // given isn't admitted, so only a DM's recipient may be asked about.
+    dmUserAdmitted(userId: string | undefined) {
+      return userId !== undefined && !offDmList.has(userId);
     },
     // A deletion re-derives what's registered from the cache, which holds
     // nothing here, and nothing is stale.
@@ -134,8 +136,9 @@ function fixture(
   return { server, fetched, lookups, left, offDmList, subscribed, nothingOpened, refused };
 }
 
-/** A history fetch held open until released, so a test can act during it. */
-function heldHistory() {
+/** A history fetch held open until released, so a test can act during it.
+ *  With `fails`, the fetch rejects with it once released. */
+function heldHistory(fails?: Error) {
   let reached!: () => void;
   let release!: () => void;
   const atFetch = new Promise<void>((resolve) => { reached = resolve; });
@@ -143,17 +146,18 @@ function heldHistory() {
   const history = async (channelId: string) => {
     reached();
     await gate;
+    if (fails) throw fails;
     return [historyItem(channelId)];
   };
   return { history, atFetch, release };
 }
 
-/** Wait until the open reaches its history fetch, failing with the open's
- *  own error, rather than waiting forever, if it settles before. */
-async function untilFetch(held: { atFetch: Promise<void> }, open: Promise<unknown>): Promise<void> {
+/** Wait until the call under test reaches a held fetch, failing with the
+ *  call's own error, rather than waiting forever, if it settles before. */
+async function untilFetch(held: { atFetch: Promise<void> }, call: Promise<unknown>, fetch = 'its history fetch'): Promise<void> {
   await Promise.race([
     held.atFetch,
-    open.then(() => { throw new Error('the open settled before its history fetch'); }),
+    call.then(() => { throw new Error(`the call settled before ${fetch}`); }),
   ]);
 }
 
@@ -304,8 +308,9 @@ describe('channels/open: what selects', () => {
     const f = fixture([general]);
     const long = `discord:g1:${'x'.repeat(5000)}`;
     await assert.rejects(f.server.handleChannelOpen({ channelId: long, type: 'discord' }), (err: Error) => {
-      assert.ok(err.message.length < 1000, `${err.message.length} characters, far fewer than the value's 5,011`);
-      assert.ok(err.message.includes(`"${long.slice(0, 100)}…"`), 'the first hundred characters, marked as cut');
+      // The value as the refusal quotes it: its first hundred characters,
+      // marked as cut, and nothing more of it.
+      assert.equal(/^No channel this server serves matches channelId "([^"]*)": /.exec(err.message)?.[1], `${long.slice(0, 100)}…`);
       return true;
     });
   });
@@ -391,10 +396,20 @@ describe("channels/open: an id the registry doesn't hold", () => {
     const f = fixture();
     await f.refused(
       { channelId: 'discord:g1:c9', type: 'discord', address: { guildId: 'g1', channelId: 'c1' }, history: { limit: 10 } }, UNKNOWN_CHANNEL,
-      /^No channel this server serves matches channelId "discord:g1:c9": Discord doesn't know it or won't show it to this bot, it was deleted lately or is in a server the bot left, or it isn't a channel messages are posted in, a thread or a DM that the filters admit\. Nothing was opened\. list_channels with a server's id lists the channels this server serves there\.$/,
+      /^No channel this server serves matches channelId "discord:g1:c9": Discord doesn't know it or won't show it to this bot, it's in another server than the id names, it was deleted lately or is in a server the bot left, or it isn't a channel messages are posted in or a thread that the filters admit\. Nothing was opened\. list_channels with a server's id lists the channels this server serves there\.$/,
     );
     await f.refused({ type: 'discord', address: { guildId: 'g1', channelId: 'c9' } }, UNKNOWN_CHANNEL, /^No channel this server serves matches address "g1"\/"c9"/);
     assert.deepEqual(f.lookups, ['g1/c9', 'g1/c9']);
+    f.nothingOpened();
+  });
+
+  it("refuses a DM id this server does not serve as unknown, with a DM's causes and no server to list", async () => {
+    const f = fixture();
+    await f.refused(
+      { channelId: 'discord:dm:d9', type: 'discord', history: { limit: 10 } }, UNKNOWN_CHANNEL,
+      /^No DM this server serves matches channelId "discord:dm:d9": Discord doesn't know it or won't show it to this bot, it isn't a DM, or the DM list doesn't admit its recipient\. Nothing was opened\.$/,
+    );
+    assert.deepEqual(f.lookups, ['dm/d9']);
     f.nothingOpened();
   });
 
@@ -562,10 +577,84 @@ describe("channels/open: a looked-up channel is registered only when the open co
     held.release();
     await assert.rejects(open, (err: Error & { code?: number }) =>
       err.code === UNKNOWN_CHANNEL
-        && err.message === "The DM list stopped admitting discord:dm:d9's recipient while this open was in progress. Nothing was opened.");
+        && err.message === "The DM list stopped admitting discord:dm:d9's recipient while this open was in progress. Nothing was opened. "
+          + 'Opening it is refused while the DM list leaves its recipient out.');
     assert.equal(f.server.channelManager.get('discord:dm:d9'), undefined, "it isn't registered");
     assert.deepEqual(added(), [], 'nothing was announced');
     assert.deepEqual(f.subscribed(), [], 'nothing was subscribed');
+  });
+
+  it('refuses one deleted, or whose server the bot leaves, as gone when that is what fails its history fetch', async () => {
+    const goneText = 'discord:g1:c9 was deleted, or the bot left its server, while this open was in progress. Nothing was opened.';
+    for (const during of ['deleted', 'left'] as const) {
+      // Discord answers the fetch with the channel gone, after the server
+      // has heard of it.
+      const held = heldHistory(new Error(during === 'deleted' ? 'Unknown Channel' : 'Missing Access'));
+      const f = fixture([general], { served: lateServed, history: held.history });
+      const added = announcing(f.server);
+      const open = f.server.handleChannelOpen({ channelId: 'discord:g1:c9', type: 'discord', history: { limit: 5 } });
+      await untilFetch(held, open);
+      if (during === 'deleted') (f.server as unknown as { channelDeleted(guildId: string, channelId: string): void }).channelDeleted('g1', 'c9');
+      else f.left.add('g1');
+      held.release();
+      await assert.rejects(open, (err: Error & { code?: number }) => err.code === UNKNOWN_CHANNEL && err.message === goneText, during);
+      assert.equal(f.server.channelManager.get('discord:g1:c9'), undefined, `${during}: it isn't registered`);
+      assert.deepEqual(added(), [], `${during}: nothing was announced`);
+      assert.deepEqual(f.subscribed(), [], `${during}: nothing was subscribed`);
+    }
+    // A registered channel deleted while its history is fetched.
+    const held = heldHistory(new Error('Unknown Channel'));
+    const g = fixture([general], { history: held.history });
+    const open = g.server.handleChannelOpen({ channelId: 'discord:g1:c1', type: 'discord', history: { limit: 5 } });
+    await untilFetch(held, open);
+    (g.server as unknown as { channelDeleted(guildId: string, channelId: string): void }).channelDeleted('g1', 'c1');
+    held.release();
+    await assert.rejects(open, (err: Error & { code?: number }) =>
+      err.code === UNKNOWN_CHANNEL
+        && err.message === 'discord:g1:c1 was unregistered while this open was in progress (deleted, archived, in a server the bot left, or no longer admitted by the filters). Nothing was opened.');
+    assert.deepEqual(g.subscribed(), [], 'nothing was subscribed');
+  });
+
+  it('refuses one gone meanwhile as gone when the filters check refuses it, before the history fetch or after it', async () => {
+    const goneText = 'discord:g1:c9 was deleted, or the bot left its server, while this open was in progress. Nothing was opened.';
+    const outside = 'Channel c9 is outside this residence\'s configured channel filters — filters bound inspection as well as delivery. Nothing was read.';
+    // Before the fetch: the bot leaves the server while the check runs, and
+    // the check refuses the channel, or fails to place it.
+    for (const check of ['refuses', 'fails'] as const) {
+      let f!: ReturnType<typeof fixture>;
+      f = fixture([general], {
+        served: lateServed,
+        inspection: async () => {
+          f.left.add('g1');
+          if (check === 'fails') throw new Error('Channel c9 not found');
+          return outside;
+        },
+      });
+      await f.refused({ channelId: 'discord:g1:c9', type: 'discord', history: { limit: 5 } }, UNKNOWN_CHANNEL,
+        /^discord:g1:c9 was deleted, or the bot left its server, while this open was in progress\. Nothing was opened\.$/);
+      assert.deepEqual(f.fetched, [], `${check}: no history was fetched`);
+      assert.equal(f.server.channelManager.get('discord:g1:c9'), undefined, `${check}: it isn't registered`);
+    }
+    // After the fetch: the bot leaves the server during it, and the check
+    // after it refuses the channel.
+    let left = false;
+    const held = heldHistory();
+    const g = fixture([general], { served: lateServed, history: held.history, inspection: async () => (left ? outside : null) });
+    const open = g.server.handleChannelOpen({ channelId: 'discord:g1:c9', type: 'discord', history: { limit: 5 } });
+    await untilFetch(held, open);
+    g.left.add('g1');
+    left = true;
+    held.release();
+    await assert.rejects(open, (err: Error & { code?: number }) => err.code === UNKNOWN_CHANNEL && err.message === goneText);
+    assert.deepEqual(g.subscribed(), [], 'nothing was subscribed');
+  });
+
+  it('opens a guild channel it looks up, with a DM list set, since the DM list is asked only about a DM', async () => {
+    const f = fixture([general], { served: lateServed });
+    f.offDmList.add('u9');
+    const res = await f.server.handleChannelOpen({ channelId: 'discord:g1:c9', type: 'discord', history: { limit: 5 } });
+    assert.equal(res.channel.id, 'discord:g1:c9');
+    assert.equal(f.server.channelManager.isOpen('discord:g1:c9'), true);
   });
 
   it('keeps a registration traffic made during the history fetch, and labels the history by what it commits to', async () => {
@@ -667,6 +756,38 @@ describe('channels/open: what arrives during the lookup or the history fetch sta
       err.code === OPEN_FAILED && /^A channels\/close or mute_channel for discord:g1:c9 arrived while this open was in progress/.test(err.message));
     assert.equal(f.server.channelManager.isOpen('discord:g1:c9'), false);
     assert.deepEqual(f.subscribed(), []);
+  });
+
+  it('refuses as gone a channel that went meanwhile, though a close or mute arrived too', async () => {
+    const late: ChannelFacts = { id: 'c9', guildId: 'g1', guildName: 'Guild', name: 'late', type: 'text' };
+    for (const during of ['close', 'mute'] as const) {
+      // Looked up, and deleted during its history fetch.
+      const held = heldHistory();
+      const f = fixture([general], {
+        served: (guild, channel) => (guild === 'g1' && channel === 'c9' ? { kind: 'guild', facts: late } : null),
+        history: held.history,
+      });
+      const open = f.server.handleChannelOpen({ channelId: 'discord:g1:c9', type: 'discord', history: { limit: 5 } });
+      await untilFetch(held, open);
+      (f.server as unknown as { channelDeleted(guildId: string, channelId: string): void }).channelDeleted('g1', 'c9');
+      if (during === 'close') f.server.handleChannelClose({ channelId: 'discord:g1:c9' });
+      else await f.server.executeToolCall('mute_channel', { channelId: 'c9' });
+      held.release();
+      await assert.rejects(open, (err: Error & { code?: number }) =>
+        err.code === UNKNOWN_CHANNEL
+          && err.message === 'discord:g1:c9 was deleted, or the bot left its server, while this open was in progress. Nothing was opened.', during);
+      // Registered, and unregistered during its history fetch.
+      const heldG = heldHistory();
+      const g = fixture([general], { history: heldG.history });
+      const openG = g.server.handleChannelOpen({ channelId: 'discord:g1:c1', type: 'discord', history: { limit: 5 } });
+      await untilFetch(heldG, openG);
+      g.server.channelManager.unregister('discord:g1:c1');
+      if (during === 'close') g.server.handleChannelClose({ channelId: 'discord:g1:c1' });
+      else await g.server.executeToolCall('mute_channel', { channelId: 'c1' });
+      heldG.release();
+      await assert.rejects(openG, (err: Error & { code?: number }) =>
+        err.code === UNKNOWN_CHANNEL && /^discord:g1:c1 was unregistered while this open was in progress/.test(err.message), `registered: ${during}`);
+    }
   });
 
   it('still lifts a mute that was in place before the open began', async () => {
@@ -812,7 +933,7 @@ describe('the adapter: which channels an exact open may register', () => {
     const gate = new Promise<void>((resolve) => { release = resolve; });
     t.mock.method(client.users, 'fetch', (async () => { reached(); await gate; return { username: 'ra' }; }) as never);
     const lookup = adapter.lookUpServedChannel('dm', 'd1');
-    await atFetch;
+    await untilFetch({ atFetch }, lookup, "the recipient's name fetch");
     adapter.updateFilters({ dmUsers: ['u2'] });
     release();
     assert.equal(await lookup, null);

@@ -93,8 +93,10 @@ in the git log and PR descriptions.
   channel unregistered while the open is in progress isn't opened, and neither
   is one looked up that's deleted, or whose server the bot leaves, meanwhile,
   or a DM looked up whose recipient the DM list stops admitting meanwhile. A
-  channel gone meanwhile is refused as unknown (`-32023`), even when the
-  filters check after the history fetch can't find it.
+  channel gone meanwhile, as far as this server has heard, is refused as
+  unknown (`-32023`) wherever the open notices it: when the channel filters
+  can't find it or refuse it, when its history fetch fails, and at commit,
+  ahead of a `channels/close` or `mute_channel` that arrived meanwhile.
   History items carry the label the open commits to. `sinceLastSeen` reads the
   persisted watermark even on the first open after a restart, before anything
   else has loaded it. An id the registry doesn't hold is looked up as every
