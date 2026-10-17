@@ -86,17 +86,19 @@ in the git log and PR descriptions.
   absent, is refused, and address ids must be strings. Refusals carry MCPL's
   codes: unknown channel (`-32023`), invalid params (`-32602`), or open failed
   (`-32024`, when the lookup can't get the channel's current facts, the
-  history fetch fails, the channel filters refuse reading its history or can't
-  be checked, or a `channels/close` or `mute_channel` for the channel arrives
-  while the open is in progress, its lookup included). No history is fetched,
-  and nothing is opened or subscribed, before a request names its channel. A
+  history fetch fails, or the channel filters refuse reading its history or
+  can't be checked). No history is fetched, and nothing is opened or
+  subscribed, before a request names its channel. Requests are handled one at
+  a time, so a `channels/close` or `mute_channel` sent during an open is
+  handled after it, and closes what it opened. A
   channel unregistered while the open is in progress isn't opened, and neither
   is one looked up that's deleted, or whose server the bot leaves, meanwhile,
   or a DM looked up whose recipient the DM list stops admitting meanwhile. A
   channel gone meanwhile, as far as this server has heard, is refused as
   unknown (`-32023`) wherever the open notices it: when the channel filters
-  can't find it or refuse it, when its history fetch fails, and at commit,
-  ahead of a `channels/close` or `mute_channel` that arrived meanwhile.
+  can't find it or refuse it, when its history fetch fails, and at commit. A
+  registered thread archived meanwhile is refused that way too, and opening
+  it again by its id opens it.
   History items carry the label the open commits to. `sinceLastSeen` reads the
   persisted watermark even on the first open after a restart, before anything
   else has loaded it. An id the registry doesn't hold is looked up as every

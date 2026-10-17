@@ -1914,7 +1914,6 @@ export class DiscordMcplServer {
         // Saved as in set_reaction_visibility: when the call changes the list
         // or the file may not hold it.
         const unsaved = wasNew || this.mutedUnsaved ? this.saveMuted() : null;
-        this.bumpLifecycle(channelId); // an open awaiting history doesn't undo this mute
         // Muting implies leaving: drop any ambient subscription so the channel
         // stops delivering; it also won't auto-subscribe back in while muted.
         // Its reaction visibility goes too, as a close drops it
@@ -3468,9 +3467,6 @@ export class DiscordMcplServer {
     if (target.kind === 'refused') throw new RequestRefusal(target.code, target.reason);
     const parsed = parseMcplChannelId(target.kind === 'registered' ? target.channel.id : target.id);
     if (!parsed) throw new Error(`Invalid Discord channel ID: ${target.kind === 'registered' ? target.channel.id : target.id}`);
-    // A close or mute of this channel from here on, during the lookup or the
-    // history fetch, stands over this open.
-    const lifecycle = this.lifecycleEpoch(parsed.channelId);
     const lookedUp = target.kind === 'registered' ? null : await this.lookUpServedTarget(target, params.type);
     const desc = target.kind === 'registered' ? target.channel : lookedUp!.desc;
     // What arrived during the lookup or the history fetch that takes the
@@ -3480,7 +3476,8 @@ export class DiscordMcplServer {
     const unregistered = () => new RequestRefusal(
       ERR_UNKNOWN_CHANNEL,
       `${desc.id} was unregistered while this open was in progress (deleted, archived, in a server the bot left, ` +
-        'or no longer admitted by the filters). Nothing was opened.',
+        'or no longer admitted by the filters). Nothing was opened. A thread archived meanwhile opens again when ' +
+        'it is opened by its id.',
     );
     const goneMeanwhile = (): RequestRefusal | null => {
       if (!lookedUp) return this.channelManager.get(desc.id) ? null : unregistered();
@@ -3573,22 +3570,17 @@ export class DiscordMcplServer {
       backscroll = { messages, truncated: requested > limit };
     }
 
-    // Commit the lifecycle only now, after the lookup and any history fetch,
-    // and only if nothing that arrived meanwhile overrides this open. A
-    // channel gone meanwhile isn't opened, and is refused as gone whatever
-    // else arrived, as wherever the open notices it: one looked up that's
-    // deleted, or of a guild the bot left, a DM looked up whose recipient
-    // the DM list stopped admitting, or a registered one unregistered. Then
-    // a close or mute of the channel stands. So a failed or overtaken open
-    // leaves nothing subscribed.
+    // Commit only now, after the lookup and any history fetch. Requests are
+    // handled one at a time (serve awaits each before reading the next), so
+    // no channels/close or mute_channel arrives during this open: one sent
+    // meanwhile is handled after it, and closes what it opened. What can
+    // arrive meanwhile is Discord's: a channel gone meanwhile isn't opened,
+    // as wherever the open notices it (one looked up that's deleted, or of a
+    // guild the bot left, a DM looked up whose recipient the DM list stopped
+    // admitting, or a registered one unregistered). So a failed open leaves
+    // nothing subscribed.
     const gone = goneMeanwhile();
     if (gone) throw gone;
-    if (this.lifecycleEpoch(parsed.channelId) !== lifecycle) {
-      throw new RequestRefusal(
-        ERR_CHANNEL_OPEN_FAILED,
-        `A channels/close or mute_channel for ${desc.id} arrived while this open was in progress, so nothing was opened.`,
-      );
-    }
     // A looked-up channel is registered, and announced, only here, so an
     // open refused before this leaves nothing for the host to act on; one
     // traffic registered meanwhile keeps that registration.
@@ -3693,25 +3685,11 @@ export class DiscordMcplServer {
       || (facts.type === 'thread' && !!facts.parentId && this.deletedChannels.has(facts.parentId));
   }
 
-  /** How many closes and mutes a Discord channel has had in this process
-   *  (bumpLifecycle), so an open that awaited history can tell whether one
-   *  arrived meanwhile. */
-  private lifecycleEpochs = new Map<string, number>();
-
-  private lifecycleEpoch(channelId: string): number {
-    return this.lifecycleEpochs.get(channelId) ?? 0;
-  }
-
-  private bumpLifecycle(channelId: string): void {
-    this.lifecycleEpochs.set(channelId, this.lifecycleEpoch(channelId) + 1);
-  }
-
   private handleChannelClose(params: ChannelsCloseParams): ChannelsCloseResult {
     const desc = this.channelManager.get(params.channelId);
     const parsed = parseMcplChannelId(params.channelId);
     const wasOpen = this.channelManager.close(params.channelId);
     if (parsed) {
-      this.bumpLifecycle(parsed.channelId); // an open awaiting history doesn't overtake this close
       this.unsubscribeRawChannel(parsed.channelId);
     }
     return { closed: wasOpen || desc !== undefined };
