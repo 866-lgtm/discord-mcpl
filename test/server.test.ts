@@ -526,7 +526,7 @@ describe('DiscordMcplServer', () => {
 
     // The enable didn't apply: history stays off, as the request before it left it.
     assert.equal(history?.isError, true);
-    assert.match(history?.content[0]?.text ?? '', /Feature set 'discord\.history' is not enabled/);
+    assert.match(history?.content[0]?.text ?? '', /^fetch_history is turned off here: this host has disabled the "discord\.history" feature set/);
     // Nor did the disable: messaging still works.
     assert.notEqual(reaction?.isError, true, `add_reaction was refused: ${reaction?.content[0]?.text}`);
     assert.deepEqual(discord.reactions.at(-1), { channelId: 'discord:g1:c1', messageId: 'm1', emoji: '👍' });
@@ -648,7 +648,7 @@ describe('DiscordMcplServer', () => {
 
     assert.equal(receipt?.accepted, true, 'the early policy was answered');
     assert.equal(history?.isError, true, "the policy's disable held past notifications/initialized");
-    assert.match(history?.content[0]?.text ?? '', /Feature set 'discord\.history' is not enabled/);
+    assert.match(history?.content[0]?.text ?? '', /^fetch_history is turned off here: this host has disabled the "discord\.history" feature set/);
   });
 
   it("a request whose handler throws something that isn't an Error is answered, and serving goes on", async (t) => {

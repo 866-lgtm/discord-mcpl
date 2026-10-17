@@ -31,8 +31,8 @@ import {
   type ApplicationCommandDataResolvable,
   type GatewayThreadListSyncDispatchData,
 } from 'discord.js';
-import { existsSync, statSync } from 'node:fs';
-import { basename } from 'node:path';
+import { accessSync, constants as fsConstants, statSync } from 'node:fs';
+import { basename, resolve as resolvePath } from 'node:path';
 import { dbg } from './debug-log.js';
 
 import {
@@ -40,8 +40,10 @@ import {
   formatChannelLabel,
   isNameAddressableKind,
   isSnowflake,
+  isThreadLabelShape,
   parseChannelRef,
   resolveChannelName,
+  threadLabelRefusal,
   type ChannelCandidate,
   type ResolveResult,
 } from './channel-names.js';
@@ -114,29 +116,90 @@ export interface OutgoingFile {
 }
 
 /**
- * Turn `OutgoingFile[]` specs into discord.js `AttachmentBuilder`s, validating
- * each path up front so a bad path yields a clear error rather than an opaque
- * discord.js failure mid-send. discord.js reads the path lazily at send time.
+ * Turn `OutgoingFile[]` specs into discord.js `AttachmentBuilder`s, checking
+ * every file before any part of the message is sent. discord.js reads each
+ * path lazily, at send time, so a file it can't read would fail after the
+ * parts before it posted. Tool arguments aren't checked against their
+ * schema, so `files` may arrive as anything. Paths are read on the machine
+ * running discord-mcpl, a relative one against its working directory.
  */
-function buildAttachments(files?: OutgoingFile[]): AttachmentBuilder[] {
-  if (!files || files.length === 0) return [];
-  if (files.length > MAX_DISCORD_ATTACHMENTS) {
+function buildAttachments(files?: unknown): AttachmentBuilder[] {
+  // No files: left out, or a value that says none (null, "", false, 0), as before.
+  if (!files) return [];
+  if (!Array.isArray(files)) {
     throw new Error(
-      `Too many files: ${files.length} (Discord allows up to ${MAX_DISCORD_ATTACHMENTS} per message)`,
+      `Nothing was sent: "files" must be a list of files, each as {"path": "<its path>"}, and this call gave ` +
+        `${kindOfValue(files)}.`,
     );
   }
-  return files.map((f) => {
-    if (!f || typeof f.path !== 'string' || !f.path.trim()) {
-      throw new Error('Each file must have a non-empty string "path"');
+  if (files.length > MAX_DISCORD_ATTACHMENTS) {
+    throw new Error(
+      `Nothing was sent: this call gave ${files.length} files, and Discord takes at most ${MAX_DISCORD_ATTACHMENTS} ` +
+        `in one message. Send ${MAX_DISCORD_ATTACHMENTS} or fewer, and the rest in another message.`,
+    );
+  }
+  return files.map((f: unknown, i) => {
+    const file = (f && typeof f === 'object' ? f : {}) as Partial<OutgoingFile>;
+    if (typeof file.path !== 'string' || !file.path.trim()) {
+      // A bare path, given as the entry itself, is the likely meaning of a
+      // string; an entry that isn't an object is named by its kind.
+      const hint = typeof f === 'string'
+        ? f.trim() ? `: give it as {"path": ${JSON.stringify(f.trim())}}` : ', and this one is blank'
+        : f && typeof f === 'object' && !Array.isArray(f) ? '' : `, and this call gave ${kindOfValue(f)}`;
+      throw new Error(
+        `Nothing was sent: files[${i}] needs "path", the path of a file on the machine running discord-mcpl, as a ` +
+          `non-empty string${hint}.`,
+      );
     }
-    if (!existsSync(f.path) || !statSync(f.path).isFile()) {
-      throw new Error(`File not found (or not a regular file): ${f.path}`);
+    // A name or description that says none (left out, null, "", false, 0)
+    // is left out, as before. A description given as a number or as true is
+    // sent as its text, such as "42". Any other value that isn't a string is
+    // refused rather than turned into text: its text form ("[object Object]"
+    // for an object, its items joined by commas for a list) would be a guess
+    // at the description the caller meant.
+    for (const key of ['name', 'description'] as const) {
+      const value: unknown = file[key];
+      const asText = key === 'description' && (typeof value === 'number' || value === true);
+      if (value && typeof value !== 'string' && !asText) {
+        throw new Error(
+          `Nothing was sent: files[${i}].${key} must be a string, and this call gave ${kindOfValue(value)}. Give it in quotes, ` +
+            `or leave it out${key === 'name' ? ' to use the file\'s own name' : ''}.`,
+        );
+      }
     }
-    const name = f.name && f.name.trim() ? f.name : basename(f.path);
-    const attachment = new AttachmentBuilder(f.path, { name });
-    if (f.description) attachment.setDescription(f.description);
+    const read = resolvePath(file.path);
+    const problem = unattachable(read);
+    if (problem) {
+      throw new Error(
+        `Nothing was sent: ${JSON.stringify(file.path)}${read === file.path ? '' : ` (read as ${read})`} ${problem} ` +
+          'on the machine running discord-mcpl. Give the path of a file there that it can read.',
+      );
+    }
+    const name = file.name && file.name.trim() ? file.name : basename(file.path);
+    const attachment = new AttachmentBuilder(file.path, { name });
+    if (file.description) attachment.setDescription(String(file.description));
     return attachment;
   });
+}
+
+/** How a refusal names a value of the wrong kind: "a number", "a list", "an
+ *  object", "null". Tool arguments aren't checked against their schema, so
+ *  a value can be anything. */
+export function kindOfValue(value: unknown): string {
+  return Array.isArray(value) ? 'a list' : value === null ? 'null' : typeof value === 'object' ? 'an object' : `a ${typeof value}`;
+}
+
+/** Why a path can't be attached, or null when it can: it must be a regular
+ *  file this process can read. */
+function unattachable(path: string): string | null {
+  try {
+    if (!statSync(path).isFile()) return "isn't a file";
+    accessSync(path, fsConstants.R_OK);
+    return null;
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    return code === 'ENOENT' || code === 'ENOTDIR' ? "doesn't exist" : `can't be read (${code ?? (err as Error).message})`;
+  }
 }
 
 // ── Public Types ──
@@ -1944,7 +2007,10 @@ export class DiscordAdapter {
     if (!guild?.channels) {
       throw new Error(`Guild ${guildId} not found`);
     }
-    const unavailable = () => new Error(`Guild ${guildId} is unavailable (a Discord outage); its channels can't be listed until it's back`);
+    const unavailable = () => new Error(
+      `Nothing was listed: server ${guildId} is unavailable in a Discord outage, so its channels can't be listed until ` +
+        "it's back. The same call can list them then.",
+    );
     if (!guild.available) throw unavailable();
     await this.refreshStale(guildId);
     // An outage can begin while those fetches are out.
@@ -2010,6 +2076,10 @@ export class DiscordAdapter {
       return { ok: false, reason: 'not-found', message: `Unusable channel reference: "${ref}"` };
     }
     if (parsed.kind === 'id') return { ok: true, id: parsed.id };
+    // A pasted thread label is refused by its shape, which no fact about a
+    // server changes, so before what follows: as a name it could reach a
+    // voice or stage room whose name has the same shape (formatThreadLabel).
+    if (isThreadLabelShape(parsed.name)) return threadLabelRefusal(ref);
     // A stale channel's current name isn't known: Discord may have renamed
     // it to any name, this one included, so no name in its guild resolves
     // while it's stale, whichever channel holds the name in the cache, and
@@ -2022,7 +2092,7 @@ export class DiscordAdapter {
       const where = parsed.guild === undefined ? 'a server this name could mean' : 'that server';
       return {
         ok: false, reason: 'ambiguous',
-        message: `${ref} can't be resolved by name right now: Discord's current facts for a channel in ${where} aren't known (its latest fetch failed or was overtaken by a change), so its current name may be this one. Address the channel by its id instead: meanwhile the registered label of each channel a name addresses there is its id, and list_channels gives the id of each channel whose facts are current.`,
+        message: `Nothing was done: ${ref} can't be resolved by name right now, since Discord's current facts for a channel in ${where} aren't known (its latest fetch failed or was overtaken by a change), so its current name may be this one. Address the channel by its id instead: until that fetch succeeds, each channel the name could mean there is shown by its id wherever its label would be, and list_channels lists the others with their ids.`,
       };
     }
     return resolveChannelName(parsed, names(parsed.name));
@@ -2481,7 +2551,10 @@ export class DiscordAdapter {
       // Discord says the new channel is gone already: deleted since, which
       // refetchChannel reported (channelGone).
       if ((err as { code?: unknown } | null)?.code === UNKNOWN_CHANNEL) {
-        throw new Error(`Channel ${created.id} was created, but Discord says it no longer exists`);
+        throw new Error(
+          `Channel ${created.id} was created, but Discord says it no longer exists: it was deleted since, so there's ` +
+            'no channel to use. create_text_channel can make it again.',
+        );
       }
       // The channel was made, but its facts aren't verified: it's marked
       // stale, labelled by its id, until a fresh fetch.

@@ -162,7 +162,7 @@ describe('fetch_history and fetch_around by numeric id', () => {
       for (const tool of ['fetch_history', 'fetch_around']) {
         const res = await server.handleToolCall(tool, { channelId, messageId: '420000000000000001' });
         assert.equal(res.isError, true, `${tool} ${JSON.stringify(channelId)}`);
-        assert.match(res.content[0].text, /needs channelId as a channel id string.*Nothing was read\.$/);
+        assert.match(res.content[0].text, new RegExp(`^Nothing was read: ${tool} needs channelId`));
       }
     }
     assert.deepEqual(reads, [], 'no history was read');

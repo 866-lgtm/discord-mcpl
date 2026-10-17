@@ -1014,6 +1014,8 @@ describe('server integration', () => {
       getFilters: () => ({}),
       updateFilters: () => ({ addedGuilds: [], removedGuilds: [] }),
       listGuilds: async () => [],
+      // A filters change re-derives the registered channels: none here.
+      getCachedChannelFactsFor: () => new Map(),
     };
   }
 
