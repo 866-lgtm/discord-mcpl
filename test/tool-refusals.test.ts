@@ -111,11 +111,11 @@ describe('tool refusals say what did not happen', () => {
   it('the retired subscription tools say nothing was done and what replaces them', async (t) => {
     const s = server(t);
     assert.equal((await s.handleToolCall('subscribe_channel', {})).content[0].text,
-      "Nothing was done: subscribe_channel is retired. Use the host's channel_open tool with the channel's id, " +
-        'discord:<server id>:<channel id>.');
+      "Nothing was done: subscribe_channel is retired. Use the host's channel_open tool with the channel's id: " +
+        'discord:<server id>:<channel id>, or discord:dm:<channel id> for a DM.');
     assert.equal((await s.handleToolCall('unsubscribe_channel', {})).content[0].text,
-      "Nothing was done: unsubscribe_channel is retired. Use the host's channel_close tool with the channel's id, " +
-        'discord:<server id>:<channel id>.');
+      "Nothing was done: unsubscribe_channel is retired. Use the host's channel_close tool with the channel's id: " +
+        'discord:<server id>:<channel id>, or discord:dm:<channel id> for a DM.');
   });
 
   it('a send with neither content nor files says nothing was sent', async (t) => {

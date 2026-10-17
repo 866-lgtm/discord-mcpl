@@ -77,7 +77,8 @@ in the git log and PR descriptions.
     `unsubscribe_channel` ("unsubscribe_channel is retired. Use the host
     channel_close tool with the MCPL channel id.") now begin by saying that
     nothing was done, and name the id the host's tool takes as the agent
-    sees it, `discord:<server id>:<channel id>`.
+    sees it: `discord:<server id>:<channel id>`, or
+    `discord:dm:<channel id>` for a DM.
   - A send with neither content nor files ("Provide "content", "files", or
     both — a message cannot be empty.") says that nothing was sent.
   - `filters_update`'s `setDmNotice` check ("setDmNotice must be true or

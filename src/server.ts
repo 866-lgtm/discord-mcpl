@@ -1925,15 +1925,15 @@ export class DiscordMcplServer {
 
       case 'subscribe_channel': {
         throw new Error(
-          "Nothing was done: subscribe_channel is retired. Use the host's channel_open tool with the channel's id, " +
-            'discord:<server id>:<channel id>.',
+          "Nothing was done: subscribe_channel is retired. Use the host's channel_open tool with the channel's id: " +
+            'discord:<server id>:<channel id>, or discord:dm:<channel id> for a DM.',
         );
       }
 
       case 'unsubscribe_channel': {
         throw new Error(
-          "Nothing was done: unsubscribe_channel is retired. Use the host's channel_close tool with the channel's id, " +
-            'discord:<server id>:<channel id>.',
+          "Nothing was done: unsubscribe_channel is retired. Use the host's channel_close tool with the channel's id: " +
+            'discord:<server id>:<channel id>, or discord:dm:<channel id> for a DM.',
         );
       }
 
