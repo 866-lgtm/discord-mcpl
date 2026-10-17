@@ -450,9 +450,17 @@ describe('the watermark store and the tools', () => {
   it('reads a padded channelId trimmed, so a store saves the id itself', async (t) => {
     const s = server(t);
     await s.executeToolCall('mute_channel', { channelId: ' chan-new ' });
+    await s.executeToolCall('mute_channel', { channelId: 'chan-old' });
     await s.executeToolCall('set_reaction_visibility', { channelId: '\tchan-shown\n', visible: true });
-    assert.deepEqual(json('muted.json'), ['chan-new']);
+    assert.deepEqual(json('muted.json'), ['chan-new', 'chan-old']);
     assert.deepEqual(json('reactions.json'), ['chan-shown']);
+    // Unmuting and reading the tally take it trimmed too.
+    assert.match(String(await s.executeToolCall('unmute_channel', { channelId: ' chan-old\t' })), /^Unmuted channel chan-old\./);
+    assert.deepEqual(json('muted.json'), ['chan-new']);
+    s.subscribeRawChannel('chan-sub');
+    const missed = await s.executeToolCall('channel_missed', { channelId: ' chan-sub ' }) as { channelId: string; subscribed: boolean };
+    assert.equal(missed.channelId, 'chan-sub');
+    assert.equal(missed.subscribed, true);
   });
 
   it("saves the muted list when a call changes it or its file may not hold it, and says so only then", async (t) => {

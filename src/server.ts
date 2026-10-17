@@ -48,7 +48,7 @@ import type {
 } from '@animalabs/mcpl-core';
 
 import type { ChannelFacts, DiscordAdapter, DiscordMessageData, DiscordAttachment, OutgoingFile, ReactionSummary, MessageEventInfo, DmRefusal, DmSendFailure, ThreadPlace } from './discord-adapter.js';
-import { LATEST_FROM_WINDOW, attachmentUrlExpiry, holdsNoMessages, isListedKind } from './discord-adapter.js';
+import { LATEST_FROM_WINDOW, attachmentUrlExpiry, holdsNoMessages, isListedKind, kindOfValue } from './discord-adapter.js';
 import { DM_NOTICE_TEXT, DmNoticeState, resolveDmNoticesPath, type DmNoticeDecision } from './dm-notices.js';
 
 /** How much of a latestFrom target's text its receipt echoes. */
@@ -228,29 +228,56 @@ function usableWatermarks(value: unknown): Usable<SavedWatermarks> {
 const unsavedNote = (store: string, failure: string | null): string =>
   failure ? ` The ${store} couldn't be saved (${failure}), so as it stands now it wouldn't survive a restart.` : '';
 
-/** The refusal for a tool called without a usable channelId, before it did
- *  anything (`nothing` says what didn't happen): it names what was wrong
- *  with the value given, and how to give one. Tool arguments aren't checked
- *  against their schema, so the value can be anything. A #name reaches only
- *  the kinds handleToolCall's resolver admits (see resolveChannelRef). */
-function channelIdRequired(tool: string, value: unknown, nothing = 'Nothing was done'): Error {
-  const wrong = value === undefined || value === null
-    ? ", which this call didn't give"
+/** How a required string argument's value fell short, for its refusal:
+ *  given none (left out, or null), blank, or not a string. Tool arguments aren't
+ *  checked against their schema, so the value can be anything. */
+function fellShort(value: unknown): string {
+  return value === undefined || value === null
+    ? ', and this call gave none'
     : typeof value === 'string'
       ? ', and this call gave it blank'
-      : ` as a string, and this call gave ${Array.isArray(value) ? 'a list' : typeof value === 'object' ? 'an object' : `a ${typeof value}`}`;
+      : ` as a string, and this call gave ${kindOfValue(value)}`;
+}
+
+/** The refusal for a tool called without a usable channelId, before it did
+ *  anything (`nothing` says what didn't happen): it names what was wrong
+ *  with the value given, and how to give one. A #name reaches only the kinds
+ *  handleToolCall's resolver admits (see resolveChannelRef). */
+function channelIdRequired(tool: string, value: unknown, nothing = 'Nothing was done'): Error {
   return new Error(
-    `${nothing}: ${tool} needs channelId${wrong}. Give the channel's id in quotes, such as "123456789012345678", ` +
-      "or, for a text, announcement or voice channel, its #name. list_channels, given a server's id (list_guilds " +
-      'lists them), lists the channels there that the configured filters allow, with their ids.',
+    `${nothing}: ${tool} needs channelId${fellShort(value)}. Give the channel's id in quotes, such as ` +
+      '"123456789012345678", or, for a text, announcement, voice or stage channel, its #name. list_channels with ' +
+      "guildId, a server's id from list_guilds, lists the channels there that the configured filters allow, with " +
+      'their ids.',
   );
 }
 
-/** A channel tool's channelId, trimmed, as handleToolCall reads it, or its
- *  refusal: a missing, blank or non-string value never reaches the tool. */
-function requiredChannelId(tool: string, value: unknown): string {
+/** A channel tool's channelId, trimmed, or its refusal: a missing, blank or
+ *  non-string value never reaches the tool. handleToolCall trims an id only
+ *  to tell it from a #name, and passes an id on as it was given. */
+function requiredChannelId(tool: string, value: unknown, nothing?: string): string {
   if (typeof value === 'string' && value.trim()) return value.trim();
-  throw channelIdRequired(tool, value);
+  throw channelIdRequired(tool, value, nothing);
+}
+
+/** send_dm's userId, or its refusal, before anything is looked up or sent. */
+function requiredUserId(value: unknown): string {
+  if (typeof value === 'string' && value.trim()) return value;
+  throw new Error(
+    `Nothing was sent: send_dm needs userId${fellShort(value)}. Give the recipient's id in quotes, such as ` +
+      '"123456789012345678", or their name: @username or display name.',
+  );
+}
+
+/** A send tool's content: its text, or none when it's left out (or null).
+ *  Anything else is refused before anything is sent. */
+function messageContent(tool: string, value: unknown): string {
+  if (value === undefined || value === null) return '';
+  if (typeof value === 'string') return value;
+  throw new Error(
+    `Nothing was sent: ${tool} takes content as a string, and this call gave ${kindOfValue(value)}. Give the message's ` +
+      'text in quotes, or, to send only files, leave content out and give files.',
+  );
 }
 
 /** A Discord message must carry text and/or attachments — reject empty sends. */
@@ -1739,7 +1766,7 @@ export class DiscordMcplServer {
 
       case 'send_message': {
         const channelId = args.channelId as string;
-        const content = (args.content as string | undefined) ?? '';
+        const content = messageContent(name, args.content);
         const files = args.files as OutgoingFile[] | undefined;
         requireContentOrFiles(content, files);
         let result: { messageId: string };
@@ -1755,7 +1782,7 @@ export class DiscordMcplServer {
 
       case 'reply_message': {
         const channelId = args.channelId as string;
-        const content = (args.content as string | undefined) ?? '';
+        const content = messageContent(name, args.content);
         const files = args.files as OutgoingFile[] | undefined;
         requireContentOrFiles(content, files);
         const { messageId: replyTo, target } = await this.resolveTargetMessage(channelId, args);
@@ -1776,13 +1803,14 @@ export class DiscordMcplServer {
       }
 
       case 'send_dm': {
-        const content = (args.content as string | undefined) ?? '';
+        const userId = requiredUserId(args.userId);
+        const content = messageContent(name, args.content);
         const files = args.files as OutgoingFile[] | undefined;
         requireContentOrFiles(content, files);
         let result: { messageId: string; channelId: string; recipientName: string };
         try {
           result = await this.discord.sendDM(
-            args.userId as string,
+            userId,
             content,
             { files },
           );
@@ -1897,13 +1925,15 @@ export class DiscordMcplServer {
 
       case 'subscribe_channel': {
         throw new Error(
-          'Nothing was done: subscribe_channel is retired. Use the host channel_open tool with the MCPL channel id.',
+          "Nothing was done: subscribe_channel is retired. Use the host's channel_open tool with the channel's id, " +
+            'discord:<server id>:<channel id>.',
         );
       }
 
       case 'unsubscribe_channel': {
         throw new Error(
-          'Nothing was done: unsubscribe_channel is retired. Use the host channel_close tool with the MCPL channel id.',
+          "Nothing was done: unsubscribe_channel is retired. Use the host's channel_close tool with the channel's id, " +
+            'discord:<server id>:<channel id>.',
         );
       }
 
@@ -1980,7 +2010,7 @@ export class DiscordMcplServer {
       case 'channel_missed': {
         // Checked before the loads, which can set aside and rewrite an
         // unusable watermarks file, so a refusal has done nothing.
-        const channelId = requiredChannelId('channel_missed', args.channelId);
+        const channelId = requiredChannelId('channel_missed', args.channelId, 'Nothing was read');
         this.ensureSubscriptionsLoaded();
         this.ensureWatermarkLoaded();
         if (this.subscribedChannels.has(channelId)) {

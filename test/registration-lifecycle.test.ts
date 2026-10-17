@@ -1477,7 +1477,7 @@ it("a name that a stale channel holds resolves to no channel when its fetch fail
   assert.equal(get.mock.callCount(), 1, 'the stale channel was fetched first');
   assert.equal(f.adapter.isStale(X), true);
   assert.equal(result.isError, true);
-  assert.match(result.content[0].text, /by its id instead: meanwhile the registered label of each channel a name addresses there is its id/);
+  assert.match(result.content[0].text, /by its id instead: until that fetch succeeds, each channel the name could mean there is shown by its id/);
   assert.deepEqual(sent, [], 'nothing was sent');
   // X may have taken any name meanwhile, so no name in its server resolves,
   // nor a name given without a server.
@@ -2314,4 +2314,77 @@ it("the catch-up's block from a stale thread whose fetch fails leaves out the na
   assert.equal(f.adapter.isStale(TH), true);
   assert.equal(f.pushes().length, 1, 'the block is delivered');
   assert.ok(!JSON.stringify(f.pushes()[0]?.params).includes('older-name'));
+});
+
+it("listing a server that's in an outage says nothing was listed, and that the same call can list it once it's back", async (t) => {
+  const f = fixture(t);
+  f.client.guilds.cache.get(G).available = false;
+  await assert.rejects(f.adapter.listChannels(G), {
+    message: `Nothing was listed: server ${G} is unavailable in a Discord outage, so its channels can't be listed until ` +
+      "it's back. The same call can list them then.",
+  });
+});
+
+it("a server that goes into an outage while list_channels refreshes it is refused the same way", async (t) => {
+  const f = fixture(t);
+  t.mock.method(f.adapter as any, 'refreshStale', async () => { f.client.guilds.cache.get(G).available = false; });
+  await assert.rejects(f.adapter.listChannels(G), {
+    message: `Nothing was listed: server ${G} is unavailable in a Discord outage, so its channels can't be listed until ` +
+      "it's back. The same call can list them then.",
+  });
+});
+
+it("a name given without a server, while some server's channel facts aren't current, says so in those words", (t) => {
+  const f = fixture(t);
+  (f.adapter as any).stale.set(P, { guildId: G });
+  assert.deepEqual(f.adapter.resolveChannelRef('#before'), {
+    ok: false,
+    reason: 'ambiguous',
+    message: "Nothing was done: #before can't be resolved by name right now, since Discord's current facts for a " +
+      'channel in a server this name could mean aren\'t known (its latest fetch failed or was overtaken by a change), ' +
+      'so its current name may be this one. Address the channel by its id instead: until that fetch succeeds, each ' +
+      'channel the name could mean there is shown by its id wherever its label would be, and list_channels lists ' +
+      'the others with their ids.',
+  });
+});
+
+it("a name in a server whose channel facts aren't current says nothing was done, and to address the channel by id", (t) => {
+  const f = fixture(t);
+  (f.adapter as any).stale.set(P, { guildId: G });
+  assert.deepEqual(f.adapter.resolveChannelRef('#before (Guild)'), {
+    ok: false,
+    reason: 'ambiguous',
+    message: "Nothing was done: #before (Guild) can't be resolved by name right now, since Discord's current facts " +
+      'for a channel in that server aren\'t known (its latest fetch failed or was overtaken by a change), so its current ' +
+      'name may be this one. Address the channel by its id instead: until that fetch succeeds, each channel the name ' +
+      'could mean there is shown by its id wherever its label would be, and list_channels lists the others with ' +
+      'their ids.',
+  });
+});
+
+it("a thread label in a server whose channel facts aren't current is refused for its shape, as anywhere", (t) => {
+  // No fact about a server changes a reference's shape, so the uncertain
+  // name's refusal, which invites a later try, doesn't answer it.
+  const f = fixture(t);
+  (f.adapter as any).stale.set(P, { guildId: G });
+  for (const label of ['#before › topic (Guild)', '#before › topic']) {
+    assert.deepEqual(f.adapter.resolveChannelRef(label), {
+      ok: false,
+      reason: 'thread-label',
+      message: `Nothing was done: "${label}" has a thread label's shape (#parent › thread), and thread labels are ` +
+        'display-only, never matched as names. Address the thread by its id instead, discord:<server id>:<thread id> ' +
+        'or its numeric id, which is shown with the label wherever the label is. A channel whose name has this ' +
+        'shape is addressed by id too.',
+    }, label);
+  }
+});
+
+it('create_text_channel whose channel is gone before its facts are fetched says so, and that it can make it again', async (t) => {
+  const f = fixture(t);
+  t.mock.method(f.client.rest, 'post', async () => channelData(X, ChannelType.GuildText, 'news'));
+  t.mock.method(f.client.rest, 'get', async () => { throw Object.assign(new Error('Unknown Channel'), { code: 10003, status: 404 }); });
+  await assert.rejects(f.adapter.createTextChannel(G, 'news'), {
+    message: `Channel ${X} was created, but Discord says it no longer exists: it was deleted since, so there's no ` +
+      'channel to use. create_text_channel can make it again.',
+  });
 });
