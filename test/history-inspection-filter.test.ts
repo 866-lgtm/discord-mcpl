@@ -24,7 +24,7 @@ const THREAD_OF_EXCLUDED = '410000000000000006';
 const OTHER_GUILD = '410000000000000007';
 const DM = '410000000000000008';
 const LOOKUP_FAILS = '410000000000000009'; // a channel whose lookup rejects
-const UNKNOWN = '410000000000000010'; // a channel whose lookup finds nothing
+const UNBUILT = '410000000000000010'; // a channel discord.js returns no object for
 const THREAD_UNDER_CATEGORY = '410000000000000011'; // a thread of a channel its category admits
 
 const channels: Record<string, Record<string, unknown>> = {
@@ -140,15 +140,18 @@ describe('fetch_history and fetch_around by numeric id', () => {
     assert.deepEqual(reads, [], 'no history was read');
   });
 
-  it("refuses a channel whose lookup finds nothing, before any message is read", async (t) => {
+  it("refuses a channel discord.js returns no object for, before any message is read", async (t) => {
     const { server, reads } = serverWith(t);
     for (const [tool, args] of [
-      ['fetch_history', { channelId: UNKNOWN }],
-      ['fetch_around', { channelId: UNKNOWN, messageId: '420000000000000001' }],
+      ['fetch_history', { channelId: UNBUILT }],
+      ['fetch_around', { channelId: UNBUILT, messageId: '420000000000000001' }],
     ] as const) {
       const res = await server.handleToolCall(tool, args);
       assert.equal(res.isError, true, tool);
-      assert.equal(res.content[0].text, `Channel ${UNKNOWN} not found`, tool);
+      assert.equal(res.content[0].text, `Channel ${UNBUILT} exists, but this adapter can't use it, so nothing was read. ` +
+        "Either it's a kind of channel this version of the adapter can't handle, which only an operator updating the " +
+        "adapter can change, or its server is still loading on this connection, in which case the same call may work " +
+        'in a moment.', tool);
     }
     assert.deepEqual(reads, [], 'no history was read');
   });
@@ -159,7 +162,7 @@ describe('fetch_history and fetch_around by numeric id', () => {
       for (const tool of ['fetch_history', 'fetch_around']) {
         const res = await server.handleToolCall(tool, { channelId, messageId: '420000000000000001' });
         assert.equal(res.isError, true, `${tool} ${JSON.stringify(channelId)}`);
-        assert.match(res.content[0].text, /needs channelId as a channel id string.*Nothing was read\.$/);
+        assert.match(res.content[0].text, new RegExp(`^Nothing was read: ${tool} needs channelId`));
       }
     }
     assert.deepEqual(reads, [], 'no history was read');
