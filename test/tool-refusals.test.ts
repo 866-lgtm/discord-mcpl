@@ -124,8 +124,9 @@ describe('tool refusals say what did not happen', () => {
       ['send_message', { channelId: '123456789012345678', content: '  ' }],
       ['reply_message', { channelId: '123456789012345678', messageId: '1' }],
       ['send_dm', { userId: '123456789012345678', files: [] }],
-      // null is content left out, as before.
+      // null is content left out, as before, and so is false.
       ['send_message', { channelId: '123456789012345678', content: null }],
+      ['send_message', { channelId: '123456789012345678', content: false }],
     ] as const) {
       const r = await s.handleToolCall(tool, args);
       assert.equal(r.isError, true, tool);
@@ -138,11 +139,11 @@ describe('tool refusals say what did not happen', () => {
     for (const [tool, args, gave] of [
       ['send_message', { channelId: '123456789012345678', content: 42 }, 'a number'],
       ['reply_message', { channelId: '123456789012345678', messageId: '1', content: { text: 'hi' } }, 'an object'],
-      // Not text, though false: the files don't go without it.
-      ['send_dm', { userId: '123456789012345678', content: false, files: [{ path: '/tmp/a.png' }] }, 'a boolean'],
+      // 0 may have been meant as "0", so the files don't go without it.
+      ['send_dm', { userId: '123456789012345678', content: 0, files: [{ path: '/tmp/a.png' }] }, 'a number'],
       // Falsy, with no files: still this refusal, not the empty message's.
       ['send_message', { channelId: '123456789012345678', content: 0 }, 'a number'],
-      ['send_message', { channelId: '123456789012345678', content: false }, 'a boolean'],
+      ['send_message', { channelId: '123456789012345678', content: true }, 'a boolean'],
     ] as const) {
       const r = await s.handleToolCall(tool, args);
       assert.equal(r.isError, true, tool);
@@ -283,11 +284,20 @@ describe('a send refused for its files says nothing was sent, and what to send i
       message: 'Nothing was sent: files[0].description must be a string, and this call gave an object. Give it in ' +
         'quotes, or leave it out.',
     });
-    await assert.rejects(send(adapter, [{ path: fine, description: true }]), {
-      message: 'Nothing was sent: files[0].description must be a string, and this call gave a boolean. Give it in ' +
+    await assert.rejects(send(adapter, [{ path: fine, description: ['a'] }]), {
+      message: 'Nothing was sent: files[0].description must be a string, and this call gave a list. Give it in ' +
         'quotes, or leave it out.',
     });
     assert.deepEqual(sends, []);
+  });
+
+  it("a file's description given as a number or true is sent as its text", async (t) => {
+    const { adapter, sends } = adapterWithChannel(t);
+    const fine = join(tempDir(t), 'fine.txt');
+    writeFileSync(fine, 'x');
+    for (const description of [42, true]) await send(adapter, [{ path: fine, description }]);
+    const attached = sends.map((s) => (s as { files: Array<{ description?: unknown }> }).files[0]!.description);
+    assert.deepEqual(attached, ['42', 'true']);
   });
 
   it("a file's name or description that says none (null, false, 0) is left out, as before", async (t) => {
@@ -352,7 +362,7 @@ describe('a send refused for its files says nothing was sent, and what to send i
     assert.deepEqual(sends, []);
   });
 
-  it('files with content left out or null go as one message of files alone, through the real sendMessage and sendDM', async (t) => {
+  it('files with content left out, null or false go as one message of files alone, through the real sendMessage and sendDM', async (t) => {
     const s = server(t);
     const adapter = (s as unknown as { discord: DiscordAdapter }).discord;
     const sends: Array<{ to: string; content?: unknown; files?: Array<{ name?: string }> }> = [];
@@ -366,14 +376,14 @@ describe('a send refused for its files says nothing was sent, and what to send i
     (adapter.rawClient as unknown as { users: { fetch: unknown } }).users.fetch = async () => user;
     const path = join(tempDir(t), 'a.txt');
     writeFileSync(path, 'x');
-    for (const content of [undefined, null]) {
+    for (const content of [undefined, null, false]) {
       const viaChannel = await s.handleToolCall('send_message', { channelId: channel.id, content, files: [{ path }] });
       assert.notEqual(viaChannel.isError, true, `send_message ${String(content)}: ${viaChannel.content[0].text}`);
       const viaDm = await s.handleToolCall('send_dm', { userId: user.id, content, files: [{ path }] });
       assert.notEqual(viaDm.isError, true, `send_dm ${String(content)}: ${viaDm.content[0].text}`);
     }
     const alone = { content: undefined, files: [{ name: 'a.txt' }] };
-    assert.deepEqual(sends, [{ to: 'channel', ...alone }, { to: 'dm', ...alone }, { to: 'channel', ...alone }, { to: 'dm', ...alone }]);
+    assert.deepEqual(sends, Array.from({ length: 3 }, () => [{ to: 'channel', ...alone }, { to: 'dm', ...alone }]).flat());
   });
 
   it('a DM is refused for its files the same way, through the real sendDM, before anything is sent', async (t) => {

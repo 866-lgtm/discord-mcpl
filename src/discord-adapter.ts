@@ -152,10 +152,15 @@ function buildAttachments(files?: unknown): AttachmentBuilder[] {
       );
     }
     // A name or description that says none (left out, null, "", false, 0)
-    // is left out, as before; any other value that isn't a string is refused.
+    // is left out, as before. A description given as a number or as true is
+    // sent as its text, such as "42". Any other value that isn't a string is
+    // refused rather than turned into text: its text form ("[object Object]"
+    // for an object, its items joined by commas for a list) would be a guess
+    // at the description the caller meant.
     for (const key of ['name', 'description'] as const) {
       const value: unknown = file[key];
-      if (value && typeof value !== 'string') {
+      const asText = key === 'description' && (typeof value === 'number' || value === true);
+      if (value && typeof value !== 'string' && !asText) {
         throw new Error(
           `Nothing was sent: files[${i}].${key} must be a string, and this call gave ${kindOfValue(value)}. Give it in quotes, ` +
             `or leave it out${key === 'name' ? ' to use the file\'s own name' : ''}.`,
@@ -172,7 +177,7 @@ function buildAttachments(files?: unknown): AttachmentBuilder[] {
     }
     const name = file.name && file.name.trim() ? file.name : basename(file.path);
     const attachment = new AttachmentBuilder(file.path, { name });
-    if (file.description) attachment.setDescription(file.description);
+    if (file.description) attachment.setDescription(String(file.description));
     return attachment;
   });
 }

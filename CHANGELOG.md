@@ -104,17 +104,19 @@ in the git log and PR descriptions.
   file. The send tools refuse, before anything is sent: `files` given as
   something other than a list, such as a string or an object, where it
   failed with a raw TypeError or as too many files (a value that says none,
-  null, `""`, `false` or `0`, still means no files); a file's `name` or
-  `description` that is neither a string nor a value that says none, where a
-  name failed with a raw TypeError and a description was sent to Discord
-  with the last part, after the parts before it had posted (one that says
-  none, null, `""`, `false` or `0`, is still left out); and `content` that
-  is given and isn't a string, where it failed with a raw TypeError, or, for
-  `false` or `0`, was read as no content (`null` still is). `send_dm`
-  without a usable `userId` is refused before the recipient is looked up,
-  where it failed with a raw TypeError and named its destination as a DM
-  with "undefined". A file this process can't read is refused before any
-  part of the message is sent: it failed at send time, after the parts
+  null, `""`, `false` or `0`, still means no files); a file's `name` that is
+  neither a string nor a value that says none, where it failed with a raw
+  TypeError, and a `description` that is an object or a list, which was sent
+  to Discord with the last part, after the parts before it had posted (a
+  name or description that says none, null, `""`, `false` or `0`, is still
+  left out, and a description given as a number or `true` is sent as its
+  text, such as "42"); and `content` that is given and isn't a string, where
+  it failed with a raw TypeError, or, for `0`, was read as no content
+  (`null` and `false` still are, so files given with them post alone).
+  `send_dm` without a usable `userId` is refused before the recipient is
+  looked up, where it failed with a raw TypeError and named its destination
+  as a DM with "undefined". A file this process can't read is refused before
+  any part of the message is sent: it failed at send time, after the parts
   before it had posted.
 
 - **Thread fields name the thread a message was posted in.** They were read

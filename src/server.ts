@@ -269,10 +269,11 @@ function requiredUserId(value: unknown): string {
   );
 }
 
-/** A send tool's content: its text, or none when it's left out (or null).
- *  Anything else is refused before anything is sent. */
+/** A send tool's content: its text, or none when it's left out, null or
+ *  false, so that with files the files post alone. Anything else is refused
+ *  before anything is sent, 0 included: it may have been meant as "0". */
 function messageContent(tool: string, value: unknown): string {
-  if (value === undefined || value === null) return '';
+  if (value === undefined || value === null || value === false) return '';
   if (typeof value === 'string') return value;
   throw new Error(
     `Nothing was sent: ${tool} takes content as a string, and this call gave ${kindOfValue(value)}. Give the message's ` +
