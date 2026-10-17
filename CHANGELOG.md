@@ -55,6 +55,30 @@ in the git log and PR descriptions.
 
 ### Fixed
 
+- **A filters change re-derives the registered labels.** Names resolve only
+  among the channels the filters admit, and a `#name (server)` label is kept
+  only while its name resolves back to its channel. A change that admitted
+  or dropped a channel inside a server already admitted re-derived nothing,
+  so a label could reach another channel: admitting text `general` beside a
+  registered voice `General` left the voice channel labelled `#General
+  (server)`, which then resolved to the text channel, and dropping text
+  `general` from the filters file left its label resolving to the voice
+  channel. Every change, by `filters_update` or a reload of the filters
+  file, now re-derives every registered channel. A server the filters no
+  longer admit keeps its channels listed until restart, as before, now under
+  their ids, since discord-mcpl stopped resolving their names with the
+  removal. A host that resolves an agent's prose (`>>name`) from the labels
+  registered with it, as agent-framework does, follows the re-derived labels
+  after a filter change: prose by a name reaches the registered channel that
+  now holds the name, and bounces with "no channel matches" while none does.
+  A channel the change admitted isn't registered until something registers
+  it, such as a message from it, `refresh_channels` or a restart, and when
+  two channels of one kind now share a name, both are labelled by their ids.
+  Before, a label left stale kept carrying such prose to its old channel,
+  including one the filters no longer admit. Registering is as before: a
+  change that admits a new server registers every text, announcement, voice
+  or stage channel the filters admit that isn't registered yet, in any
+  admitted server, and any other change registers none.
 - **Thread fields name the thread a message was posted in.** They were read
   from discord.js `message.thread`, which is the thread a message *started*,
   so a message that had spawned a thread was tagged `chat:thread`, rendered
