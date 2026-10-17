@@ -340,10 +340,8 @@ export interface DiscordChannelInfo {
    *  (channelLabelFor): `#name (GuildName)` where that name resolves back to
    *  it, otherwise its id, `discord:<guild>:<channel>`. Either form is a
    *  string the channelId argument accepts. Returned so listings hand back
-   *  something PASTEABLE: the not-found error tells agents to "use
-   *  list_channels to see what is addressable", which was only true once this
-   *  field existed. Both forms are present on purpose — label to compose a
-   *  send now, id to store. */
+   *  something PASTEABLE. Both forms are present on purpose — label to
+   *  compose a send now, id to store. */
   label: string;
 }
 
@@ -1186,7 +1184,8 @@ export class DiscordAdapter {
    *  enforced, so the REST layer's own retries after a lost response can't
    *  post a second copy (Discord returns the first instead). An error that
    *  carries `notPosted: true` was raised before anything was sent: the
-   *  channel lookup failed or found no text channel. */
+   *  channel lookup failed, gave no channel, or gave one that holds no
+   *  messages. */
   async sendDmNotice(channelId: string, content: string, nonce: string): Promise<{ messageId: string }> {
     const channel = await this.channelById(channelId).catch((err: unknown) => {
       throw Object.assign(
@@ -1194,8 +1193,11 @@ export class DiscordAdapter {
         { notPosted: true },
       );
     });
-    if (!channel || !('send' in channel)) {
-      throw Object.assign(new Error(`Channel ${channelId} not found or not a text channel`), { notPosted: true });
+    // A DM has no server, so discord.js returns null for one only when it
+    // can't build its kind: that one cause, and nothing retries the notice.
+    if (!channel) throw Object.assign(unhandledKind(channelId, 'nothing was sent'), { notPosted: true });
+    if (!('send' in channel)) {
+      throw Object.assign(noMessagesHere(channel, channelId, 'nothing was sent'), { notPosted: true });
     }
     const sent = await (channel as DMChannel).send({
       content,
@@ -1212,9 +1214,8 @@ export class DiscordAdapter {
     options?: { replyTo?: string; files?: OutgoingFile[]; requireReplyTarget?: boolean },
   ): Promise<{ messageId: string }> {
     const channel = await this.channelById(channelId);
-    if (!channel || !('send' in channel)) {
-      throw new Error(`Channel ${channelId} not found or not a text channel`);
-    }
+    if (!channel) throw channelUnusable(channelId, 'nothing was sent');
+    if (!('send' in channel)) throw noMessagesHere(channel, channelId, 'nothing was sent');
     const resolved = await this.resolveOutgoingMentions(channel, content);
     const attachments = buildAttachments(options?.files);
     const chunks = this.splitForDiscord(resolved);
@@ -1353,9 +1354,8 @@ export class DiscordAdapter {
 
   async editMessage(channelId: string, messageId: string, content: string): Promise<void> {
     const channel = await this.channelById(channelId);
-    if (!channel || !('messages' in channel)) {
-      throw new Error(`Channel ${channelId} not found`);
-    }
+    if (!channel) throw channelUnusable(channelId, 'nothing was edited');
+    if (!('messages' in channel)) throw noMessagesHere(channel, channelId, 'nothing was edited');
     const msg = await (channel as TextChannel).messages.fetch(messageId);
     const resolved = await this.resolveOutgoingMentions(channel, content);
     await msg.edit(resolved);
@@ -1434,27 +1434,24 @@ export class DiscordAdapter {
 
   async deleteMessage(channelId: string, messageId: string): Promise<void> {
     const channel = await this.channelById(channelId);
-    if (!channel || !('messages' in channel)) {
-      throw new Error(`Channel ${channelId} not found`);
-    }
+    if (!channel) throw channelUnusable(channelId, 'nothing was deleted');
+    if (!('messages' in channel)) throw noMessagesHere(channel, channelId, 'nothing was deleted');
     const msg = await (channel as TextChannel).messages.fetch(messageId);
     await msg.delete();
   }
 
   async addReaction(channelId: string, messageId: string, emoji: string): Promise<void> {
     const channel = await this.channelById(channelId);
-    if (!channel || !('messages' in channel)) {
-      throw new Error(`Channel ${channelId} not found`);
-    }
+    if (!channel) throw channelUnusable(channelId, 'no reaction was added');
+    if (!('messages' in channel)) throw noMessagesHere(channel, channelId, 'no reaction was added');
     const msg = await (channel as TextChannel).messages.fetch(messageId);
     await msg.react(this.resolveReactionEmoji(emoji, msg.guild));
   }
 
   async removeReaction(channelId: string, messageId: string, emoji: string): Promise<void> {
     const channel = await this.channelById(channelId);
-    if (!channel || !('messages' in channel)) {
-      throw new Error(`Channel ${channelId} not found`);
-    }
+    if (!channel) throw channelUnusable(channelId, 'no reaction was removed');
+    if (!('messages' in channel)) throw noMessagesHere(channel, channelId, 'no reaction was removed');
     const msg = await (channel as TextChannel).messages.fetch(messageId);
     const selfId = this.client.user?.id;
     if (!selfId) throw new Error('Discord bot user is not ready');
@@ -1552,14 +1549,17 @@ export class DiscordAdapter {
     }
   }
 
+  /** A channel's messages, newest first. When the channel can't be read,
+   *  its error says what didn't happen in the caller's words (`nothing`),
+   *  'nothing was read' by default. */
   async fetchHistory(
     channelId: string,
-    options?: { limit?: number; before?: string; after?: string },
+    options?: { limit?: number; before?: string; after?: string; nothing?: string },
   ): Promise<HistoryMessage[]> {
+    const nothing = options?.nothing ?? 'nothing was read';
     const channel = await this.channelById(channelId);
-    if (!channel || !('messages' in channel)) {
-      throw new Error(`Channel ${channelId} not found`);
-    }
+    if (!channel) throw channelUnusable(channelId, nothing);
+    if (!('messages' in channel)) throw noMessagesHere(channel, channelId, nothing);
     // Discord's REST endpoint caps a single fetch at 100 messages and
     // discord.js does not auto-paginate. To support backscroll requests
     // larger than 100 (we want up to 300), walk backwards page-by-page
@@ -1636,9 +1636,8 @@ export class DiscordAdapter {
     limit = 50,
   ): Promise<HistoryMessage[]> {
     const channel = await this.channelById(channelId);
-    if (!channel || !('messages' in channel)) {
-      throw new Error(`Channel ${channelId} not found`);
-    }
+    if (!channel) throw channelUnusable(channelId, 'nothing was read');
+    if (!('messages' in channel)) throw noMessagesHere(channel, channelId, 'nothing was read');
     const pageLimit = Math.min(100, Math.max(1, limit));
     const page = await (channel as TextChannel).messages.fetch({
       around: messageId,
@@ -2013,10 +2012,12 @@ export class DiscordAdapter {
    * 2. Applies `channelAllowed` BEFORE matching, so a name can never address a
    *    channel the allowlist excludes, and an excluded `#general` cannot
    *    manufacture a spurious collision with a permitted one.
-   * 3. Excludes categories and threads. Categories are not sendable. Thread
+   * 3. Matches only the sendable kinds: text, announcement, voice and
+   *    stage channels (SENDABLE in channel-names.ts). Categories, forums,
+   *    media and directory channels, and threads, are given by id. Thread
    *    names are not unique — not even within one channel — so including them
    *    would make the ambiguity error fire constantly and render the feature
-   *    unusable. Threads remain addressable by id.
+   *    unusable.
    */
   resolveChannelRef(ref: string): ResolveResult {
     return this.resolveAmong(ref, this.nameView());
@@ -2138,7 +2139,7 @@ export class DiscordAdapter {
     opts: { cap?: boolean; withPermission?: bigint; warmups?: Map<string, boolean> } = {},
   ): Promise<DiscordChannelMembers> {
     const channel = await this.channelById(channelId);
-    if (!channel) throw new Error(`Channel ${channelId} not found`);
+    if (!channel) throw channelUnusable(channelId, 'no members were listed');
     const warm = async (guild: Guild): Promise<boolean> => {
       let warmed = opts.warmups?.get(guild.id);
       if (warmed === undefined) {
@@ -2290,11 +2291,13 @@ export class DiscordAdapter {
     const bare = raw.replace(/^@/, '').trim();
     if (!bare) return { ok: false, message: 'latestFrom names no one; nothing was done.' };
     const channel = await this.channelById(channelId);
-    if (!channel) throw new Error(`Channel ${channelId} not found`);
+    if (!channel) throw channelUnusable(channelId, 'nothing was done');
     const refused = await this.latestFromFilterRefusal(channel, channelId);
     if (refused) return { ok: false, message: refused };
     const guildId = 'guildId' in channel && channel.guildId ? channel.guildId : null;
-    const window = await this.fetchHistory(channelId, { limit: LATEST_FROM_WINDOW });
+    // A channel without messages is refused there, saying, as this call's
+    // other refusals do, that nothing was done.
+    const window = await this.fetchHistory(channelId, { limit: LATEST_FROM_WINDOW, nothing: 'nothing was done' });
     if (window.length === 0) {
       return { ok: false, message: 'This channel has no messages, so latestFrom has nothing to choose from; nothing was done.' };
     }
@@ -2531,7 +2534,7 @@ export class DiscordAdapter {
 
   async deleteChannel(channelId: string): Promise<void> {
     const channel = await this.channelById(channelId);
-    if (!channel) throw new Error(`Channel ${channelId} not found`);
+    if (!channel) throw channelUnusable(channelId, 'nothing was deleted');
     if ('delete' in channel) {
       await (channel as TextChannel).delete();
     } else {
@@ -3349,9 +3352,9 @@ export class DiscordAdapter {
    *  bound delivery, not reads. */
   async inspectionRefusal(channelId: string): Promise<string | null> {
     const channel = await this.channelById(channelId);
-    // A lookup that finds nothing can't be placed, so it fails closed, with
-    // the not-found error the read itself would give.
-    if (!channel) throw new Error(`Channel ${channelId} not found`);
+    // A channel discord.js returns nothing for can't be placed, so it fails
+    // closed, with the error the read itself would give.
+    if (!channel) throw channelUnusable(channelId, 'nothing was read');
     // A DM passes: the DM list filters incoming DMs only.
     if (channel.isDMBased()) return null;
     const guildId = 'guildId' in channel ? channel.guildId : null;
@@ -3598,6 +3601,80 @@ export function holdsNoMessages(type: DiscordChannelInfo['type']): boolean {
  *  it. Its name is in each post's label. */
 export function holdsPosts(type: ChannelType | undefined): boolean {
   return type === ChannelType.GuildForum || type === ChannelType.GuildMedia;
+}
+
+/** The errors a call gets when discord.js returns no channel for an id, with
+ *  what didn't happen (`nothing`, from the call). Discord answered for the id
+ *  (an id it doesn't know throws Unknown Channel, which explainDiscordError
+ *  explains), but discord.js couldn't build a channel from the answer: a type
+ *  it has no class for, which only an update of the adapter changes, or a
+ *  server channel whose server isn't in its cache. In discord.js 14.26.5,
+ *  READY puts every server the bot is in into that cache, unavailable ones
+ *  included, and GUILD_CREATE adds one it joins later, so a server is
+ *  missing only until the gateway delivers it, and the same call may work a
+ *  moment later. Telling the two causes apart would take a second lookup,
+ *  whose channel would need every check a normal lookup gets, for a rare
+ *  case, so channelUnusable names both, with the retry hint on the second.
+ *  A DM has no server, so only the first cause applies to one, but at a null
+ *  the adapter can't tell a DM's id from a server channel's: every call gets
+ *  both causes except sendDmNotice, which knows its channel is a DM and uses
+ *  unhandledKind, naming the first alone. */
+function channelUnusable(channelId: string, nothing: string): Error {
+  return new Error(
+    `Channel ${channelId} exists, but this adapter can't use it, so ${nothing}. Either it's a kind of channel ` +
+      "this version of the adapter can't handle, which only an operator updating the adapter can change, or its " +
+      'server is still loading on this connection, in which case the same call may work in a moment.',
+  );
+}
+
+function unhandledKind(channelId: string, nothing: string): Error {
+  return new Error(
+    `Channel ${channelId} exists, but it's a kind of channel this version of the adapter can't handle, so ${nothing}. ` +
+      'Only an operator updating the adapter can change that.',
+  );
+}
+
+/** What the kinds of channel that hold no messages of their own are called,
+ *  by Discord type number, in the errors that name them (noMessagesHere).
+ *  holdsNoMessages answers another question, for registration: which of
+ *  mapChannelType's kinds no delivery is registered from. It takes the
+ *  mapped kind, so it can't name a directory or a media channel, which
+ *  both map to unknown. */
+const HOLDS_NO_MESSAGES: Record<number, string> = {
+  4: 'a category',
+  14: 'a directory channel',
+  15: 'a forum',
+  16: 'a media channel',
+};
+
+/** The error for a channel this adapter can't read or send to, naming what
+ *  it is and what didn't happen (`nothing`, from the call), then where its
+ *  messages are or plainly that nothing here can use it. A category's
+ *  channels are the ones list_channels shows for its server with it as their
+ *  parent, as far as the channel filters allow. A forum's or media channel's
+ *  posts are threads, which no tool here lists, so a post's id comes only
+ *  from a message posted in it or a link to it. Its messages are written
+ *  through that id, and read through it as far as the channel filters
+ *  allow, since the filters bound reads but not sends. A directory channel
+ *  lists servers. A kind this table doesn't name, such as one a later
+ *  discord.js builds, is named by its type number, without a claim that it
+ *  holds no messages, and only an operator updating the adapter can change
+ *  that this adapter can't use it. */
+function noMessagesHere(channel: { type: number; guildId?: string | null }, channelId: string, nothing: string): Error {
+  const kind = HOLDS_NO_MESSAGES[channel.type];
+  if (!kind) {
+    return new Error(
+      `Channel ${channelId} is a kind of channel (type ${channel.type}) that this adapter can't read or send to, so ${nothing}. ` +
+        'Only an operator updating the adapter can change that.',
+    );
+  }
+  const after = holdsPosts(channel.type)
+    ? " Its posts are threads, and no tool here lists them, so a post's id comes only from a message posted in it or a link to it. " +
+      "A post's messages are written through that id, and read through it where the configured channel filters allow."
+    : channel.type === 4
+      ? ` The channels in it that the configured channel filters allow are the ones list_channels for server ${channel.guildId} shows with ${channelId} as their parent.`
+      : ' It lists servers, and nothing here can read it or send to it.';
+  return new Error(`Channel ${channelId} is ${kind}, which holds no messages, so ${nothing}.${after}`);
 }
 
 /**
