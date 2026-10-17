@@ -551,6 +551,28 @@ describe('the tool chokepoint', () => {
     assert.equal((r.content[0].text ?? '').split('\n\n')[2], unknownOne);
   });
 
+  it("doesn't name fetch_history where the channel's history cap is 0, under which it reads no message", async (t) => {
+    const unavailable = () => Object.assign(new Error('Service Unavailable'), { status: 503 });
+    const noCheck = "Whether this message posted is unknown, since Discord didn't answer it with a refusal. That can't be " +
+      'checked from here: sending it again risks a second copy, and not sending it risks it missing; someone who can see ' +
+      'the channel can tell.';
+    const caps = process.env.DISCORD_BACKSCROLL_CHANNELS;
+    t.after(() => {
+      if (caps === undefined) delete process.env.DISCORD_BACKSCROLL_CHANNELS;
+      else process.env.DISCORD_BACKSCROLL_CHANNELS = caps;
+    });
+    const noteUnder = async (channelCaps: string) => {
+      process.env.DISCORD_BACKSCROLL_CHANNELS = channelCaps;
+      const { channel } = channelAnswering(unavailable());
+      const r = await serverOver(await realAdapter(t, { channel })).handleToolCall('send_message', { channelId: CHANNEL, content: 'hi' });
+      return (r.content[0].text ?? '').split('\n\n')[2];
+    };
+    assert.equal(await noteUnder(`${CHANNEL}:0`), noCheck);
+    // A cap of 1 still shows the newest message, and another channel's cap is that channel's.
+    assert.equal(await noteUnder(`${CHANNEL}:1`), unknownOne);
+    assert.equal(await noteUnder('111111111111111111:0'), unknownOne);
+  });
+
   it("answers no for a channel discord.js returns nothing for, or whose bot member the cache doesn't hold, rather than failing", async (t) => {
     const adapter = await realAdapter(t, {});
     const client = (adapter as unknown as { client: { channels: { fetch: unknown } } }).client;

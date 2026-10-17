@@ -2434,14 +2434,18 @@ export class DiscordMcplServer {
    *  two checks handleToolCall gives it, its feature set is enabled, or no
    *  host gates tools by feature set, and the channel filters' inspection
    *  boundary admits the channel (DiscordAdapter.inspectionRefusal), which a
-   *  send doesn't meet; and by Discord's, this bot holds Read Message History
-   *  there (DiscordAdapter.readsMessageHistory). Without that, Discord
-   *  answers the read with no messages, which would read as nothing posted.
-   *  A lookup that fails counts as not readable, as fetch_history would fail
-   *  with it, so the note doesn't point at a check that may refuse. */
+   *  send doesn't meet; by its own cap, the channel's history cap
+   *  (DISCORD_BACKSCROLL_CHANNELS, capHistoryLimit) isn't 0; and by
+   *  Discord's, this bot holds Read Message History there
+   *  (DiscordAdapter.readsMessageHistory). Under a cap of 0, or without that
+   *  permission, fetch_history answers with no messages, which would read as
+   *  nothing posted. A lookup that fails counts as not readable, as
+   *  fetch_history would fail with it, so the note doesn't point at a check
+   *  that may refuse. */
   private async historyReadable(channelId: string): Promise<boolean> {
     // fetch_history always belongs to a feature set (featureSetForTool).
     if (this.mcplEnabled && !isEnabled(featureSetForTool('fetch_history')!, this.enabledFeatureSets)) return false;
+    if (this.capHistoryLimit(channelId, 1) === 0) return false;
     try {
       return (await this.discord.inspectionRefusal(channelId)) === null && await this.discord.readsMessageHistory(channelId);
     } catch {

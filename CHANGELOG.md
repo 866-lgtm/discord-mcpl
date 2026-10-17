@@ -397,8 +397,9 @@ in the git log and PR descriptions.
   Permissions explanation says the text may go through without them.
   When the outcome is unknown, it says to check the channel's latest
   messages first where `fetch_history` would show them: with its feature set
-  on, the channel filters admitting the channel, and this bot holding Read
-  Message History there, without which Discord shows no messages. Otherwise
+  on, the channel filters admitting the channel, the channel's history cap
+  (`DISCORD_BACKSCROLL_CHANNELS`) above 0, and this bot holding Read Message
+  History there, without which Discord shows no messages. Otherwise
   it says that this can't be checked from here, what sending again and not
   sending each risk, and that someone who can see the channel can tell. A
   message sent in one part whose outcome is unknown says the same. A first
