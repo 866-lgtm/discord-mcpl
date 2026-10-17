@@ -96,6 +96,13 @@ type ChannelOpenResponse = ChannelsOpenResult & {
   historyTruncated?: boolean;
 };
 
+/** What registering the channels the filters newly let be seen brought. */
+interface ChannelRefresh {
+  visible: number;
+  added: Array<{ id: string; label: string }>;
+  note: string;
+}
+
 interface ChannelAcknowledgeRequest {
   channelId: string;
   messageId: string;
@@ -2260,7 +2267,7 @@ export class DiscordMcplServer {
     // known-good again (we just wrote it atomically), and this keeps the
     // effective state and digest in sync with disk without waiting a poll.
     this.filtersState.applyParsed(next);
-    const refreshed = diff.addedGuilds.length ? this.refreshChannels() : null;
+    const refreshed = this.applyFilterChange(diff);
     console.error(
       `[discord-mcpl] filters updated via tool (guilds +${diff.addedGuilds.length}/-${diff.removedGuilds.length})`,
     );
@@ -2274,7 +2281,7 @@ export class DiscordMcplServer {
     const applied = this.discord.getFilters();
     if (diff.removedGuilds.length) {
       notes.push(
-        'Removed guilds stop delivering events immediately, but their channels stay listed on the host until restart.',
+        'Removed guilds stop delivering events immediately, but their channels stay listed on the host until restart, under their ids.',
       );
     }
     return {
@@ -2291,10 +2298,30 @@ export class DiscordMcplServer {
     };
   }
 
-  /** Re-register channels after an externally-driven filter change (the
-   *  filters-file hot-reload poller in index.ts). */
-  applyFilterChange(): void {
-    this.refreshChannels();
+  /** A changed filters file, as index.ts's poller reads it: applied as
+   *  filters_update applies the file it writes (applyFilterChange). */
+  applyReloadedFilters(next: DiscordFilters): ReturnType<DiscordAdapter['updateFilters']> {
+    const diff = this.discord.updateFilters(next);
+    this.filtersState.applyParsed(next);
+    this.applyFilterChange(diff);
+    return diff;
+  }
+
+  /**
+   * After any change of the filters, by filters_update or a reload of the
+   * file (applyReloadedFilters). When the change admits a new guild, every
+   * channel of a listed kind that the filters admit and that isn't
+   * registered yet is registered, in any admitted guild (refreshChannels).
+   * Then every registered channel is re-derived. Names resolve only among
+   * the channels the filters admit (nameView), so any change can give a
+   * registered label's name to another channel, give a channel back the
+   * name its label lacked (channelLabelFor), or, by removing its guild,
+   * leave a channel labelled by its id.
+   */
+  private applyFilterChange(diff: { addedGuilds: string[] }): ChannelRefresh | null {
+    const refreshed = diff.addedGuilds.length ? this.refreshChannels() : null;
+    this.rederiveChannels(this.channelManager.getAll());
+    return refreshed;
   }
 
   // ── Sticky-reply state mutators ──
@@ -3469,11 +3496,7 @@ export class DiscordMcplServer {
    *  for "I was added to a channel/server but don't see it" — it doesn't rely
    *  on any specific gateway event having fired, so it covers cases the
    *  event handlers miss (missed events, eventual-consistency gaps, etc.). */
-  private refreshChannels(): {
-    visible: number;
-    added: Array<{ id: string; label: string }>;
-    note: string;
-  } {
+  private refreshChannels(): ChannelRefresh {
     const descriptors = this.discord.getPostingChannels().map((facts) => this.guildDescriptor(facts));
     const { added } = this.registerChannels(descriptors);
     dbg('refreshChannels', { visible: descriptors.length, added: added.length });

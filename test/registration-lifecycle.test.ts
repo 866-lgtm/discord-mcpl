@@ -23,7 +23,7 @@
  */
 import { it, type TestContext } from 'node:test';
 import * as assert from 'node:assert/strict';
-import { readFileSync, unlinkSync, writeFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync, existsSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -184,6 +184,151 @@ async function until(what: () => boolean): Promise<void> {
 }
 
 const unknownChannel = () => Object.assign(new Error('Unknown Channel'), { code: 10003 });
+
+/** filters_update's file, named for the test, holding these filters. */
+function filtersFile(t: TestContext, filters: Record<string, unknown>): void {
+  const dir = mkdtempSync(join(tmpdir(), 'registration-lifecycle-filters-'));
+  const path = join(dir, 'filters.json');
+  writeFileSync(path, JSON.stringify(filters));
+  const before = process.env.DISCORD_FILTERS_FILE;
+  process.env.DISCORD_FILTERS_FILE = path;
+  t.after(() => {
+    if (before === undefined) delete process.env.DISCORD_FILTERS_FILE;
+    else process.env.DISCORD_FILTERS_FILE = before;
+    rmSync(dir, { recursive: true, force: true });
+  });
+}
+
+/** A voice channel and a text channel of one name, which a text channel holds
+ *  wherever both are admitted (channelLabelFor). */
+const VOICE = '100000000000000041';
+const TEXT = '100000000000000042';
+const sameName = [channelData(VOICE, ChannelType.GuildVoice, 'General'), channelData(TEXT, ChannelType.GuildText, 'general')];
+/** The channel a name resolves to, or the refusal. */
+const resolvedId = (f: { adapter: DiscordAdapter }, ref: string) => {
+  const r = f.adapter.resolveChannelRef(ref);
+  return r.ok ? r.id : r;
+};
+
+it('filters_update admitting a channel inside an admitted guild re-derives the label whose name it takes', async (t) => {
+  const f = fixture(t, { guildIds: [G], guildChannels: [VOICE], channels: sameName });
+  filtersFile(t, { guildIds: [G], guildChannels: { [G]: [VOICE] } });
+  f.server.registerGuildDelivery(G, VOICE);
+  assert.equal(f.label(VOICE), '#General (Guild)');
+  f.sent.length = 0;
+  const r = await f.server.handleToolCall('filters_update', { addGuilds: [`${G}:${TEXT}`] });
+  assert.notEqual(r.isError, true, r.content[0].text);
+  assert.deepEqual(JSON.parse(r.content[0].text).guildsNowDelivering, [], 'no guild was added');
+  // The text channel holds the name now, so the voice channel's label is its id.
+  assert.deepEqual(resolvedId(f, '#General (Guild)'), TEXT);
+  assert.equal(f.label(VOICE), idOf(VOICE));
+  assert.ok(f.announced('updated', idOf(VOICE)));
+  // A channel admitted inside a guild already admitted isn't registered by the change.
+  assert.equal(f.label(TEXT), undefined);
+});
+
+it('a reload of the filters file dropping a channel re-derives the labels its name leaves', (t) => {
+  const f = fixture(t, { guildIds: [G], guildChannels: [VOICE, TEXT], channels: sameName });
+  f.server.registerGuildDelivery(G, TEXT);
+  f.server.registerGuildDelivery(G, VOICE);
+  assert.equal(f.label(TEXT), '#general (Guild)');
+  assert.equal(f.label(VOICE), idOf(VOICE));
+  f.sent.length = 0;
+  const diff = f.server.applyReloadedFilters({ guildIds: [G], guildChannels: { [G]: [VOICE] } });
+  assert.deepEqual(diff.addedGuilds, []);
+  // The name resolves to the voice channel now, so each label is the one that reaches its channel.
+  assert.deepEqual(resolvedId(f, '#general (Guild)'), VOICE);
+  assert.equal(f.label(VOICE), '#General (Guild)');
+  assert.equal(f.label(TEXT), idOf(TEXT), 'still registered, labelled by its id');
+  assert.ok(f.announced('updated', idOf(VOICE)));
+  assert.ok(f.announced('updated', idOf(TEXT)));
+  // The id-form label the voice channel was shown by still reaches it.
+  assert.deepEqual(resolvedId(f, idOf(VOICE)), VOICE);
+  // The plane reports the filters the file now holds.
+  assert.deepEqual(f.server.filtersState.effectiveFilters()?.guildChannels, { [G]: [VOICE] });
+});
+
+it('a filters change that moves no name announces nothing, and leaves a registered DM as it is', async (t) => {
+  const f = fixture(t, { guildIds: [G], guildChannels: [VOICE, TEXT], channels: sameName });
+  filtersFile(t, { guildIds: [G], guildChannels: { [G]: [VOICE, TEXT] } });
+  f.server.registerGuildDelivery(G, TEXT);
+  f.server.registerGuildDelivery(G, VOICE);
+  // A DM the cache holds whole: it has no guild, so a re-derivation leaves it.
+  const D = '100000000000000046';
+  f.client.channels._add({
+    id: D, type: ChannelType.DM, last_message_id: null, recipients: [{ id: U, username: 'Bob', discriminator: '0', avatar: null }],
+  });
+  const dm = f.server.registerDmDelivery(D, { id: U, name: 'Bob' });
+  const dmLabel = f.server.channelManager.get(dm)?.label;
+  assert.ok(dmLabel);
+  f.sent.length = 0;
+  const r = await f.server.handleToolCall('filters_update', { setDmUsers: [U] });
+  assert.notEqual(r.isError, true, r.content[0].text);
+  assert.equal(f.sent.filter((x) => x.method === 'channels/changed').length, 0);
+  assert.deepEqual([f.label(TEXT), f.label(VOICE)], ['#general (Guild)', idOf(VOICE)]);
+  assert.equal(f.server.channelManager.get(dm)?.label, dmLabel);
+});
+
+/** A second guild the bot is in, holding one text channel, `lobby`. */
+const OTHER_GUILD = '100000000000000044';
+const LOBBY = '100000000000000045';
+const lobbyId = `discord:${OTHER_GUILD}:${LOBBY}`;
+function otherGuild(f: { client: any }): void {
+  const guild = f.client.guilds._add({
+    id: OTHER_GUILD, name: 'Other', owner_id: BOT, roles: [],
+    channels: [{ id: LOBBY, guild_id: OTHER_GUILD, type: ChannelType.GuildText, name: 'lobby', parent_id: null }],
+  });
+  guild.members._add({ user: bot, roles: [] });
+}
+
+it('filters_update admitting a new guild registers every listed channel the filters admit that is not registered yet, and lists them', async (t) => {
+  const f = fixture(t, { guildIds: [G], guildChannels: [TEXT], channels: [channelData(TEXT, ChannelType.GuildText, 'general')] });
+  otherGuild(f);
+  filtersFile(t, { guildIds: [G], guildChannels: { [G]: [TEXT] } });
+  f.sent.length = 0;
+  const r = await f.server.handleToolCall('filters_update', { addGuilds: [OTHER_GUILD] });
+  assert.notEqual(r.isError, true, r.content[0].text);
+  const result = JSON.parse(r.content[0].text);
+  assert.deepEqual(result.guildsNowDelivering, [OTHER_GUILD]);
+  // The new guild's channel, and one in an admitted guild that wasn't registered yet.
+  assert.deepEqual(
+    result.newChannelsRegistered.map((c: { id: string; label: string }) => [c.id, c.label]).sort(),
+    [[idOf(TEXT), '#general (Guild)'], [lobbyId, '#lobby (Other)']],
+  );
+  assert.equal(f.server.channelManager.get(lobbyId)?.label, '#lobby (Other)');
+  assert.ok(f.sent.some((x) => x.method === 'channels/changed' && x.params.added?.some((d: { id: string }) => d.id === lobbyId)));
+});
+
+it('a reload of the filters file admitting a new guild registers its channels', (t) => {
+  const f = fixture(t, { guildIds: [G], guildChannels: [TEXT], channels: [channelData(TEXT, ChannelType.GuildText, 'general')] });
+  otherGuild(f);
+  f.server.registerGuildDelivery(G, TEXT);
+  f.sent.length = 0;
+  const diff = f.server.applyReloadedFilters({ guildIds: [G, OTHER_GUILD], guildChannels: { [G]: [TEXT] } });
+  assert.deepEqual(diff.addedGuilds, [OTHER_GUILD]);
+  assert.equal(f.server.channelManager.get(lobbyId)?.label, '#lobby (Other)');
+  assert.ok(f.sent.some((x) => x.method === 'channels/changed' && x.params.added?.some((d: { id: string }) => d.id === lobbyId)));
+});
+
+it('a filters change removing a guild lists its registered channels under their ids, which still reach them', async (t) => {
+  const f = fixture(t, { guildIds: [G, OTHER_GUILD], guildChannels: [TEXT], channels: [channelData(TEXT, ChannelType.GuildText, 'general')] });
+  filtersFile(t, { guildIds: [G, OTHER_GUILD], guildChannels: { [G]: [TEXT] } });
+  f.server.registerGuildDelivery(G, TEXT);
+  assert.equal(f.label(TEXT), '#general (Guild)');
+  f.sent.length = 0;
+  const r = await f.server.handleToolCall('filters_update', { removeGuilds: [G] });
+  assert.notEqual(r.isError, true, r.content[0].text);
+  assert.ok(
+    JSON.parse(r.content[0].text).notes.some((n: string) => n.includes('stay listed on the host until restart, under their ids')),
+    r.content[0].text,
+  );
+  // Names resolve only in admitted guilds, so the name stopped reaching the
+  // channel with the removal itself; its id still does.
+  assert.equal((resolvedId(f, '#general (Guild)') as { ok?: boolean }).ok, false);
+  assert.deepEqual(resolvedId(f, idOf(TEXT)), TEXT);
+  assert.equal(f.label(TEXT), idOf(TEXT), 'still listed, under its id');
+  assert.ok(f.announced('updated', idOf(TEXT)));
+});
 
 for (const type of [ChannelType.GuildText, ChannelType.GuildForum, ChannelType.GuildMedia]) {
   it(`a ${ChannelType[type]} channel's rename re-derives the labels of its registered threads`, (t) => {
