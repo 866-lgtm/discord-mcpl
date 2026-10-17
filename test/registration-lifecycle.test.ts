@@ -81,6 +81,8 @@ function fixture(t: TestContext, opts: {
   guildChannels?: string[];
   /** The guild filter: the guilds it admits. */
   guildIds?: string[];
+  /** The category P is under; the category itself comes in `channels`. */
+  category?: string;
 } = {}) {
   const adapter = new DiscordAdapter({
     token: 'unused',
@@ -92,7 +94,7 @@ function fixture(t: TestContext, opts: {
   client.user = client.users._add({ ...bot, bot: true });
   const guild = client.guilds._add({
     id: G, name: 'Guild', owner_id: opts.owner ?? BOT, roles: opts.roles ?? [],
-    channels: [parentData(opts.type ?? ChannelType.GuildText), ...(opts.channels ?? [])],
+    channels: [{ ...parentData(opts.type ?? ChannelType.GuildText), parent_id: opts.category ?? null }, ...(opts.channels ?? [])],
   });
   guild.members._add({ user: bot, roles: [] });
   const thread = client.channels._add(opts.sparse ? { id: TH, guild_id: G, type: ChannelType.PublicThread } : threadData);
@@ -1036,6 +1038,131 @@ it('the catch-up fetches a stale thread again before it decides, and registers i
   assert.equal(get.mock.callCount(), 1);
   assert.equal(f.adapter.isStale(TH), false);
   assert.equal(f.pushes()[0]?.params.origin.mcplChannelId, threadMcplId);
+});
+
+/** A category the guild filter can list, and P under it. */
+const CAT = '100000000000000051';
+const categoryData = { id: CAT, guild_id: G, type: ChannelType.GuildCategory, name: 'cat', parent_id: null };
+/** The channel P as Discord answers its lookup, under the category. */
+const parentInCategory = { ...parentData(ChannelType.GuildText), parent_id: CAT };
+
+/** A catch-up of one missed message (200, its watermark at 100) in
+ *  `channelId`, every lookup answered with P under the category, or failing. */
+async function catchUp(t: TestContext, f: ReturnType<typeof fixture>, channelId: string, lookup: 'answers' | 'fails') {
+  watermarkFile(t);
+  f.server.subscribedChannels.add(channelId);
+  f.server.forwardedWatermark.set(channelId, '100');
+  f.adapter.fetchHistory = async () => [{
+    id: '200', content: 'later', cleanContent: 'later', authorId: U, authorName: 'Bob',
+    timestamp: new Date(T + 1000), mentionsBot: false, attachments: [],
+  }] as any;
+  const asked: string[] = [];
+  t.mock.method(f.client.rest, 'get', async (route: string) => {
+    asked.push(route);
+    if (lookup === 'fails') throw new Error('Service Unavailable');
+    return parentInCategory;
+  });
+  const errors: string[] = [];
+  t.mock.method(console, 'error', (...a: unknown[]) => { errors.push(a.map(String).join(' ')); });
+  await f.server.runReconnectSweep();
+  return { asked, errors };
+}
+
+/** A catch-up of the thread, whose channel P, under the category, is stale. */
+async function sweepWithStaleParent(
+  t: TestContext, guildChannels: string[], lookup: 'answers' | 'fails', guildIds?: string[],
+) {
+  const f = fixture(t, { guildChannels, category: CAT, channels: [categoryData], ...(guildIds ? { guildIds } : {}) });
+  (f.adapter as any).markStale(P, G);
+  return { f, ...(await catchUp(t, f, TH, lookup)) };
+}
+
+it("the catch-up looks a thread's stale channel up before it decides, so the channel's category admits the thread", { timeout: 5000 }, async (t) => {
+  const { f, asked } = await sweepWithStaleParent(t, [CAT], 'answers');
+  assert.deepEqual(asked, [`/channels/${P}`]);
+  assert.equal(f.adapter.isStale(P), false);
+  assert.equal(f.pushes().length, 1);
+  assert.equal(f.server.forwardedWatermark.get(TH), '200');
+});
+
+it("the catch-up holds a thread back, its watermark untouched, when its channel stays stale and the filters would withhold it", { timeout: 5000 }, async (t) => {
+  const { f, errors } = await sweepWithStaleParent(t, [CAT], 'fails');
+  assert.equal(f.adapter.isStale(P), true);
+  assert.equal(f.pushes().length, 0);
+  assert.equal(f.server.forwardedWatermark.get(TH), '100', 'tried again at the next start');
+  assert.ok(errors.some((e) => e.includes(`Catch-up held back channel ${TH}: the channel filters would withhold its 1 missed message(s)`)
+    && e.includes(`(its channel ${P} is still stale after its lookup)`)), errors.join('\n'));
+  assert.ok(!errors.some((e) => e.includes('Catch-up withheld')), 'not reported as withheld');
+});
+
+it("the catch-up still delivers a thread listed by its own id while its channel stays stale", { timeout: 5000 }, async (t) => {
+  const { f } = await sweepWithStaleParent(t, [TH], 'fails');
+  assert.equal(f.adapter.isStale(P), true);
+  assert.equal(f.pushes().length, 1);
+  assert.equal(f.server.forwardedWatermark.get(TH), '200');
+});
+
+it("the catch-up moves past a thread the filters withhold on current facts, as the live path never revisits what it refused", { timeout: 5000 }, async (t) => {
+  const { f, errors } = await sweepWithStaleParent(t, [G], 'answers');
+  assert.equal(f.adapter.isStale(P), false);
+  assert.equal(f.pushes().length, 0);
+  assert.equal(f.server.forwardedWatermark.get(TH), '200');
+  assert.ok(errors.some((e) => e.includes(`Catch-up withheld 1 missed message(s) in channel ${TH}: channel-not-allowed`)), errors.join('\n'));
+});
+
+it("the catch-up looks up no stale channel of a thread in a guild the filters leave out", { timeout: 5000 }, async (t) => {
+  const { f, asked, errors } = await sweepWithStaleParent(t, [CAT], 'answers', ['100000000000000099']);
+  assert.deepEqual(asked, []);
+  assert.equal(f.adapter.isStale(P), true);
+  assert.equal(f.pushes().length, 0);
+  assert.equal(f.server.forwardedWatermark.get(TH), '200');
+  assert.ok(errors.some((e) => e.includes(`Catch-up withheld 1 missed message(s) in channel ${TH}: guild-not-allowed`)), errors.join('\n'));
+});
+
+it("the catch-up holds back a stale channel whose own lookup fails when the filters would withhold it, naming the failure", { timeout: 5000 }, async (t) => {
+  const f = fixture(t, { guildChannels: [CAT], channels: [categoryData] });
+  (f.adapter as any).markStale(P, G);
+  const { errors } = await catchUp(t, f, P, 'fails');
+  assert.equal(f.adapter.isStale(P), true);
+  assert.equal(f.pushes().length, 0);
+  assert.equal(f.server.forwardedWatermark.get(P), '100');
+  assert.ok(errors.some((e) => e.includes(`Catch-up held back channel ${P}`)
+    && e.includes(`(it's still stale after its lookup; channel ${P}'s own lookup failed: Service Unavailable)`)), errors.join('\n'));
+  assert.ok(!errors.some((e) => e.includes('may go out')), 'no line says its messages may go out');
+});
+
+it("the catch-up holds back a thread whose channel isn't known when its lookup fails and the filters would withhold it", { timeout: 5000 }, async (t) => {
+  const f = fixture(t, { sparse: true, guildChannels: [CAT], channels: [categoryData], category: CAT });
+  const { asked, errors } = await catchUp(t, f, TH, 'fails');
+  assert.deepEqual(asked, [`/channels/${TH}`]);
+  assert.equal(f.pushes().length, 0);
+  assert.equal(f.server.forwardedWatermark.get(TH), '100', 'tried again at the next start');
+  assert.ok(errors.some((e) => e.includes(`Catch-up held back channel ${TH}`)
+    && e.includes(`(its channel isn't known; channel ${TH}'s own lookup failed: Service Unavailable)`)), errors.join('\n'));
+  assert.ok(!errors.some((e) => e.includes('Catch-up withheld')), 'not reported as withheld');
+  assert.ok(!errors.some((e) => e.includes('may go out')), 'no line says its messages may go out');
+});
+
+it("the catch-up moves past a stale thread the filters withhold on its current channel, since its own mark changes nothing they read", { timeout: 5000 }, async (t) => {
+  const f = fixture(t, { guildChannels: [CAT], channels: [categoryData] });
+  (f.adapter as any).markStale(TH, G);
+  const { asked, errors } = await catchUp(t, f, TH, 'fails');
+  assert.deepEqual(asked, [`/channels/${TH}`]);
+  assert.equal(f.adapter.isStale(TH), true);
+  assert.equal(f.pushes().length, 0);
+  assert.equal(f.server.forwardedWatermark.get(TH), '200');
+  assert.ok(errors.some((e) => e.includes(`Catch-up withheld 1 missed message(s) in channel ${TH}: channel-not-allowed`)), errors.join('\n'));
+  assert.ok(errors.some((e) => e.includes(`Catch-up couldn't look up channel ${TH} (Service Unavailable)`)), errors.join('\n'));
+});
+
+it("the catch-up moves past a thread whose channel the cache doesn't hold, counting that channel as known", { timeout: 5000 }, async (t) => {
+  const f = fixture(t, { guildChannels: [CAT], channels: [categoryData], category: CAT });
+  f.client.channels.cache.delete(P);
+  const { asked, errors } = await catchUp(t, f, TH, 'answers');
+  assert.deepEqual(asked, [], 'the thread is held whole, and its channel isn\'t stale');
+  assert.equal(f.pushes().length, 0);
+  assert.equal(f.server.forwardedWatermark.get(TH), '200');
+  assert.ok(errors.some((e) => e.includes(`Catch-up withheld 1 missed message(s) in channel ${TH}: channel-not-allowed`)), errors.join('\n'));
 });
 
 it("a lookup whose later try fails after an overtaken one leaves its thread stale", { timeout: 5000 }, async (t) => {

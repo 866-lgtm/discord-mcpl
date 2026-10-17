@@ -55,6 +55,22 @@ in the git log and PR descriptions.
 
 ### Fixed
 
+- **The catch-up looks a thread's stale channel up before it decides, and
+  holds back what it would withhold on facts that aren't current.** A thread
+  the channel filters admit only through its channel's category had every
+  missed message withheld when that channel's facts were stale at the
+  catch-up, since a stale channel's category admits none of its threads, and
+  the catch-up then moved its watermark past them, so no later start
+  delivered them. The catch-up now looks the thread's channel up first, as a
+  live message does. When the channel filters would withhold a channel's
+  messages and a fact that answer rests on isn't known or current after the
+  lookups (the channel's own, while it's stale, or for a thread, its
+  channel's, while that's stale or not known), the channel is held back with
+  its watermark untouched, and stderr says which fact. It's tried again at
+  the next start, so if the filters admit it by then, its messages arrive
+  then, where before they were skipped; a message forwarded live in it
+  before then moves its watermark past them, as for a channel whose identity
+  can't be resolved. An answer that admits the messages stands, as before.
 - **Thread fields name the thread a message was posted in.** They were read
   from discord.js `message.thread`, which is the thread a message *started*,
   so a message that had spawned a thread was tagged `chat:thread`, rendered

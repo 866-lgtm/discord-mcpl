@@ -2815,12 +2815,9 @@ export class DiscordMcplServer {
         );
         continue;
       }
-      if (lookupFailure) {
-        console.error(
-          `[discord-mcpl] Catch-up couldn't look up channel ${channelId} (${lookupFailure}). ` +
-            'Its missed messages are placed and filtered by what the cache knew of it, and may go out without its names.',
-        );
-      }
+      // A thread's channel whose facts may be older than Discord's is looked
+      // up too, as a live create's is: its category can admit the thread.
+      if (guildId) await this.discord.lookUpStaleParent(channelId);
 
       // The live ingress decision (guild, channel and thread parent, DM
       // author), evaluated now, after the fetch, so a filter change made
@@ -2834,6 +2831,33 @@ export class DiscordMcplServer {
         else if (reason) withheld.set(reason, (withheld.get(reason) ?? 0) + 1);
         return reason === null;
       });
+      // The channel filters' answer rests on what the cache knows of the
+      // channel, and of a thread's channel (ingressFactsNotCurrent). When the
+      // answer is to withhold and a fact it rests on isn't known or current
+      // after the lookups, it may be wrong, and moving past the messages
+      // would lose them for good: the channel is held back, its watermark
+      // untouched, as one whose identity can't be resolved is, and only the
+      // held line is printed for it. An answer that admits stands, as what
+      // the cache knew does (issue #28).
+      const filtered = withheld.get('channel-not-allowed');
+      const notCurrent = filtered ? this.discord.ingressFactsNotCurrent(channelId) : null;
+      if (notCurrent) {
+        dbg('sweep:held-facts-not-current', { channelId, filtered, notCurrent });
+        console.error(
+          `[discord-mcpl] Catch-up held back channel ${channelId}: the channel filters would withhold its ` +
+            `${filtered} missed message(s), but that answer rests on facts that aren't current ` +
+            `(${notCurrent}${lookupFailure ? `; channel ${channelId}'s own lookup failed: ${lookupFailure}` : ''}), so they were not ` +
+            'delivered. It is tried again at the next start, unless a message forwarded live in it before then ' +
+            'moves its watermark past them.',
+        );
+        continue;
+      }
+      if (lookupFailure) {
+        console.error(
+          `[discord-mcpl] Catch-up couldn't look up channel ${channelId} (${lookupFailure}). Its missed messages ` +
+            'are placed and filtered by what the cache knew of it, and any that are delivered may go out without its names.',
+        );
+      }
       // Refused DMs are decided alongside delivery, which doesn't wait for
       // them; the watermark only moves past this batch once all of them are
       // decided, or the wait for them runs out (advance). Their notices go
