@@ -1621,7 +1621,10 @@ export class DiscordAdapter {
    * forum, which hold no messages, a kind this server doesn't know, another
    * guild, a channel the filters refuse, an id Discord refuses, and a lookup
    * that finds nothing. A guild channel comes back as the facts its
-   * descriptor is made from.
+   * descriptor is made from. A DM's recipient is its other party as the DM
+   * list reads it (dmOtherParty): when the cache can't name one, Discord is
+   * asked again, past the cache, by the freshness rule, and a DM whose other
+   * party that answer doesn't name either is null.
    *
    * The channel is read as the tools read one (channelById): from the cache
    * when it holds the channel whole and current, else from Discord by the
@@ -1642,26 +1645,27 @@ export class DiscordAdapter {
     try {
       channel = await this.channelById(channelId);
     } catch (err) {
-      // Discord refusing the id means this server doesn't serve it: Unknown
-      // Channel, Missing Access, a malformed id's Invalid Form Body, or any
-      // other 403 or 404. Anything else leaves its facts unknown, and another
-      // open fetches it again: no answer (a 5xx, a timeout, a dropped
-      // connection, or a rejection that isn't Discord's), and a refusal that
-      // isn't about the id, such as a 401 after the bot's token changed.
-      const status = (err as { status?: unknown } | null)?.status;
-      const code = (err as { code?: unknown } | null)?.code;
-      const refused = code === UNKNOWN_CHANNEL || code === MISSING_ACCESS || code === INVALID_FORM_BODY
-        || status === 403 || status === 404;
-      dbg('lookUpServedChannel:failed', { channelId, refused, error: err instanceof Error ? err.message : String(err) });
-      return refused ? null : { kind: 'uncertain' };
+      return lookUpFailure(channelId, err);
     }
     if (!channel) return null;
     if (guildSegment === 'dm') {
       if (channel.type !== ChannelType.DM) return null;
-      const recipientId = (channel as DMChannel).recipientId;
+      // discord.js holds a DM it has seen a message in as whole, whatever
+      // recipients it recorded, and when the bot's own message was the first
+      // it saw there, it recorded only the bot. Its recipientId getter then
+      // gives the bot's id, so the other party is read as the DM list reads
+      // it.
+      let recipientId = this.dmOtherParty(channel);
+      if (!recipientId) {
+        try {
+          recipientId = this.dmOtherParty(await this.refetchChannel(channelId));
+        } catch (err) {
+          return lookUpFailure(channelId, err);
+        }
+      }
       if (!recipientId || (this.dmUsers && !this.dmUsers.has(recipientId))) return null;
       // The username, as an inbound DM's descriptor is labelled.
-      const recipient = (channel as DMChannel).recipient ?? (await this.client.users.fetch(recipientId).catch(() => null));
+      const recipient = this.client.users.resolve(recipientId) ?? (await this.client.users.fetch(recipientId).catch(() => null));
       // The DM list may have changed while the name was fetched.
       if (this.dmUsers && !this.dmUsers.has(recipientId)) return null;
       return { kind: 'dm', recipientId, recipientName: recipient?.username ?? recipientId };
@@ -3588,6 +3592,22 @@ export function mapAllAttachments(m: {
     }
   }
   return out;
+}
+
+/** What an exact open's lookup makes of a fetch that failed. Discord refusing
+ *  the id means this server doesn't serve it: Unknown Channel, Missing
+ *  Access, a malformed id's Invalid Form Body, or any other 403 or 404.
+ *  Anything else leaves its facts unknown, and another open fetches it
+ *  again: no answer (a 5xx, a timeout, a dropped connection, or a rejection
+ *  that isn't Discord's), and a refusal that isn't about the id, such as a
+ *  401 after the bot's token changed. */
+function lookUpFailure(channelId: string, err: unknown): null | { kind: 'uncertain' } {
+  const status = (err as { status?: unknown } | null)?.status;
+  const code = (err as { code?: unknown } | null)?.code;
+  const refused = code === UNKNOWN_CHANNEL || code === MISSING_ACCESS || code === INVALID_FORM_BODY
+    || status === 403 || status === 404;
+  dbg('lookUpServedChannel:failed', { channelId, refused, error: err instanceof Error ? err.message : String(err) });
+  return refused ? null : { kind: 'uncertain' };
 }
 
 /** The kinds of guild channel registered by listing them (at boot, when one

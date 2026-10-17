@@ -67,6 +67,11 @@ function fixture(
     served?: (guildSegment: string, channelId: string) => Served | null | Promise<Served | null>;
     history?: (channelId: string) => Promise<unknown[]>;
     inspection?: (channelId: string) => Promise<string | null>;
+    /** What the cache knows of channels when the server asks, as
+     *  getCachedChannelFactsFor answers: nothing unless a test says. */
+    cachedFacts?: (channelIds: string[]) => Map<string, ChannelFacts>;
+    /** The channels whose facts are stale (isStale): none unless a test says. */
+    stale?: Set<string>;
   } = {},
 ) {
   const fetched: Array<{ channelId: string; after?: string }> = [];
@@ -95,15 +100,15 @@ function fixture(
       return userId !== undefined && !offDmList.has(userId);
     },
     // A deletion re-derives what's registered from the cache, which holds
-    // nothing here, and nothing is stale.
-    isStale() {
-      return false;
+    // nothing here unless a test says, and nothing is stale unless one does.
+    isStale(channelId: string) {
+      return opts.stale?.has(channelId) ?? false;
     },
     hasGuild(guildId: string) {
       return !left.has(guildId);
     },
-    getCachedChannelFactsFor() {
-      return new Map();
+    getCachedChannelFactsFor(channelIds: Iterable<string>) {
+      return opts.cachedFacts ? opts.cachedFacts([...channelIds]) : new Map();
     },
   } as unknown as DiscordAdapter;
   const server = new DiscordMcplServer(adapter) as unknown as {
@@ -464,7 +469,7 @@ describe("channels/open: an id the registry doesn't hold", () => {
   });
 });
 
-describe("channels/open: a looked-up channel is registered only when the open commits", () => {
+describe("channels/open: the open registers a looked-up channel only when it commits", () => {
   const late: ChannelFacts = { id: 'c9', guildId: 'g1', guildName: 'Guild', name: 'late', type: 'text' };
   const lateServed = (guild: string, channel: string): Served | null =>
     (guild === 'g1' && channel === 'c9' ? { kind: 'guild', facts: late } : null);
@@ -657,6 +662,75 @@ describe("channels/open: a looked-up channel is registered only when the open co
     assert.equal(res.history?.[0].channelLabel, '#renamed (Guild)');
   });
 
+  it('registers a looked-up channel as the names stand at commit, when another channel takes its name during the fetch', async () => {
+    const voice: ChannelFacts = { id: 'c7', guildId: 'g1', guildName: 'Guild', name: 'General', type: 'voice' };
+    // What the cache knows of it, which the history fetch's wait can change.
+    let known: ChannelFacts = voice;
+    const held = heldHistory();
+    const f = fixture([dev], {
+      served: (guild, channel) => (guild === 'g1' && channel === 'c7' ? { kind: 'guild', facts: voice } : null),
+      history: held.history,
+      cachedFacts: (ids) => new Map(ids.includes('c7') ? [['c7', known]] : []),
+    });
+    // What the host is told, so a label announced and then corrected shows.
+    const announced: string[] = [];
+    Object.assign(f.server as object, {
+      mcplEnabled: true,
+      conn: {
+        isClosed: false,
+        sendNotification: (_m: string, p: { added?: Array<{ id: string; label: string }>; updated?: Array<{ id: string; label: string }> }) => {
+          for (const d of [...(p.added ?? []), ...(p.updated ?? [])]) if (d.id === 'discord:g1:c7') announced.push(d.label);
+        },
+      },
+    });
+    const open = f.server.handleChannelOpen({ channelId: 'discord:g1:c7', type: 'discord', history: { limit: 5 } });
+    await untilFetch(held, open);
+    // A text channel named general is made meanwhile, and the resolver
+    // prefers it, so General no longer resolves back to the voice channel.
+    known = { ...voice, nameResolves: false };
+    held.release();
+    const res = await open as OpenResult & { history?: Array<{ channelLabel?: string }> };
+    assert.equal(res.channel.label, 'discord:g1:c7', 'labelled by its id, since its name now reaches another channel');
+    assert.equal(f.server.channelManager.get('discord:g1:c7')?.label, 'discord:g1:c7');
+    assert.equal(res.history?.[0].channelLabel, 'discord:g1:c7');
+    assert.deepEqual(announced, ['discord:g1:c7'], 'announced once, by the label it commits to');
+  });
+
+  it('registers a looked-up channel that went stale during the fetch labelled by its id', async () => {
+    const stale = new Set<string>();
+    const held = heldHistory();
+    const f = fixture([general], {
+      served: lateServed,
+      history: held.history,
+      cachedFacts: (ids) => new Map(ids.includes('c9') ? [['c9', late]] : []),
+      stale,
+    });
+    const open = f.server.handleChannelOpen({ channelId: 'discord:g1:c9', type: 'discord', history: { limit: 5 } });
+    await untilFetch(held, open);
+    // A fetch of it is overtaken meanwhile, so its cached facts decide nothing.
+    stale.add('c9');
+    held.release();
+    const res = await open;
+    assert.equal(res.channel.label, 'discord:g1:c9', 'its name may no longer be its own, so it answers none');
+    assert.equal(f.server.channelManager.get('discord:g1:c9')?.label, 'discord:g1:c9');
+  });
+
+  it('re-derives the registered channels of its name once it registers a looked-up channel, as a creation does', async () => {
+    const voice: ChannelFacts = { id: 'c5', guildId: 'g1', guildName: 'Guild', name: 'General', type: 'voice' };
+    const text: ChannelFacts = { id: 'c6', guildId: 'g1', guildName: 'Guild', name: 'general', type: 'text' };
+    // The cache didn't hold the text channel when the voice channel was
+    // labelled, and now the resolver prefers it.
+    const known = new Map<string, ChannelFacts>([['c5', { ...voice, nameResolves: false }], ['c6', text]]);
+    const f = fixture([dev, toDescriptor(voice)], {
+      served: (guild, channel) => (guild === 'g1' && channel === 'c6' ? { kind: 'guild', facts: text } : null),
+      cachedFacts: (ids) => new Map(ids.filter((id) => known.has(id)).map((id) => [id, known.get(id)!])),
+    });
+    assert.equal(f.server.channelManager.get('discord:g1:c5')?.label, '#General (Guild)', 'labelled by its name before the open');
+    const res = await f.server.handleChannelOpen({ channelId: 'discord:g1:c6', type: 'discord', history: { limit: 5 } });
+    assert.equal(res.channel.label, '#general (Guild)');
+    assert.equal(f.server.channelManager.get('discord:g1:c5')?.label, 'discord:g1:c5', 'the voice channel answers its name no longer');
+  });
+
   it('labels a registered channel\'s history by its label at commit, when it is relabelled during the fetch', async () => {
     const held = heldHistory();
     const f = fixture([general], { history: held.history });
@@ -791,14 +865,82 @@ describe('the adapter: which channels an exact open may register', () => {
   it('serves a DM whose recipient the DM list admits, labelled by username, and no other', async (t) => {
     const { adapter, client } = adapterFixture(t, { dmUsers: ['u1'] });
     const dms: Record<string, unknown> = {
-      d1: { type: ChannelType.DM, recipientId: 'u1', recipient: { username: 'ra' } },
-      d2: { type: ChannelType.DM, recipientId: 'u2', recipient: { username: 'someone' } },
+      d1: { type: ChannelType.DM, recipientIds: ['u1'] },
+      d2: { type: ChannelType.DM, recipientIds: ['u2'] },
     };
+    const names: Record<string, string> = { u1: 'ra', u2: 'someone' };
     t.mock.method(client.channels, 'fetch', (async (id: string) => dms[id] ?? null) as never);
+    t.mock.method(client.users, 'fetch', (async (id: string) => ({ username: names[id] })) as never);
     assert.deepEqual(await adapter.lookUpServedChannel('dm', 'd1'), { kind: 'dm', recipientId: 'u1', recipientName: 'ra' });
     assert.equal(await adapter.lookUpServedChannel('dm', 'd2'), null, 'the DM list refuses its recipient');
     assert.equal(await adapter.lookUpServedChannel('g1', 'd1'), null, 'a DM named under a guild');
     assert.equal(await adapter.lookUpServedChannel('dm', 'gone'), null, 'Discord finds nothing');
+  });
+
+  /** A DM as discord.js 14.26.5 holds one it has seen a message in, in the
+   *  client's channel cache: whole (it has a last message), with the
+   *  recipients it recorded, which are only the bot when the bot's own
+   *  message came first (Action.getChannel), and none when it was told of
+   *  none. Its recipientId and recipient getters are discord.js's
+   *  (DMChannel.js:83-95): the bot's id, and the bot's user, when the bot is
+   *  all it recorded, and a throw when nothing is. The bot's own user is in
+   *  the client's user cache. Asked past the cache, Discord answers with
+   *  `discordSays`. */
+  function heldDm(t: TestContext, client: Client, recorded: string[] | undefined, discordSays: () => Promise<unknown>) {
+    (client as unknown as { user: { id: string } }).user = { id: 'the-bot' };
+    t.mock.method(client.users, 'resolve', ((id: string) => (id === 'the-bot' ? { id, username: 'the-bot-itself' } : null)) as never);
+    const held = {
+      type: ChannelType.DM,
+      partial: false,
+      recipientIds: recorded,
+      get recipientId(): string {
+        return this.recipientIds!.find((id) => id !== 'the-bot') ?? this.recipientIds![0];
+      },
+      get recipient(): unknown {
+        return client.users.resolve(this.recipientId);
+      },
+    };
+    client.channels.cache.set('d1', held as never);
+    const forced: boolean[] = [];
+    t.mock.method(client.channels, 'fetch', (async (_id: string, o?: { force?: boolean }) => {
+      forced.push(o?.force === true);
+      return discordSays();
+    }) as never);
+    t.mock.method(client.users, 'fetch', (async (id: string) => ({ username: id === 'u1' ? 'ra' : id })) as never);
+    return forced;
+  }
+
+  it('asks Discord again, past the cache, for the other party of a DM held with only the bot recorded, or none', async (t) => {
+    for (const recorded of [['the-bot'], undefined]) {
+      for (const dmUsers of [['u1'], undefined]) {
+        const { adapter, client } = adapterFixture(t, dmUsers ? { dmUsers } : {});
+        const forced = heldDm(t, client, recorded, async () => ({ type: ChannelType.DM, recipientIds: ['u1', 'the-bot'] }));
+        const what = `recorded ${JSON.stringify(recorded)}, DM list ${JSON.stringify(dmUsers)}`;
+        assert.deepEqual(await adapter.lookUpServedChannel('dm', 'd1'), { kind: 'dm', recipientId: 'u1', recipientName: 'ra' }, what);
+        assert.deepEqual(forced, [true], `${what}: the cache answers the lookup, then Discord is asked past it`);
+      }
+    }
+  });
+
+  it('asks Discord nothing for a DM whose cache names its other party', async (t) => {
+    const { adapter, client } = adapterFixture(t, { dmUsers: ['u1'] });
+    const forced = heldDm(t, client, ['u1', 'the-bot'], async () => { throw Object.assign(new Error('Service Unavailable'), { status: 503 }); });
+    assert.deepEqual(await adapter.lookUpServedChannel('dm', 'd1'), { kind: 'dm', recipientId: 'u1', recipientName: 'ra' });
+    assert.deepEqual(forced, [], 'no fetch past the cache');
+  });
+
+  it("serves no DM whose other party Discord's answer past the cache doesn't name either, and reads that fetch's failure as the lookup's", async (t) => {
+    const outcomes: Array<[string, () => Promise<unknown>, unknown]> = [
+      ['names only the bot', async () => ({ type: ChannelType.DM, recipientIds: ['the-bot'] }), null],
+      ['names a party the DM list leaves out', async () => ({ type: ChannelType.DM, recipientIds: ['u2', 'the-bot'] }), null],
+      ['gets no answer', async () => { throw Object.assign(new Error('Service Unavailable'), { status: 503 }); }, { kind: 'uncertain' }],
+      ['is refused', async () => { throw Object.assign(new Error('Unknown Channel'), { status: 404, code: 10003 }); }, null],
+    ];
+    for (const [what, discordSays, expected] of outcomes) {
+      const { adapter, client } = adapterFixture(t, { dmUsers: ['u1'] });
+      heldDm(t, client, ['the-bot'], discordSays);
+      assert.deepEqual(await adapter.lookUpServedChannel('dm', 'd1'), expected, what);
+    }
   });
 
   it('comes back uncertain when Discord gives its lookup no answer, a rejection that is not an Error included', async (t) => {
@@ -855,7 +997,7 @@ describe('the adapter: which channels an exact open may register', () => {
 
   it("serves no DM whose recipient the DM list stops admitting while the recipient's name is fetched", async (t) => {
     const { adapter, client } = adapterFixture(t, { dmUsers: ['u1'] });
-    t.mock.method(client.channels, 'fetch', (async () => ({ type: ChannelType.DM, recipientId: 'u1', recipient: null })) as never);
+    t.mock.method(client.channels, 'fetch', (async () => ({ type: ChannelType.DM, recipientIds: ['u1'] })) as never);
     let reached!: () => void;
     let release!: () => void;
     const atFetch = new Promise<void>((resolve) => { reached = resolve; });

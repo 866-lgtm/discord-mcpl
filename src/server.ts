@@ -3173,10 +3173,18 @@ export class DiscordMcplServer {
 
   /** Re-derive registered guild channels from what the cache knows of them
    *  now (a rename of the channel, its parent or its guild), announcing each
-   *  whose label or metadata changed. One the cache no longer holds keeps
-   *  what it has. Their facts are read together, so their labels are checked
-   *  against one view of the channels names resolve among. */
+   *  whose label or metadata changed, as derivedNow derives them. */
   private rederiveChannels(descriptors: ChannelDescriptor[]): void {
+    this.registerChannels(this.derivedNow(descriptors));
+  }
+
+  /** Guild channels' descriptors as what the cache knows of them now
+   *  derives them. A stale one is labelled by its id, whether or not the
+   *  cache still holds it, and of the rest, one the cache no longer holds is
+   *  left out, its descriptor standing as it is, as is a stale one already
+   *  labelled by its id. Their facts are read together, so their labels are
+   *  checked against one view of the channels names resolve among. */
+  private derivedNow(descriptors: ChannelDescriptor[]): ChannelDescriptor[] {
     const channelIdOf = (d: ChannelDescriptor) => (d.address as { channelId?: string } | undefined)?.channelId;
     // A stale channel's cached facts decide nothing: what's registered of it
     // stands, labelled by its id, since it answers no name until a fresh
@@ -3189,10 +3197,10 @@ export class DiscordMcplServer {
       .map(channelIdOf)
       .filter((id): id is string => id !== undefined && !this.discord.isStale(id));
     const facts = this.discord.getCachedChannelFactsFor(channelIds);
-    this.registerChannels([
+    return [
       ...[...facts.values()].map((f) => this.guildDescriptor(f)),
       ...staleNamed.map((d) => ({ ...d, label: d.id })),
-    ]);
+    ];
   }
 
   /** Whether the filters' answer for a thread rests on facts that are
@@ -3581,10 +3589,29 @@ export class DiscordMcplServer {
     // nothing subscribed.
     const gone = goneMeanwhile();
     if (gone) throw gone;
-    // A looked-up channel is registered, and announced, only here, so an
-    // open refused before this leaves nothing for the host to act on; one
-    // traffic registered meanwhile keeps that registration.
-    if (lookedUp && !this.channelManager.get(desc.id)) this.registerChannels([desc]);
+    // The open registers a looked-up channel, and announces it, only here,
+    // so an open refused before this registers nothing itself. The lookup
+    // fetches a stale channel fresh, the stale channel of a looked-up thread
+    // included, and that fetch registers the channel it fetched when that's
+    // a text, announcement, voice or stage channel the filters admit, as any
+    // fresh fetch of a stale channel does (onChannelRefreshed), whether or
+    // not the open goes on to succeed. One registered meanwhile, by that or
+    // by traffic, keeps its registration.
+    // The open's own is derived from what the cache knows now (derivedNow),
+    // as a registered channel's label is re-derived: a name another channel
+    // took or gave up during the history fetch changes it, and re-derivation
+    // by name (rederiveNamed) only reaches registered channels. A DM, which
+    // the cache's guild facts don't cover, keeps the lookup's descriptor.
+    // Then the registered channels of its name are re-derived, as a
+    // channel's creation does (onChannelCreate): the lookup's fetch can be
+    // what brought it into the cache, and one of them may hold a label that
+    // now reaches it.
+    if (lookedUp && !this.channelManager.get(desc.id)) {
+      const now = this.derivedNow([desc])[0] ?? desc;
+      this.registerChannels([now]);
+      const name = (now.metadata as { channelName?: string } | undefined)?.channelName;
+      if (name) this.rederiveNamed({ name });
+    }
     const opened = this.channelManager.open(desc.id);
     if (!opened) throw unregistered();
     const result: ChannelOpenResponse = { channel: opened };

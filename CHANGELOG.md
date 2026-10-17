@@ -67,9 +67,17 @@ in the git log and PR descriptions.
   channel or is refused: an id the registry doesn't hold is looked up in
   Discord, and opened when it's a channel messages are posted in (text,
   announcement, voice or stage), a thread, or a DM, that the filters admit,
-  so a DM or thread after a restart still opens. It's registered, by the rule
-  every other path registers by, only when the open succeeds, so a refused
-  open leaves nothing registered or announced for the host to act on. An
+  so a DM or thread after a restart still opens. The open registers it only
+  when it succeeds, by the rule every other path registers by, so a refused
+  open registers and announces nothing itself. A guild channel is registered
+  from what the cache knows then, and the registered channels of its name are
+  re-derived, as a channel's creation does; a DM keeps the descriptor its
+  lookup built. (The lookup fetches a stale channel fresh, a looked-up
+  thread's stale channel included, and that fetch registers the channel when
+  it's a text, announcement, voice or stage channel the filters admit, as any
+  fresh fetch of a stale channel does.) A looked-up DM's recipient is the
+  party at its other end, and when the cache can't name it, as when
+  discord.js recorded only the bot, Discord is asked again, past the cache. An
   archived thread opens too, since the host named it, and is forgotten as any
   archived thread is: when it's reported archived again, or a sync of its
   channel's threads doesn't list it. Any other id is refused, a lately
