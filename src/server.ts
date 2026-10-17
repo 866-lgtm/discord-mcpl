@@ -48,7 +48,7 @@ import type {
 } from '@animalabs/mcpl-core';
 
 import type { ChannelFacts, DiscordAdapter, DiscordMessageData, DiscordAttachment, OutgoingFile, ReactionSummary, MessageEventInfo, DmRefusal, DmSendFailure, ThreadPlace } from './discord-adapter.js';
-import { LATEST_FROM_WINDOW, attachmentUrlExpiry, holdsNoMessages, isListedKind } from './discord-adapter.js';
+import { LATEST_FROM_WINDOW, attachmentUrlExpiry, holdsNoMessages, isListedKind, kindOfValue } from './discord-adapter.js';
 import { DM_NOTICE_TEXT, DmNoticeState, resolveDmNoticesPath, type DmNoticeDecision } from './dm-notices.js';
 
 /** How much of a latestFrom target's text its receipt echoes. */
@@ -228,10 +228,63 @@ function usableWatermarks(value: unknown): Usable<SavedWatermarks> {
 const unsavedNote = (store: string, failure: string | null): string =>
   failure ? ` The ${store} couldn't be saved (${failure}), so as it stands now it wouldn't survive a restart.` : '';
 
+/** How a required string argument's value fell short, for its refusal:
+ *  given none (left out, or null), blank, or not a string. Tool arguments aren't
+ *  checked against their schema, so the value can be anything. */
+function fellShort(value: unknown): string {
+  return value === undefined || value === null
+    ? ', and this call gave none'
+    : typeof value === 'string'
+      ? ', and this call gave it blank'
+      : ` as a string, and this call gave ${kindOfValue(value)}`;
+}
+
+/** The refusal for a tool called without a usable channelId, before it did
+ *  anything (`nothing` says what didn't happen): it names what was wrong
+ *  with the value given, and how to give one. A #name reaches only the kinds
+ *  handleToolCall's resolver admits (see resolveChannelRef). */
+function channelIdRequired(tool: string, value: unknown, nothing = 'Nothing was done'): Error {
+  return new Error(
+    `${nothing}: ${tool} needs channelId${fellShort(value)}. Give the channel's id in quotes, such as ` +
+      '"123456789012345678", or, for a text, announcement, voice or stage channel, its #name. list_channels with ' +
+      "guildId, a server's id from list_guilds, lists the channels there that the configured filters allow, with " +
+      'their ids.',
+  );
+}
+
+/** A channel tool's channelId, trimmed, or its refusal: a missing, blank or
+ *  non-string value never reaches the tool. handleToolCall trims an id only
+ *  to tell it from a #name, and passes an id on as it was given. */
+function requiredChannelId(tool: string, value: unknown, nothing?: string): string {
+  if (typeof value === 'string' && value.trim()) return value.trim();
+  throw channelIdRequired(tool, value, nothing);
+}
+
+/** send_dm's userId, or its refusal, before anything is looked up or sent. */
+function requiredUserId(value: unknown): string {
+  if (typeof value === 'string' && value.trim()) return value;
+  throw new Error(
+    `Nothing was sent: send_dm needs userId${fellShort(value)}. Give the recipient's id in quotes, such as ` +
+      '"123456789012345678", or their name: @username or display name.',
+  );
+}
+
+/** A send tool's content: its text, or none when it's left out, null or
+ *  false, so that with files the files post alone. Anything else is refused
+ *  before anything is sent, 0 included: it may have been meant as "0". */
+function messageContent(tool: string, value: unknown): string {
+  if (value === undefined || value === null || value === false) return '';
+  if (typeof value === 'string') return value;
+  throw new Error(
+    `Nothing was sent: ${tool} takes content as a string, and this call gave ${kindOfValue(value)}. Give the message's ` +
+      'text in quotes, or, to send only files, leave content out and give files.',
+  );
+}
+
 /** A Discord message must carry text and/or attachments — reject empty sends. */
 function requireContentOrFiles(content: string, files: OutgoingFile[] | undefined): void {
   if ((!content || !content.trim()) && (!files || files.length === 0)) {
-    throw new Error('Provide "content", "files", or both — a message cannot be empty.');
+    throw new Error('Nothing was sent: the message is empty. Give it "content", "files", or both.');
   }
 }
 
@@ -1589,7 +1642,11 @@ export class DiscordMcplServer {
     const fs = featureSetForTool(name);
     if (fs && this.mcplEnabled && !isEnabled(fs, this.enabledFeatureSets)) {
       return {
-        content: [textContent(`Feature set '${fs}' is not enabled`)],
+        content: [textContent(
+          `${name} is turned off here: this host has disabled the "${fs}" feature set it belongs to, ` +
+            "so the call didn't run, and calling it again won't change that. " +
+            'If you need it, ask whoever runs this host.',
+        )],
         isError: true,
       };
     }
@@ -1660,10 +1717,7 @@ export class DiscordMcplServer {
     // stringified into Discord's route.
     if (INSPECTION_TOOLS.has(name)) {
       if (typeof args.channelId !== 'string' || args.channelId.trim().length === 0) {
-        return {
-          content: [textContent(`${name} needs channelId as a channel id string, such as "123456789012345678". Nothing was read.`)],
-          isError: true,
-        };
+        return { content: [textContent(channelIdRequired(name, args.channelId, 'Nothing was read').message)], isError: true };
       }
       let refusal: string | null;
       try {
@@ -1713,7 +1767,7 @@ export class DiscordMcplServer {
 
       case 'send_message': {
         const channelId = args.channelId as string;
-        const content = (args.content as string | undefined) ?? '';
+        const content = messageContent(name, args.content);
         const files = args.files as OutgoingFile[] | undefined;
         requireContentOrFiles(content, files);
         let result: { messageId: string };
@@ -1729,7 +1783,7 @@ export class DiscordMcplServer {
 
       case 'reply_message': {
         const channelId = args.channelId as string;
-        const content = (args.content as string | undefined) ?? '';
+        const content = messageContent(name, args.content);
         const files = args.files as OutgoingFile[] | undefined;
         requireContentOrFiles(content, files);
         const { messageId: replyTo, target } = await this.resolveTargetMessage(channelId, args);
@@ -1750,13 +1804,14 @@ export class DiscordMcplServer {
       }
 
       case 'send_dm': {
-        const content = (args.content as string | undefined) ?? '';
+        const userId = requiredUserId(args.userId);
+        const content = messageContent(name, args.content);
         const files = args.files as OutgoingFile[] | undefined;
         requireContentOrFiles(content, files);
         let result: { messageId: string; channelId: string; recipientName: string };
         try {
           result = await this.discord.sendDM(
-            args.userId as string,
+            userId,
             content,
             { files },
           );
@@ -1814,10 +1869,7 @@ export class DiscordMcplServer {
         return await this.discord.listEmojis(args.guildId as string | undefined);
 
       case 'set_reaction_visibility': {
-        const channelId = args.channelId as string;
-        if (typeof channelId !== 'string' || channelId.length === 0) {
-          throw new Error('channelId is required');
-        }
+        const channelId = requiredChannelId('set_reaction_visibility', args.channelId);
         this.ensureReactionChannelsLoaded();
         const visible = args.visible as boolean;
         const changed = visible !== this.reactionChannels.has(channelId);
@@ -1874,21 +1926,20 @@ export class DiscordMcplServer {
 
       case 'subscribe_channel': {
         throw new Error(
-          'subscribe_channel is retired. Use the host channel_open tool with the MCPL channel id.',
+          "Nothing was done: subscribe_channel is retired. Use the host's channel_open tool with the channel's id: " +
+            'discord:<server id>:<channel id>, or discord:dm:<channel id> for a DM.',
         );
       }
 
       case 'unsubscribe_channel': {
         throw new Error(
-          'unsubscribe_channel is retired. Use the host channel_close tool with the MCPL channel id.',
+          "Nothing was done: unsubscribe_channel is retired. Use the host's channel_close tool with the channel's id: " +
+            'discord:<server id>:<channel id>, or discord:dm:<channel id> for a DM.',
         );
       }
 
       case 'mute_channel': {
-        const channelId = args.channelId as string;
-        if (typeof channelId !== 'string' || channelId.length === 0) {
-          throw new Error('channelId is required');
-        }
+        const channelId = requiredChannelId('mute_channel', args.channelId);
         this.ensureMutedLoaded();
         const wasNew = !this.mutedChannels.has(channelId);
         this.mutedChannels.add(channelId);
@@ -1918,10 +1969,7 @@ export class DiscordMcplServer {
       }
 
       case 'unmute_channel': {
-        const channelId = args.channelId as string;
-        if (typeof channelId !== 'string' || channelId.length === 0) {
-          throw new Error('channelId is required');
-        }
+        const channelId = requiredChannelId('unmute_channel', args.channelId);
         this.ensureMutedLoaded();
         const removed = this.mutedChannels.delete(channelId);
         const unsaved = removed || this.mutedUnsaved ? this.saveMuted() : null; // as in mute_channel
@@ -1961,12 +2009,11 @@ export class DiscordMcplServer {
       }
 
       case 'channel_missed': {
+        // Checked before the loads, which can set aside and rewrite an
+        // unusable watermarks file, so a refusal has done nothing.
+        const channelId = requiredChannelId('channel_missed', args.channelId, 'Nothing was read');
         this.ensureSubscriptionsLoaded();
         this.ensureWatermarkLoaded();
-        const channelId = args.channelId as string;
-        if (typeof channelId !== 'string' || channelId.length === 0) {
-          throw new Error('channelId is required');
-        }
         if (this.subscribedChannels.has(channelId)) {
           return {
             ...this.resolveChannelMeta(channelId),
@@ -2039,7 +2086,7 @@ export class DiscordMcplServer {
         return await this.filtersUpdate(args);
 
       default:
-        throw new Error(`Unknown tool: ${name}`);
+        throw new Error(`There's no Discord tool "${name}", so nothing ran. Call one of the Discord tools listed for you.`);
     }
   }
 
@@ -2102,7 +2149,7 @@ export class DiscordMcplServer {
     // configured. Alone, it needs nothing else; alongside whitelist changes
     // it's applied after them, so a refused filter change applies nothing.
     if (args.setDmNotice !== undefined && typeof args.setDmNotice !== 'boolean') {
-      throw new Error('setDmNotice must be true or false.');
+      throw new Error('setDmNotice must be true or false. Nothing was changed.');
     }
     const setDmNotice = args.setDmNotice as boolean | undefined;
     const applyNotice = async (notes: string[]): Promise<void> => {

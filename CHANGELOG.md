@@ -53,7 +53,71 @@ in the git log and PR descriptions.
   carries `expiresAt` beside its `url`, and both tools' descriptions say
   what it means. A URL without a readable `ex` gets neither.
 
+### Changed
+
+- **These refusals, each given before the call sends or saves anything,
+  now say what didn't happen and what the agent can do.** Anything matching
+  one of the old texts, quoted here, needs the new one:
+  - A tool whose feature set the host disabled ("Feature set '<set>' is
+    not enabled") names the tool and the feature set, says that the call
+    didn't run and that calling it again won't change that, and points to
+    whoever runs the host.
+  - `set_reaction_visibility`, `mute_channel`, `unmute_channel` and
+    `channel_missed` ("channelId is required"), and `fetch_history` and
+    `fetch_around` ("<tool> needs channelId as a channel id string, such as
+    …"), without a usable `channelId`: each says that nothing was done, or,
+    for `channel_missed` and the history reads, read, and what was wrong with
+    the value given, and that the id goes in quotes. It names the channels a
+    #name reaches (text, announcement, voice and stage channels), and says
+    that `list_channels` with `guildId`, a server's id from `list_guilds`,
+    lists the channels there that the configured filters allow.
+  - An unknown tool name ("Unknown tool: <name>") says that nothing ran.
+  - The retired `subscribe_channel` ("subscribe_channel is retired. Use the
+    host channel_open tool with the MCPL channel id.") and
+    `unsubscribe_channel` ("unsubscribe_channel is retired. Use the host
+    channel_close tool with the MCPL channel id.") now begin by saying that
+    nothing was done, and name the id the host's tool takes as the agent
+    sees it: `discord:<server id>:<channel id>`, or
+    `discord:dm:<channel id>` for a DM.
+  - A send with neither content nor files ("Provide "content", "files", or
+    both — a message cannot be empty.") says that nothing was sent.
+  - `filters_update`'s `setDmNotice` check ("setDmNotice must be true or
+    false.") adds that nothing was changed.
+  - The attachment checks ("Too many files: <n> (Discord allows up to 10 per
+    message)", "Each file must have a non-empty string "path"" and "File not
+    found (or not a regular file): <path>") say that nothing was sent and
+    what to send instead. The count check names the count, and each file's
+    check names the file by its place in the list or by its path as read on
+    the machine running discord-mcpl.
+
 ### Fixed
+
+- **`set_reaction_visibility`, `mute_channel`, `unmute_channel` and
+  `channel_missed` given a blank `channelId`, and a send given a value of
+  the wrong kind, no usable `userId`, or a file this process can't read, no
+  longer go ahead.** `set_reaction_visibility`,
+  `mute_channel`, `unmute_channel` and `channel_missed`, and no other tools,
+  read `channelId` trimmed: a whitespace-only id, which `mute_channel` saved
+  as a muted channel, is refused, and a padded id is used without its
+  padding. `channel_missed` checks its `channelId` before it loads anything,
+  so a refused call no longer sets aside and rewrites an unusable watermarks
+  file. The send tools refuse, before anything is sent: `files` given as
+  something other than a list, such as a string or an object, where it
+  failed with a raw TypeError or as too many files (a value that says none,
+  null, `""`, `false` or `0`, still means no files); a file's `name` that is
+  neither a string nor a value that says none, where it failed with a raw
+  TypeError, and a `description` that is an object or a list, which was sent
+  to Discord with the last part, after the parts before it had posted (a
+  name or description that says none, null, `""`, `false` or `0`, is still
+  left out, and a description given as a number or `true` is sent as its
+  text, such as "42"); and `content` that is given and isn't a string, where
+  it failed with a raw TypeError, or, for `0`, was read as no content
+  (`null` and `false` still are, so files given with them post alone).
+  `send_dm` without a usable `userId` is refused before the recipient is
+  looked up, where it failed with a raw TypeError and named its destination
+  as a DM with "undefined". A file this process can't read is refused before
+  any part of the message is sent: it failed at send time, after the parts
+  before it had posted.
 
 - **Thread fields name the thread a message was posted in.** They were read
   from discord.js `message.thread`, which is the thread a message *started*,
