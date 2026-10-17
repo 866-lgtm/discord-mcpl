@@ -10,11 +10,12 @@ import { DiscordAdapter, type HistoryMessage } from '../src/discord-adapter.js';
 import { DiscordMcplServer } from '../src/server.js';
 import { toolDefinitions } from '../src/tools.js';
 
-// Every assert.ok here carries a message. Without one, a failing assert.ok on
-// Node 20 quotes the failed expression by re-reading this file at the call's
-// position, which under tsx is the compiled code's (line 1, a large column);
-// that search retries without progress, so a regression hangs the run
-// instead of failing it.
+// Every assert.ok here carries a message. On Node 20, a failing assert.ok
+// without one quoted the failed expression by re-reading this file at the
+// call's position, which under tsx is the compiled code's (line 1, a large
+// column); that search retried without progress, so a regression hung the
+// run instead of failing it. Later Node versions weren't checked, and a
+// message costs nothing, so the rule stays.
 
 const at = (s: number) => new Date(Date.UTC(2026, 9, 7, 8, 0, s));
 const msg = (id: string, authorId: string, authorName: string, text: string, s: number, isBot = false): HistoryMessage => ({

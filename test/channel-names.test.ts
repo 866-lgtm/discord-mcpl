@@ -4,6 +4,7 @@ import * as assert from 'node:assert/strict';
 import {
   buildCandidates,
   channelLabel,
+  formatThreadLabel,
   isSnowflake,
   parseChannelRef,
   resolveChannelName,
@@ -21,6 +22,8 @@ const SEPARATRIX_GENERAL = ch('100000000000000001', 'general', 'g1', 'Separatrix
 const ANIMA_GENERAL = ch('100000000000000002', 'general', 'g2', 'Anima Mundi');
 const KITCHEN = ch('100000000000000003', 'kitchen-table', 'g1', 'Separatrix');
 const CANDIDATES = [SEPARATRIX_GENERAL, ANIMA_GENERAL, KITCHEN];
+const BY_ID = "list_channels shows a server's channels with their ids, and a channel of any other kind, such as a " +
+  'category or a forum, is given by its id instead.';
 
 describe('isSnowflake', () => {
   it('accepts 17-20 digit ids', () => {
@@ -123,16 +126,30 @@ describe('resolveChannelName', () => {
 
   it('distinguishes wrong-guild from no-such-channel', () => {
     const r = resolveChannelName({ name: 'general', guild: 'Nowhere' }, CANDIDATES);
-    assert.ok(!r.ok);
-    assert.equal(r.reason, 'not-found');
-    assert.match(r.message, /exists elsewhere/);
-    assert.match(r.message, /Separatrix/);
+    assert.deepEqual(r, {
+      ok: false,
+      reason: 'not-found',
+      message: 'No text, announcement, voice or stage channel that the configured channel filters allow is named #general ' +
+        'in a guild named "Nowhere", and a #name reaches only those. That name exists elsewhere: ' +
+        `#general (Separatrix), #general (Anima Mundi). ${BY_ID}`,
+    });
   });
 
-  it('reports not-found for an unknown name', () => {
-    const r = resolveChannelName({ name: 'no-such-room' }, CANDIDATES);
-    assert.ok(!r.ok);
-    assert.equal(r.reason, 'not-found');
+  it('reports not-found for an unknown name, saying what a #name reaches and how other channels are given', () => {
+    // A typo, and a name in a guild that has none by it, among the
+    // candidates, which are only channels a #name reaches.
+    assert.deepEqual(resolveChannelName({ name: 'genral' }, CANDIDATES), {
+      ok: false,
+      reason: 'not-found',
+      message: 'No text, announcement, voice or stage channel that the configured channel filters allow is named #genral, ' +
+        `and a #name reaches only those. ${BY_ID}`,
+    });
+    assert.deepEqual(resolveChannelName({ name: 'plans', guild: 'Separatrix' }, CANDIDATES), {
+      ok: false,
+      reason: 'not-found',
+      message: 'No text, announcement, voice or stage channel that the configured channel filters allow is named #plans ' +
+        `in "Separatrix", and a #name reaches only those. ${BY_ID}`,
+    });
   });
 
   it('does no fuzzy matching', () => {
@@ -201,6 +218,44 @@ describe('resolveChannelName', () => {
     assert.ok(!r.ok);
     assert.match(r.message, /\[voice\]/);
   });
+
+  it('REFUSES a pasted thread label, even where a voice room carries its name', () => {
+    // A thread's label is display-only (formatThreadLabel). A voice channel's
+    // name may hold spaces and ›: matched as a name, the label would send to
+    // a voice room named `general › design-chat`.
+    const lookalike = ch('100000000000000009', 'general › design-chat', 'g1', 'Separatrix', 'voice');
+    const parentless = ch('100000000000000010', '› design-chat', 'g1', 'Separatrix', 'voice');
+    const world = [...CANDIDATES, lookalike, parentless];
+    for (const label of [
+      formatThreadLabel('general', 'design-chat', 'Separatrix'),
+      formatThreadLabel(null, 'design-chat', 'Separatrix'),
+      // The same shapes, typed without a guild.
+      '#general › design-chat',
+      '› design-chat',
+    ]) {
+      const parsed = parseChannelRef(label);
+      assert.ok(parsed?.kind === 'name', label);
+      const r = resolveChannelName(parsed, world);
+      assert.ok(!r.ok, `${label} must not resolve`);
+      assert.equal(r.reason, 'thread-label', label);
+      assert.match(r.message, /by its id/, label);
+    }
+  });
+
+  it('matches a name that merely contains › as usual', () => {
+    // Only the label's shape is refused: › at the start or after a space,
+    // with a space after it. Each side of that boundary is a name.
+    for (const [i, name] of ['news›daily', 'ops ›room', 'ops› room'].entries()) {
+      const c = ch(`10000000000000001${i}`, name, 'g1', 'Separatrix', 'voice');
+      const r = resolveChannelName({ name }, [...CANDIDATES, c]);
+      assert.ok(r.ok, `${name}: ${JSON.stringify(r)}`);
+      assert.equal(r.id, c.id, name);
+    }
+    for (const name of ['› room', 'ops › room']) {
+      const r = resolveChannelName({ name }, CANDIDATES);
+      assert.ok(!r.ok && r.reason === 'thread-label', name);
+    }
+  });
 });
 
 describe('channelLabel', () => {
@@ -224,7 +279,7 @@ describe('channelLabel', () => {
 
 const TYPES: Record<number, string> = {
   0: 'text', 2: 'voice', 4: 'category', 11: 'thread', 12: 'thread',
-  13: 'unknown', 15: 'forum', 16: 'unknown',
+  13: 'stage', 15: 'forum', 16: 'unknown',
 };
 const mapType = (t: number | undefined) => TYPES[t ?? -1] ?? 'unknown';
 const chan = (id: string, name: string, type: number, parentId: string | null = null) =>
@@ -241,9 +296,10 @@ describe('buildCandidates', () => {
       chan('5', 'a-forum', 15), chan('6', 'a-stage', 13), chan('7', 'media', 16),
     ]);
     const got = buildCandidates([g], { mapType, allowed: allowAll });
-    assert.deepEqual(got.map((c) => c.name).sort(), ['text-room', 'voice-room']);
-    // Forums 400 on a bare send; stage/media land in 'unknown'. All still
-    // reachable by id -- excluded from NAME addressing only.
+    assert.deepEqual(got.map((c) => c.name).sort(), ['a-stage', 'text-room', 'voice-room']);
+    // Forums 400 on a bare send, and media lands in 'unknown'. All still
+    // reachable by id -- excluded from NAME addressing only. A stage
+    // channel's text chat takes messages, as a voice channel's does.
   });
 
   it('carries the type through, so the tie-break has something to work with', () => {
@@ -317,6 +373,7 @@ function mockAdapter(withResolver: boolean) {
   };
   if (!withResolver) return base;
   return Object.assign(base, {
+    async refreshStale() {},
     resolveChannelRef(ref: string) {
       // Delegate id/composite handling to the real parser, as the real adapter
       // does — otherwise the mock quietly diverges from the thing under test.
@@ -428,7 +485,7 @@ describe('channel type classification', () => {
     [10, 'thread',       false],  // AnnouncementThread — names not unique
     [11, 'thread',       false],  // PublicThread
     [12, 'thread',       false],  // PrivateThread
-    [13, 'unknown',      false],  // Stage — not sendable
+    [13, 'stage',        true],   // Stage — has text chat, as voice does
     [15, 'forum',        false],  // Forum root — a bare send 400s
     [16, 'unknown',      false],  // Media — forum-like
   ];
@@ -487,9 +544,8 @@ describe('display form == address form', () => {
     // The claim the whole feature rests on. These live in different modules
     // (channels.ts vs channel-names.ts) and previously built the string
     // independently, so nothing stopped them drifting apart.
-    const desc = toDescriptor('g1', 'Separatrix', {
-      id: '100000000000000001', name: 'kitchen-table', type: 'text',
-      label: formatChannelLabel('kitchen-table', 'Separatrix'),
+    const desc = toDescriptor({
+      id: '100000000000000001', guildId: 'g1', guildName: 'Separatrix', type: 'text', name: 'kitchen-table',
     });
     assert.deepEqual(parseChannelRef(desc.label!), {
       kind: 'name', name: 'kitchen-table', guild: 'Separatrix',

@@ -9,7 +9,7 @@
 import { describe, it, type TestContext } from 'node:test';
 import * as assert from 'node:assert/strict';
 import type { Client } from 'discord.js';
-import { DiscordAdapter, type DiscordAdapterConfig } from '../src/discord-adapter.js';
+import { DiscordAdapter, mapAllAttachments, type DiscordAdapterConfig } from '../src/discord-adapter.js';
 import { DiscordMcplServer } from '../src/server.js';
 import { mcplChannelId, toDescriptor } from '../src/channels.js';
 
@@ -24,7 +24,7 @@ const THREAD_OF_EXCLUDED = '410000000000000006';
 const OTHER_GUILD = '410000000000000007';
 const DM = '410000000000000008';
 const LOOKUP_FAILS = '410000000000000009'; // a channel whose lookup rejects
-const UNKNOWN = '410000000000000010'; // a channel whose lookup finds nothing
+const UNBUILT = '410000000000000010'; // a channel discord.js returns no object for
 const THREAD_UNDER_CATEGORY = '410000000000000011'; // a thread of a channel its category admits
 
 const channels: Record<string, Record<string, unknown>> = {
@@ -43,7 +43,7 @@ function adapterWith(t: TestContext, config: Partial<DiscordAdapterConfig>) {
   t.after(() => client.destroy());
   // channelAllowed reads a thread's channel from the cache to find its
   // category (#73), as the gateway leaves it there for a guild's channels.
-  client.channels.cache.set(UNDER_CATEGORY, { id: UNDER_CATEGORY, parentId: CATEGORY } as never);
+  client.channels.cache.set(UNDER_CATEGORY, { id: UNDER_CATEGORY, isDMBased: () => false, ...channels[UNDER_CATEGORY], parentId: CATEGORY } as never);
   (client.channels as unknown as { fetch: unknown }).fetch = async (id: string) => {
     if (id === DM) return { id, isDMBased: () => true };
     // As discord.js's DiscordAPIError carries it: Discord's JSON code.
@@ -140,15 +140,18 @@ describe('fetch_history and fetch_around by numeric id', () => {
     assert.deepEqual(reads, [], 'no history was read');
   });
 
-  it("refuses a channel whose lookup finds nothing, before any message is read", async (t) => {
+  it("refuses a channel discord.js returns no object for, before any message is read", async (t) => {
     const { server, reads } = serverWith(t);
     for (const [tool, args] of [
-      ['fetch_history', { channelId: UNKNOWN }],
-      ['fetch_around', { channelId: UNKNOWN, messageId: '420000000000000001' }],
+      ['fetch_history', { channelId: UNBUILT }],
+      ['fetch_around', { channelId: UNBUILT, messageId: '420000000000000001' }],
     ] as const) {
       const res = await server.handleToolCall(tool, args);
       assert.equal(res.isError, true, tool);
-      assert.equal(res.content[0].text, `Channel ${UNKNOWN} not found`, tool);
+      assert.equal(res.content[0].text, `Channel ${UNBUILT} exists, but this adapter can't use it, so nothing was read. ` +
+        "Either it's a kind of channel this version of the adapter can't handle, which only an operator updating the " +
+        "adapter can change, or its server is still loading on this connection, in which case the same call may work " +
+        'in a moment.', tool);
     }
     assert.deepEqual(reads, [], 'no history was read');
   });
@@ -213,7 +216,7 @@ describe('channels/open backscroll', () => {
     } as const;
     for (const [id, type] of Object.entries(kinds)) {
       const name = `${type}-${id.slice(-1)}`;
-      server.channelManager.register(toDescriptor(G1, 'Guild', { id, name, type, label: `#${name} (Guild)` }));
+      server.channelManager.register(toDescriptor({ id, guildId: G1, guildName: 'Guild', type, name }));
     }
     const opened = (id: string) =>
       server.channelManager.isOpen(mcplChannelId(G1, id)) || server.subscribedChannels.has(id);
@@ -274,5 +277,54 @@ describe('channels/open backscroll', () => {
     assert.equal(opened(EXCLUDED), true);
     assert.equal(opened(THREAD_OF_EXCLUDED), true);
     assert.deepEqual(reads, []);
+  });
+});
+
+describe('attachment links in history results', () => {
+  const signed = 'https://cdn.discordapp.example/1/2/notes.txt?ex=6ad179e0&is=6ad02860&hm=1';
+  function serverWith(t: TestContext) {
+    const { adapter } = adapterWith(t, {});
+    const message = {
+      id: '420000000000000001', authorId: 'u1', authorName: 'Alice', isBot: false, content: 'see the file',
+      cleanContent: 'see the file', mentionsBot: false, timestamp: new Date(), reactions: [],
+      attachments: mapAllAttachments({
+        attachments: new Map([['a1', { id: 'a1', name: 'notes.txt', url: signed, contentType: 'text/plain', size: 3 }]]),
+      }),
+    };
+    const a = adapter as unknown as Record<string, unknown>;
+    a.fetchHistory = async () => [message];
+    a.fetchAround = async () => [message];
+    const server = new DiscordMcplServer(adapter) as unknown as {
+      channelManager: { register(d: unknown): void };
+      handleToolCall(name: string, args: Record<string, unknown>): Promise<{ content: Array<{ text: string }>; isError?: boolean }>;
+      handleChannelOpen(params: { channelId: string; type: string; history?: { limit: number } }): Promise<{
+        history?: Array<{ metadata: { attachments: Array<{ url: string; expiresAt?: string }> } }>;
+      }>;
+    };
+    return server;
+  }
+
+  it('gives each attachment its expiresAt beside its url in fetch_history and fetch_around results', async (t) => {
+    const server = serverWith(t);
+    for (const [tool, args] of [
+      ['fetch_history', { channelId: ALLOWED }],
+      ['fetch_around', { channelId: ALLOWED, messageId: '420000000000000001' }],
+    ] as const) {
+      const res = await server.handleToolCall(tool, args);
+      assert.ok(!res.isError, res.content[0].text);
+      const [message] = JSON.parse(res.content[0].text) as Array<{ attachments: Array<{ url: string; expiresAt?: string }> }>;
+      assert.deepEqual(
+        [message.attachments[0].url, message.attachments[0].expiresAt],
+        [signed, '2026-10-16T01:12:00.000Z'],
+        tool,
+      );
+    }
+  });
+
+  it('keeps it in the metadata of channels/open history', async (t) => {
+    const server = serverWith(t);
+    server.channelManager.register(toDescriptor({ id: ALLOWED, guildId: G1, guildName: 'Guild', type: 'text', name: 'text-1' }));
+    const result = await server.handleChannelOpen({ channelId: mcplChannelId(G1, ALLOWED), type: 'discord', history: { limit: 20 } });
+    assert.equal(result.history?.[0]?.metadata.attachments[0]?.expiresAt, '2026-10-16T01:12:00.000Z');
   });
 });

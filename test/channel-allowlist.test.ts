@@ -192,7 +192,7 @@ describe('a thread the client knows only partly is fetched before the filters de
     await failing.settle();
     assert.deepEqual(failing.delivered, [], 'its channel stays unknown, so it is excluded');
     assert.ok(
-      logged.mock.calls.some((c) => String(c.arguments[0]).includes(`Couldn't look up thread ${PARTLY_KNOWN_THREAD}`)),
+      logged.mock.calls.some((c) => String(c.arguments[0]).includes(`Couldn't look up channel ${PARTLY_KNOWN_THREAD}`)),
       'the operator log says why',
     );
     assert.equal(failing.internals.threadLookups.size, 0, 'nothing is left waiting');

@@ -7,6 +7,7 @@
  * Follows the pattern from zero-k/game-manager/src/mcpl_server.rs.
  */
 
+import type * as net from 'node:net';
 import {
   McplConnection,
   textContent,
@@ -46,8 +47,8 @@ import type {
   ChannelsOutgoingCompleteParams,
 } from '@animalabs/mcpl-core';
 
-import type { DiscordAdapter, DiscordMessageData, DiscordAttachment, OutgoingFile, ReactionSummary, MessageEventInfo, DmRefusal, DmSendFailure } from './discord-adapter.js';
-import { LATEST_FROM_WINDOW } from './discord-adapter.js';
+import type { ChannelFacts, DiscordAdapter, DiscordMessageData, DiscordAttachment, OutgoingFile, ReactionSummary, MessageEventInfo, DmRefusal, DmSendFailure, ThreadPlace } from './discord-adapter.js';
+import { LATEST_FROM_WINDOW, attachmentUrlExpiry, holdsNoMessages, isListedKind } from './discord-adapter.js';
 import { DM_NOTICE_TEXT, DmNoticeState, resolveDmNoticesPath, type DmNoticeDecision } from './dm-notices.js';
 
 /** How much of a latestFrom target's text its receipt echoes. */
@@ -85,15 +86,16 @@ import {
 import { toolDefinitions } from './tools.js';
 import { withToolClasses } from './tool-classes.js';
 import { featureSets, isEnabled, featureSetForTool } from './feature-sets.js';
-import { ChannelManager, mcplChannelId, parseMcplChannelId, toDescriptor, toDmDescriptor } from './channels.js';
+import { ChannelManager, channelLabelFor, mcplChannelId, parseMcplChannelId, toDescriptor, toDmDescriptor } from './channels.js';
 import {
   channelLabel,
-  formatChannelLabel,
+  isNameAddressableKind,
   isSnowflake,
   looksLikeExplicitName,
+  parseChannelRef,
   type AddressingPath,
 } from './channel-names.js';
-import { explainDiscordError, type ExplainContext } from './discord-errors.js';
+import { UNKNOWN_CHANNEL, explainDiscordError, type ExplainContext } from './discord-errors.js';
 import { saveFiltersFile, loadFiltersFile, DiscordFiltersState, type DiscordFilters } from './filters.js';
 import { StateTracker } from './state.js';
 import { existsSync, readFileSync } from 'node:fs';
@@ -159,6 +161,47 @@ function lastVisibleLines(lastVisible: unknown, ifAbsent?: string): string[] {
     `Last message now visible to the agent — **${who}**: ` +
       (preview === undefined || preview === null || preview === '' ? '*(empty message)*' : "*(a preview this server can't read)*"),
   ];
+}
+
+/** Where a message sits, as the location prefix and the reconnect sweep's
+ *  `<missed>` header name it. Posted in a thread, that is the channel the
+ *  thread hangs off and the thread itself, named by its id when it has no
+ *  name; otherwise it is the message's channel. A part that isn't known is
+ *  null. */
+function messagePlace(channelName: string | null | undefined, thread: ThreadPlace): { channel: string | null; thread: string | null } {
+  return thread.threadId
+    ? { channel: thread.threadParentName ?? null, thread: thread.threadName ?? thread.threadId }
+    : { channel: channelName ?? null, thread: null };
+}
+
+/** A thread message's identity, as every lane that delivers it carries it
+ *  (channels/incoming metadata, a push's origin, the sweep's): the thread's
+ *  name and the channel it hangs off, each left out when it isn't known.
+ *  No MCPL threadId: that names a thread within a channel, and a Discord
+ *  thread is its own channel, already named by the channel id. Empty for a
+ *  message that isn't in a thread. */
+function threadFields(thread: ThreadPlace): { threadName?: string; threadParentName?: string } {
+  if (!thread.threadId) return {};
+  return {
+    ...(thread.threadName ? { threadName: thread.threadName } : {}),
+    ...(thread.threadParentName ? { threadParentName: thread.threadParentName } : {}),
+  };
+}
+
+/** The place tag every lane gives a message posted in a thread: `chat:thread`
+ *  (the host documents it as "Occurred in a thread"). */
+function threadTags(thread: ThreadPlace): string[] {
+  return thread.threadId ? ['chat:thread'] : [];
+}
+
+/** Whether descriptor `d` lacks a name that `known`, the same channel's
+ *  registered descriptor, has (toDescriptor's metadata names): what the cache
+ *  knows of a channel now can be less than what it knew. */
+function knowsLessThan(d: ChannelDescriptor, known: ChannelDescriptor): boolean {
+  const names = (x: ChannelDescriptor) => (x.metadata ?? {}) as { channelName?: string; guildName?: string; parentName?: string };
+  const now = names(d);
+  const then = names(known);
+  return (['channelName', 'guildName', 'parentName'] as const).some((k) => then[k] !== undefined && now[k] === undefined);
 }
 
 interface SavedTally {
@@ -363,6 +406,9 @@ interface CreateMemory {
   edits: number;
 }
 const RECENT_CREATES_MAX = 512;
+/** How many deleted channel ids the server remembers (deletedChannels). A
+ *  delivery is on its way for seconds, not for a thousand deletions. */
+const DELETED_CHANNELS_KEPT = 1000;
 /** Attachment blocks above this size are not kept for edits (inline images). */
 const RECENT_CREATE_ATTACHMENT_BYTES = 64 * 1024;
 
@@ -615,7 +661,18 @@ export class DiscordMcplServer {
   private readonly recentCreates = new Map<string, CreateMemory>();
   private editSeq = 0;
   private enabledFeatureSets = new Set<string>();
+  /** Every channel registered in this process, whether or not a host is
+   *  connected: each connection is given all of it (syncChannelsWithHost). */
   private channelManager = new ChannelManager();
+  /** Channels forgotten while no host was connected, which the next
+   *  connection's sync announces as removed. */
+  private unannouncedRemovals = new Set<string>();
+  /** Discord channels and threads deleted lately, oldest first, at most
+   *  DELETED_CHANNELS_KEPT: a message, an edit or the reconnect sweep can
+   *  still be on its way from one when it goes, and must not register it
+   *  again (registerGuildDelivery). Snowflakes aren't reused, so an id here
+   *  stays true. */
+  private deletedChannels = new Set<string>();
   private stateTracker = new StateTracker();
   /** Buffers for channels/outgoing/chunk streams, keyed by inferenceId */
 
@@ -1478,7 +1535,7 @@ export class DiscordMcplServer {
       // as a featureSets/update REQUEST right after initialize with a 15s
       // timeout; until the loop reads, that request sits unanswered. Round 1:
       // the reconnect sweep blocked the loop → timeout → deny-until-policy.
-      // Round 2: registerDiscordChannels still ran pre-loop, and its own
+      // Round 2: channel registration still ran pre-loop, and its own
       // server→host Request is itself REJECTED by the host until policy is
       // established (-32002 after ~15s) — a clean cross-request deadlock; the
       // policy answer landed ~600ms after the host gave up. So channel
@@ -1498,7 +1555,7 @@ export class DiscordMcplServer {
         ]);
         if (this.mcplEnabled) {
           try {
-            await this.registerDiscordChannels();
+            await this.syncChannelsWithHost();
           } catch (err) {
             console.error('[discord-mcpl] Channel registration failed:', errorText(err));
           }
@@ -1946,6 +2003,11 @@ export class DiscordMcplServer {
         };
       }
       if (path === 'name-resolved' && !noResolver) {
+        // A name a stale channel holds resolves to no channel
+        // (DiscordAdapter.resolveChannelRef), so stale channels are fetched
+        // first, and one whose fetch is fresh now is found by the name
+        // Discord has. An id needs no name.
+        if (parseChannelRef(given)?.kind === 'name') await this.discord.refreshStale();
         const resolved = this.discord.resolveChannelRef(given);
         if (!resolved.ok) {
           // Telemetry: log the failure with what was ASKED FOR, so drift is
@@ -2153,6 +2215,8 @@ export class DiscordMcplServer {
       }
 
       case 'refresh_channels':
+        // What's stale is fetched first, so its fresh facts are listed.
+        await this.discord.refreshStale();
         return this.refreshChannels();
 
       case 'fetch_history':
@@ -2628,9 +2692,11 @@ export class DiscordMcplServer {
     } else {
       const meta = this.resolveChannelMeta(discordChannelId);
       canonical = meta.mcplChannelId;
-      if (meta.guildId && meta.channelName && meta.guildName) {
-        fallbackLabel = formatChannelLabel(meta.channelName, meta.guildName);
-      }
+      // An unregistered channel is labelled as it would be registered
+      // (channelLabelFor): a thread's label is its display form, never a
+      // `#name (Guild)` that pastes back as a same-named channel.
+      const facts = this.discord.getCachedChannelFacts?.(discordChannelId);
+      if (facts) fallbackLabel = channelLabelFor(facts);
     }
     const label = (canonical ? this.channelManager.get(canonical)?.label : undefined) ?? fallbackLabel;
     const id = canonical ?? `discord:?:${discordChannelId}`;
@@ -2935,20 +3001,22 @@ export class DiscordMcplServer {
         metadataResolved: cached.name !== null,
       };
     }
-    // Descriptor fallback: registration keeps address + label even when the
-    // gateway cache doesn't hold the channel (evicted, or a filtered late
-    // join). Label format is toDescriptor's `#name (Guild)`.
+    // Descriptor fallback: registration keeps the address and the names the
+    // label was made from (toDescriptor's metadata) even when the gateway
+    // cache doesn't hold the channel (evicted, or a filtered late join). The
+    // names are read from those fields, never parsed back out of the label,
+    // whose shape depends on the kind (a thread's names its parent too).
     for (const desc of this.channelManager.getAll()) {
       const addr = desc.address as { guildId?: string; channelId?: string } | undefined;
       if (addr?.channelId === channelId && addr.guildId && addr.guildId !== 'dm') {
-        const m = /^#(.+) \((.+)\)$/.exec(desc.label ?? '');
+        const names = desc.metadata as { channelName?: string; guildName?: string } | undefined;
         return {
           channelId,
           mcplChannelId: desc.id,
-          channelName: m ? m[1] : (desc.label ?? null),
+          channelName: names?.channelName ?? null,
           guildId: addr.guildId,
-          guildName: m ? m[2] : null,
-          metadataResolved: true,
+          guildName: names?.guildName ?? null,
+          metadataResolved: names?.channelName !== undefined,
         };
       }
     }
@@ -3059,6 +3127,22 @@ export class DiscordMcplServer {
         });
       } catch (err) {
         dbg('sweep:fetch-failed', { channelId, error: errorText(err) });
+        // Discord doesn't know the channel: it was deleted, perhaps while
+        // discord-mcpl was down, or with a deleted channel it hung off, so no
+        // deletion event reached it. Where its guild is known, that is its
+        // deletion (channelDeleted): it's forgotten, remembered as deleted,
+        // and loses its watermark and missed tally. Otherwise those two go,
+        // so later starts stop fetching it. Any other failure keeps them, to
+        // try again at the next start.
+        if ((err as { code?: unknown } | null)?.code === UNKNOWN_CHANNEL) {
+          const guildId = this.guildOfChannel(channelId);
+          if (guildId) {
+            this.channelDeleted(guildId, channelId);
+          } else {
+            const tallied = this.missedTally.delete(channelId);
+            if (this.forwardedWatermark.delete(channelId) || tallied) this.saveWatermark();
+          }
+        }
         continue;
       }
       msgs.sort((a, b) => a.timestamp.getTime() - b.timestamp.getTime());
@@ -3069,33 +3153,50 @@ export class DiscordMcplServer {
 
       const newestId = msgs[msgs.length - 1].id;
 
-      // Cache-first, REST only as fallback; a failed lookup leaves a trace
-      // instead of silently shipping a name-less block (issue #28). Resolved
-      // before anything is delivered, because the ingress decision below
-      // needs the channel's identity.
+      // Cache first. The channel is looked up when the cache doesn't hold it
+      // (the sweep starts from the channels it saved, not from an event, so
+      // the cache may not have seen one, such as a DM), when it holds a
+      // thread whose parent channel it can't name, or when its facts may be
+      // older than Discord's (isStale). The lookup fetches from Discord what
+      // the cache doesn't hold whole and current, as the live path does; for
+      // a thread whose parent just isn't cached, it reads the cache again. A
+      // failed lookup is logged (issue #28), and what the cache knew stands.
+      // Resolved before anything is delivered, because the ingress decision
+      // below needs the channel's identity.
       let meta = this.discord.getCachedChannelMeta(channelId);
-      if (!meta) {
-        meta = await this.discord.getChannelMeta(channelId).catch((err) => {
-          dbg('sweep:channel-meta-failed', { channelId, error: errorText(err) });
+      let lookupFailure = null as string | null;
+      if (!meta || (meta.threadId && meta.threadParentName === null) || this.discord.isStale(channelId)) {
+        const cached = meta;
+        meta = (await this.discord.getChannelMeta(channelId).catch((err) => {
+          lookupFailure = errorText(err);
+          dbg('sweep:channel-meta-failed', { channelId, error: lookupFailure });
           return null;
-        });
+        })) ?? cached;
       }
       // A channel is a DM only when that's known: recorded as one when a DM
       // was forwarded, or reported so by Discord. A failed lookup is never
       // read as "no guild, so a DM"; the channel is held back, its watermark
       // untouched. The sweep runs once per process, so it's tried again at
       // the next start, unless a message forwarded live in it first moves
-      // its watermark past what was held.
+      // its watermark past what was held. A failed lookup reaches stderr in
+      // whichever line says what became of the channel.
       const isDM = this.dmChannelIds.has(channelId) || meta?.isDM === true;
       const guildId = isDM ? null : (meta?.guildId ?? null);
       if (!isDM && !guildId) {
         dbg('sweep:identity-unresolved', { channelId });
         console.error(
           `[discord-mcpl] Catch-up held back channel ${channelId}: neither its guild nor DM identity could be ` +
-            'resolved, so its missed messages were not delivered. It is tried again at the next start, unless a ' +
-            'message forwarded live in it before then moves its watermark past them.',
+            `resolved${lookupFailure ? ` (its lookup failed: ${lookupFailure})` : ''}, so its missed messages ` +
+            'were not delivered. It is tried again at the next start, unless a message forwarded live in it ' +
+            'before then moves its watermark past them.',
         );
         continue;
+      }
+      if (lookupFailure) {
+        console.error(
+          `[discord-mcpl] Catch-up couldn't look up channel ${channelId} (${lookupFailure}). ` +
+            'Its missed messages are placed and filtered by what the cache knew of it, and may go out without its names.',
+        );
       }
 
       // The live ingress decision (guild, channel and thread parent, DM
@@ -3121,6 +3222,9 @@ export class DiscordMcplServer {
       );
       const advance = async () => {
         if (refusalsDecided.length) await this.awaitSweepDecisions(channelId, refusalsDecided);
+        // Not for a channel deleted while the sweep worked on it: the
+        // deletion dropped its watermark, and there's nothing to catch up on.
+        if (guildId && this.deletedLately(guildId, channelId)) return;
         // Only forward: the live path may have moved it past this batch
         // while the sweep waited.
         const current = this.forwardedWatermark.get(channelId);
@@ -3177,12 +3281,23 @@ export class DiscordMcplServer {
       }
       const hadMention = isDM || mentionCount > 0;
 
+      // The channel is named as the live location names it: a thread by the
+      // channel it hangs off and the thread itself.
+      const thread: ThreadPlace = meta ?? {};
+      const place = messagePlace(meta?.name, thread);
+      // Each name is an attribute's value, so it is always quoted, with
+      // quotedValue's escaping, which the live location uses too: a bidi
+      // control or line separator in one can't reorder or split the header.
+      // (The live location writes a channel or guild name bare where the
+      // header rule allows, and always quotes a thread's.)
       const attrs: string[] = [];
-      if (meta?.name) attrs.push(`channel="#${meta.name}"`);
+      if (place.channel) attrs.push(`channel=${quotedValue(`#${place.channel}`)}`);
+      if (place.thread) attrs.push(`thread=${quotedValue(place.thread)}`);
       // channelId is load-bearing: it's what fetch_around/fetch_history need to
       // let the agent jump to any of these messages and read the full context.
+      // For a thread it is the thread's own id.
       attrs.push(`channelId="${channelId}"`);
-      if (meta?.guildName) attrs.push(`guild=${JSON.stringify(meta.guildName)}`);
+      if (meta?.guildName) attrs.push(`guild=${quotedValue(meta.guildName)}`);
       else if (isDM) attrs.push('dm="true"');
       // count = number of actual mentions; lines = total delivered (mentions +
       // their ±2min vicinity) so the agent knows how much is context vs ping.
@@ -3208,6 +3323,18 @@ export class DiscordMcplServer {
         '</missed>',
       ].join('\n');
 
+      // Register the channel this push delivers from before naming it (MCPL
+      // RFC-011 §3), as the live path does, or re-derive what's registered:
+      // a missed DM or thread is otherwise unknown to a freshly started host,
+      // which can then neither open it nor tell where a reply would land.
+      // The bot's own messages are filtered out above, so every kept message
+      // in a DM is from the other party.
+      const sweptMcplId = isDM
+        ? this.registerDmDelivery(channelId, { id: kept[0].authorId, name: kept[0].authorName })
+        : guildId
+          ? this.registerGuildDelivery(guildId, channelId)
+          : undefined;
+
       try {
         await conn.sendRequest(method.PUSH_EVENT, {
           featureSet: 'discord.messaging',
@@ -3218,10 +3345,20 @@ export class DiscordMcplServer {
             channelId,
             guildId: meta?.guildId ?? null,
             guildName: meta?.guildName ?? undefined,
+            // The composite id the host registers and routes by, as a live
+            // push's origin carries it, named when the channel is registered
+            // (registerGuildDelivery says when it isn't: a thread archived
+            // since its missed messages, a channel deleted or a guild left
+            // meanwhile, or one its guild came back without).
+            ...(sweptMcplId ? { mcplChannelId: sweptMcplId } : {}),
             channelName: meta?.name ?? undefined,
+            ...threadFields(thread),
             isMention: hadMention,
             isDM,
           } as Record<string, unknown>,
+          // The place tag only: the block's messages share their channel, but
+          // not whether each mentions the bot or who wrote it.
+          ...(threadTags(thread).length > 0 ? { tags: threadTags(thread) } : {}),
           payload: { content: [textContent(block)] },
         } satisfies PushEventParams);
       } catch (err) {
@@ -3299,63 +3436,362 @@ export class DiscordMcplServer {
 
   // ── Channel Operations ──
 
-  private async registerDiscordChannels(): Promise<void> {
+  /** Give a host connection the whole registry: every listed channel the bot
+   *  can see now (getPostingChannels, refreshed without announcing, since
+   *  the register request carries it), and everything registered earlier in
+   *  this process, whichever connection was there then: threads, DMs and
+   *  other channels messages came from. The delivery paths announce a
+   *  channel only when it's new to the registry, so they rely on this: a
+   *  connection that wasn't given the registry would never hear of what was
+   *  registered before it. Channels forgotten while no host was connected
+   *  are announced as removed after it, since a host may keep a server's
+   *  channels across a reconnect (agent-framework keeps them until it drops
+   *  the server). */
+  private async syncChannelsWithHost(): Promise<void> {
     const conn = this.conn;
-    dbg('registerDiscordChannels:enter', { hasConn: !!conn, mcplEnabled: this.mcplEnabled });
     if (!conn || !this.mcplEnabled) {
-      dbg('registerDiscordChannels:skip', { reason: !conn ? 'no-conn' : 'mcpl-disabled' });
+      dbg('syncChannelsWithHost:skip', { reason: !conn ? 'no-conn' : 'mcpl-disabled' });
       return;
     }
-
-    this.ensureSubscriptionsLoaded();
-    const textChannels = this.discord.getTextChannels();
-    const descriptors = textChannels.map(({ guildId, guildName, channel }) =>
-      toDescriptor(
-        guildId,
-        guildName,
-        channel,
-        this.subscribedChannels.has(channel.id),
-        this.backscrollLimitFor(channel.id),
-      ),
-    );
-    dbg('registerDiscordChannels:enumerated', {
-      count: descriptors.length,
-      ids: descriptors.map(d => d.id),
-    });
-
-    if (descriptors.length === 0) {
-      dbg('registerDiscordChannels:skip', { reason: 'no-channels' });
-      return;
+    for (const facts of this.discord.getPostingChannels()) {
+      this.channelManager.register(this.guildDescriptor(facts));
     }
-
-    this.channelManager.registerAll(descriptors);
-
-    const regParams: ChannelsRegisterParams = { channels: descriptors };
-    try {
-      await conn.sendRequest(method.CHANNELS_REGISTER, regParams);
-      dbg('registerDiscordChannels:sent', { count: descriptors.length });
-    } catch (err) {
-      console.error('[discord-mcpl] Failed to register channels:', errorText(err));
-      dbg('registerDiscordChannels:send-failed', { error: errorText(err) });
+    const channels = this.channelManager.getAll();
+    dbg('syncChannelsWithHost', { count: channels.length, ids: channels.map((d) => d.id) });
+    if (channels.length > 0) {
+      const regParams: ChannelsRegisterParams = { channels };
+      try {
+        await conn.sendRequest(method.CHANNELS_REGISTER, regParams);
+        dbg('syncChannelsWithHost:sent', { count: channels.length });
+      } catch (err) {
+        console.error('[discord-mcpl] Failed to register channels:', errorText(err));
+        dbg('syncChannelsWithHost:send-failed', { error: errorText(err) });
+      }
+    }
+    // Read after the register is answered: a channel registered again
+    // meanwhile was announced as added, and isn't removed now.
+    if (conn.isClosed) return;
+    const removed = [...this.unannouncedRemovals].filter((id) => !this.channelManager.get(id));
+    this.unannouncedRemovals.clear();
+    if (removed.length > 0) {
+      dbg('syncChannelsWithHost:removed', { removed });
+      conn.sendNotification(method.CHANNELS_CHANGED, { removed });
     }
   }
 
-  /** Register the given descriptors and emit a single `channels/changed`
-   *  notification for the ones that weren't already known. Idempotent:
-   *  re-registering a known channel refreshes its descriptor (e.g. a renamed
-   *  label) but does NOT re-announce it, so repeat calls (channelUpdate
-   *  firing on every edit, or a manual refresh) don't spam the host. Returns
-   *  the descriptors that were newly added. */
-  private registerAndNotifyNew(descriptors: ChannelDescriptor[]): ChannelDescriptor[] {
+  /** A guild channel's descriptor, by the one rule every path registers by
+   *  (toDescriptor), with its subscription and history settings. */
+  private guildDescriptor(facts: ChannelFacts): ChannelDescriptor {
+    return toDescriptor(facts, this.isChannelSubscribed(facts.id), this.backscrollLimitFor(facts.id));
+  }
+
+  /** Register descriptors, and tell a connected host of each one that's new
+   *  (added) or whose label or metadata changed (updated): a rename, a name
+   *  learned since. One that's unchanged is stored again (its subscription
+   *  and history settings refreshed) without a word, so repeat calls
+   *  (channelUpdate firing on a topic edit, a manual refresh, each message in
+   *  a channel) don't spam the host. What's known of a channel now can be
+   *  less than what was (its guild or its name not cached), so a descriptor
+   *  that lacks a name the registered one has doesn't replace it; one that
+   *  knows every name replaces it, whatever its label (a voice channel
+   *  renamed into a thread label's shape is labelled by its id). With no
+   *  host connected, the next connection's sync carries them. */
+  private registerChannels(descriptors: ChannelDescriptor[]): { added: ChannelDescriptor[]; updated: ChannelDescriptor[] } {
     const added: ChannelDescriptor[] = [];
+    const updated: ChannelDescriptor[] = [];
     for (const d of descriptors) {
-      if (!this.channelManager.get(d.id)) added.push(d);
+      const known = this.channelManager.get(d.id);
+      if (known && knowsLessThan(d, known)) continue;
+      if (!known) added.push(d);
+      else if (known.label !== d.label || JSON.stringify(known.metadata) !== JSON.stringify(d.metadata)) updated.push(d);
       this.channelManager.register(d);
+      this.unannouncedRemovals.delete(d.id);
     }
-    if (added.length > 0 && this.conn && this.mcplEnabled) {
-      this.conn.sendNotification(method.CHANNELS_CHANGED, { added });
+    if ((added.length > 0 || updated.length > 0) && this.conn && this.mcplEnabled) {
+      this.conn.sendNotification(method.CHANNELS_CHANGED, {
+        ...(added.length > 0 ? { added } : {}),
+        ...(updated.length > 0 ? { updated } : {}),
+      });
     }
-    return added;
+    return { added, updated };
+  }
+
+  /** Forget registered channels, and tell the host: at once when one is
+   *  connected, else through the next connection's sync. An id that isn't
+   *  registered is left out. */
+  private forgetChannels(ids: string[]): void {
+    const removed = ids.filter((id) => this.channelManager.unregister(id));
+    if (removed.length === 0) return;
+    if (this.conn && !this.conn.isClosed && this.mcplEnabled) {
+      this.conn.sendNotification(method.CHANNELS_CHANGED, { removed });
+    } else {
+      for (const id of removed) this.unannouncedRemovals.add(id);
+    }
+  }
+
+  /** Re-derive registered guild channels from what the cache knows of them
+   *  now (a rename of the channel, its parent or its guild), announcing each
+   *  whose label or metadata changed. One the cache no longer holds keeps
+   *  what it has. Their facts are read together, so their labels are checked
+   *  against one view of the channels names resolve among. */
+  private rederiveChannels(descriptors: ChannelDescriptor[]): void {
+    const channelIdOf = (d: ChannelDescriptor) => (d.address as { channelId?: string } | undefined)?.channelId;
+    // A stale channel's cached facts decide nothing: what's registered of it
+    // stands, labelled by its id, since it answers no name until a fresh
+    // fetch derives it again (onChannelRefreshed).
+    const staleNamed = descriptors.filter((d) => {
+      const channelId = channelIdOf(d);
+      return channelId !== undefined && this.discord.isStale(channelId) && d.label !== d.id;
+    });
+    const channelIds = descriptors
+      .map(channelIdOf)
+      .filter((id): id is string => id !== undefined && !this.discord.isStale(id));
+    const facts = this.discord.getCachedChannelFactsFor(channelIds);
+    this.registerChannels([
+      ...[...facts.values()].map((f) => this.guildDescriptor(f)),
+      ...staleNamed.map((d) => ({ ...d, label: d.id })),
+    ]);
+  }
+
+  /** Whether the filters' answer for a thread rests on facts that are
+   *  known: a thread whose channel is stale may be admitted through a
+   *  category that's no longer the channel's, or not admitted through one
+   *  that is now (channelAllowed), so its registration stays as it is
+   *  until that channel's fresh fetch or update decides it. */
+  private threadAdmissionKnown(thread: { parentId?: string | null }): boolean {
+    return !thread.parentId || !this.discord.isStale(thread.parentId);
+  }
+
+  /** A thread Discord reported on, by an update, a fresh fetch, or a sync
+   *  that lists it, when it's registered: forgotten when it's archived, and
+   *  otherwise registered again or forgotten as the filters decide, once
+   *  their answer is known (threadAdmissionKnown). One that isn't registered
+   *  is left to its next message. */
+  private threadReported(thread: ChannelFacts): void {
+    const id = mcplChannelId(thread.guildId, thread.id);
+    if (!this.channelManager.get(id)) return;
+    if (thread.archived) this.forgetChannels([id]);
+    else if (this.threadAdmissionKnown(thread)) this.registerOrForgetThread(thread);
+  }
+
+  /** A registered thread's facts, as an update brings them: registered
+   *  again while the filters admit it, forgotten when they don't. */
+  private registerOrForgetThread(thread: ChannelFacts): void {
+    const id = mcplChannelId(thread.guildId, thread.id);
+    if (this.discord.channelAdmitted(thread.guildId, thread.id, thread.parentId ?? null)) {
+      this.registerChannels([this.guildDescriptor(thread)]);
+    } else {
+      this.forgetChannels([id]);
+    }
+  }
+
+  /**
+   * Re-derive the registered channels whose label can have changed because
+   * another channel took or gave up their name. A `#name (Guild)` label is
+   * kept only while it resolves back to its channel (channelLabelFor): a
+   * voice channel's name goes to a same-named text channel, and two channels
+   * of one name and kind lose it to each other. So a channel's creation,
+   * rename or deletion re-derives those labelled by id although they have a
+   * name (another channel held it) and those named like the channel
+   * (`name`); a guild joined, left, renamed or back re-derives every one,
+   * since a label names its guild.
+   */
+  private rederiveNamed(which: { name: string | null } | 'every'): void {
+    const named = which === 'every' ? undefined : which.name?.toLowerCase();
+    this.rederiveChannels(this.channelManager.getAll().filter((d) => {
+      const m = d.metadata as { channelType?: string; channelName?: string } | undefined;
+      if (!m?.channelType || !isNameAddressableKind(m.channelType) || !m.channelName) return false;
+      return which === 'every' || d.label === d.id || m.channelName.toLowerCase() === named;
+    }));
+  }
+
+  /**
+   * A guild is back (from an outage, or in a new gateway session) with what
+   * it has now: its listed channels, and the ids of every channel and live
+   * thread it holds. Discord doesn't replay what happened while it was away,
+   * so a registered channel or thread it no longer has is forgotten (deleted,
+   * or a thread archived, meanwhile), and so is a listed channel, or a
+   * thread, the filters no longer admit; its listed channels are registered
+   * or re-derived, and
+   * the threads that remain with them. Nothing is remembered as deleted
+   * (deletedChannels): what's gone may only have been archived.
+   */
+  private guildReturned(guildId: string, channels: ChannelFacts[], present: ReadonlySet<string>): void {
+    const listed = new Set(channels.map((c) => c.id));
+    this.forgetChannels(this.registeredInGuild(guildId).filter((d) => {
+      const channelId = (d.address as { channelId: string }).channelId;
+      const type = (d.metadata as { channelType?: string } | undefined)?.channelType;
+      return !present.has(channelId)
+        || (type !== undefined && isListedKind(type as ChannelFacts['type']) && !listed.has(channelId))
+        || (type === 'thread' && !this.admitted(d));
+    }).map((d) => d.id));
+    this.registerChannels(channels.map((c) => this.guildDescriptor(c)));
+    this.rederiveChannels(this.registeredInGuild(guildId));
+    this.rederiveNamed('every');
+  }
+
+  /** Registered threads whose channel is `channelId`. */
+  private registeredThreadsOf(channelId: string): ChannelDescriptor[] {
+    return this.channelManager.getAll().filter((d) => {
+      const m = d.metadata as { channelType?: string; parentId?: string } | undefined;
+      return m?.channelType === 'thread' && m.parentId === channelId;
+    });
+  }
+
+  /** Registered channels and threads of a guild. */
+  private registeredInGuild(guildId: string): ChannelDescriptor[] {
+    return this.channelManager.getAll().filter((d) => (d.address as { guildId?: string } | undefined)?.guildId === guildId);
+  }
+
+  /** Whether the channel filters still admit a registered guild channel or
+   *  thread, a thread through the channel its metadata names. */
+  private admitted(d: ChannelDescriptor): boolean {
+    const address = d.address as { guildId?: string; channelId?: string } | undefined;
+    if (!address?.guildId || !address.channelId || address.guildId === 'dm') return true;
+    const parentId = (d.metadata as { parentId?: string | null } | undefined)?.parentId ?? null;
+    return this.discord.channelAdmitted(address.guildId, address.channelId, parentId);
+  }
+
+  /** The guild a channel is in, as the client's cache or the registry knows
+   *  it; undefined for a DM, or a channel neither knows. */
+  private guildOfChannel(channelId: string): string | undefined {
+    const cached = this.discord.getCachedChannelFacts(channelId)?.guildId;
+    if (cached) return cached;
+    const address = this.channelManager.getAll()
+      .map((d) => d.address as { guildId?: string; channelId?: string } | undefined)
+      .find((a) => a?.channelId === channelId);
+    return address?.guildId && address.guildId !== 'dm' ? address.guildId : undefined;
+  }
+
+  /** Whether a guild channel was deleted lately, or the channel a thread is
+   *  under was (deletedChannels): a delivery from it set out before the
+   *  deletion. A channel's own parent is its category, whose channels
+   *  outlive it, so only a thread's counts. */
+  private deletedLately(guildId: string, channelId: string): boolean {
+    if (this.deletedChannels.has(channelId)) return true;
+    const facts = this.discord.getCachedChannelFacts(channelId);
+    const known = this.channelManager.get(mcplChannelId(guildId, channelId))?.metadata as
+      { channelType?: string; parentId?: string } | undefined;
+    const parentId = facts
+      ? (facts.type === 'thread' ? facts.parentId : null)
+      : (known?.channelType === 'thread' ? known.parentId : null);
+    return !!parentId && this.deletedChannels.has(parentId);
+  }
+
+  /**
+   * Register the guild channel a message is delivered from (created live or
+   * swept, edited or deleted), before the delivery names it, or re-derive
+   * what's registered from what's known now (a rename, or a parent's or the
+   * guild's name learned since). Returns the channel's MCPL id when it is
+   * registered, which is when the delivery names it (origin.mcplChannelId);
+   * undefined when it isn't.
+   *
+   * The channel is described as the client's cache has it now: a thread the
+   * client knows only partly by the partial it holds, labelled by its id
+   * (channelLabelFor); one registered already keeps its name
+   * (registerChannels). Not registered, and named only if registered:
+   * - a channel the cache doesn't hold: a message's channel is always there,
+   *   as a partial at least, until it's removed;
+   * - a channel whose cached facts may be older than what Discord has
+   *   reported since (DiscordAdapter.isStale): its guild came back, from an
+   *   outage or a gap in the gateway connection, without it, or its fetch
+   *   kept landing after newer reports. It may have been archived or
+   *   deleted meanwhile, whatever the cache still says of it. A delivery
+   *   from it fetches it again first, so it's stale here when the delivery
+   *   decided on facts from before the mark, or that fetch failed or was
+   *   overtaken;
+   * - a channel the channel filters no longer admit (channelAdmitted), a
+   *   thread through its channel: an update moved it out while the delivery
+   *   was on its way;
+   * - an archived thread, unless the message was posted in it after the
+   *   archive (`postedAt` later than `archivedAt`, by Discord's clocks),
+   *   which unarchived it, whatever the cache has heard yet. A message
+   *   posted before the archive, whose thread was archived while it was on
+   *   its way, leaves it archived, and so does one whose time equals the
+   *   archive's, or one whose thread's archive time isn't known: the next
+   *   message registers a thread wrongly left out, and nothing would remove
+   *   one wrongly registered. A thread is registered
+   *   while it's live and forgotten when it's archived, so the registry
+   *   holds the live threads, and a swept message from a thread archived
+   *   since is delivered without one.
+   * Neither registered nor named:
+   * - a channel of a guild the bot isn't in (hasGuild): it left, or was
+   *   removed, while the delivery was on its way. Leaving takes the
+   *   channels the guild's cache holds, with their threads, out of the
+   *   client's cache, but not a channel the guild had stopped listing, or
+   *   that channel's threads;
+   * - a channel deleted lately, or a thread whose channel was
+   *   (deletedLately): the delivery set out before the deletion;
+   * - a category or forum, which hold no messages.
+   * A withheld registration is written to the debug log with its reason.
+   */
+  private registerGuildDelivery(
+    guildId: string,
+    channelId: string,
+    opts: { postedAt?: number } = {},
+  ): string | undefined {
+    const withheld = (reason: string, named?: string): string | undefined => {
+      dbg('registry:withheld', { guildId, channelId, reason, named: named !== undefined });
+      return named;
+    };
+    if (!this.discord.hasGuild(guildId)) return withheld('guild-left');
+    if (this.deletedLately(guildId, channelId)) return withheld('deleted');
+    const id = mcplChannelId(guildId, channelId);
+    const facts = this.discord.getCachedChannelFacts(channelId);
+    if (facts && holdsNoMessages(facts.type)) return undefined;
+    const named = this.channelManager.get(id) ? id : undefined;
+    if (!facts) return withheld('uncached', named);
+    if (this.discord.isStale(channelId)) return withheld('stale', named);
+    if (!this.discord.channelAdmitted(guildId, channelId, facts.parentId ?? null)) return withheld('not-admitted', named);
+    const unarchived = opts.postedAt !== undefined && facts.archivedAt !== undefined && opts.postedAt > facts.archivedAt;
+    if (facts.archived && !unarchived) return withheld('archived', named);
+    this.registerChannels([this.guildDescriptor(facts)]);
+    return id;
+  }
+
+  /** Register the DM a message is delivered from, labelled with its other
+   *  party's name, or refresh it (a renamed party). Returns its MCPL id when
+   *  it's registered: a DM whose other party isn't known by name keeps the
+   *  registration it had, or has none. */
+  private registerDmDelivery(channelId: string, peer: { id?: string; name?: string }): string | undefined {
+    const id = mcplChannelId('dm', channelId);
+    if (peer.name) {
+      this.registerChannels([toDmDescriptor(channelId, peer.name, false, this.backscrollLimitFor(channelId), peer.id)]);
+      return id;
+    }
+    return this.channelManager.get(id) ? id : undefined;
+  }
+
+  /** A Discord channel or thread was deleted: forget it, and the threads
+   *  under a deleted channel, those registered and those the client's cache
+   *  held (`threadIds`; Discord sends no threadDelete for them); drop their
+   *  watermarks and missed tallies, since there is nothing left to catch up
+   *  on; and remember the ids a while (deletedChannels), so a delivery from
+   *  one that set out before the deletion registers nothing. An archived
+   *  thread keeps its watermark (it isn't deleted, and can come back). */
+  private channelDeleted(guildId: string, channelId: string, threadIds: string[] = []): void {
+    const ids = [...new Set([
+      channelId,
+      ...threadIds,
+      ...this.registeredThreadsOf(channelId).map((d) => (d.address as { channelId: string }).channelId),
+    ])];
+    for (const id of ids) {
+      this.deletedChannels.delete(id);
+      this.deletedChannels.add(id);
+    }
+    while (this.deletedChannels.size > DELETED_CHANNELS_KEPT) {
+      this.deletedChannels.delete(this.deletedChannels.values().next().value as string);
+    }
+    this.ensureWatermarkLoaded();
+    let pruned = false;
+    for (const id of ids) {
+      if (this.forwardedWatermark.delete(id)) pruned = true;
+      if (this.missedTally.delete(id)) pruned = true;
+    }
+    if (pruned) this.saveWatermark();
+    this.forgetChannels(ids.map((id) => mcplChannelId(guildId, id)));
+    // A name the deleted channel held can go back to a channel labelled by id.
+    this.rederiveNamed({ name: null });
   }
 
   /** Re-enumerate every channel currently visible to the bot and register any
@@ -3368,17 +3804,8 @@ export class DiscordMcplServer {
     added: Array<{ id: string; label: string }>;
     note: string;
   } {
-    const textChannels = this.discord.getTextChannels();
-    const descriptors = textChannels.map(({ guildId, guildName, channel }) =>
-      toDescriptor(
-        guildId,
-        guildName,
-        channel,
-        this.isChannelSubscribed(channel.id),
-        this.backscrollLimitFor(channel.id),
-      ),
-    );
-    const added = this.registerAndNotifyNew(descriptors);
+    const descriptors = this.discord.getPostingChannels().map((facts) => this.guildDescriptor(facts));
+    const { added } = this.registerChannels(descriptors);
     dbg('refreshChannels', { visible: descriptors.length, added: added.length });
     return {
       visible: descriptors.length,
@@ -3591,20 +4018,48 @@ export class DiscordMcplServer {
 
   // ── Discord Event Forwarding ──
 
-  /** Push-event origin for an edit/delete. Carries the guild (and the composite
-   *  channel id) so the host places the event in the right channel — without
-   *  it a guild channel's edit was reconstructed as `discord:dm:<channelId>` —
-   *  plus the message and author ids when the adapter knows them. */
-  private messageEventOrigin(channelId: string, messageId: string, info?: MessageEventInfo): Record<string, unknown> {
+  /** Push-event origin for an edit/delete. Carries the guild and the
+   *  composite channel id, when the channel is registered, so the host places
+   *  the event in the right channel — without them a guild channel's edit
+   *  was reconstructed as `discord:dm:<channelId>` — the thread's fields when
+   *  the message is in one, as its create carried them, plus the message and
+   *  author ids when the adapter knows them. */
+  private messageEventOrigin(
+    channelId: string,
+    messageId: string,
+    info: MessageEventInfo | undefined,
+    registeredId: string | undefined,
+  ): Record<string, unknown> {
     const guildId = info?.guildId ?? null;
     return {
       source: 'discord',
       channelId,
-      ...(guildId ? { guildId, mcplChannelId: mcplChannelId(guildId, channelId) } : {}),
+      ...(guildId ? { guildId } : {}),
+      ...(registeredId ? { mcplChannelId: registeredId } : {}),
+      ...threadFields(info ?? {}),
       messageId,
       ...(info?.authorId ? { authorId: info.authorId } : {}),
       ...(info?.authorName ? { authorName: info.authorName } : {}),
     };
+  }
+
+  /** Register the channel an edit or delete is delivered from, as a create's
+   *  is, before the push names it, so one that arrives first (a subscribed
+   *  thread's edit after a restart, say) doesn't name a channel the host was
+   *  never told of. A DM's other party is the author, unless the message is
+   *  the bot's own (a delete), when only its id is known. Returns the MCPL
+   *  id when the channel is registered. */
+  private registerEventChannel(channelId: string, isDM: boolean, info: MessageEventInfo | undefined): string | undefined {
+    if (isDM) {
+      const peer = info?.authorId !== undefined && info.authorId !== this.discord.botUserId ? info : undefined;
+      return this.registerDmDelivery(
+        channelId,
+        peer ? { id: peer.authorId, name: peer.authorName } : { id: info?.dmRecipientId },
+      );
+    }
+    return info?.guildId
+      ? this.registerGuildDelivery(info.guildId, channelId)
+      : undefined;
   }
 
   /**
@@ -3647,11 +4102,12 @@ export class DiscordMcplServer {
       dbg('handleMessageEdit:drop', { channelId, messageId, reason: this.isChannelMuted(channelId) ? 'muted' : 'not-open-or-subscribed' });
       return;
     }
-    await this.afterCreate(messageId, () => this.sendMessageEdit(channelId, messageId, newContent, info));
+    await this.afterCreate(messageId, () => this.sendMessageEdit(channelId, messageId, newContent, isDM, info));
   }
 
-  private sendMessageEdit(channelId: string, messageId: string, newContent: string, info?: MessageEventInfo): void {
+  private sendMessageEdit(channelId: string, messageId: string, newContent: string, isDM: boolean, info?: MessageEventInfo): void {
     if (!this.conn) return;
+    const registeredId = this.registerEventChannel(channelId, isDM, info);
     const scope = this.subjectScope(messageId, info?.guildId ?? null, channelId);
     const mem = this.recentCreates.get(messageId);
     const timestamp = info?.editedAt ?? new Date().toISOString();
@@ -3675,8 +4131,8 @@ export class DiscordMcplServer {
       // The counter keeps two edits that share a millisecond distinct.
       eventId: `discord_edit_${messageId}_${timestamp}_${mem ? ++mem.edits : ++this.editSeq}`,
       timestamp,
-      origin: this.messageEventOrigin(channelId, messageId, info),
-      tags: ['chat:edited'],
+      origin: this.messageEventOrigin(channelId, messageId, info, registeredId),
+      tags: ['chat:edited', ...threadTags(info ?? {})],
       payload: { content },
       // RFC-006: replace the unread original; append once it was read.
       ...(this.hostCoalescing?.pushEvents
@@ -3693,19 +4149,20 @@ export class DiscordMcplServer {
       dbg('handleMessageDelete:drop', { channelId, messageId, reason: this.isChannelMuted(channelId) ? 'muted' : 'not-open-or-subscribed' });
       return;
     }
-    await this.afterCreate(messageId, () => this.sendMessageDelete(channelId, messageId, info));
+    await this.afterCreate(messageId, () => this.sendMessageDelete(channelId, messageId, isDM, info));
   }
 
-  private sendMessageDelete(channelId: string, messageId: string, info?: MessageEventInfo): void {
+  private sendMessageDelete(channelId: string, messageId: string, isDM: boolean, info?: MessageEventInfo): void {
     if (!this.conn) return;
+    const registeredId = this.registerEventChannel(channelId, isDM, info);
     const scope = this.subjectScope(messageId, info?.guildId ?? null, channelId);
     const timestamp = new Date().toISOString();
     const params: CoalescedPushEventParams = {
       featureSet: 'discord.messaging',
       eventId: `discord_delete_${messageId}_${timestamp}_${++this.editSeq}`,
       timestamp,
-      origin: this.messageEventOrigin(channelId, messageId, info),
-      tags: ['chat:deleted'],
+      origin: this.messageEventOrigin(channelId, messageId, info, registeredId),
+      tags: ['chat:deleted', ...threadTags(info ?? {})],
       // The deletion notice (RFC-006 §6): shown only if a model read a
       // version of the message; an unread message is withdrawn without trace.
       payload: { content: [textContent(`[message deleted] ${messageId}${info?.authorName ? ` by @${info.authorName}` : ''}`)] },
@@ -3874,7 +4331,10 @@ export class DiscordMcplServer {
       if (!isEnabled('discord.messaging', this.enabledFeatureSets)) return;
       // Reaction visibility is a per-channel opt-in (default off). Reactions
       // NEVER wake the agent — the reaction tags match no wake policy — they
-      // just land in context so the agent sees them when next active.
+      // just land in context so the agent sees them when next active. A
+      // reaction in a thread names the thread in its origin but keeps the
+      // reaction tags only, so a gate rule keyed on chat:thread, written for a
+      // thread's messages, doesn't start matching its reactions.
       // SPEC §16.2 defines `chat:reaction` and `chat:reaction-remove` as
       // distinct tags: collapsing both onto `chat:reaction` made any consumer
       // rule for "reactions to my messages" fire on un-reactions too, with the
@@ -3917,6 +4377,7 @@ export class DiscordMcplServer {
       // message id is meaningless to the agent (it can't look messages up).
       const quoted = ev.messageSnippet ? ` — "${ev.messageSnippet}"` : '';
       const line = `[reaction] @${ev.userName} ${verb} ${ev.emoji} on ${target}${quoted}`;
+      const reactionChannelId = mcplChannelId(ev.guildId ?? 'dm', ev.channelId);
       this.conn.sendRequest(method.PUSH_EVENT, {
         featureSet: 'discord.messaging',
         eventId: `discord_reaction_${ev.action}_${ev.messageId}_${ev.emojiId ?? ev.emoji}_${ev.userId}_${ev.timestamp.getTime()}`,
@@ -3926,72 +4387,156 @@ export class DiscordMcplServer {
           channelId: ev.channelId,
           messageId: ev.messageId,
           guildId: ev.guildId,
+          // The composite id the host registers and routes by, when the
+          // channel is registered, as the origins of the message's own
+          // pushes carry it.
+          ...(this.channelManager.get(reactionChannelId) ? { mcplChannelId: reactionChannelId } : {}),
           reactorId: ev.userId,
           reactorName: ev.userName,
           emoji: ev.emoji,
           emojiToken: ev.token,
           onOwnMessage: ev.onOwnMessage,
           action: ev.action,
+          ...threadFields(ev),
         } as Record<string, unknown>,
         tags: [ev.action === 'add' ? 'chat:reaction' : 'chat:reaction-remove'],
         payload: { content: [textContent(line)] },
       } satisfies PushEventParams).catch(() => {});
     });
 
-    this.discord.onChannelCreate((guildId, channel) => {
-      if (!this.conn || !this.mcplEnabled) return;
-      const guildName = this.discord.getGuildName(guildId);
-      this.registerAndNotifyNew([
-        toDescriptor(
-          guildId,
-          guildName,
-          channel,
-          this.isChannelSubscribed(channel.id),
-          this.backscrollLimitFor(channel.id),
-        ),
-      ]);
+    // The registry follows Discord whether or not a host is connected; a
+    // host connecting later is given all of it, removals included
+    // (syncChannelsWithHost).
+    // A channel's name can take a label's name from a channel registered
+    // under it (rederiveNamed).
+    this.discord.onChannelCreate((channel) => {
+      this.registerChannels([this.guildDescriptor(channel)]);
+      this.rederiveNamed({ name: channel.name });
     });
 
-    // Bot joined a new guild after startup: register all of its existing
-    // text channels so they show up in the host's channel list (channelCreate
-    // only covers channels created *after* the join).
-    this.discord.onGuildCreate((guildId, guildName, channels) => {
-      if (!this.conn || !this.mcplEnabled) return;
-      const descriptors = channels.map((c) =>
-        toDescriptor(
-          guildId,
-          guildName,
-          c,
-          this.isChannelSubscribed(c.id),
-          this.backscrollLimitFor(c.id),
-        ));
-      const added = this.registerAndNotifyNew(descriptors);
-      dbg('onGuildCreate', { guildId, guildName, total: channels.length, added: added.length });
+    // A listed channel changed (renamed, moved, or the bot let into it): it
+    // is registered or re-derived, and so are the threads registered under
+    // it, whose labels name it. A forum or media channel isn't registered,
+    // holding no messages, but its posts' labels name it too. One moved out
+    // of what the filters admit is forgotten, with the threads the filters
+    // admitted through it, as a guild's return forgets them (guildReturned).
+    this.discord.onChannelUpdate((channel, change) => {
+      const id = mcplChannelId(channel.guildId, channel.id);
+      if (!change.admitted) {
+        // Its threads are admitted through it, unless the filters list one.
+        const gone = [id, ...this.registeredThreadsOf(channel.id).filter((d) => !this.admitted(d)).map((d) => d.id)];
+        this.forgetChannels(gone.filter((g) => this.channelManager.get(g)));
+      } else if (isListedKind(channel.type)) {
+        this.registerChannels([this.guildDescriptor(channel)]);
+      }
+      // Only a new name, kind or category can change its threads' labels,
+      // or give a name to another channel, or take one from it, and so can
+      // a channel that's no longer stale, giving its guild's names back.
+      if (change.addressChanged) {
+        this.rederiveChannels(this.registeredThreadsOf(channel.id));
+        this.rederiveNamed({ name: channel.name });
+      }
     });
 
-    // Bot was granted access to a pre-existing channel (permission overwrite).
-    this.discord.onChannelAvailable((guildId, channel) => {
-      if (!this.conn || !this.mcplEnabled) return;
-      const guildName = this.discord.getGuildName(guildId);
-      const added = this.registerAndNotifyNew([
-        toDescriptor(
-          guildId,
-          guildName,
-          channel,
-          this.isChannelSubscribed(channel.id),
-          this.backscrollLimitFor(channel.id),
-        ),
-      ]);
-      dbg('onChannelAvailable', { guildId, channelId: channel.id, added: added.length });
+    // Bot joined a new guild after startup: register its existing channels
+    // of a listed kind so they show up in the host's channel list
+    // (channelCreate only covers channels created *after* the join).
+    this.discord.onGuildCreate((guildId, channels) => {
+      const { added } = this.registerChannels(channels.map((c) => this.guildDescriptor(c)));
+      this.rederiveNamed('every');
+      dbg('onGuildCreate', { guildId, total: channels.length, added: added.length });
     });
 
-    this.discord.onChannelDelete((guildId, channelId) => {
-      if (!this.conn || !this.mcplEnabled) return;
-      const id = mcplChannelId(guildId, channelId);
-      this.channelManager.unregister(id);
-      this.conn.sendNotification(method.CHANNELS_CHANGED, {
-        removed: [id],
-      });
+    // The bot left a guild, or was removed from it: what's registered there
+    // is forgotten. Its channels still exist, so they keep their watermarks
+    // and aren't remembered as deleted (deletedChannels). If the bot
+    // rejoins, the guild's guildCreate registers its listed channels again,
+    // as boot does, and its threads come back by their messages.
+    this.discord.onGuildDelete((guildId) => {
+      this.forgetChannels(this.registeredInGuild(guildId).map((d) => d.id));
+      this.rederiveNamed('every');
+    });
+
+    // A guild back from an outage or a gateway gap: Discord doesn't replay
+    // what happened while it was away, so the registry is reconciled with
+    // what the guild has now (guildReturned).
+    this.discord.onGuildAvailable((guildId, channels, present) => this.guildReturned(guildId, channels, present));
+
+    // A guild's name is in every label of its channels.
+    this.discord.onGuildRename((guildId) => {
+      this.rederiveChannels(this.registeredInGuild(guildId));
+      this.rederiveNamed('every');
+    });
+
+    // A registered thread that's archived is forgotten, so the registry
+    // holds the live threads; the next message posted in it, which
+    // unarchives it, registers it again. Its watermark stays, since it can
+    // come back. A registered thread otherwise changed (renamed, locked) is
+    // re-derived. An unregistered one waits for a message.
+    this.discord.onThreadUpdate((thread) => this.threadReported(thread));
+
+    // A fetch left a channel stale: its current name isn't known, so no
+    // name in its guild resolves (resolveChannelRef), and the labels of the
+    // channels a name addresses there are derived again, by id, as is its
+    // own registration's, a thread's included. A registered thread under it
+    // that isn't stale itself keeps its display-only label, with the names
+    // it was registered with (knowsLessThan). Its fresh fetch derives them
+    // again by name (onChannelRefreshed).
+    this.discord.onChannelStale((channelId) => {
+      const registered = this.channelManager.getAll()
+        .filter((d) => (d.address as { channelId?: string } | undefined)?.channelId === channelId);
+      if (registered.length > 0) this.rederiveChannels(registered);
+      this.rederiveNamed('every');
+    });
+
+    this.discord.onChannelDelete((guildId, channelId, threadIds) => this.channelDeleted(guildId, channelId, threadIds));
+    this.discord.onThreadDelete((guildId, threadId) => this.channelDeleted(guildId, threadId));
+    // Discord synced a guild's threads (onThreadsSynced). A registered
+    // thread it doesn't list is forgotten when its registration places it
+    // under a channel the sync covers (any, for a whole-guild sync), or the
+    // sync dropped it from the cache, which places a thread by the channel
+    // the cache knew for it. It isn't remembered as deleted, since it may
+    // only have been archived. A thread whose channel neither knows is under
+    // none. A registered thread the sync lists is taken as updated.
+    this.discord.onThreadsSynced((guildId, covered, listed, dropped) => {
+      const channelOf = (d: ChannelDescriptor) => (d.address as { channelId: string }).channelId;
+      const threads = this.registeredInGuild(guildId)
+        .filter((d) => (d.metadata as { channelType?: string } | undefined)?.channelType === 'thread');
+      const omitted = (d: ChannelDescriptor): boolean => {
+        if (listed.has(channelOf(d))) return false;
+        const parentId = (d.metadata as { parentId?: string } | undefined)?.parentId;
+        return covered === null || dropped.has(channelOf(d)) || (parentId !== undefined && covered.has(parentId));
+      };
+      this.forgetChannels(threads.filter(omitted).map((d) => d.id));
+      for (const d of threads) {
+        if (!listed.has(channelOf(d))) continue;
+        const facts = this.discord.getCachedChannelFacts(channelOf(d));
+        if (facts) this.threadReported(facts);
+      }
+    });
+    // A stale channel fetched fresh is taken as an update of it, since what
+    // was derived from its older facts may be wrong in any of them: a thread
+    // the fetch shows archived, or a channel it shows outside the filters,
+    // is forgotten, as an update would forget it. Otherwise its registration
+    // is derived again, with its threads' labels and the labels of channels
+    // that share or shared its name.
+    this.discord.onChannelRefreshed((channelId) => {
+      const facts = this.discord.getCachedChannelFacts(channelId);
+      if (!facts) return;
+      const id = mcplChannelId(facts.guildId, channelId);
+      const admitted = this.discord.channelAdmitted(facts.guildId, channelId, facts.parentId ?? null);
+      if (facts.type === 'thread') {
+        this.threadReported(facts);
+        return;
+      }
+      if (!admitted) {
+        const gone = [id, ...this.registeredThreadsOf(channelId).filter((d) => !this.admitted(d)).map((d) => d.id)];
+        this.forgetChannels(gone.filter((g) => this.channelManager.get(g)));
+      } else if (isListedKind(facts.type)) {
+        this.registerChannels([this.guildDescriptor(facts)]);
+      }
+      this.rederiveChannels(this.registeredThreadsOf(channelId));
+      this.rederiveNamed({ name: facts.name });
     });
   }
 
@@ -4088,6 +4633,16 @@ export class DiscordMcplServer {
         ? ''
         : multiSnapshot ? ` (forwarded #${att.forwardedSnapshotIndex})` : ' (forwarded)';
 
+    // A Discord CDN URL is signed and stops working at its `ex` time, so each
+    // marker says when, and the message says once how to get a fresh one.
+    let linksExpire = false;
+    const link = (att: DiscordAttachment) => {
+      const expiry = attachmentUrlExpiry(att.url);
+      if (!expiry) return att.url;
+      linksExpire = true;
+      return `${att.url} (link expires ${expiry.toISOString().slice(0, 16).replace('T', ' ')} UTC)`;
+    };
+
     const inlineCap = this.attachmentInlineMaxBytes;
     const blocks: ContentBlock[] = [];
     for (const att of attachments) {
@@ -4102,17 +4657,17 @@ export class DiscordMcplServer {
           // Declared size is already over the cap — no fetch at all. (A
           // misdeclared small size still gets caught below on actual bytes.)
           blocks.push(textContent(
-            `[attachment: ${att.name}${fwd(att)} (${fmt(att.size)}) over the ${fmt(inlineCap)} inline cap — not inlined: ${att.url}]`,
+            `[attachment: ${att.name}${fwd(att)} (${fmt(att.size)}) over the ${fmt(inlineCap)} inline cap — not inlined: ${link(att)}]`,
           ));
           dbg('attachment:over-inline-cap', { name: att.name, declaredSize: att.size, cap: inlineCap });
         } else if ((isImage || isText) && att.size > fetchBudgetLeft) {
           blocks.push(textContent(
-            `[attachment: ${att.name}${fwd(att)} (${fmt(att.size)}) not inlined — message attachment budget exhausted: ${att.url}]`,
+            `[attachment: ${att.name}${fwd(att)} (${fmt(att.size)}) not inlined — message attachment budget exhausted: ${link(att)}]`,
           ));
           dbg('attachment:budget-exhausted', { name: att.name, size: att.size, budgetLeft: fetchBudgetLeft });
         } else if (isImage) {
           if (att.size > IMAGE_FETCH_CEILING) {
-            blocks.push(textContent(`[image attachment "${att.name}"${fwd(att)} (${fmt(att.size)}) too large to fetch — ${att.url}]`));
+            blocks.push(textContent(`[image attachment "${att.name}"${fwd(att)} (${fmt(att.size)}) too large to fetch — ${link(att)}]`));
           } else {
             fetchBudgetLeft -= att.size;
             const res = await fetchWithTimeout(att.url);
@@ -4124,9 +4679,9 @@ export class DiscordMcplServer {
             const norm = await normalizeImageForInference(raw, att.contentType);
             if (norm) {
               blocks.push({ type: 'image', data: norm.data, mimeType: norm.mimeType } as ContentBlock);
-              blocks.push(textContent(`[image attachment: ${att.name}${fwd(att)}]`));
+              blocks.push(textContent(`[image attachment: ${att.name}${fwd(att)} — ${link(att)}]`));
             } else {
-              blocks.push(textContent(`[image attachment "${att.name}"${fwd(att)} (${fmt(att.size)}) could not be inlined — ${att.url}]`));
+              blocks.push(textContent(`[image attachment "${att.name}"${fwd(att)} (${fmt(att.size)}) could not be inlined — ${link(att)}]`));
             }
           }
         } else if (isText) {
@@ -4139,7 +4694,7 @@ export class DiscordMcplServer {
             // Declared size said it fit; the wire said otherwise. The cap is
             // a bound on actual bytes, so this degrades to a note too.
             blocks.push(textContent(
-              `[attachment: ${att.name}${fwd(att)} (over the ${fmt(inlineCap)} inline cap; declared ${fmt(att.size)}) — not inlined: ${att.url}]`,
+              `[attachment: ${att.name}${fwd(att)} (over the ${fmt(inlineCap)} inline cap; declared ${fmt(att.size)}) — not inlined: ${link(att)}]`,
             ));
             dbg('attachment:over-inline-cap', {
               name: att.name,
@@ -4148,10 +4703,10 @@ export class DiscordMcplServer {
               misdeclared: true,
             });
           } else {
-            blocks.push(textContent(`[attachment: ${att.name}${fwd(att)} (${fmt(att.size)})]\n${text}`));
+            blocks.push(textContent(`[attachment: ${att.name}${fwd(att)} (${fmt(att.size)}) — ${link(att)}]\n${text}`));
           }
         } else {
-          blocks.push(textContent(`[attachment: ${att.name}${fwd(att)} (${ct || 'unknown type'}, ${fmt(att.size)}) — not inlined: ${att.url}]`));
+          blocks.push(textContent(`[attachment: ${att.name}${fwd(att)} (${ct || 'unknown type'}, ${fmt(att.size)}) — not inlined: ${link(att)}]`));
         }
         dbg('attachment', {
           name: att.name,
@@ -4160,9 +4715,12 @@ export class DiscordMcplServer {
           kind: isImage ? 'image' : isText ? 'text' : 'other',
         });
       } catch (err) {
-        blocks.push(textContent(`[attachment: ${att.name} — could not fetch (${(err as Error).message}); ${att.url}]`));
+        blocks.push(textContent(`[attachment: ${att.name}${fwd(att)} — could not fetch (${(err as Error).message}); ${link(att)}]`));
         dbg('attachment:failed', { name: att.name, error: (err as Error).message });
       }
+    }
+    if (linksExpire) {
+      blocks.push(textContent('[Attachment links expire as marked; fetching the message again gives fresh links.]'));
     }
     return blocks;
   }
@@ -4354,12 +4912,6 @@ export class DiscordMcplServer {
 
     const guildId = msg.guildId ?? 'dm';
     const channelMcplId = mcplChannelId(guildId, msg.channelId);
-    const channelIsOpen = this.channelManager.isOpen(channelMcplId);
-    dbg('handleDiscordMessage:forwarding', {
-      channelMcplId,
-      channelIsOpen,
-      path: channelIsOpen ? 'channels/incoming' : 'push/event',
-    });
 
     // discord.js's `cleanContent` resolves <@id> / <@&role> / <#channel>
     // mentions to @username / @role / #channel — always use that in the
@@ -4380,10 +4932,12 @@ export class DiscordMcplServer {
       // prefix's own words (` in <guild>`): a text channel's name never has
       // one, but a voice, stage or forum channel's can.
       const locationParts: string[] = [];
-      if (msg.channelName) {
-        locationParts.push(`#${/\s/.test(msg.channelName) ? quotedValue(msg.channelName) : headerValue(msg.channelName)}`);
+      // Posted in a thread: the channel it hangs off, then the thread.
+      const place = messagePlace(msg.channelName, msg);
+      if (place.channel) {
+        locationParts.push(`#${/\s/.test(place.channel) ? quotedValue(place.channel) : headerValue(place.channel)}`);
       }
-      if (msg.threadName) locationParts.push(`thread ${quotedValue(msg.threadName)}`);
+      if (place.thread) locationParts.push(`thread ${quotedValue(place.thread)}`);
       if (msg.guildName) locationParts.push(`in ${headerValue(msg.guildName)}`);
       else if (msg.guildId === null) locationParts.push('DM');
       if (locationParts.length > 0) location = `[${locationParts.join(' ')}] `;
@@ -4400,23 +4954,11 @@ export class DiscordMcplServer {
     // re-include this message. Set regardless of which forwarding path we
     // take below (channels/incoming vs push/event) — what matters is that
     // we forwarded it. Persist it (and the DM channel, if this is one) so the
-    // reconnect catch-up sweep has a current anchor after a restart.
-    this.forwardedWatermark.set(msg.channelId, msg.id);
-    if (isDM) {
-      this.dmChannelIds.add(msg.channelId);
-      // Register the DM as a real channel descriptor so channel_open /
-      // isOpen resolve it. The message author IS the recipient (bot's own
-      // outbound doesn't come through here), so their name labels it.
-      this.registerAndNotifyNew([
-        toDmDescriptor(
-          msg.channelId,
-          msg.authorName,
-          false,
-          this.backscrollLimitFor(msg.channelId),
-          msg.authorId,
-        ),
-      ]);
-    }
+    // reconnect catch-up sweep has a current anchor after a restart. Not for
+    // a channel deleted while this message was on its way: the deletion
+    // dropped its watermark, and there's nothing there to catch up on.
+    if (isDM || !this.deletedLately(guildId, msg.channelId)) this.forwardedWatermark.set(msg.channelId, msg.id);
+    if (isDM) this.dmChannelIds.add(msg.channelId);
     this.saveWatermark();
     // Update sticky-reply state: this inbound is now the "last
     // communication" for auto-reply routing, and the message we'd
@@ -4429,6 +4971,30 @@ export class DiscordMcplServer {
     const attachmentBlocks =
       msg.attachments.length > 0 ? await this.buildAttachmentBlocks(msg.attachments) : [];
 
+    // Register the channel the message was posted in, or re-derive what's
+    // registered (a rename, a name learned since), so the host knows it (its
+    // label, and where a publish lands) before this message reaches it. A
+    // DM's author is its other party (the bot's own messages don't come
+    // through here), so their name labels it. A guild channel the listings
+    // leave out is registered here: every thread, by its messages, so only
+    // threads with activity are, never a server's whole thread archive.
+    // Registered after the last await, and whether the channel is open read
+    // then too, so the delivery names what's registered when it goes out,
+    // judged by what's newest (registerGuildDelivery): a thread archived
+    // after this message was posted stays archived, and a channel deleted, a
+    // guild left, or a channel its guild came back without, while the
+    // attachments were fetched, isn't registered.
+    const registeredId = isDM
+      ? this.registerDmDelivery(msg.channelId, { id: msg.authorId, name: msg.authorName })
+      : this.registerGuildDelivery(guildId, msg.channelId, { postedAt: msg.timestamp.getTime() });
+    const channelIsOpen = this.channelManager.isOpen(channelMcplId);
+    dbg('handleDiscordMessage:forwarding', {
+      channelMcplId,
+      registeredId,
+      channelIsOpen,
+      path: channelIsOpen ? 'channels/incoming' : 'push/event',
+    });
+
     // MCPL RFC-001 event tags — emit reserved chat:* core (umbrellas included,
     // so no host-side implication expansion is needed) derived from the address
     // flags computed above. The host's wake gate routes on these.
@@ -4439,7 +5005,7 @@ export class DiscordMcplServer {
       if (isDM) { t.add('chat:dm'); t.add('chat:private'); }
       t.add(isMention || isDM ? 'chat:addressed' : 'chat:ambient');
       t.add(isBot ? 'chat:from-bot' : 'chat:from-human');
-      if (msg.threadId) t.add('chat:thread');
+      for (const tag of threadTags(msg)) t.add(tag);
       for (const a of msg.attachments) {
         const ct = (a.contentType || '').toLowerCase();
         if (ct.startsWith('image/')) t.add('chat:has-image');
@@ -4471,7 +5037,8 @@ export class DiscordMcplServer {
           ...(this.hostCoalescing?.channelsIncoming
             ? { eventId: `discord_msg_${msg.id}`, coalesce: { key: `message:${msg.id}`, initial: true } }
             : {}),
-          threadId: msg.threadId,
+          // No MCPL threadId: it means a thread WITHIN the channel, and a
+          // Discord thread is its own channel, already named by channelId.
           author: { id: msg.authorId, name: msg.authorName },
           timestamp: msg.timestamp.toISOString(),
           content: [textContent(renderedContent), ...attachmentBlocks],
@@ -4482,7 +5049,7 @@ export class DiscordMcplServer {
             replyToAuthorName: msg.replyToUserName ?? undefined,
             channelName: msg.channelName,
             guildName: msg.guildName,
-            threadName: msg.threadName,
+            ...threadFields(msg),
             rawContent: msg.content,
             isMention,
             isExplicitMention,
@@ -4536,11 +5103,15 @@ export class DiscordMcplServer {
           // form the host registers and routes replies to. Raw `channelId` above
           // is Discord-internal; DMs especially only ever arrive via push/event
           // (channel closed), so without this the host can't route a reply back
-          // to the DM (item-3 redux, DM sub-case).
-          mcplChannelId: channelMcplId,
+          // to the DM (item-3 redux, DM sub-case). Named once registered, as
+          // every channel a message is posted in is, except one deleted,
+          // archived, or left out when its guild came back, or in a guild the
+          // bot left, while this message was on its way
+          // (registerGuildDelivery).
+          ...(registeredId ? { mcplChannelId: registeredId } : {}),
           channelName: msg.channelName,
-          threadId: msg.threadId,
-          threadName: msg.threadName,
+          // Display only; the composite channel id already names the thread.
+          ...threadFields(msg),
           authorId: msg.authorId,
           authorName: msg.authorName,
           replyTo: msg.replyToId,
@@ -4587,4 +5158,65 @@ export async function serveStdio(
   await server.serve(conn);
   console.error('[discord-mcpl] stdio connection ended; exiting');
   exit(0);
+}
+
+/**
+ * Serve MCPL clients on a listening TCP server, one at a time, for as long as
+ * the process runs. It owns the server's 'connection' and 'error' events for
+ * the server's life, which a one-at-a-time server needs: mcpl-core's
+ * `acceptTcp` takes a single connection, and leaves no listener that logs
+ * the server's errors.
+ *
+ * - A client that connects while none is served is served: `serve` runs with
+ *   its connection, and once `serve` settles, whether it resolves, rejects
+ *   or throws, the connection is closed and the next client can be served.
+ *   A rejection or a throw is logged. A client counts as served until then,
+ *   after its socket has closed too.
+ * - A client that connects while another is served is refused: its socket
+ *   is destroyed at once, and the refusal logged. Its 'error' listener goes
+ *   on first, so nothing that socket reports can go unheard.
+ * - An 'error' the server emits (an accept that fails, say) is logged
+ *   whenever it comes, and serving goes on: Node's server keeps listening.
+ *
+ * A read error on the served client's own socket (a reset, say) still ends
+ * the process: it also reaches mcpl-core's readline interface, which listens
+ * for none (see serve()).
+ *
+ * The server must be listening already, or this throws: a failure to listen
+ * (a port already taken) belongs to the caller, and with the 'error'
+ * listener added here it would only be logged, and the caller would wait for
+ * a 'listening' that never comes.
+ */
+export function serveTcp(
+  tcpServer: net.Server,
+  serve: (conn: McplConnection) => Promise<void>,
+  log: (...args: unknown[]) => void = console.error,
+): void {
+  if (!tcpServer.listening) {
+    throw new Error("serveTcp needs a listening server: call it once the server has emitted 'listening'");
+  }
+  tcpServer.on('error', (err) => log('[discord-mcpl] TCP server error:', errorText(err)));
+  // Set before anything awaits, so two clients connecting in the same tick
+  // can't both be served.
+  let serving = false;
+  tcpServer.on('connection', (socket) => {
+    if (serving) {
+      socket.on('error', (err) => log('[discord-mcpl] Refused client socket error:', errorText(err)));
+      socket.destroy();
+      log('[discord-mcpl] Refused a client: one client is served at a time');
+      return;
+    }
+    serving = true;
+    // fromTcp listens for the socket's errors before this handler returns.
+    const conn = McplConnection.fromTcp(socket);
+    log('[discord-mcpl] Client connected');
+    void Promise.resolve()
+      .then(() => serve(conn))
+      .catch((err) => log('[discord-mcpl] Serving a client failed:', errorText(err)))
+      .finally(() => {
+        conn.close();
+        serving = false;
+        log('[discord-mcpl] Client disconnected, waiting for next...');
+      });
+  });
 }
