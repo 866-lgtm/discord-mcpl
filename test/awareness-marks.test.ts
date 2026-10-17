@@ -6,9 +6,9 @@
  *   passed to a host that has the `marks` verb, which places the marks and
  *   returns a `markers` receipt.
  * - A host without the verb places branch-following marks on undo that no
- *   option can make a one-shot act, so /undo is refused there. /hide there
- *   reacts 💤 itself only for `all`, and refuses `addressed`.
- * - /marks lists the journal and cancels, retracts or releases.
+ *   option can make a one-shot act, so /undo is refused there. It keeps no
+ *   journal, so /hide there refuses a marks choice.
+ * - /marks lists the journal and cancels or retracts.
  *
  * The host is a stub answering host/command; Discord is a stub adapter.
  */
@@ -35,8 +35,11 @@ const isProbe = (p: Sent): boolean => p.command === 'marks' && p.action === unde
 
 /** How agent-framework#250 answers the probe, and how every older framework
  *  with host/command answers a verb it lacks. */
-const VERB_ANSWER = { ok: false, error: 'marks needs action list, cancel, retract or release' };
+const VERB_ANSWER = { ok: false, error: 'marks needs action list, cancel or retract' };
 const NO_VERB_ANSWER = { ok: false, error: 'Unknown host command: marks' };
+/** What a refusal after a failed probe ends with, at /undo, /hide and /marks. */
+const PROBE_AGAIN = 'Running it again can work after a timeout, or once the host is back if it was restarting. ' +
+  'If the host refuses host commands, whoever runs it has to allow them for this server (`allowHostCommands`).';
 
 /** A host whose host/command answers are scripted; `marksVerb` decides how
  *  it answers the probe, `{ fails }` making the probe's request fail. */
@@ -59,12 +62,11 @@ function host(opts: {
   return { conn, sent, probes: () => sent.filter(isProbe), commands: () => sent.filter((p) => !isProbe(p)) };
 }
 
-function serverWith(conn: unknown, opts: { failReaction?: (messageId: string) => Error | undefined } = {}) {
+/** A server over `conn`, recording any reaction it places itself, which it never should. */
+function serverWith(conn: unknown) {
   const reactions: Array<{ channelId: string; messageId: string; emoji: string }> = [];
   const discord = {
     addReaction: async (channelId: string, messageId: string, emoji: string) => {
-      const failure = opts.failReaction?.(messageId);
-      if (failure) throw failure;
       reactions.push({ channelId, messageId, emoji });
     },
   };
@@ -151,14 +153,15 @@ describe('/undo and the marks choice', () => {
     const { server } = serverWith(h.conn);
     const first = interaction('undo', {});
     await asAdmin(() => server.handleSlashCommand(first.value));
-    assert.match(first.out.replies.at(-1)!, /^⚠️ Undo not sent: couldn't learn .*\(request timed out\)\. Nothing was changed\.$/);
+    assert.match(first.out.replies.at(-1)!, /^⚠️ Undo not sent: couldn't learn .*\(request timed out\)\. Nothing was changed\. /);
+    assert.ok(first.out.replies.at(-1)!.endsWith(` ${PROBE_AGAIN}`));
     const second = interaction('undo', {});
     await asAdmin(() => server.handleSlashCommand(second.value));
     assert.equal(h.probes().length, 2, 'an unproven answer is not kept');
     assert.equal(h.commands().length, 0);
   });
 
-  it('sends no marks when none are chosen, and probes once per connection', async () => {
+  it('sends no marks when none are chosen, and probes for each command', async () => {
     const h = host({ marksVerb: 'yes', answer: undoAnswer({ scope: 'none', unmarked: 2, notRemoved: 0, status: 'none', queued: 0 }) });
     const { server } = serverWith(h.conn);
     for (let n = 0; n < 2; n++) {
@@ -170,7 +173,7 @@ describe('/undo and the marks choice', () => {
     const undos = h.commands();
     assert.equal(undos.length, 2);
     for (const u of undos) assert.equal('marks' in u, false);
-    assert.equal(h.probes().length, 1, 'one probe per connection');
+    assert.equal(h.probes().length, 2, 'one probe per command');
   });
 
   it('reads an explicit none as none, the same as one left out', async () => {
@@ -232,7 +235,7 @@ describe('the marks probe', () => {
     assert.deepEqual(h.probes(), [{ command: 'marks' }]);
   });
 
-  it('keeps any answer the host gives: only "Unknown host command" means an older host', async () => {
+  it('reads any answer but "Unknown host command" as the verb, and asks for each command', async () => {
     // agent-framework#250 refuses the probe for its missing action; any other
     // answer that isn't "Unknown host command" proves the verb as well.
     for (const answer of [VERB_ANSWER, { ok: false, error: 'marks is busy' }, { ok: true, awareness: [] }]) {
@@ -249,15 +252,15 @@ describe('the marks probe', () => {
         await asAdmin(() => server.handleSlashCommand(i.value));
         assert.match(i.out.replies.at(-1)!, /^🗑️ Removed the last \*\*1\*\*/, JSON.stringify(answer));
       }
-      assert.equal(conn.sent.filter(isProbe).length, 1, `${JSON.stringify(answer)}: kept`);
+      assert.equal(conn.sent.filter(isProbe).length, 2, `${JSON.stringify(answer)}: asked for each command`);
     }
     const old = host({ marksVerb: 'no' });
     const { server } = serverWith(old.conn);
     for (let n = 0; n < 2; n++) await asAdmin(() => server.handleSlashCommand(interaction('undo', {}).value));
-    assert.equal(old.probes().length, 1, 'an older host is known for the connection too');
+    assert.equal(old.probes().length, 2, 'an older host is asked for each command too');
   });
 
-  it('refuses without promising that a retry will help when its request fails', async () => {
+  it('refuses when its request fails, saying when running it again can work and what a host refusing host commands needs', async () => {
     const refusal = new Error('host/command requires host-owned authority (McplServerConfig.allowHostCommands)');
     for (const fails of [refusal, new Error('request timed out')]) {
       const h = host({ marksVerb: { fails } });
@@ -275,7 +278,7 @@ describe('the marks probe', () => {
         const reply = i.out.replies.at(-1)!;
         assert.match(reply, refused, `${name} ${JSON.stringify(options)}`);
         assert.ok(reply.includes(fails.message), reply);
-        assert.doesNotMatch(reply, /try again/i, reply);
+        assert.ok(reply.endsWith(` ${PROBE_AGAIN}`), reply);
       }
       assert.equal(h.commands().length, 0, `${fails.message}: nothing sent`);
     }
@@ -298,69 +301,18 @@ describe('the marks probe', () => {
     }
   });
 
-  it('is shared by commands that arrive while it is out', async () => {
+  it('is asked by each command, two that arrive together included', async () => {
     const h = gatedHost();
     const { server } = serverWith(h.conn);
     const a = interaction('undo', {});
     const b = interaction('undo', {});
     const both = asAdmin(() => Promise.all([server.handleSlashCommand(a.value), server.handleSlashCommand(b.value)]));
     await settle();
-    assert.equal(h.probes.length, 1, 'one probe for both commands');
-    h.probes[0]!.resolve(VERB_ANSWER);
+    assert.equal(h.probes.length, 2, 'a probe for each command');
+    for (const probe of h.probes) probe.resolve(VERB_ANSWER);
     await both;
-    assert.equal(h.probes.length, 1);
     assert.equal(h.undos(), 2);
     for (const i of [a, b]) assert.match(i.out.replies.at(-1)!, /Removed the last \*\*1\*\*/);
-  });
-
-  it('forgets an unproven answer once it settles, so the next command asks again', async () => {
-    const h = gatedHost();
-    const { server } = serverWith(h.conn);
-    const a = interaction('undo', {});
-    const b = interaction('undo', {});
-    const both = asAdmin(() => Promise.all([server.handleSlashCommand(a.value), server.handleSlashCommand(b.value)]));
-    await settle();
-    assert.equal(h.probes.length, 1);
-    h.probes[0]!.reject(new Error('request timed out'));
-    await both;
-    for (const i of [a, b]) assert.match(i.out.replies.at(-1)!, /Undo not sent: couldn't learn .*request timed out/);
-    assert.equal(h.undos(), 0);
-
-    const c = interaction('undo', {});
-    const third = asAdmin(() => server.handleSlashCommand(c.value));
-    await settle();
-    assert.equal(h.probes.length, 2, 'asked again');
-    h.probes[1]!.resolve(VERB_ANSWER);
-    await third;
-    assert.match(c.out.replies.at(-1)!, /Removed the last \*\*1\*\*/);
-  });
-
-  it("probes a replaced connection afresh, and the old probe's late answer leaves the new one's kept", async () => {
-    const old = gatedHost();
-    const fresh = gatedHost();
-    const { server } = serverWith(old.conn);
-    const a = interaction('undo', {});
-    const first = asAdmin(() => server.handleSlashCommand(a.value));
-    await settle();
-    server.conn = fresh.conn; // the host reconnected while the old probe was out
-    const b = interaction('undo', {});
-    const second = asAdmin(() => server.handleSlashCommand(b.value));
-    await settle();
-    assert.equal(fresh.probes.length, 1, 'the new connection is probed');
-    fresh.probes[0]!.resolve(VERB_ANSWER);
-    await second;
-    // The old connection's host answers last, and definitely: it's an older one.
-    old.probes[0]!.resolve(NO_VERB_ANSWER);
-    await first;
-    assert.match(a.out.replies.at(-1)!, /Undo refused: this host can't make awareness marks a choice/);
-
-    const c = interaction('undo', {});
-    const third = asAdmin(() => server.handleSlashCommand(c.value));
-    await settle();
-    assert.equal(fresh.probes.length, 1, "the new connection's answer is still kept");
-    await third;
-    assert.equal(fresh.undos(), 2);
-    assert.equal(old.undos(), 0);
   });
 });
 
@@ -414,14 +366,18 @@ describe('replies stay within one message, and never misreport an applied surger
     assert.equal(hd.out.replies.at(-1), "🙈 Hide applied: removed 1 message from the agent's context. Marks: none. (The full reply couldn't be shown: Unknown interaction.)");
   });
 
-  it("names an applied surgery's marks in its short account: the batch, or this server's own reactions", async () => {
+  it("names an applied surgery's marks in its short account: the batch it scheduled, with the journal's warning when its sync failed", async () => {
     const receipts: Array<[unknown, string]> = [
       [{ scope: 'all', unmarked: 0, notRemoved: 0, status: 'queued', queued: 3, batchId: 'b-7' }, 'Marks: 3 💤 marks requested (batch `b-7`).'],
-      [{ scope: 'all', unmarked: 0, notRemoved: 0, status: 'unresolved', queued: 0, batchId: 'b-8', error: 'disk' }, 'Marks: unresolved (batch `b-8`); check `/marks list`.'],
-      [{ scope: 'all', unmarked: 0, notRemoved: 0, status: 'not-scheduled', queued: 0, error: 'journal full' }, 'Marks: not scheduled.'],
+      [{ scope: 'all', unmarked: 0, notRemoved: 0, status: 'queued', queued: 3, batchId: 'b-9', error: 'sync failed: EIO' },
+        "Marks: 3 💤 marks requested (batch `b-9`); the host's journal sync failed after recording them, so an operating system crash " +
+        'or a power failure before its next sync could lose them.'],
+      [{ scope: 'all', unmarked: 0, notRemoved: 0, status: 'unresolved', queued: 0, batchId: 'b-8', error: 'disk' }, 'Marks: unresolved — disk (batch `b-8`); check `/marks list`.'],
+      [{ scope: 'all', unmarked: 0, notRemoved: 0, status: 'not-scheduled', queued: 0, error: 'journal full' }, 'Marks: not scheduled — journal full.'],
+      [{ scope: 'all', unmarked: 0, notRemoved: 0, status: 'not-scheduled', queued: 0, error: 'e'.repeat(300) }, `Marks: not scheduled — ${'e'.repeat(99)}….`],
       [{ scope: 'all', unmarked: 2, notRemoved: 0, status: 'none', queued: 0 }, 'Marks: none placed.'],
       [{ scope: 'all', status: 'deferred' }, "Marks: the host's receipt couldn't be read; `/marks list` shows the journal."],
-      [undefined, 'Marks: the host reported nothing about them.'],
+      [undefined, 'Marks: the host reported nothing about them; `/marks list` shows whether it scheduled any.'],
       [{ scope: 'all', unmarked: 0, notRemoved: 0, status: 'queued', queued: 1, batchId: 'b'.repeat(300) }, `Marks: 1 💤 mark requested (batch \`${'b'.repeat(99)}…\`).`],
     ];
     for (const [markers, short] of receipts) {
@@ -431,11 +387,6 @@ describe('replies stay within one message, and never misreport an applied surger
       await asAdmin(() => server.handleSlashCommand(i.value));
       assert.equal(i.out.replies.at(-1), `🗑️ Undo applied: removed 2 context messages. ${short} (The full reply couldn't be shown: Unknown interaction.)`, JSON.stringify(markers));
     }
-    const older = host({ marksVerb: 'no', answer: (p) => (p.command === 'hide' ? { ok: true, hidden: 2, hiddenRefs: [{ channelId: 'c1', messageId: 'm1' }, { channelId: 'c1', messageId: 'm2' }] } : { ok: true }) });
-    const { server } = serverWith(older.conn);
-    const i = interaction('hide', { message: '111111111111111111', marks: 'all' }, { rejectEdits: 1 });
-    await asAdmin(() => server.handleSlashCommand(i.value));
-    assert.equal(i.out.replies.at(-1), "🙈 Hide applied: removed 2 messages from the agent's context. Marks: this server reacted 💤 itself on 2 of 2; these have no cancel. (The full reply couldn't be shown: Unknown interaction.)");
   });
 
   it('logs what the command did to stderr when Discord refuses both replies', async (t) => {
@@ -466,8 +417,8 @@ describe('replies stay within one message, and never misreport an applied surger
       ['yes', 'undo', { marks: 'addressed' }, true],
       ['yes', 'hide', { message: '111111111111111111', marks: 'all' }, true],
       ['yes', 'hide', { message: '111111111111111111' }, false],
-      // An older host was sent no choice, so it can have scheduled no batch.
-      ['no', 'hide', { message: '111111111111111111', marks: 'all' }, false],
+      // An older host is sent the plain hide, so it can have scheduled no batch.
+      ['no', 'hide', { message: '111111111111111111' }, false],
     ];
     for (const [marksVerb, name, options, pointer] of cases) {
       const command = name === 'undo' ? 'Undo' : 'Hide';
@@ -504,7 +455,7 @@ describe('replies stay within one message, and never misreport an applied surger
     const { server } = serverWith(probeThrows);
     const i = interaction('undo', {});
     await asAdmin(() => server.handleSlashCommand(i.value));
-    assert.equal(i.out.replies.at(-1), "⚠️ Undo not sent: couldn't learn whether this host makes awareness marks a choice (undefined). Nothing was changed.");
+    assert.equal(i.out.replies.at(-1), `⚠️ Undo not sent: couldn't learn whether this host makes awareness marks a choice (undefined). Nothing was changed. ${PROBE_AGAIN}`);
   });
 
   it('keeps an unknown outcome and its check-before-retry when Discord also refuses the reply', async () => {
@@ -585,25 +536,21 @@ describe('an answer only `ok: false` makes a failure', () => {
 
   it('still replies to an applied undo or hide whose fields it cannot read', async () => {
     const verbHost = (answer: Sent) => host({ marksVerb: 'yes', answer: () => answer });
-    const oldHost = (answer: Sent) => host({ marksVerb: 'no', answer: () => answer });
     const cases: Array<[string, ReturnType<typeof host>, Record<string, string>, RegExp]> = [
       ['a preview that is not text', verbHost({ ok: true, messagesRemoved: 1, markers: null, lastVisible: { participant: 'Lena', preview: 42 } }),
         { name: 'undo' }, /\nLast message now visible to the agent — \*\*Lena\*\*: \*\(a preview this server can't read\)\*$/],
       ['a speaker that is not text', verbHost({ ok: true, messagesRemoved: 1, markers: null, lastVisible: { participant: { id: 1 }, role: 7, preview: 'hi' } }),
         { name: 'undo' }, /\nLast message now visible to the agent — \*\*\?\*\*:\n> hi$/],
-      ['hidden refs that are not a list', oldHost({ ok: true, hidden: 2, hiddenRefs: { m1: 'c1' } }),
-        { name: 'hide', marks: 'all' }, /\nMarks: this host doesn't place them, and it gave no list of hidden messages this server can read, so this server placed none\.$/],
-      ['a null ref beside a good one', oldHost({ ok: true, hidden: 2, hiddenRefs: [null, { channelId: 'c1', messageId: 'm2' }] }),
-        { name: 'hide', marks: 'all' }, /\nMarks: this host doesn't place them, so this server reacted 💤 itself on 1 of 2 \(the first failure: the host's reference to a hidden message couldn't be read\)\.$/],
+      ['a hide whose preview is not text', verbHost({ ok: true, hidden: 2, markers: null, lastVisible: { participant: 'Lena', preview: [] } }),
+        { name: 'hide' }, /\nLast message now visible to the agent — \*\*Lena\*\*: \*\(a preview this server can't read\)\*$/],
     ];
     for (const [what, h, { name, ...options }, expected] of cases) {
-      const { server, reactions } = serverWith(h.conn);
+      const { server } = serverWith(h.conn);
       const i = interaction(name!, name === 'hide' ? { message: '111111111111111111', ...options } : options);
       await asAdmin(() => server.handleSlashCommand(i.value));
       const reply = i.out.replies.at(-1) ?? '(no reply)';
       assert.match(reply, name === 'undo' ? /^🗑️ Removed the last \*\*1\*\*/ : /^🙈 Removed \*\*2\*\*/, what);
       assert.match(reply, expected, what);
-      if (what === 'a null ref beside a good one') assert.deepEqual(reactions.map((r) => r.messageId), ['m2']);
     }
   });
 });
@@ -632,31 +579,28 @@ describe('/hide and the marks choice', () => {
     const i = interaction('hide', { message: '111111111111111111', marks: 'all' });
     await asAdmin(() => server.handleSlashCommand(i.value));
     assert.deepEqual(reactions, []);
-    assert.match(i.out.replies.at(-1)!, /Marks: this host reported nothing about 💤 marks\./);
+    assert.match(i.out.replies.at(-1)!, /Marks: this host reported nothing about 💤 marks; `\/marks list` shows whether it scheduled any\./);
   });
 
-  it('on an older host, reacts itself only for `all`, refuses `addressed`, and marks nothing otherwise', async () => {
+  it('on an older host, refuses either marks choice before anything is sent, and hides without marks when none is chosen', async () => {
     const answer = (p: Sent) => (p.command === 'hide' ? { ok: true, hidden: 2, hiddenRefs: hidden } : { ok: true });
-
-    const all = host({ marksVerb: 'no', answer });
-    const a = serverWith(all.conn);
-    const ia = interaction('hide', { message: '111111111111111111', marks: 'all' });
-    await asAdmin(() => a.server.handleSlashCommand(ia.value));
-    assert.equal('marks' in all.commands()[0], false, 'an older host is not sent a choice it cannot read');
-    assert.deepEqual(a.reactions.map((r) => [r.channelId, r.messageId, r.emoji]), [['c1', 'm1', '💤'], ['c1', 'm2', '💤']]);
-    assert.match(ia.out.replies.at(-1)!, /reacted 💤 itself on 2 of 2/);
-
-    const addressed = host({ marksVerb: 'no', answer });
-    const b = serverWith(addressed.conn);
-    const ib = interaction('hide', { message: '111111111111111111', marks: 'addressed' });
-    await asAdmin(() => b.server.handleSlashCommand(ib.value));
-    assert.equal(addressed.commands().length, 0, 'nothing hidden');
-    assert.match(ib.out.replies.at(-1)!, /`marks: addressed` isn't available here/);
-
+    for (const marks of ['all', 'addressed']) {
+      const older = host({ marksVerb: 'no', answer });
+      const { server, reactions } = serverWith(older.conn);
+      const i = interaction('hide', { message: '111111111111111111', marks });
+      await asAdmin(() => server.handleSlashCommand(i.value));
+      assert.equal(older.commands().length, 0, `${marks}: nothing hidden`);
+      assert.deepEqual(reactions, [], marks);
+      assert.equal(i.out.replies.at(-1),
+        "⚠️ Hide not sent: this host can't place awareness marks (no `marks` host command), so a marks choice isn't " +
+        'available here. Upgrade the host (an agent framework with the `marks` host command) to mark hidden messages, ' +
+        'or leave marks out.', marks);
+    }
     const none = host({ marksVerb: 'no', answer });
     const c = serverWith(none.conn);
     const ic = interaction('hide', { message: '111111111111111111' });
     await asAdmin(() => c.server.handleSlashCommand(ic.value));
+    assert.equal(none.commands().length, 1);
     assert.deepEqual(c.reactions, []);
     assert.match(ic.out.replies.at(-1)!, /\nMarks: none\.$/);
   });
@@ -672,26 +616,14 @@ describe('/hide and the marks choice', () => {
     assert.match(i.out.replies.at(-1)!, /\nMarks: none\.$/);
   });
 
-  it("on an older host, still replies when a reaction fails, with the count and the first failure's reason", async () => {
-    const h = host({ marksVerb: 'no', answer: (p) => (p.command === 'hide' ? { ok: true, hidden: 2, hiddenRefs: hidden } : { ok: true }) });
-    const { server, reactions } = serverWith(h.conn, { failReaction: (id) => (id === 'm1' ? new Error('Missing Permissions') : undefined) });
-    const i = interaction('hide', { message: '111111111111111111', marks: 'all' });
-    await asAdmin(() => server.handleSlashCommand(i.value));
-    assert.deepEqual(reactions.map((r) => r.messageId), ['m2']);
-    assert.match(
-      i.out.replies.at(-1)!,
-      /\nMarks: this host doesn't place them, so this server reacted 💤 itself on 1 of 2 \(the first failure: Missing Permissions\)\.$/,
-    );
-  });
-
-  it('on an older host, reacts itself only when the host sent no receipt at all, and shows any it did send', async () => {
+  it('shows any receipt a plain hide brought back, even one it cannot read, and never supplements it', async () => {
     const hiding = (markers: unknown) => host({
       marksVerb: 'no',
       answer: (p) => (p.command === 'hide' ? { ok: true, hidden: 2, hiddenRefs: hidden, markers } : { ok: true }),
     });
     for (const markers of [false, 0, '', {}, 'queued']) {
       const { server, reactions } = serverWith(hiding(markers).conn);
-      const i = interaction('hide', { message: '111111111111111111', marks: 'all' });
+      const i = interaction('hide', { message: '111111111111111111' });
       await asAdmin(() => server.handleSlashCommand(i.value));
       const what = JSON.stringify(markers);
       assert.deepEqual(reactions, [], `${what}: never supplemented`);
@@ -701,15 +633,15 @@ describe('/hide and the marks choice', () => {
     }
     for (const markers of [undefined, null]) {
       const { server, reactions } = serverWith(hiding(markers).conn);
-      const i = interaction('hide', { message: '111111111111111111', marks: 'all' });
+      const i = interaction('hide', { message: '111111111111111111' });
       await asAdmin(() => server.handleSlashCommand(i.value));
-      assert.equal(reactions.length, 2, String(markers));
-      assert.match(i.out.replies.at(-1)!, /reacted 💤 itself on 2 of 2/, String(markers));
+      assert.deepEqual(reactions, [], String(markers));
+      assert.match(i.out.replies.at(-1)!, /\nMarks: none\.$/, String(markers));
     }
   });
 });
 
-// Shapes as agent-framework#250 (dc2928c, unchanged at 763c932b) produces them:
+// Shapes as agent-framework#250 at 15a822b6 produces them (receipts/af250-receipts-probe-15a822b6.txt):
 // DiscordAwarenessBatchView / RetractView, and each action's receipt.
 const batch = (n: number, extra: Partial<Record<string, unknown>> = {}): AwarenessView => ({
   kind: 'batch',
@@ -743,7 +675,7 @@ describe('/marks', () => {
   it('lists the journal newest first, ephemerally, keeping imported evidence', async () => {
     const views = [
       batch(1, { legacy: { entries: 2, lastAddConfirmed: 1, lastRemoveConfirmed: 0, outcomesUnrecorded: 3 } }),
-      batch(2, { status: 'held', held: { reason: 'branch switched while prepared', at: 1760000005000, releaseActions: 2 } }),
+      batch(2, { status: 'discarded', cancelled: { at: 1760000006000, by: 'Admin' } }),
       retractView(1760000009000),
     ];
     const h = host({ marksVerb: 'yes', answer: listing(views) });
@@ -755,15 +687,15 @@ describe('/marks', () => {
     const lines = reply.split('\n');
     assert.match(lines[0]!, /page 1 of 1, 3 entries, newest first/);
     assert.match(lines[1]!, /retract `retract-9f8e.*` → all: removals requested 2, confirmed 4, unknown 1; 1 unresolved/);
-    assert.match(lines[2]!, /batch `batch-0002.*` — held, all, 3 messages \(lena\): adds requested 1, confirmed 2; removals none; held: branch switched/);
+    assert.match(lines[2]!, /batch `batch-0002.*` — discarded, cancelled, all, 3 messages \(lena\): adds requested 1, confirmed 2; removals none$/);
     assert.match(lines[3]!, /batch `batch-0001.*imported history \(3 unrecorded outcomes\)/);
     assert.ok(reply.length <= REPLY_LIMIT);
   });
 
   it('pages a long journal within one reply each, every entry reachable', async () => {
-    const reason = 'x'.repeat(600);
+    const agentName = 'x'.repeat(600);
     const views = [
-      ...Array.from({ length: 13 }, (_, n) => batch(n + 1, { status: 'held', held: { reason, at: 1, releaseActions: 1 } })),
+      ...Array.from({ length: 13 }, (_, n) => batch(n + 1, { agentName })),
       retractView(1),
     ];
     const pages = paginate(views);
@@ -789,8 +721,7 @@ describe('/marks', () => {
 
   it('shows one entry in full by id, cutting a long one visibly with the record attached', async () => {
     const long = batch(5, {
-      status: 'held',
-      held: { reason: 'r'.repeat(2500), at: 1760000005000, releaseActions: 2 },
+      agentName: 'r'.repeat(2500),
       legacy: { entries: 1, lastAddConfirmed: 1, lastRemoveConfirmed: 0, outcomesUnrecorded: 2 },
     });
     const views = [batch(4), long];
@@ -808,7 +739,7 @@ describe('/marks', () => {
     assert.ok(reply.length <= REPLY_LIMIT, `${reply.length} chars`);
     assert.match(reply, /cut to fit one message; the whole answer is attached as JSON/);
     const attached = JSON.parse(i.out.files.at(-1)![0]!.attachment.toString('utf8'));
-    assert.equal(attached[0].held.reason.length, 2500);
+    assert.equal(attached[0].agentName.length, 2500);
     assert.deepEqual(attached[0].legacy, { entries: 1, lastAddConfirmed: 1, lastRemoveConfirmed: 0, outcomesUnrecorded: 2 });
 
     const missing = interaction('marks', { action: 'list', target: 'nope' });
@@ -817,25 +748,41 @@ describe('/marks', () => {
   });
 
   it("renders cancel's receipt, keeping what cancel can't undo", async () => {
-    const receipt = { target: 'batch-1', kind: 'batch', cancelled: 2, heldDropped: 1, inFlight: 1, unknown: 1, confirmed: 3, unresolvedAttempts: 2, legacyOutcomesUnrecorded: 1 };
+    const receipt = { target: 'batch-1', kind: 'batch', cancelled: 2, inFlight: 1, unknown: 1, confirmed: 3, unresolvedAttempts: 2, legacyOutcomesUnrecorded: 1 };
     const h = host({ marksVerb: 'yes', answer: (p) => (p.action === 'cancel' ? { ok: true, awareness: receipt } : { ok: true }) });
     const { server } = serverWith(h.conn);
+    const missing = interaction('marks', { action: 'cancel' });
+    await asAdmin(() => server.handleSlashCommand(missing.value));
+    assert.equal(missing.out.replies.at(-1), '`/marks cancel` needs a target: a batch id or a retract request id.');
+    assert.equal(h.commands().length, 0);
     const i = interaction('marks', { action: 'cancel', target: 'batch-1' });
     await asAdmin(() => server.handleSlashCommand(i.value));
     assert.equal(h.commands()[0]!.target, 'batch-1');
     const reply = i.out.replies.at(-1)!;
-    assert.match(reply, /Cancelled batch `batch-1`: 2 requests will now never be sent, and 1 held release action dropped\./);
+    assert.match(reply, /Cancelled batch `batch-1`: 2 requests will now never be sent\./);
     assert.match(reply, /Cancel removes nothing from Discord: 3 already confirmed on Discord stay as they are; 1 on the wire may still land; 1 with unknown outcome may have landed; 2 unresolved attempts in all; 1 imported attempt with unrecorded outcomes may have landed\./);
     assert.match(reply, /`\/marks retract target:batch-1`/);
   });
 
-  it("renders retract's and release's receipts as requested, not confirmed", async () => {
+  it('says so when a cancel found no request still waiting to be sent, keeping its heading', async () => {
+    // agent-framework#250 journals a first cancel whatever its count: the
+    // batch is cancelled, and retries on the wire or unknown are stopped.
+    const receipt = { target: 'batch-2', kind: 'batch', cancelled: 0, inFlight: 0, unknown: 0, confirmed: 3, unresolvedAttempts: 0, legacyOutcomesUnrecorded: 0 };
+    const h = host({ marksVerb: 'yes', answer: (p) => (p.action === 'cancel' ? { ok: true, awareness: receipt } : { ok: true }) });
+    const { server } = serverWith(h.conn);
+    const i = interaction('marks', { action: 'cancel', target: 'batch-2' });
+    await asAdmin(() => server.handleSlashCommand(i.value));
+    assert.equal(
+      i.out.replies.at(-1),
+      '✅ Cancelled batch `batch-2`: no request was still waiting to be sent.\n' +
+        'Cancel removes nothing from Discord: 3 already confirmed on Discord stay as they are.\n' +
+        'To take marks down, `/marks retract target:batch-2`.',
+    );
+  });
+
+  it("renders retract's receipt as requested, not confirmed", async () => {
     const retract = { requestId: 'r-1', removalsQueued: 4, addsSuperseded: 1, keysWithUnresolvedAdds: 2, unresolvedAddAttempts: 3, keysWithLegacyUncertainty: 1 };
-    const release = { batchId: 'b-1', addsQueued: 2, removalsQueued: 0 };
-    const h = host({
-      marksVerb: 'yes',
-      answer: (p) => (p.action === 'retract' ? { ok: true, awareness: retract } : p.action === 'release' ? { ok: true, awareness: release } : { ok: true }),
-    });
+    const h = host({ marksVerb: 'yes', answer: (p) => (p.action === 'retract' ? { ok: true, awareness: retract } : { ok: true }) });
     const { server } = serverWith(h.conn);
 
     const missing = interaction('marks', { action: 'retract' });
@@ -853,10 +800,6 @@ describe('/marks', () => {
     assert.match(rr, /Retract `r-1`: 4 💤 removals requested — not yet confirmed on Discord; 1 unsent add superseded\./);
     assert.match(rr, /2 messages have earlier add attempts still unresolved \(3 attempts\): such an add may land after its removal\./);
     assert.match(rr, /1 message has imported history with unrecorded outcomes\./);
-
-    const l = interaction('marks', { action: 'release', target: 'b-1' });
-    await asAdmin(() => server.handleSlashCommand(l.value));
-    assert.match(l.out.replies.at(-1)!, /Released held batch `b-1`: 2 adds and 0 removals requested — not yet confirmed on Discord\./);
   });
 
   it('shows a shape it cannot read as sent, bounded, never misread', async () => {
@@ -871,10 +814,21 @@ describe('/marks', () => {
     assert.deepEqual(JSON.parse(i.out.files.at(-1)![0]!.attachment.toString('utf8')), odd);
   });
 
+  it('shows an accepted answer that left out its journal or receipt whole, never as "undefined"', async () => {
+    for (const [action, target, what] of [['list', undefined, '/marks list'], ['cancel', 'b-1', '/marks cancel'], ['retract', 'all', '/marks retract']] as const) {
+      const h = host({ marksVerb: 'yes', answer: (p) => (p.action === action ? { ok: true, note: 'moved' } : { ok: true }) });
+      const { server } = serverWith(h.conn);
+      const i = interaction('marks', target === undefined ? { action } : { action, target });
+      await asAdmin(() => server.handleSlashCommand(i.value));
+      const reply = i.out.replies.at(-1)!;
+      assert.equal(reply, `The host answered ${what} in a shape this server can't read; here it is as sent:\n\`\`\`json\n{"ok":true,"note":"moved"}\n\`\`\``, action);
+    }
+  });
+
   it('shows a journal with an entry it cannot read as sent, listed or opened', async () => {
-    // A hold with no reason: rendering it would have thrown, and the
-    // fire-and-forget command with it.
-    const partial = batch(2, { status: 'held', held: {} });
+    // A cancel stamp with no time: rendering it would have shown "unknown
+    // time" for a field the host does send, so it's shown as sent instead.
+    const partial = batch(2, { cancelled: {} });
     const h = host({ marksVerb: 'yes', answer: listing([batch(1), partial]) });
     const { server } = serverWith(h.conn);
     for (const options of [{ action: 'list' }, { action: 'list', target: partial.id }]) {
@@ -882,7 +836,7 @@ describe('/marks', () => {
       await asAdmin(() => server.handleSlashCommand(i.value));
       const reply = i.out.replies.at(-1)!;
       assert.match(reply, /^The host answered the journal in a shape this server can't read; here it is as sent:\n```json\n/, JSON.stringify(options));
-      assert.match(reply, /"held":\{\}/);
+      assert.match(reply, /"cancelled":\{\}/);
     }
   });
 
@@ -907,7 +861,7 @@ describe('/marks', () => {
 
   it('keeps what an accepted control requested when its reply is refused', async () => {
     const retract = { requestId: 'r-1', removalsQueued: 4, addsSuperseded: 0, keysWithUnresolvedAdds: 0, unresolvedAddAttempts: 0, keysWithLegacyUncertainty: 0 };
-    const cancel = { target: 'b-2', kind: 'batch', cancelled: 3, heldDropped: 0, inFlight: 0, unknown: 0, confirmed: 1, unresolvedAttempts: 0, legacyOutcomesUnrecorded: 0 };
+    const cancel = { target: 'b-2', kind: 'batch', cancelled: 3, inFlight: 0, unknown: 0, confirmed: 1, unresolvedAttempts: 0, legacyOutcomesUnrecorded: 0 };
     const h = host({ marksVerb: 'yes', answer: (p) => (p.action === 'retract' ? { ok: true, awareness: retract } : p.action === 'cancel' ? { ok: true, awareness: cancel } : { ok: true }) });
     const { server } = serverWith(h.conn);
     const r = interaction('marks', { action: 'retract', target: 'b-1' }, { rejectEdits: 1 });
@@ -918,8 +872,27 @@ describe('/marks', () => {
     assert.match(c.out.replies.at(-1)!, /^✅ Cancelled batch `b-2`: 3 requests will never be sent; cancel removes nothing from Discord\. \(The full reply/);
   });
 
+  it("keeps a retract's caveats in its short account, and says when a cancel found nothing still waiting", async () => {
+    const receipts: Array<[string, unknown, string]> = [
+      ['retract', { requestId: 'r-2', removalsQueued: 3, addsSuperseded: 0, keysWithUnresolvedAdds: 1, unresolvedAddAttempts: 2, keysWithLegacyUncertainty: 0 },
+        '✅ Retract `r-2`: 3 removals requested, not yet confirmed on Discord; 1 message has an earlier add still unresolved, which may land after its removal.'],
+      ['retract', { requestId: 'r-3', removalsQueued: 5, addsSuperseded: 1, keysWithUnresolvedAdds: 2, unresolvedAddAttempts: 3, keysWithLegacyUncertainty: 1 },
+        '✅ Retract `r-3`: 5 removals requested, not yet confirmed on Discord; 2 messages have earlier adds still unresolved, which may land ' +
+          'after their removal; 1 message has imported history with unrecorded outcomes.'],
+      ['cancel', { target: 'b-4', kind: 'batch', cancelled: 0, inFlight: 1, unknown: 0, confirmed: 2, unresolvedAttempts: 1, legacyOutcomesUnrecorded: 0 },
+        '✅ Cancelled batch `b-4`: no request was still waiting to be sent; cancel removes nothing from Discord: 1 on the wire may still land.'],
+    ];
+    for (const [action, receipt, short] of receipts) {
+      const h = host({ marksVerb: 'yes', answer: () => ({ ok: true, awareness: receipt }) });
+      const { server } = serverWith(h.conn);
+      const i = interaction('marks', { action, target: 'b-1' }, { rejectEdits: 1 });
+      await asAdmin(() => server.handleSlashCommand(i.value));
+      assert.equal(i.out.replies.at(-1), `${short} (The full reply couldn't be shown: Unknown interaction.)`, short);
+    }
+  });
+
   it("keeps a cancel's limits in its short account: what may still land, or may have landed", async () => {
-    const cancel = { target: 'b-3', kind: 'batch', cancelled: 2, heldDropped: 0, inFlight: 1, unknown: 2, confirmed: 1, unresolvedAttempts: 3, legacyOutcomesUnrecorded: 1 };
+    const cancel = { target: 'b-3', kind: 'batch', cancelled: 2, inFlight: 1, unknown: 2, confirmed: 1, unresolvedAttempts: 3, legacyOutcomesUnrecorded: 1 };
     const h = host({ marksVerb: 'yes', answer: () => ({ ok: true, awareness: cancel }) });
     const { server } = serverWith(h.conn);
     const c = interaction('marks', { action: 'cancel', target: 'b-3' }, { rejectEdits: 1 });
@@ -934,9 +907,9 @@ describe('/marks', () => {
   it("reports the host's refusal with its code, and explains an older host", async () => {
     const busy = host({ marksVerb: 'yes', answer: () => ({ ok: false, error: 'an agent sharing the store is mid-turn', code: 'agent-busy' }) });
     const a = serverWith(busy.conn);
-    const ia = interaction('marks', { action: 'release', target: 'b-1' });
+    const ia = interaction('marks', { action: 'cancel', target: 'b-1' });
     await asAdmin(() => a.server.handleSlashCommand(ia.value));
-    assert.match(ia.out.replies.at(-1)!, /\/marks release failed \(agent-busy\): an agent sharing the store is mid-turn/);
+    assert.match(ia.out.replies.at(-1)!, /\/marks cancel failed \(agent-busy\): an agent sharing the store is mid-turn/);
 
     const old = host({ marksVerb: 'no' });
     const b = serverWith(old.conn);
@@ -955,8 +928,23 @@ describe('rendering', () => {
       describeMarkers({ scope: 'all', unmarked: 0, notRemoved: 0, status: 'queued', queued: 2, batchId: 'b-1' }),
       'Marks: 2 💤 marks requested (all; batch `b-1`) — not yet confirmed on Discord; `/marks list` shows progress.',
     );
+    // agent-framework#250 at 15a822b6: a queued batch whose journal sync failed says so.
+    assert.equal(
+      describeMarkers({ scope: 'all', unmarked: 0, notRemoved: 0, status: 'queued', queued: 2, batchId: 'b-1', error: 'sync failed: EIO' }),
+      'Marks: 2 💤 marks requested (all; batch `b-1`) — not yet confirmed on Discord; `/marks list` shows progress. ' +
+        "The host's journal couldn't be synced after recording them (sync failed: EIO), so an operating system crash or a " +
+        'power failure before its next sync could lose them.',
+    );
     assert.match(describeMarkers({ scope: 'all', unmarked: 0, notRemoved: 2, status: 'not-scheduled', queued: 0, error: 'journal full' }), /not scheduled — journal full\. None will be placed\. \(2 chosen messages not removed, so not marked\)/);
     assert.match(describeMarkers({ scope: 'all', unmarked: 0, notRemoved: 0, status: 'unresolved', queued: 0, batchId: 'b-2', error: 'disk' }), /may still be delivered later/);
+  });
+
+  it("reads a batch's left-unmarked counts as #250 keeps them: a count left out is zero", () => {
+    // agent-framework#250 at 15a822b6 keeps unmarked and notRemoved only when
+    // each isn't zero, and its view carries only what it kept.
+    assert.match(detailText(batch(1, { unmarked: 2 })), /\nLeft unmarked: 2 outside the scope; 0 chosen but not removed\.\n/);
+    assert.match(detailText(batch(1, { notRemoved: 1 })), /\nLeft unmarked: 0 outside the scope; 1 chosen but not removed\.\n/);
+    assert.doesNotMatch(detailText(batch(1)), /Left unmarked/);
   });
 
   it("reads imported history's confirmations as the counts they are, and says what may have landed only when some outcome is unrecorded", () => {
@@ -987,6 +975,7 @@ describe('rendering', () => {
       ['a status this server does not know', { scope: 'all', unmarked: 0, notRemoved: 0, status: 'deferred', queued: 0 }],
       ['queued with no batch', { scope: 'all', unmarked: 0, notRemoved: 0, status: 'queued', queued: 2 }],
       ['queued with no count', { scope: 'all', unmarked: 0, notRemoved: 0, status: 'queued', batchId: 'b-1' }],
+      ['queued with an error that is not text', { scope: 'all', unmarked: 0, notRemoved: 0, status: 'queued', queued: 2, batchId: 'b-1', error: 7 }],
       ['not scheduled with no reason', { scope: 'all', unmarked: 0, notRemoved: 0, status: 'not-scheduled', queued: 0 }],
       ['unresolved with no batch', { scope: 'all', unmarked: 0, notRemoved: 0, status: 'unresolved', queued: 0, error: 'disk' }],
       ['a scope that is no marks choice', { scope: 'everyone', unmarked: 0, notRemoved: 0, status: 'none', queued: 0 }],
@@ -1012,14 +1001,10 @@ describe('rendering', () => {
     assert.ok(isView(later));
     assert.match(renderListPage([later], 1), /— staged, legacy, 3 messages \(lena\): adds requested 1, superseded 2;/);
     const entries: Array<[string, unknown]> = [
-      ['an empty hold', batch(1, { held: {} })],
-      ['a hold whose reason is not text', batch(1, { held: { reason: 7, at: 1, releaseActions: 1 } })],
-      ['a hold with no release-action count', batch(1, { held: { reason: 'r', at: 1 } })],
       ['imported history missing its counts', batch(1, { legacy: { entries: 1 } })],
       ['a count that is not a number', batch(1, { adds: { requested: '3' } })],
       ['removals that are not counts', batch(1, { removals: [] })],
       ['a cancellation with no time', batch(1, { cancelled: { by: 'Admin' } })],
-      ['a release by someone not named in text', batch(1, { released: { at: 1, by: { id: 'u1' } } })],
       ['no creation time', batch(1, { createdAt: undefined })],
       ['no agent', batch(1, { agentName: undefined })],
       ['branches that are not text', batch(1, { sourceBranch: 3 })],
@@ -1028,7 +1013,7 @@ describe('rendering', () => {
       ['a retract with no time', { ...retractView(1), at: 'yesterday' }],
       ['a retract by someone not named in text', { ...retractView(1), by: 7 }],
       ['a retract with no target', { ...retractView(1), target: undefined }],
-      ['an entry of another kind', { ...retractView(1), kind: 'release' }],
+      ['an entry of another kind', { ...retractView(1), kind: 'note' }],
     ];
     for (const [what, entry] of entries) assert.equal(isView(entry), false, what);
   });
@@ -1057,7 +1042,7 @@ describe('registration', () => {
       assert.deepEqual(marks?.choices?.map((c) => c.value), ['none', 'addressed', 'all'], name);
     }
     const marksCommand = registered.find((c) => c.name === 'marks');
-    assert.deepEqual(marksCommand?.options?.find((o) => o.name === 'action')?.choices?.map((c) => c.value), ['list', 'cancel', 'retract', 'release']);
+    assert.deepEqual(marksCommand?.options?.find((o) => o.name === 'action')?.choices?.map((c) => c.value), ['list', 'cancel', 'retract']);
     assert.ok(marksCommand?.options?.some((o) => o.name === 'target'));
     assert.ok(marksCommand?.options?.some((o) => o.name === 'page'));
   });

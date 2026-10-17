@@ -5,8 +5,9 @@
  * command (anima-research/agent-framework#250) places them for an /undo or
  * /hide only when the operator chooses a scope (`addressed` or `all`), keeps
  * a journal of what it asked Discord to do, and returns a `markers` receipt
- * describing what it scheduled. This module turns those answers into the
- * operator's replies and reads the operator's choice from an interaction.
+ * describing what it scheduled. This server places none itself. This module
+ * turns those answers into the operator's replies and reads the operator's
+ * choice from an interaction.
  */
 import type { ChatInputCommandInteraction } from 'discord.js';
 
@@ -40,7 +41,7 @@ export type MarkersReceipt = {
   notRemoved: number;
 } & (
   | { status: 'none'; queued: 0 }
-  | { status: 'queued'; queued: number; batchId: string }
+  | { status: 'queued'; queued: number; batchId: string; error?: string }
   | { status: 'not-scheduled'; queued: 0; error: string }
   | { status: 'unresolved'; queued: 0; batchId: string; error: string }
 );
@@ -61,7 +62,9 @@ export const markersReported = (markers: unknown): boolean => markers !== undefi
  * shown as sent, never described as something else or left out.
  */
 export function describeMarkers(markers: unknown): string {
-  if (!markersReported(markers)) return 'Marks: this host reported nothing about 💤 marks.';
+  if (!markersReported(markers)) {
+    return 'Marks: this host reported nothing about 💤 marks; `/marks list` shows whether it scheduled any.';
+  }
   if (!isMarkersReceipt(markers)) {
     return `Marks: the host's receipt is in a shape this server can't read; here it is as sent:\n${asSent(markers)}`;
   }
@@ -81,7 +84,9 @@ export function describeMarkers(markers: unknown): string {
         : `Marks: none placed — nothing removed fell within "${markers.scope}".${tail}`;
     case 'queued':
       return `Marks: ${plural(markers.queued, '💤 mark')} requested (${markers.scope}; batch \`${markers.batchId}\`) — ` +
-        `not yet confirmed on Discord; \`/marks list\` shows progress.${tail}`;
+        `not yet confirmed on Discord; \`/marks list\` shows progress.${tail}` + (markers.error === undefined ? '' :
+          ` The host's journal couldn't be synced after recording them (${markers.error}), so an operating system crash ` +
+          'or a power failure before its next sync could lose them.');
     case 'not-scheduled':
       return `Marks: not scheduled — ${markers.error}. None will be placed.${tail}`;
     case 'unresolved':
@@ -99,18 +104,20 @@ const SHORT_TEXT_MAX = 100;
  * scheduled and the batch to find it by, never what Discord confirmed.
  */
 export function summarizeMarkers(markers: unknown): string {
-  if (!markersReported(markers)) return 'Marks: the host reported nothing about them.';
+  if (!markersReported(markers)) return 'Marks: the host reported nothing about them; `/marks list` shows whether it scheduled any.';
   if (!isMarkersReceipt(markers)) return "Marks: the host's receipt couldn't be read; `/marks list` shows the journal.";
   const batch = (id: string): string => `batch \`${clip(id, SHORT_TEXT_MAX)}\``;
   switch (markers.status) {
     case 'none':
       return markers.scope === 'none' ? 'Marks: none.' : 'Marks: none placed.';
     case 'queued':
-      return `Marks: ${plural(markers.queued, '💤 mark')} requested (${batch(markers.batchId)}).`;
+      return `Marks: ${plural(markers.queued, '💤 mark')} requested (${batch(markers.batchId)})` +
+        (markers.error === undefined ? '.' : "; the host's journal sync failed after recording them, so an operating system " +
+          'crash or a power failure before its next sync could lose them.');
     case 'not-scheduled':
-      return 'Marks: not scheduled.';
+      return `Marks: not scheduled — ${clip(markers.error, SHORT_TEXT_MAX)}.`;
     case 'unresolved':
-      return `Marks: unresolved (${batch(markers.batchId)}); check \`/marks list\`.`;
+      return `Marks: unresolved — ${clip(markers.error, SHORT_TEXT_MAX)} (${batch(markers.batchId)}); check \`/marks list\`.`;
   }
 }
 
@@ -122,8 +129,8 @@ type Counts = Partial<Record<OpStatus, number>>;
 export interface BatchView {
   kind: 'batch';
   id: string;
-  /** prepared, active, held or discarded at agent-framework#250; shown as the
-   *  host names it, so a state a later host adds still reads. */
+  /** prepared, active or discarded at agent-framework#250; shown as the host
+   *  names it, so a state a later host adds still reads. */
   status: string;
   scope: string;
   agentName: string;
@@ -134,9 +141,7 @@ export interface BatchView {
   refs: number;
   unmarked?: number;
   notRemoved?: number;
-  held?: { reason: string; at: number; releaseActions: number };
   cancelled?: { at: number; by?: string };
-  released?: { at: number; by?: string };
   adds: Counts;
   removals: Counts;
   unresolvedAttempts: number;
@@ -166,7 +171,6 @@ export interface CancelReceipt {
   target: string;
   kind: 'batch' | 'retract';
   cancelled: number;
-  heldDropped: number;
   inFlight: number;
   unknown: number;
   confirmed: number;
@@ -182,13 +186,6 @@ export interface RetractReceipt {
   keysWithUnresolvedAdds: number;
   unresolvedAddAttempts: number;
   keysWithLegacyUncertainty: number;
-}
-
-/** release's receipt (agent-framework's DiscordAwarenessReleaseReceipt). */
-export interface ReleaseReceipt {
-  batchId: string;
-  addsQueued: number;
-  removalsQueued: number;
 }
 
 /** Discord's limit on one reply. */
@@ -235,20 +232,16 @@ const legacyText = (l: NonNullable<BatchView['legacy']>): string =>
   `and ${l.lastRemoveConfirmed} a removal confirmed` +
   (l.outcomesUnrecorded > 0 ? `; ${plural(l.outcomesUnrecorded, 'attempt')} with unrecorded outcomes — any may have landed` : '');
 
-/** A long free-text field (a held reason) in a summary line. */
-const SUMMARY_TEXT_MAX = 80;
-
 /** One line per entry, for the paged list. */
 export function summaryLine(v: AwarenessView): string {
   const unresolved = v.unresolvedAttempts ? `; ${v.unresolvedAttempts} unresolved` : '';
   if (v.kind === 'retract') {
     return `• retract \`${v.id}\` → ${v.target}${v.cancelled ? ' (cancelled)' : ''}: removals ${counts(v.removals)}${unresolved}`;
   }
-  const state = v.cancelled ? `${v.status}, cancelled` : v.released ? `${v.status}, released` : v.status;
-  const held = v.held ? `; held: ${clip(v.held.reason, SUMMARY_TEXT_MAX)}` : '';
+  const state = v.cancelled ? `${v.status}, cancelled` : v.status;
   const legacy = v.legacy ? `; imported history (${plural(v.legacy.outcomesUnrecorded, 'unrecorded outcome')})` : '';
   return `• batch \`${v.id}\` — ${state}, ${v.scope}, ${plural(v.refs, 'message')} (${v.agentName}): ` +
-    `adds ${counts(v.adds)}; removals ${counts(v.removals)}${unresolved}${held}${legacy}`;
+    `adds ${counts(v.adds)}; removals ${counts(v.removals)}${unresolved}${legacy}`;
 }
 
 /** One entry in full (the caller fits it into a reply). */
@@ -262,12 +255,12 @@ export function detailText(v: AwarenessView): string {
   } else {
     lines.push(`**Batch \`${v.id}\`** — ${v.status}; ${v.scope} for ${v.agentName}; ${plural(v.refs, 'message')}; created ${when(v.createdAt)}.`);
     if (v.sourceBranch || v.targetBranch) lines.push(`Branches: ${v.sourceBranch ?? '?'} → ${v.targetBranch ?? '?'}.`);
+    // agent-framework#250 keeps each of these counts only when it isn't zero
+    // (and its view carries only what it kept), so one left out is zero.
     if (isNum(v.unmarked) || isNum(v.notRemoved)) {
       lines.push(`Left unmarked: ${v.unmarked ?? 0} outside the scope; ${v.notRemoved ?? 0} chosen but not removed.`);
     }
-    if (v.held) lines.push(`Held ${when(v.held.at)} (${plural(v.held.releaseActions, 'release action')}): ${v.held.reason}`);
     if (v.cancelled) lines.push(`Cancelled ${when(v.cancelled.at)}${v.cancelled.by ? ` by ${v.cancelled.by}` : ''}.`);
-    if (v.released) lines.push(`Released ${when(v.released.at)}${v.released.by ? ` by ${v.released.by}` : ''}.`);
     lines.push(`Adds: ${counts(v.adds)}. Removals on its messages: ${counts(v.removals)}.`);
     if (v.unresolvedAttempts) lines.push(`${plural(v.unresolvedAttempts, 'request')} on its messages on the wire or with unknown outcome — any may land.`);
     if (v.legacy) {
@@ -338,7 +331,7 @@ const opt = (v: unknown, is: (x: unknown) => boolean): boolean => v === undefine
 const allNums = (o: Record<string, unknown>, keys: string[]): boolean => keys.every((k) => isNum(o[k]));
 /** Operations by status: a status is shown as the host names it, and every count is a number. */
 const isCounts = (v: unknown): boolean => isObj(v) && Object.values(v).every(isNum);
-/** When something was cancelled or released, and by whom if known. */
+/** When something was cancelled, and by whom if known. */
 const isStamp = (v: unknown): boolean => isObj(v) && isNum(v.at) && opt(v.by, isStr);
 
 /**
@@ -355,8 +348,7 @@ export function isView(v: unknown): v is AwarenessView {
   if (v.kind === 'retract') return isStr(v.target) && isNum(v.at) && opt(v.by, isStr);
   return v.kind === 'batch' && isStr(v.status) && isStr(v.scope) && isStr(v.agentName) && isNum(v.createdAt) &&
     isNum(v.refs) && isCounts(v.adds) && opt(v.sourceBranch, isStr) && opt(v.targetBranch, isStr) &&
-    opt(v.unmarked, isNum) && opt(v.notRemoved, isNum) && opt(v.released, isStamp) &&
-    opt(v.held, (h) => isObj(h) && isStr(h.reason) && isNum(h.at) && isNum(h.releaseActions)) &&
+    opt(v.unmarked, isNum) && opt(v.notRemoved, isNum) &&
     opt(v.legacy, (l) => isObj(l) && allNums(l, ['entries', 'lastAddConfirmed', 'lastRemoveConfirmed', 'outcomesUnrecorded']));
 }
 
@@ -371,7 +363,7 @@ export function isMarkersReceipt(m: unknown): m is MarkersReceipt {
     case 'none':
       return true;
     case 'queued':
-      return isNum(m.queued) && isStr(m.batchId);
+      return isNum(m.queued) && isStr(m.batchId) && opt(m.error, isStr);
     case 'not-scheduled':
       return isStr(m.error);
     case 'unresolved':
@@ -383,7 +375,7 @@ export function isMarkersReceipt(m: unknown): m is MarkersReceipt {
 
 export function isCancelReceipt(r: unknown): r is CancelReceipt {
   return isObj(r) && typeof r.target === 'string' && (r.kind === 'batch' || r.kind === 'retract') &&
-    allNums(r, ['cancelled', 'heldDropped', 'inFlight', 'unknown', 'confirmed', 'unresolvedAttempts', 'legacyOutcomesUnrecorded']);
+    allNums(r, ['cancelled', 'inFlight', 'unknown', 'confirmed', 'unresolvedAttempts', 'legacyOutcomesUnrecorded']);
 }
 
 export function isRetractReceipt(r: unknown): r is RetractReceipt {
@@ -391,15 +383,14 @@ export function isRetractReceipt(r: unknown): r is RetractReceipt {
     allNums(r, ['removalsQueued', 'addsSuperseded', 'keysWithUnresolvedAdds', 'unresolvedAddAttempts', 'keysWithLegacyUncertainty']);
 }
 
-export function isReleaseReceipt(r: unknown): r is ReleaseReceipt {
-  return isObj(r) && typeof r.batchId === 'string' && allNums(r, ['addsQueued', 'removalsQueued']);
-}
+/** What a cancel stopped: its unsent requests, or none still waiting. */
+const stopped = (cancelled: number, fate: string): string =>
+  cancelled === 0 ? 'no request was still waiting to be sent' : `${plural(cancelled, 'request')} ${fate}`;
 
 /** cancel's reply: what will never be sent, and what cancel can't undo. */
 export function describeCancel(r: CancelReceipt): string {
   const what = r.kind === 'batch' ? `batch \`${r.target}\`` : `retract \`${r.target}\``;
-  const held = r.heldDropped ? `, and ${plural(r.heldDropped, 'held release action')} dropped` : '';
-  const lines = [`✅ Cancelled ${what}: ${plural(r.cancelled, 'request')} will now never be sent${held}.`];
+  const lines = [`✅ Cancelled ${what}: ${stopped(r.cancelled, 'will now never be sent')}.`];
   const limits: string[] = [];
   if (r.confirmed) limits.push(`${r.confirmed} already confirmed on Discord ${r.confirmed === 1 ? 'stays' : 'stay'} as ${r.confirmed === 1 ? 'it is' : 'they are'}`);
   if (r.inFlight) limits.push(`${r.inFlight} on the wire may still land`);
@@ -428,12 +419,6 @@ export function describeRetract(r: RetractReceipt): string {
   }
   lines.push(`\`/marks list target:${r.requestId}\` shows progress; \`/marks cancel target:${r.requestId}\` stops what hasn't been sent.`);
   return lines.join('\n');
-}
-
-/** release's reply: what the release queued. */
-export function describeRelease(r: ReleaseReceipt): string {
-  return `✅ Released held batch \`${r.batchId}\`: ${plural(r.addsQueued, 'add')} and ${plural(r.removalsQueued, 'removal')} ` +
-    `requested — not yet confirmed on Discord. \`/marks list target:${r.batchId}\` shows progress.`;
 }
 
 /** A reply too long for one message: cut visibly, with the whole answer attached. */
@@ -474,14 +459,26 @@ export function summarizeControl(action: string, target: string | undefined, ans
         ? [`${plural(answer.legacyOutcomesUnrecorded, 'imported attempt')} with unrecorded outcomes may have landed`]
         : []),
     ];
-    return `✅ Cancelled ${answer.kind} \`${answer.target}\`: ${plural(answer.cancelled, 'request')} will never be sent; ` +
+    return `✅ Cancelled ${answer.kind} \`${answer.target}\`: ${stopped(answer.cancelled, 'will never be sent')}; ` +
       `cancel removes nothing from Discord${mayLand.length ? `: ${mayLand.join('; ')}` : ''}.`;
   }
   if (action === 'retract' && isRetractReceipt(answer)) {
-    return `✅ Retract \`${answer.requestId}\`: ${plural(answer.removalsQueued, 'removal')} requested, not yet confirmed on Discord.`;
-  }
-  if (action === 'release' && isReleaseReceipt(answer)) {
-    return `✅ Released \`${answer.batchId}\`: ${plural(answer.addsQueued, 'add')} and ${plural(answer.removalsQueued, 'removal')} requested, not yet confirmed on Discord.`;
+    // Like cancel's, it keeps what may still change Discord after it: an
+    // earlier add that may land after its removal, and imported history
+    // whose outcomes weren't recorded.
+    const after = [
+      ...(answer.keysWithUnresolvedAdds
+        ? [answer.keysWithUnresolvedAdds === 1
+          ? '1 message has an earlier add still unresolved, which may land after its removal'
+          : `${answer.keysWithUnresolvedAdds} messages have earlier adds still unresolved, which may land after their removal`]
+        : []),
+      ...(answer.keysWithLegacyUncertainty
+        ? [`${plural(answer.keysWithLegacyUncertainty, 'message')} ${answer.keysWithLegacyUncertainty === 1 ? 'has' : 'have'} ` +
+          'imported history with unrecorded outcomes']
+        : []),
+    ];
+    return `✅ Retract \`${answer.requestId}\`: ${plural(answer.removalsQueued, 'removal')} requested, not yet confirmed on Discord` +
+      `${after.length ? `; ${after.join('; ')}` : ''}.`;
   }
   return `✅ The host accepted /marks ${action}${target ? ` \`${target}\`` : ''} (its receipt couldn't be read).`;
 }
@@ -491,16 +488,21 @@ export function summarizeControl(action: string, target: string | undefined, ans
  * Without `error`, it's the short account kept when the reply can't be shown.
  */
 export function controlOutcomeUnknown(action: string, target: string | undefined, error?: string): string {
-  const effect = action === 'cancel'
-    ? 'already have cancelled it'
-    : action === 'retract'
-      ? 'already have queued the removals'
-      : 'already have queued the release';
+  const effect = action === 'cancel' ? 'already have cancelled it' : 'already have queued the removals';
   return `⚠️ /marks ${action} outcome unknown${error ? ` (${error})` : ''}: the host may ${effect}. ${controlCheck(target)}`;
 }
 
 const controlCheck = (target: string | undefined): string =>
   `Check ${target && target !== 'all' ? `\`/marks list target:${target}\`` : '`/marks list`'} before trying again.`;
+
+/**
+ * After a probe whose request failed: what can make running the command
+ * again work. agent-framework refuses every host command from a server its
+ * config doesn't allow (`allowHostCommands`, deny by default), and the
+ * reason shown names it then; a timeout or a restarting host can clear.
+ */
+export const PROBE_AGAIN = 'Running it again can work after a timeout, or once the host is back if it was restarting. ' +
+  'If the host refuses host commands, whoever runs it has to allow them for this server (`allowHostCommands`).';
 
 /** Before retrying an /undo or /hide that may have been applied: the agent's
  *  context, and, when marks were chosen, the journal for a batch it scheduled. */
