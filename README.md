@@ -12,9 +12,11 @@ In the Connectome stack, [connectome-host](https://github.com/anima-research/con
 - **Attachments.** Images arrive inline, with still images scaled down to at most 1568 pixels on their longest side. Text files are inlined up to a size limit, 5 KiB by default. Other files, and images too large to inline, arrive as a note with the file's name, size and URL.
 - **Catch-up after downtime.** With `DISCORD_WATERMARK_FILE` set, discord-mcpl saves a catch-up position for each channel it has delivered from, which is the newest message it has delivered or scanned there. After the first host connects, it reads up to `DISCORD_CATCHUP_LIMIT` messages after each saved position and delivers those the current filters admit. In DMs and open channels that's all of them, and in other channels it's each mention of the bot with up to seven messages on either side.
 - **Filters.** Environment variables or a JSON filters file choose which Discord servers, channels and DM senders the agent hears from. Edits to the file take effect within seconds, and with the file configured, the agent can change the server and DM lists with `filters_update`. With no filters set, the agent hears from every server the bot is in and from anyone who DMs it.
-- **Admin commands.** Discord users listed in `DISCORD_ADMIN_USERS` can run four slash commands. Each asks the host to act through a `host/command` request. agent-framework carries it out only for a server whose configuration sets `allowHostCommands: true`, and refuses it otherwise.
-  - `/undo [messages]` removes the last messages from the agent's context (1 by default, at most 50).
-  - `/hide message [to]` removes a message, or the range from it through `to`, from the agent's context. Both take a message link or ID.
+- **Admin commands.** Discord users listed in `DISCORD_ADMIN_USERS` can run five slash commands. Each asks the host to act through a `host/command` request. agent-framework carries it out only for a server whose configuration sets `allowHostCommands: true`, and refuses it otherwise.
+  - `/undo [messages] [marks]` removes the last messages from the agent's context (1 by default, at most 50).
+  - `/hide message [to] [marks]` removes a message, or the range from it through `to`, from the agent's context. Both take a message link or ID.
+  - `marks`, on either command, chooses which removed messages get a 💤 awareness mark: `none`, the default, `addressed`, those that addressed the agent, or `all`. It needs a host whose agent framework has the `marks` host command (anima-research/agent-framework#250). On an older host, `/undo` is refused, and so is a `/hide` that chooses marks.
+  - `/marks list [target] [page]` shows the host's journal of the marks it scheduled, `/marks cancel target` stops what it hasn't sent, and `/marks retract target` takes marks down. It needs the same host.
   - `/nudge` runs the agent on its current context, with no new event.
   - `/unstick [max]` rewinds the turns behind a refusal and runs the agent again until the model stops refusing, at most `max` times.
 - **Voice.** Optionally, discord-mcpl joins a voice channel and speaks the agent's replies through ElevenLabs as the host streams them. It waits for silence before it speaks, stops when a person talks over it, and tells the agent what went unheard. It doesn't transcribe speech.
@@ -154,7 +156,7 @@ discord-mcpl reads the leading digits of `DISCORD_BACKSCROLL_LIMIT` and `DISCORD
 
 | Variable | What it does | When unset |
 |---|---|---|
-| `DISCORD_ADMIN_USERS` | Comma-separated IDs of the users who may run `/undo`, `/hide`, `/nudge` and `/unstick`. | Nobody may. |
+| `DISCORD_ADMIN_USERS` | Comma-separated IDs of the users who may run `/undo`, `/hide`, `/marks`, `/nudge` and `/unstick`. | Nobody may. |
 
 ### Reaction suppression
 

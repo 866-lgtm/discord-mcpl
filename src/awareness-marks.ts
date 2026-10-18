@@ -232,7 +232,7 @@ export function summaryLine(v: AwarenessView): string {
     return `• retract \`${v.id}\` → ${v.target}${v.cancelled ? ' (cancelled)' : ''}: removals ${counts(v.removals)}${unresolved}`;
   }
   const state = v.cancelled ? `${v.status}, cancelled` : v.status;
-  const legacy = isNum(v.legacyAdded) ? `; 0.22.x recorded ${v.legacyAdded} added` : '';
+  const legacy = isNum(v.legacyAdded) ? `; 0.22.x recorded ${plural(v.legacyAdded, 'mark')} as added` : '';
   return `• batch \`${v.id}\` — ${state}, ${v.scope}, ${plural(v.refs, 'message')} (${v.agentName}): ` +
     `adds ${counts(v.adds)}; removals ${counts(v.removals)}${unresolved}${legacy}`;
 }
@@ -257,7 +257,8 @@ export function detailText(v: AwarenessView): string {
     lines.push(`Adds: ${counts(v.adds)}. Removals on its messages: ${counts(v.removals)}.`);
     if (v.unresolvedAttempts) lines.push(`${plural(v.unresolvedAttempts, 'request')} on its messages on the wire or with unknown outcome — any may land.`);
     if (isNum(v.legacyAdded)) {
-      lines.push(`Imported from agent-framework 0.22.x, which recorded ${plural(v.legacyAdded, 'mark')} on these messages as added.`);
+      lines.push(`Imported from agent-framework 0.22.x, which recorded ${plural(v.legacyAdded, 'mark')} on these messages as added. ` +
+        `Marks it placed may still be on Discord: \`/marks retract target:${v.id}\` takes them down.`);
     }
   }
   return lines.join('\n');
@@ -389,9 +390,9 @@ export function describeCancel(r: CancelReceipt): string {
   if (r.confirmed) limits.push(`${r.confirmed} already confirmed on Discord ${r.confirmed === 1 ? 'stays' : 'stay'} as ${r.confirmed === 1 ? 'it is' : 'they are'}`);
   if (r.unresolvedAttempts) limits.push(mayLand(r.unresolvedAttempts));
   lines.push(`Cancel removes nothing from Discord${limits.length ? `: ${limits.join('; ')}.` : '.'}`);
-  if (r.kind === 'batch' && (r.confirmed || r.unresolvedAttempts)) {
-    lines.push(`To take marks down, \`/marks retract target:${r.target}\`.`);
-  }
+  // Every batch's: its receipt can't see marks an import brought, or marks
+  // another batch placed on the same messages, which a retract takes off too.
+  if (r.kind === 'batch') lines.push(`If any of its marks are on Discord, \`/marks retract target:${r.target}\` takes them down.`);
   return lines.join('\n');
 }
 

@@ -374,6 +374,8 @@ describe('replies stay within one message, and never misreport an applied surger
         "Marks: 3 💤 marks requested (batch `b-9`); the host's journal sync failed after recording them, so an operating system crash " +
         'or a power failure before its next sync could lose them.'],
       [{ scope: 'all', unmarked: 0, notRemoved: 0, status: 'unresolved', queued: 0, batchId: 'b-8', error: 'disk' }, 'Marks: unresolved — disk (batch `b-8`); check `/marks list`.'],
+      [{ scope: 'all', unmarked: 0, notRemoved: 0, status: 'unresolved', queued: 0, batchId: 'b-8', error: 'u'.repeat(300) },
+        `Marks: unresolved — ${'u'.repeat(99)}… (batch \`b-8\`); check \`/marks list\`.`],
       [{ scope: 'all', unmarked: 0, notRemoved: 0, status: 'not-scheduled', queued: 0, error: 'journal full' }, 'Marks: not scheduled — journal full.'],
       [{ scope: 'all', unmarked: 0, notRemoved: 0, status: 'not-scheduled', queued: 0, error: 'e'.repeat(300) }, `Marks: not scheduled — ${'e'.repeat(99)}….`],
       [{ scope: 'all', unmarked: 2, notRemoved: 0, status: 'none', queued: 0 }, 'Marks: none placed.'],
@@ -754,7 +756,7 @@ describe('/marks', () => {
     assert.match(lines[0]!, /page 1 of 1, 3 entries, newest first/);
     assert.match(lines[1]!, /retract `retract-9f8e.*` → all: removals requested 2, confirmed 4, unknown 1; 1 unresolved/);
     assert.match(lines[2]!, /batch `batch-0002.*` — discarded, cancelled, all, 3 messages \(lena\): adds requested 1, confirmed 2; removals none$/);
-    assert.match(lines[3]!, /batch `batch-0001.*` — active, legacy, 3 messages \(lena\): adds none; removals none; 0\.22\.x recorded 1 added$/);
+    assert.match(lines[3]!, /batch `batch-0001.*` — active, legacy, 3 messages \(lena\): adds none; removals none; 0\.22\.x recorded 1 mark as added$/);
     assert.ok(reply.length <= REPLY_LIMIT);
   });
 
@@ -827,8 +829,32 @@ describe('/marks', () => {
     const reply = i.out.replies.at(-1)!;
     assert.match(reply, /Cancelled batch `batch-1`: 2 requests will now never be sent\./);
     assert.match(reply, /\nCancel removes nothing from Discord: 2 requests on the wire or with unknown outcome may land\.\n/);
-    // Nothing confirmed yet, but what may land is reason enough to retract.
-    assert.match(reply, /\nTo take marks down, `\/marks retract target:batch-1`\.$/);
+    assert.match(reply, /\nIf any of its marks are on Discord, `\/marks retract target:batch-1` takes them down\.$/);
+  });
+
+  it("points every batch cancel to retract, an imported batch's all-zero receipt included, and never a retract's cancel", async () => {
+    // An imported batch has no requests of its own, so its receipt counts
+    // nothing, though marks 0.22.x placed may be on its messages.
+    const imported = { target: 'dd34b043', kind: 'batch', cancelled: 0, confirmed: 0, unresolvedAttempts: 0 };
+    // A retract's cancel: retract takes a batch id or all, never a retract's.
+    const retractCancel = { target: 'r-5', kind: 'retract', cancelled: 1, confirmed: 2, unresolvedAttempts: 3 };
+    const replyTo = async (receipt: { target: string }) => {
+      const h = host({ marksVerb: 'yes', answer: (p) => (p.action === 'cancel' ? { ok: true, awareness: receipt } : { ok: true }) });
+      const { server } = serverWith(h.conn);
+      const i = interaction('marks', { action: 'cancel', target: receipt.target });
+      await asAdmin(() => server.handleSlashCommand(i.value));
+      return i.out.replies.at(-1)!;
+    };
+    assert.equal(
+      await replyTo(imported),
+      '✅ Cancelled batch `dd34b043`: no request was still waiting to be sent.\nCancel removes nothing from Discord.\n' +
+        'If any of its marks are on Discord, `/marks retract target:dd34b043` takes them down.',
+    );
+    assert.equal(
+      await replyTo(retractCancel),
+      '✅ Cancelled retract `r-5`: 1 request will now never be sent.\n' +
+        'Cancel removes nothing from Discord: 2 already confirmed on Discord stay as they are; 3 requests on the wire or with unknown outcome may land.',
+    );
   });
 
   it('says so when a cancel found no request still waiting to be sent, keeping its heading', async () => {
@@ -843,7 +869,7 @@ describe('/marks', () => {
       i.out.replies.at(-1),
       '✅ Cancelled batch `batch-2`: no request was still waiting to be sent.\n' +
         'Cancel removes nothing from Discord: 3 already confirmed on Discord stay as they are.\n' +
-        'To take marks down, `/marks retract target:batch-2`.',
+        'If any of its marks are on Discord, `/marks retract target:batch-2` takes them down.',
     );
   });
 
@@ -918,7 +944,7 @@ describe('/marks', () => {
       await replyTo({ action: 'cancel', target: a }),
       `✅ Cancelled batch \`${a}\`: 1 request will now never be sent.\n` +
         'Cancel removes nothing from Discord: 1 already confirmed on Discord stays as it is; 1 request on the wire or with unknown ' +
-        `outcome may land.\nTo take marks down, \`/marks retract target:${a}\`.`,
+        `outcome may land.\nIf any of its marks are on Discord, \`/marks retract target:${a}\` takes them down.`,
     );
     const r = AF250.retract.requestId;
     assert.equal(
@@ -938,11 +964,11 @@ describe('/marks', () => {
         `\`/marks list target:${ri}\` shows progress; \`/marks cancel target:${ri}\` stops what hasn't been sent.`,
     );
     const list = await replyTo({ action: 'list' });
-    assert.match(list, /\n• batch `dd34b043` — active, legacy, 3 messages \(resident\): adds none; removals requested 6; 0\.22\.x recorded 1 added\n/);
-    assert.match(list, /\n• batch `pending-batch` — active, legacy, 1 message \(resident\): adds none; removals requested 1; 0\.22\.x recorded 0 added\n/);
+    assert.match(list, /\n• batch `dd34b043` — active, legacy, 3 messages \(resident\): adds none; removals requested 6; 0\.22\.x recorded 1 mark as added\n/);
+    assert.match(list, /\n• batch `pending-batch` — active, legacy, 1 message \(resident\): adds none; removals requested 1; 0\.22\.x recorded 0 marks as added\n/);
     assert.match(
       await replyTo({ action: 'list', target: 'dd34b043' }),
-      /\nAdds: none\. Removals on its messages: requested 6\.\nImported from agent-framework 0\.22\.x, which recorded 1 mark on these messages as added\.$/,
+      /\nAdds: none\. Removals on its messages: requested 6\.\nImported from agent-framework 0\.22\.x, which recorded 1 mark on these messages as added\. Marks it placed may still be on Discord: `\/marks retract target:dd34b043` takes them down\.$/,
     );
   });
 
@@ -1082,11 +1108,14 @@ describe('rendering', () => {
 
   it('says how many marks 0.22.x recorded as added for an imported batch, none included, and nothing for a journal batch', () => {
     const imported = (legacyAdded: number) => detailText(batch(1, { scope: 'legacy', legacyAdded }));
-    assert.match(imported(2), /\nImported from agent-framework 0\.22\.x, which recorded 2 marks on these messages as added\.$/);
-    assert.match(imported(1), /\nImported from agent-framework 0\.22\.x, which recorded 1 mark on these messages as added\.$/);
-    assert.match(imported(0), /\nImported from agent-framework 0\.22\.x, which recorded 0 marks on these messages as added\.$/);
+    const id = batch(1).id;
+    const takeDown = ` Marks it placed may still be on Discord: \`/marks retract target:${id}\` takes them down.`;
+    assert.ok(imported(2).endsWith(`\nImported from agent-framework 0.22.x, which recorded 2 marks on these messages as added.${takeDown}`));
+    assert.ok(imported(1).endsWith(`\nImported from agent-framework 0.22.x, which recorded 1 mark on these messages as added.${takeDown}`));
+    assert.ok(imported(0).endsWith(`\nImported from agent-framework 0.22.x, which recorded 0 marks on these messages as added.${takeDown}`));
     assert.doesNotMatch(detailText(batch(1)), /Imported|0\.22\.x/);
-    assert.match(summaryLine(batch(1, { scope: 'legacy', legacyAdded: 0 })), /; 0\.22\.x recorded 0 added$/);
+    assert.match(summaryLine(batch(1, { scope: 'legacy', legacyAdded: 0 })), /; 0\.22\.x recorded 0 marks as added$/);
+    assert.match(summaryLine(batch(1, { scope: 'legacy', legacyAdded: 1 })), /; 0\.22\.x recorded 1 mark as added$/);
     assert.doesNotMatch(summaryLine(batch(1)), /0\.22\.x/);
   });
 
