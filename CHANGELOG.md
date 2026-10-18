@@ -118,7 +118,6 @@ in the git log and PR descriptions.
   as a DM with "undefined". A file this process can't read is refused before
   any part of the message is sent: it failed at send time, after the parts
   before it had posted.
-
 - **A filters change re-derives the registered labels.** Names resolve only
   among the channels the filters admit, and a `#name (server)` label is kept
   only while its name resolves back to its channel. A change that admitted
@@ -387,6 +386,71 @@ in the git log and PR descriptions.
   automatic DM notice's failure, in the operator log, now names the
   channel's kind, or says that this version can't handle it, where it said
   `not found or not a text channel`.
+- **A message the REST client sends again no longer posts twice.** The REST
+  client sends a request again after a 5xx, a timeout or a reset connection,
+  so a message whose first attempt posted, and whose answer was lost, could
+  post a second copy. Each message sent by `send_message`, `reply_message`,
+  `send_dm` or a host's `channels/publish`, and each part of one sent in
+  parts, now carries a nonce of its own, which Discord enforces: it answers
+  a repeat sent within a few minutes with the message it already made.
+- **A message sent in parts is no longer hard-cut inside a character.** A
+  message longer than 1,900 UTF-16 code units is sent in parts, each cut at
+  a line break or a space late enough in its first 1,900 units, or else
+  hard, at the last character boundary at or before 1,900 units, so the
+  character begins the next part. The hard cut used to fall at 1,900 itself,
+  which could be inside a character: between the two halves of one outside
+  the Basic Multilingual Plane, such as most emoji, or between the code
+  points of what a reader sees as one character, such as an emoji's ZWJ
+  sequence, a flag's two regional indicators, or a letter and its combining
+  marks. A single character longer than 1,900 units is still cut inside,
+  never between the halves of a surrogate pair.
+- **Missing Permissions and a refused DM are explained, and a send tool
+  whose message fails says what posted.** A tool's error for Discord's
+  Missing Permissions (50013) now says that Discord refused the request
+  because this bot lacks a permission it needs, in the channel or server the
+  call named, and that calling again will be refused the same way until
+  someone who manages the server's permissions grants it. When the refused
+  request was a message post, it names what Discord documents a post needs:
+  Send Messages (Send Messages in Threads, in a thread); Read Message History
+  too when the part refused was a reply's first, which carries the reply;
+  and Attach Files too when the part refused carried files, saying that the
+  text alone may go through if Attach Files is all that's missing. Discord
+  doesn't say which of the permissions named is missing, so a refusal naming
+  more than one speaks of granting what's missing. Another request's refusal
+  names no permission, since which one it needs isn't known there. A DM
+  Discord won't deliver says so, naming the recipient when the call names
+  them, with each cause it may have and who can change it: 50278 is that the
+  recipient shares no server with this bot, which changes when they join one
+  this bot is in or this bot is added to one they're in; 50007 may be that,
+  or the recipient's DM setting or a block, which only they can change. A
+  message longer than 1,900 UTF-16 code units is sent in parts, with any
+  files on the last. When a part of a message sent in parts fails, the error
+  of `send_message`, `reply_message` or `send_dm` now says which parts posted,
+  with their message ids; whether Discord refused the part that failed or
+  its outcome is unknown (a 5xx, a timeout or a lost connection); where the
+  rest begins in the text as sent, by its first words, if that part didn't
+  post and, when its outcome is unknown, if it did; and that sending the
+  whole message again could post parts twice. When Discord refused the part,
+  it says to send only the rest when sending again, unless that part carried
+  the message's files, which may be what Discord refused; there, the Missing
+  Permissions explanation says the text may go through without them.
+  When the outcome is unknown, it says to check the channel's latest
+  messages first where `fetch_history` would show them: with its feature set
+  on, the channel filters admitting the channel, the channel's history cap
+  (`DISCORD_BACKSCROLL_CHANNELS`) above 0, and this bot holding Read Message
+  History there, without which Discord shows no messages. Otherwise
+  it says that this can't be checked from here, what sending again and not
+  sending each risk, and that someone who can see the channel can tell. A
+  message sent in one part whose outcome is unknown says the same. A first
+  part that Discord refused says that none of the message posted; a message
+  sent in one part that Discord refused gets no such note, since Discord's
+  refusal means it didn't make the message, and the error is that refusal.
+  After parts posted, the Missing Permissions explanation says that sending
+  what didn't post will be refused, rather than calling again, or, when the
+  part refused carried the files, that the permission missing is likely
+  Attach Files and the rest of the text may go through without them. A
+  host's `channels/publish` gets the nonces and the cut above, and its
+  errors are unchanged.
 
 ## 0.2.0 — 2026-10-13
 
