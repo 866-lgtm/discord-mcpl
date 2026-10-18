@@ -1119,6 +1119,45 @@ export class DiscordAdapter {
     return this.isStale(thread.parentId) ? thread.parentId : null;
   }
 
+  /** The catch-up's lookup of a thread's channel when it's stale, before
+   *  the filters decide on the thread's missed messages, as a live event's
+   *  is (staleParentOf), in a guild the filters admit. A lookup Discord
+   *  answers with Unknown Channel reports the channel deleted; one that
+   *  fails otherwise is logged and leaves the channel stale (lookUpChannel). */
+  async lookUpStaleParent(channelId: string): Promise<void> {
+    const thread = this.client.channels.cache.get(channelId) as { guildId?: string | null } | undefined;
+    const guildId = thread?.guildId ?? null;
+    const staleParent = guildId && this.guildAdmitted(guildId) ? this.staleParentOf(thread) : null;
+    if (guildId && staleParent) await this.lookUpChannel(guildId, staleParent);
+  }
+
+  /** What the channel filters' answer for a channel rests on that the cache
+   *  doesn't know or hold current (channelAllowed), in words for the
+   *  catch-up's held line, or null when the answer rests on current facts.
+   *  For a thread, that's its channel, whose category can admit it: not
+   *  known by id, or stale. The thread's own stale mark doesn't count, since
+   *  Discord doesn't move a thread to another channel. The server's
+   *  threadAdmissionKnown reads a thread's channel's mark the same way, but
+   *  counts a thread without a channel id as known, where the catch-up's
+   *  answer for one rests on no channel at all. A thread's channel the cache
+   *  doesn't hold counts as known: channelAllowed excludes through it, as
+   *  the live paths do, and holding the thread back would hold it at every
+   *  start for as long as the cache lacks it. For any other channel, it's
+   *  the channel itself, while it's stale, since a stale channel's category
+   *  may no longer be its own. That includes a channel the cache no longer
+   *  holds, which something removed during the catch-up, such as a deletion,
+   *  which also drops its watermark. */
+  ingressFactsNotCurrent(channelId: string): string | null {
+    const channel = this.client.channels.cache.get(channelId) as
+      | { isThread?: () => boolean; parentId?: string | null }
+      | undefined;
+    if (channel?.isThread?.()) {
+      if (channel.parentId == null) return "its channel isn't known";
+      return this.isStale(channel.parentId) ? `its channel ${channel.parentId} is still stale after its lookup` : null;
+    }
+    return this.isStale(channelId) ? "it's still stale after its lookup" : null;
+  }
+
   /** Whether the guild filter (guildIds) admits a guild. */
   private guildAdmitted(guildId: string): boolean {
     return !this.guildIds?.length || this.guildIds.includes(guildId);
