@@ -107,6 +107,26 @@ in the git log and PR descriptions.
     what to send instead. The count check names the count, and each file's
     check names the file by its place in the list or by its path as read on
     the machine running discord-mcpl.
+- **Built with TypeScript 7.** The `typescript` dev dependency is now
+  `^7.0.2`, the native compiler, in place of 5.9.3. Built from the same
+  tree, the JavaScript is byte-identical to 5.9.3's, in `dist/src` and
+  `dist/test` alike. Two declarations print their string-literal types with
+  single quotes, the same types: `TOOL_CLASS_VOCABULARY` in
+  `tool-classes.d.ts` and `PlaybackFailure` in `voice.d.ts`. TypeScript
+  5.9.3 and 5.0.4 read the new declarations without errors, with
+  `skipLibCheck` off. Source maps differ in their `mappings` only, which
+  reaches only tools that read them, such as a debugger or Node's
+  `--enable-source-maps`: a position can resolve to another column or to
+  none, and go-to-definition can land on another line. Without that flag,
+  Node's stack traces cite the JavaScript, which is unchanged.
+- **Building from a clone needs TypeScript 7's native binary.** `tsc` now
+  comes from one of 20 per-platform packages that npm installs as optional
+  dependencies, so an install that leaves out optional dependencies, or a
+  platform with no package, such as 32-bit x86 or Android, can't build.
+  TypeScript 7 ships no `tsserver`, so an editor set to use the workspace's
+  TypeScript finds no language server there. `tsconfig.json` now names the
+  Node types (`"types": ["node"]`), which TypeScript 7 no longer includes
+  on its own.
 
 ### Fixed
 
