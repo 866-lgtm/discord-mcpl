@@ -657,6 +657,8 @@ describe('DiscordMcplServer', () => {
     (server as unknown as { handleChannelClose: () => never }).handleChannelClose = () => {
       throw undefined;
     };
+    // What the server answers with, as it hands it to its connection.
+    const sendError = t.mock.method(serverConn, 'sendError');
     const serverPromise = server.serve(serverConn);
     let refusal: unknown;
     let answered = false;
@@ -674,8 +676,7 @@ describe('DiscordMcplServer', () => {
 
     const { code, message } = refusal as { code?: number; message?: string };
     assert.equal(code, -32603, `answered with an internal error: ${String(message)}`);
-    // mcpl-core's RpcError prefixes the code to the server's message.
-    assert.match(String(message), /-32603: undefined$/, 'the thrown value as text');
+    assert.deepEqual(sendError.mock.calls.map((call) => call.arguments.slice(1)), [[-32603, 'undefined']], 'the thrown value as text');
     assert.equal(answered, true, 'the next request was answered');
   });
 
@@ -945,6 +946,8 @@ describe('DiscordMcplServer', () => {
     (server as unknown as { handleChannelClose: () => never }).handleChannelClose = () => {
       throw new Error('');
     };
+    // What the server answers with, as it hands it to its connection.
+    const sendError = t.mock.method(serverConn, 'sendError');
     const serverPromise = server.serve(serverConn);
     let refusal: unknown;
     try {
@@ -958,10 +961,9 @@ describe('DiscordMcplServer', () => {
       await serverPromise;
     }
 
-    const { code, message } = refusal as { code?: number; message?: string };
+    const { code } = refusal as { code?: number };
     assert.equal(code, -32603);
-    // mcpl-core's RpcError prefixes the code to the server's message.
-    assert.match(String(message), /-32603: Error$/, 'an empty message falls back to the value as text');
+    assert.deepEqual(sendError.mock.calls.map((call) => call.arguments.slice(1)), [[-32603, 'Error']], 'an empty message falls back to the value as text');
   });
 
   it('tools/list returns tool definitions', async () => {
