@@ -16,6 +16,7 @@ import {
   ChannelType,
   MessageType,
   AttachmentBuilder,
+  SnowflakeUtil,
   type Message,
   type PartialMessage,
   type Channel,
@@ -31,8 +32,8 @@ import {
   type ApplicationCommandDataResolvable,
   type GatewayThreadListSyncDispatchData,
 } from 'discord.js';
-import { existsSync, statSync } from 'node:fs';
-import { basename } from 'node:path';
+import { accessSync, constants as fsConstants, statSync } from 'node:fs';
+import { basename, resolve as resolvePath } from 'node:path';
 import { dbg } from './debug-log.js';
 
 import {
@@ -40,8 +41,10 @@ import {
   formatChannelLabel,
   isNameAddressableKind,
   isSnowflake,
+  isThreadLabelShape,
   parseChannelRef,
   resolveChannelName,
+  threadLabelRefusal,
   type ChannelCandidate,
   type ResolveResult,
 } from './channel-names.js';
@@ -94,6 +97,28 @@ export type ThreadsSyncedHandler = (
 /** Maximum attachments Discord accepts on a single message. */
 const MAX_DISCORD_ATTACHMENTS = 10;
 
+/** Graphemes: what a reader takes as one character, such as an emoji's ZWJ
+ *  sequence, a flag's two regional indicators, or a letter and its combining
+ *  marks. */
+const GRAPHEMES = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
+
+/** Where to cut `text` hard at `limit` UTF-16 units: the last grapheme
+ *  boundary at or before it, so this cut parts no character between two
+ *  parts. splitForDiscord's line-break and space cuts don't look at
+ *  graphemes. When a single grapheme runs past the limit from the start,
+ *  there's no such boundary, so the cut falls inside it, moved back one unit
+ *  if it would part a surrogate pair. */
+function hardCut(text: string, limit: number): number {
+  let cut = 0;
+  for (const { index } of GRAPHEMES.segment(text)) {
+    if (index > limit) break;
+    cut = index;
+  }
+  if (cut > 0) return cut;
+  const unit = text.charCodeAt(limit - 1);
+  return unit >= 0xd800 && unit <= 0xdbff ? limit - 1 : limit;
+}
+
 /** What a sendDM failure carries once its DM channel was resolved. */
 export interface DmSendFailure {
   dmChannel?: { id: string; recipientName: string };
@@ -114,29 +139,90 @@ export interface OutgoingFile {
 }
 
 /**
- * Turn `OutgoingFile[]` specs into discord.js `AttachmentBuilder`s, validating
- * each path up front so a bad path yields a clear error rather than an opaque
- * discord.js failure mid-send. discord.js reads the path lazily at send time.
+ * Turn `OutgoingFile[]` specs into discord.js `AttachmentBuilder`s, checking
+ * every file before any part of the message is sent. discord.js reads each
+ * path lazily, at send time, so a file it can't read would fail after the
+ * parts before it posted. Tool arguments aren't checked against their
+ * schema, so `files` may arrive as anything. Paths are read on the machine
+ * running discord-mcpl, a relative one against its working directory.
  */
-function buildAttachments(files?: OutgoingFile[]): AttachmentBuilder[] {
-  if (!files || files.length === 0) return [];
-  if (files.length > MAX_DISCORD_ATTACHMENTS) {
+function buildAttachments(files?: unknown): AttachmentBuilder[] {
+  // No files: left out, or a value that says none (null, "", false, 0), as before.
+  if (!files) return [];
+  if (!Array.isArray(files)) {
     throw new Error(
-      `Too many files: ${files.length} (Discord allows up to ${MAX_DISCORD_ATTACHMENTS} per message)`,
+      `Nothing was sent: "files" must be a list of files, each as {"path": "<its path>"}, and this call gave ` +
+        `${kindOfValue(files)}.`,
     );
   }
-  return files.map((f) => {
-    if (!f || typeof f.path !== 'string' || !f.path.trim()) {
-      throw new Error('Each file must have a non-empty string "path"');
+  if (files.length > MAX_DISCORD_ATTACHMENTS) {
+    throw new Error(
+      `Nothing was sent: this call gave ${files.length} files, and Discord takes at most ${MAX_DISCORD_ATTACHMENTS} ` +
+        `in one message. Send ${MAX_DISCORD_ATTACHMENTS} or fewer, and the rest in another message.`,
+    );
+  }
+  return files.map((f: unknown, i) => {
+    const file = (f && typeof f === 'object' ? f : {}) as Partial<OutgoingFile>;
+    if (typeof file.path !== 'string' || !file.path.trim()) {
+      // A bare path, given as the entry itself, is the likely meaning of a
+      // string; an entry that isn't an object is named by its kind.
+      const hint = typeof f === 'string'
+        ? f.trim() ? `: give it as {"path": ${JSON.stringify(f.trim())}}` : ', and this one is blank'
+        : f && typeof f === 'object' && !Array.isArray(f) ? '' : `, and this call gave ${kindOfValue(f)}`;
+      throw new Error(
+        `Nothing was sent: files[${i}] needs "path", the path of a file on the machine running discord-mcpl, as a ` +
+          `non-empty string${hint}.`,
+      );
     }
-    if (!existsSync(f.path) || !statSync(f.path).isFile()) {
-      throw new Error(`File not found (or not a regular file): ${f.path}`);
+    // A name or description that says none (left out, null, "", false, 0)
+    // is left out, as before. A description given as a number or as true is
+    // sent as its text, such as "42". Any other value that isn't a string is
+    // refused rather than turned into text: its text form ("[object Object]"
+    // for an object, its items joined by commas for a list) would be a guess
+    // at the description the caller meant.
+    for (const key of ['name', 'description'] as const) {
+      const value: unknown = file[key];
+      const asText = key === 'description' && (typeof value === 'number' || value === true);
+      if (value && typeof value !== 'string' && !asText) {
+        throw new Error(
+          `Nothing was sent: files[${i}].${key} must be a string, and this call gave ${kindOfValue(value)}. Give it in quotes, ` +
+            `or leave it out${key === 'name' ? ' to use the file\'s own name' : ''}.`,
+        );
+      }
     }
-    const name = f.name && f.name.trim() ? f.name : basename(f.path);
-    const attachment = new AttachmentBuilder(f.path, { name });
-    if (f.description) attachment.setDescription(f.description);
+    const read = resolvePath(file.path);
+    const problem = unattachable(read);
+    if (problem) {
+      throw new Error(
+        `Nothing was sent: ${JSON.stringify(file.path)}${read === file.path ? '' : ` (read as ${read})`} ${problem} ` +
+          'on the machine running discord-mcpl. Give the path of a file there that it can read.',
+      );
+    }
+    const name = file.name && file.name.trim() ? file.name : basename(file.path);
+    const attachment = new AttachmentBuilder(file.path, { name });
+    if (file.description) attachment.setDescription(String(file.description));
     return attachment;
   });
+}
+
+/** How a refusal names a value of the wrong kind: "a number", "a list", "an
+ *  object", "null". Tool arguments aren't checked against their schema, so
+ *  a value can be anything. */
+export function kindOfValue(value: unknown): string {
+  return Array.isArray(value) ? 'a list' : value === null ? 'null' : typeof value === 'object' ? 'an object' : `a ${typeof value}`;
+}
+
+/** Why a path can't be attached, or null when it can: it must be a regular
+ *  file this process can read. */
+function unattachable(path: string): string | null {
+  try {
+    if (!statSync(path).isFile()) return "isn't a file";
+    accessSync(path, fsConstants.R_OK);
+    return null;
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    return code === 'ENOENT' || code === 'ENOTDIR' ? "doesn't exist" : `can't be read (${code ?? (err as Error).message})`;
+  }
 }
 
 // ── Public Types ──
@@ -1056,6 +1142,45 @@ export class DiscordAdapter {
     return this.isStale(thread.parentId) ? thread.parentId : null;
   }
 
+  /** The catch-up's lookup of a thread's channel when it's stale, before
+   *  the filters decide on the thread's missed messages, as a live event's
+   *  is (staleParentOf), in a guild the filters admit. A lookup Discord
+   *  answers with Unknown Channel reports the channel deleted; one that
+   *  fails otherwise is logged and leaves the channel stale (lookUpChannel). */
+  async lookUpStaleParent(channelId: string): Promise<void> {
+    const thread = this.client.channels.cache.get(channelId) as { guildId?: string | null } | undefined;
+    const guildId = thread?.guildId ?? null;
+    const staleParent = guildId && this.guildAdmitted(guildId) ? this.staleParentOf(thread) : null;
+    if (guildId && staleParent) await this.lookUpChannel(guildId, staleParent);
+  }
+
+  /** What the channel filters' answer for a channel rests on that the cache
+   *  doesn't know or hold current (channelAllowed), in words for the
+   *  catch-up's held line, or null when the answer rests on current facts.
+   *  For a thread, that's its channel, whose category can admit it: not
+   *  known by id, or stale. The thread's own stale mark doesn't count, since
+   *  Discord doesn't move a thread to another channel. The server's
+   *  threadAdmissionKnown reads a thread's channel's mark the same way, but
+   *  counts a thread without a channel id as known, where the catch-up's
+   *  answer for one rests on no channel at all. A thread's channel the cache
+   *  doesn't hold counts as known: channelAllowed excludes through it, as
+   *  the live paths do, and holding the thread back would hold it at every
+   *  start for as long as the cache lacks it. For any other channel, it's
+   *  the channel itself, while it's stale, since a stale channel's category
+   *  may no longer be its own. That includes a channel the cache no longer
+   *  holds, which something removed during the catch-up, such as a deletion,
+   *  which also drops its watermark. */
+  ingressFactsNotCurrent(channelId: string): string | null {
+    const channel = this.client.channels.cache.get(channelId) as
+      | { isThread?: () => boolean; parentId?: string | null }
+      | undefined;
+    if (channel?.isThread?.()) {
+      if (channel.parentId == null) return "its channel isn't known";
+      return this.isStale(channel.parentId) ? `its channel ${channel.parentId} is still stale after its lookup` : null;
+    }
+    return this.isStale(channelId) ? "it's still stale after its lookup" : null;
+  }
+
   /** Whether the guild filter (guildIds) admits a guild. */
   private guildAdmitted(guildId: string): boolean {
     return !this.guildIds?.length || this.guildIds.includes(guildId);
@@ -1102,9 +1227,11 @@ export class DiscordAdapter {
 
   // ── Operations ──
 
-  /** Split text into Discord-safe chunks (<=1900 chars), preferring newline then
-   *  space boundaries; hard-splits over-long runs. Discord rejects content over
-   *  the per-message limit (DiscordAPIError 50035). */
+  /** Split text into Discord-safe chunks (<=1900 UTF-16 units), preferring
+   *  newline then space boundaries; hard-splits over-long runs at a character
+   *  boundary, unless one character is itself longer than the limit
+   *  (hardCut). Discord rejects content over the per-message limit
+   *  (DiscordAPIError 50035). */
   private splitForDiscord(text: string, limit = 1900): string[] {
     if (!text) return [];
     if (text.length <= limit) return [text];
@@ -1113,7 +1240,7 @@ export class DiscordAdapter {
     while (rest.length > limit) {
       let cut = rest.lastIndexOf('\n', limit);
       if (cut < limit * 0.5) cut = rest.lastIndexOf(' ', limit);
-      if (cut < limit * 0.5) cut = limit;
+      if (cut < limit * 0.5) cut = hardCut(rest, limit);
       chunks.push(rest.slice(0, cut));
       rest = rest.slice(cut).replace(/^\s+/, '');
     }
@@ -1164,6 +1291,7 @@ export class DiscordAdapter {
     // Files-only message (no text): still send one message carrying the files.
     if (chunks.length === 0 && attachments.length > 0) chunks.push('');
     let lastId = '';
+    const posted: string[] = [];
     for (let i = 0; i < chunks.length; i++) {
       // Attach files to the LAST chunk so they render after the full text.
       const isLast = i === chunks.length - 1;
@@ -1179,7 +1307,17 @@ export class DiscordAdapter {
           ? { messageReference: options.replyTo, ...(options.requireReplyTarget ? { failIfNotExists: true } : {}) }
           : undefined,
         files: isLast && attachments.length > 0 ? attachments : undefined,
+        // Each part carries a nonce of its own that Discord enforces: the REST
+        // client sends a part again after a 5xx, a timeout or a reset
+        // connection, and if the first attempt posted, Discord answers a
+        // repeat sent within a few minutes with that message instead of
+        // posting another.
+        nonce: SnowflakeUtil.generate().toString(),
+        enforceNonce: true,
+      }).catch((err: unknown) => {
+        throw withPostedParts(err, posted, chunks, attachments.length > 0, Boolean(options?.replyTo));
       });
+      posted.push(sent.id);
       lastId = sent.id;
     }
     return { messageId: lastId };
@@ -1263,12 +1401,19 @@ export class DiscordAdapter {
       const chunks = this.splitForDiscord(resolved);
       if (chunks.length === 0 && attachments.length > 0) chunks.push('');
       let lastId = '';
+      const posted: string[] = [];
       for (let i = 0; i < chunks.length; i++) {
         const isLast = i === chunks.length - 1;
         const sent = await user.send({
           content: chunks[i] || undefined,
           files: isLast && attachments.length > 0 ? attachments : undefined,
+          // An enforced nonce for each part, as sendMessage gives.
+          nonce: SnowflakeUtil.generate().toString(),
+          enforceNonce: true,
+        }).catch((err: unknown) => {
+          throw withPostedParts(err, posted, chunks, attachments.length > 0, false);
         });
+        posted.push(sent.id);
         lastId = sent.id;
       }
       return { messageId: lastId, channelId: dm.id, recipientName };
@@ -1905,7 +2050,10 @@ export class DiscordAdapter {
     if (!guild?.channels) {
       throw new Error(`Guild ${guildId} not found`);
     }
-    const unavailable = () => new Error(`Guild ${guildId} is unavailable (a Discord outage); its channels can't be listed until it's back`);
+    const unavailable = () => new Error(
+      `Nothing was listed: server ${guildId} is unavailable in a Discord outage, so its channels can't be listed until ` +
+        "it's back. The same call can list them then.",
+    );
     if (!guild.available) throw unavailable();
     await this.refreshStale(guildId);
     // An outage can begin while those fetches are out.
@@ -1971,6 +2119,10 @@ export class DiscordAdapter {
       return { ok: false, reason: 'not-found', message: `Unusable channel reference: "${ref}"` };
     }
     if (parsed.kind === 'id') return { ok: true, id: parsed.id };
+    // A pasted thread label is refused by its shape, which no fact about a
+    // server changes, so before what follows: as a name it could reach a
+    // voice or stage room whose name has the same shape (formatThreadLabel).
+    if (isThreadLabelShape(parsed.name)) return threadLabelRefusal(ref);
     // A stale channel's current name isn't known: Discord may have renamed
     // it to any name, this one included, so no name in its guild resolves
     // while it's stale, whichever channel holds the name in the cache, and
@@ -1983,7 +2135,7 @@ export class DiscordAdapter {
       const where = parsed.guild === undefined ? 'a server this name could mean' : 'that server';
       return {
         ok: false, reason: 'ambiguous',
-        message: `${ref} can't be resolved by name right now: Discord's current facts for a channel in ${where} aren't known (its latest fetch failed or was overtaken by a change), so its current name may be this one. Address the channel by its id instead: meanwhile the registered label of each channel a name addresses there is its id, and list_channels gives the id of each channel whose facts are current.`,
+        message: `Nothing was done: ${ref} can't be resolved by name right now, since Discord's current facts for a channel in ${where} aren't known (its latest fetch failed or was overtaken by a change), so its current name may be this one. Address the channel by its id instead: until that fetch succeeds, each channel the name could mean there is shown by its id wherever its label would be, and list_channels lists the others with their ids.`,
       };
     }
     return resolveChannelName(parsed, names(parsed.name));
@@ -2442,7 +2594,10 @@ export class DiscordAdapter {
       // Discord says the new channel is gone already: deleted since, which
       // refetchChannel reported (channelGone).
       if ((err as { code?: unknown } | null)?.code === UNKNOWN_CHANNEL) {
-        throw new Error(`Channel ${created.id} was created, but Discord says it no longer exists`);
+        throw new Error(
+          `Channel ${created.id} was created, but Discord says it no longer exists: it was deleted since, so there's ` +
+            'no channel to use. create_text_channel can make it again.',
+        );
       }
       // The channel was made, but its facts aren't verified: it's marked
       // stale, labelled by its id, until a fresh fetch.
@@ -3298,6 +3453,22 @@ export class DiscordAdapter {
     );
   }
 
+  /** Whether Discord would show this bot a channel's messages: a DM's
+   *  always, and a server channel's, a thread's included, when discord.js's
+   *  cached permissions give this bot Read Message History there (a
+   *  thread's are its parent's). Without it Discord answers a read of the
+   *  channel's messages with none, not a refusal. A channel discord.js
+   *  returns nothing for, or a bot member the cache doesn't hold, counts as
+   *  not shown. */
+  async readsMessageHistory(channelId: string): Promise<boolean> {
+    const channel = await this.channelById(channelId);
+    if (!channel) return false;
+    if (channel.isDMBased()) return true;
+    const me = channel.guild.members.me;
+    return me !== null && (channel as GuildBasedChannel & { permissionsFor(m: GuildMember): Readonly<PermissionsBitField> | null })
+      .permissionsFor(me)?.has(PermissionsBitField.Flags.ReadMessageHistory) === true;
+  }
+
   private messageFilterReason(message: Message): string | null {
     const parentId =
       message.channel && 'parentId' in message.channel
@@ -3478,6 +3649,51 @@ export function attachmentUrlExpiry(url: string): Date | null {
   if (!ex || !/^[0-9a-f]+$/i.test(ex)) return null;
   const expiry = new Date(Number.parseInt(ex, 16) * 1000);
   return Number.isFinite(expiry.getTime()) ? expiry : null;
+}
+
+/** Where a message stood when the send of one of its parts failed, a
+ *  message sent in one part included, carried on the error so the send
+ *  tools can say so: the agent would otherwise read the failure as nothing
+ *  sent, and sending the whole message again could post parts twice. The
+ *  parts' texts are as sent, after mentions are rewritten, so the agent
+ *  finds where the rest begins by its words, not by a position it would
+ *  have to count to. */
+export interface PostedParts {
+  /** The ids of the parts that posted, in order: none when the first failed. */
+  ids: string[];
+  /** How many parts the message was split into. */
+  of: number;
+  /** The text of the part that failed: '' for a message of files alone. */
+  failed: string;
+  /** The text of the part after it, unless it was the last. */
+  next?: string;
+  /** Whether the message carried files, which go with its last part. */
+  files: boolean;
+  /** Whether the message replied to one, which its first part carries. */
+  reply: boolean;
+}
+
+/** Carries what a failed send posted, on any send's error, a message sent
+ *  in one part included: whether that part posted is as unknown as a later
+ *  part's when Discord didn't refuse it. Attached only here, where
+ *  sendMessage or sendDM's post of a part throws, so it also says that post
+ *  was the request that failed. The DM notice's post (sendDmNotice) attaches
+ *  none: its errors stay with the notice's own outcome. */
+function withPostedParts(err: unknown, posted: string[], chunks: string[], files: boolean, reply: boolean): unknown {
+  if (err && typeof err === 'object') {
+    const k = posted.length;
+    Object.assign(err, {
+      postedParts: {
+        ids: [...posted],
+        of: chunks.length,
+        failed: chunks[k],
+        ...(k + 1 < chunks.length ? { next: chunks[k + 1] } : {}),
+        files,
+        reply,
+      } satisfies PostedParts,
+    });
+  }
+  return err;
 }
 
 /** A message's own attachments plus any carried by forwarded snapshots.

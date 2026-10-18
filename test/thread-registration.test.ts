@@ -13,7 +13,7 @@ import { describe, it } from 'node:test';
 import * as assert from 'node:assert/strict';
 import { ChannelType, type Client } from 'discord.js';
 import { DiscordAdapter, type ChannelFacts } from '../src/discord-adapter.js';
-import { formatThreadLabel, parseChannelRef } from '../src/channel-names.js';
+import { formatThreadLabel, parseChannelRef, threadLabelRefusal } from '../src/channel-names.js';
 import { channelLabelFor, toDescriptor } from '../src/channels.js';
 import { DiscordMcplServer } from '../src/server.js';
 
@@ -79,11 +79,19 @@ describe('labels', () => {
       id: 'g1', name: 'Test Server', channels: { cache: new Map<string, unknown>([
         ['c1', { id: 'c1', type: ChannelType.GuildText, name: 'general', parentId: null }],
         ['v1', { id: 'v1', type: ChannelType.GuildVoice, name: 'general › design-chat', parentId: null }],
+        ['v2', { id: 'v2', type: ChannelType.GuildVoice, name: '› design-chat', parentId: null }],
       ]) },
     });
-    const r = adapter.resolveChannelRef(formatThreadLabel('general', 'design-chat', 'Test Server'));
-    assert.ok(!r.ok, JSON.stringify(r));
-    assert.equal(r.reason, 'thread-label');
+    for (const label of [
+      formatThreadLabel('general', 'design-chat', 'Test Server'),
+      formatThreadLabel(null, 'design-chat', 'Test Server'),
+      // The same shapes, typed without a server.
+      '#general › design-chat',
+      '› design-chat',
+    ]) {
+      // Refused, quoting the label as it was given, where a voice room has its name.
+      assert.deepEqual(adapter.resolveChannelRef(label), threadLabelRefusal(label), label);
+    }
     // The resolver does see this guild's channels: a channel label resolves.
     const general = adapter.resolveChannelRef('#general (Test Server)');
     assert.ok(general.ok, JSON.stringify(general));

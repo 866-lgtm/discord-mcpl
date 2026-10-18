@@ -9,11 +9,16 @@
  * rather than copied is the commonest way to reach this.
  *
  * The explanation is appended after the error's own text, so the error's
- * words stay as they were. Errors other than these five pass through
- * unchanged.
+ * words stay as they were. Two refusals the agent can't change itself,
+ * Missing Permissions and a DM Discord won't deliver, are explained too:
+ * what Discord refused, who can change it, what calling again will do
+ * until then, and, for Missing Permissions on a message with files, what
+ * may still go through. Errors with other codes pass through unchanged.
  */
 import { isSnowflake } from './channel-names.js';
 import { parseMcplChannelId } from './channels.js';
+import type { PostedParts } from './discord-adapter.js';
+import { quotedValue } from './source-header.js';
 
 /** Discord's JSON error codes for an id it can't resolve, or can't reach. A
  *  channel Discord answers with Unknown Channel no longer exists. */
@@ -22,6 +27,11 @@ const UNKNOWN_GUILD = 10004;
 const UNKNOWN_MESSAGE = 10008;
 const UNKNOWN_USER = 10013;
 const MISSING_ACCESS = 50001;
+/** Discord's codes for a refusal the agent can't change itself. */
+const CANNOT_DM_USER = 50007;
+const MISSING_PERMISSIONS = 50013;
+/** Cannot send messages to this user, when it shares no server with the bot. */
+const CANNOT_DM_NO_MUTUAL_GUILDS = 50278;
 
 /** What the tool chokepoint knows that the args no longer show. */
 export interface ExplainContext {
@@ -102,6 +112,77 @@ export function explainDiscordError(err: unknown, args: Record<string, unknown>,
             'list_guilds shows the servers it is in.'
           : "This bot can't reach what this call needs: permissions leave it out.";
       break;
+    case MISSING_PERMISSIONS: {
+      // Named by what the call was aimed at, as missing access is. It speaks
+      // of the request Discord refused. A send refused partway has its own
+      // note on what posted, so this says only what sending the rest will do.
+      const lacks = `Discord refused this request: this bot lacks a permission it needs${channel ? ` in channel ${channel}` : guild ? ` in server ${guild}` : ''}`;
+      // postedParts is attached only where sendMessage or sendDM's post of a
+      // part throws, so a 50013 without it came from another request, whose
+      // permission isn't known here. (The DM notice's post, sendDmNotice,
+      // attaches none, and its errors don't come here.)
+      const posted = (err as { postedParts?: PostedParts } | null)?.postedParts;
+      if (posted === undefined) {
+        why = `${lacks}. Calling again will be refused the same way until someone who manages this server's permissions ` +
+          'grants that permission.';
+        break;
+      }
+      const k = posted.ids.length;
+      // The files go with the last part, so the part refused carried them when
+      // it was the last (a message sent in one part, its only one). Refused
+      // after text before it posted, that part most likely lacked Attach Files.
+      const filesRefused = posted.files && k === posted.of - 1;
+      if (filesRefused && k > 0) {
+        why = `${lacks}, likely Attach Files, since the part it refused carried the files and the text before that part ` +
+          'posted. The rest of the text may go through without the files; the files will be refused the same way until ' +
+          "someone who manages this server's permissions grants that permission.";
+        break;
+      }
+      // What Discord documents a message post needs: Send Messages in a guild
+      // channel (Send Messages in Threads in a thread), Read Message History
+      // for a reply, which the first part carries, and Attach Files for files.
+      const needs = [
+        'Send Messages (Send Messages in Threads, in a thread)',
+        ...(posted.reply && k === 0 ? ['Read Message History, which a reply needs'] : []),
+        ...(filesRefused ? ['Attach Files, since this message carried files'] : []),
+      ];
+      const named = needs.length === 1 ? needs[0]
+        : needs.length === 2 ? `${needs[0]}, or ${needs[1]}`
+        : `${needs.slice(0, -1).join('; ')}; or ${needs[needs.length - 1]}`;
+      // Discord doesn't say which of them is missing, or how many.
+      const grants = `until someone who manages this server's permissions grants ${needs.length === 1 ? 'it' : "what's missing"}`;
+      // Refused with the files and no part before it, the part was the
+      // message's only one, so its text is all the message had.
+      why = `${lacks}: ${named}. ` + (
+        filesRefused && posted.failed !== ''
+          ? `If Attach Files is all that's missing, the text alone may go through. Calling again with the files will be ` +
+            `refused the same way ${grants}.`
+          : k > 0
+            ? `Sending what didn't post will be refused the same way ${grants}.`
+            : `Calling again will be refused the same way ${grants}.`);
+      break;
+    }
+    case CANNOT_DM_USER:
+    case CANNOT_DM_NO_MUTUAL_GUILDS: {
+      // Who can change each cause. Sharing a server takes either side: the
+      // recipient joining one this bot is in, or this bot being added to one
+      // the recipient is in; the text names no one for that, since who can
+      // add the bot depends on how it's set up. A DM setting or a block is
+      // the recipient's alone.
+      // 50278 is Discord's code for the no-shared-server cause by itself.
+      const to = user ? ` to ${quotedValue(user)}` : '';
+      const [they, them, theyAre] = user ? ['they', 'them', "they're"] : ['the recipient', 'the recipient', 'the recipient is'];
+      const sharing = (what: string) =>
+        `Sharing a server changes ${what}: ${they} can join a server this bot is in, or this bot can be added to a ` +
+        `server ${theyAre} in.`;
+      why = code === CANNOT_DM_NO_MUTUAL_GUILDS
+        ? `Discord won't deliver this DM${to}: this bot shares no server with ${them}. ${sharing('that')} ` +
+          'Until then, calling again will be refused the same way.'
+        : `Discord won't deliver this DM${to}: ${they} may share no server with this bot, have turned off DMs from server ` +
+          `members, or have blocked it. ${sharing('the first')} Only ${they} can change the other two. Until one of ` +
+          'these changes, calling again will be refused the same way.';
+      break;
+    }
   }
   return why ? `${message}\n\n${why}` : message;
 }

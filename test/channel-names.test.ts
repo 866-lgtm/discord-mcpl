@@ -6,8 +6,10 @@ import {
   channelLabel,
   formatThreadLabel,
   isSnowflake,
+  isThreadLabelShape,
   parseChannelRef,
   resolveChannelName,
+  threadLabelRefusal,
   type ChannelCandidate,
   type GuildLike,
 } from '../src/channel-names.js';
@@ -219,13 +221,10 @@ describe('resolveChannelName', () => {
     assert.match(r.message, /\[voice\]/);
   });
 
-  it('REFUSES a pasted thread label, even where a voice room carries its name', () => {
-    // A thread's label is display-only (formatThreadLabel). A voice channel's
-    // name may hold spaces and ›: matched as a name, the label would send to
-    // a voice room named `general › design-chat`.
-    const lookalike = ch('100000000000000009', 'general › design-chat', 'g1', 'Separatrix', 'voice');
-    const parentless = ch('100000000000000010', '› design-chat', 'g1', 'Separatrix', 'voice');
-    const world = [...CANDIDATES, lookalike, parentless];
+  it("a pasted thread label's refusal quotes it as given and says where its id is", () => {
+    // A thread's label is display-only (formatThreadLabel). The resolver
+    // refuses one by its shape before anything else (thread-registration's
+    // tests drive it, beside a voice room carrying the label's name).
     for (const label of [
       formatThreadLabel('general', 'design-chat', 'Separatrix'),
       formatThreadLabel(null, 'design-chat', 'Separatrix'),
@@ -234,11 +233,15 @@ describe('resolveChannelName', () => {
       '› design-chat',
     ]) {
       const parsed = parseChannelRef(label);
-      assert.ok(parsed?.kind === 'name', label);
-      const r = resolveChannelName(parsed, world);
-      assert.ok(!r.ok, `${label} must not resolve`);
-      assert.equal(r.reason, 'thread-label', label);
-      assert.match(r.message, /by its id/, label);
+      assert.ok(parsed?.kind === 'name' && isThreadLabelShape(parsed.name), label);
+      assert.deepEqual(threadLabelRefusal(label), {
+        ok: false,
+        reason: 'thread-label',
+        message: `Nothing was done: "${label}" has a thread label's shape (#parent › thread), and thread labels are ` +
+        'display-only, never matched as names. Address the thread by its id instead, discord:<server id>:<thread id> ' +
+        'or its numeric id, which is shown with the label wherever the label is. A channel whose name has this ' +
+        'shape is addressed by id too.',
+      }, label);
     }
   });
 
@@ -251,10 +254,7 @@ describe('resolveChannelName', () => {
       assert.ok(r.ok, `${name}: ${JSON.stringify(r)}`);
       assert.equal(r.id, c.id, name);
     }
-    for (const name of ['› room', 'ops › room']) {
-      const r = resolveChannelName({ name }, CANDIDATES);
-      assert.ok(!r.ok && r.reason === 'thread-label', name);
-    }
+    for (const name of ['› room', 'ops › room']) assert.ok(isThreadLabelShape(name), name);
   });
 });
 
