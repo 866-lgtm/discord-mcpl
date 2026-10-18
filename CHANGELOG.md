@@ -92,6 +92,14 @@ in the git log and PR descriptions.
 
 ### Fixed
 
+- **The send tools say where a message's text goes.** `send_message`'s and
+  `reply_message`'s `content` now say, in `send_dm`'s form, that it holds
+  the text to send, required unless files are attached, and that a call
+  that gives neither is rejected as empty. `send_dm`'s description says
+  to reply to a DM by passing the sender as `userId` and the reply as
+  `content`. An agent that left the text out of the call, writing it only
+  in its reasoning, could repeat a refused call.
+
 - **`set_reaction_visibility`, `mute_channel`, `unmute_channel` and
   `channel_missed` given a blank `channelId`, and a send given a value of
   the wrong kind, no usable `userId`, or a file this process can't read, no
