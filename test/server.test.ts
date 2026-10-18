@@ -2237,6 +2237,60 @@ describe('DiscordMcplServer', () => {
     await serverPromise;
   });
 
+  it('handles a channels/close sent while an open waits for its history after that open, so the close stands', { timeout: 10_000 }, async (t: TestContext) => {
+    const { client, serverConn, discord } = await createTestPair();
+    const server = new DiscordMcplServer(discord as unknown as DiscordAdapter);
+    const serverPromise = server.serve(serverConn);
+
+    await mcplHandshake(client);
+    const regMsg = await client.nextMessage();
+    if (regMsg.type === 'request') client.sendResponse(regMsg.request.id, {});
+
+    // Hold the open's history fetch until the close has been sent and has had
+    // time to reach the server.
+    let entered!: () => void;
+    const fetchEntered = new Promise<void>((resolve) => { entered = resolve; });
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    // A failed assertion mustn't leave the fetch held and the connection open.
+    t.after(() => {
+      release();
+      if (!client.isClosed) client.close();
+    });
+    discord.fetchHistory = async () => {
+      entered();
+      await held;
+      return discord.historyToReturn;
+    };
+
+    const settled: string[] = [];
+    const open = client.sendRequest('channels/open', {
+      channelId: 'discord:g1:c1',
+      type: 'discord',
+      address: { guildId: 'g1', channelId: 'c1' },
+      history: { limit: 10 },
+    }, 5_000).then((result) => { settled.push('open'); return result as ChannelsOpenResult; });
+    await fetchEntered;
+    const close = client.sendRequest('channels/close', { channelId: 'discord:g1:c1' }, 5_000)
+      .then((result) => { settled.push('close'); return result as { closed: boolean }; });
+
+    // A server that handled requests concurrently would answer the close now.
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    assert.deepEqual(settled, [], 'nothing is answered while the open waits for its history');
+
+    release();
+    const opened = await open;
+    const closed = await close;
+    assert.deepEqual(settled, ['open', 'close'], 'the open is answered first, then the close');
+    assert.equal(opened.channel.id, 'discord:g1:c1');
+    assert.equal(closed.closed, true);
+    const channels = (server as unknown as { channelManager: { isOpen(id: string): boolean } }).channelManager;
+    assert.equal(channels.isOpen('discord:g1:c1'), false, 'the close stands');
+
+    client.close();
+    await serverPromise;
+  });
+
   it('channels/publish sends Discord message', async () => {
     const { client, serverConn, discord } = await createTestPair();
     const server = new DiscordMcplServer(discord as unknown as DiscordAdapter);

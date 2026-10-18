@@ -2660,3 +2660,24 @@ it('create_text_channel whose channel is gone before its facts are fetched says 
       'channel to use. create_text_channel can make it again.',
   });
 });
+
+it("an archived thread channels/open names exactly is forgotten as any archived thread: reported archived again, or omitted by a sync of its channel", async (t) => {
+  for (const how of ['update', 'sync'] as const) {
+    const f = fixture(t);
+    // Archived before anything registers it, so only the exact open does.
+    dispatch(f.client, 'THREAD_UPDATE', threadUpdate, { d: threadAt(true, T) });
+    assert.equal(f.server.channelManager.get(threadMcplId), undefined, `${how}: not registered before the open`);
+    const res = await f.server.handleChannelOpen({ channelId: threadMcplId, type: 'discord' });
+    assert.equal(res.channel.id, threadMcplId, how);
+    assert.equal(f.server.channelManager.isOpen(threadMcplId), true, `${how}: opened`);
+    if (how === 'update') {
+      // Still archived, and locked now.
+      const archived = threadAt(true, T);
+      dispatch(f.client, 'THREAD_UPDATE', threadUpdate, { d: { ...archived, thread_metadata: { ...archived.thread_metadata, locked: true } } });
+    } else {
+      dispatch(f.client, 'THREAD_LIST_SYNC', threadListSync, { d: { guild_id: G, channel_ids: [P], threads: [], members: [] } });
+    }
+    assert.equal(f.server.channelManager.get(threadMcplId), undefined, `${how}: forgotten`);
+    assert.ok(f.removed(threadMcplId), `${how}: its removal is announced`);
+  }
+});
