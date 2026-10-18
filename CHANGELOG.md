@@ -53,8 +53,111 @@ in the git log and PR descriptions.
   carries `expiresAt` beside its `url`, and both tools' descriptions say
   what it means. A URL without a readable `ex` gets neither.
 
+### Changed
+
+- **These refusals, each given before the call sends or saves anything,
+  now say what didn't happen and what the agent can do.** Anything matching
+  one of the old texts, quoted here, needs the new one:
+  - A tool whose feature set the host disabled ("Feature set '<set>' is
+    not enabled") names the tool and the feature set, says that the call
+    didn't run and that calling it again won't change that, and points to
+    whoever runs the host.
+  - `set_reaction_visibility`, `mute_channel`, `unmute_channel` and
+    `channel_missed` ("channelId is required"), and `fetch_history` and
+    `fetch_around` ("<tool> needs channelId as a channel id string, such as
+    …"), without a usable `channelId`: each says that nothing was done, or,
+    for `channel_missed` and the history reads, read, and what was wrong with
+    the value given, and that the id goes in quotes. It names the channels a
+    #name reaches (text, announcement, voice and stage channels), and says
+    that `list_channels` with `guildId`, a server's id from `list_guilds`,
+    lists the channels there that the configured filters allow.
+  - An unknown tool name ("Unknown tool: <name>") says that nothing ran.
+  - The retired `subscribe_channel` ("subscribe_channel is retired. Use the
+    host channel_open tool with the MCPL channel id.") and
+    `unsubscribe_channel` ("unsubscribe_channel is retired. Use the host
+    channel_close tool with the MCPL channel id.") now begin by saying that
+    nothing was done, and name the id the host's tool takes as the agent
+    sees it: `discord:<server id>:<channel id>`, or
+    `discord:dm:<channel id>` for a DM.
+  - A send with neither content nor files ("Provide "content", "files", or
+    both — a message cannot be empty.") says that nothing was sent.
+  - `filters_update`'s `setDmNotice` check ("setDmNotice must be true or
+    false.") adds that nothing was changed.
+  - The attachment checks ("Too many files: <n> (Discord allows up to 10 per
+    message)", "Each file must have a non-empty string "path"" and "File not
+    found (or not a regular file): <path>") say that nothing was sent and
+    what to send instead. The count check names the count, and each file's
+    check names the file by its place in the list or by its path as read on
+    the machine running discord-mcpl.
+
 ### Fixed
 
+- **`set_reaction_visibility`, `mute_channel`, `unmute_channel` and
+  `channel_missed` given a blank `channelId`, and a send given a value of
+  the wrong kind, no usable `userId`, or a file this process can't read, no
+  longer go ahead.** `set_reaction_visibility`,
+  `mute_channel`, `unmute_channel` and `channel_missed`, and no other tools,
+  read `channelId` trimmed: a whitespace-only id, which `mute_channel` saved
+  as a muted channel, is refused, and a padded id is used without its
+  padding. `channel_missed` checks its `channelId` before it loads anything,
+  so a refused call no longer sets aside and rewrites an unusable watermarks
+  file. The send tools refuse, before anything is sent: `files` given as
+  something other than a list, such as a string or an object, where it
+  failed with a raw TypeError or as too many files (a value that says none,
+  null, `""`, `false` or `0`, still means no files); a file's `name` that is
+  neither a string nor a value that says none, where it failed with a raw
+  TypeError, and a `description` that is an object or a list, which was sent
+  to Discord with the last part, after the parts before it had posted (a
+  name or description that says none, null, `""`, `false` or `0`, is still
+  left out, and a description given as a number or `true` is sent as its
+  text, such as "42"); and `content` that is given and isn't a string, where
+  it failed with a raw TypeError, or, for `0`, was read as no content
+  (`null` and `false` still are, so files given with them post alone).
+  `send_dm` without a usable `userId` is refused before the recipient is
+  looked up, where it failed with a raw TypeError and named its destination
+  as a DM with "undefined". A file this process can't read is refused before
+  any part of the message is sent: it failed at send time, after the parts
+  before it had posted.
+- **A filters change re-derives the registered labels.** Names resolve only
+  among the channels the filters admit, and a `#name (server)` label is kept
+  only while its name resolves back to its channel. A change that admitted
+  or dropped a channel inside a server already admitted re-derived nothing,
+  so a label could reach another channel: admitting text `general` beside a
+  registered voice `General` left the voice channel labelled `#General
+  (server)`, which then resolved to the text channel, and dropping text
+  `general` from the filters file left its label resolving to the voice
+  channel. Every change, by `filters_update` or a reload of the filters
+  file, now re-derives every registered channel. A server the filters no
+  longer admit keeps its channels listed until restart, as before, now under
+  their ids, since discord-mcpl stopped resolving their names with the
+  removal. A host that resolves an agent's prose (`>>name`) from the labels
+  registered with it, as agent-framework does, follows the re-derived labels
+  after a filter change: prose by a name reaches the registered channel that
+  now holds the name, and bounces with "no channel matches" while none does.
+  A channel the change admitted isn't registered until something registers
+  it, such as a message from it, `refresh_channels` or a restart, and when
+  two channels of one kind now share a name, both are labelled by their ids.
+  Before, a label left stale kept carrying such prose to its old channel,
+  including one the filters no longer admit. Registering is as before: a
+  change that admits a new server registers every text, announcement, voice
+  or stage channel the filters admit that isn't registered yet, in any
+  admitted server, and any other change registers none.
+- **The catch-up looks a thread's stale channel up before it decides, and
+  holds back what it would withhold on facts that aren't current.** A thread
+  the channel filters admit only through its channel's category had every
+  missed message withheld when that channel's facts were stale at the
+  catch-up, since a stale channel's category admits none of its threads, and
+  the catch-up then moved its watermark past them, so no later start
+  delivered them. The catch-up now looks the thread's channel up first, as a
+  live message does. When the channel filters would withhold a channel's
+  messages and a fact that answer rests on isn't known or current after the
+  lookups (the channel's own, while it's stale, or for a thread, its
+  channel's, while that's stale or not known), the channel is held back with
+  its watermark untouched, and stderr says which fact. It's tried again at
+  the next start, so if the filters admit it by then, its messages arrive
+  then, where before they were skipped; a message forwarded live in it
+  before then moves its watermark past them, as for a channel whose identity
+  can't be resolved. An answer that admits the messages stands, as before.
 - **`channels/open` opens exactly the channel it was asked for.** A stale or
   unknown `channelId` used to fall through to the first registered channel of
   the same type, so a host could open, subscribe to, and receive history from
@@ -351,6 +454,71 @@ in the git log and PR descriptions.
   automatic DM notice's failure, in the operator log, now names the
   channel's kind, or says that this version can't handle it, where it said
   `not found or not a text channel`.
+- **A message the REST client sends again no longer posts twice.** The REST
+  client sends a request again after a 5xx, a timeout or a reset connection,
+  so a message whose first attempt posted, and whose answer was lost, could
+  post a second copy. Each message sent by `send_message`, `reply_message`,
+  `send_dm` or a host's `channels/publish`, and each part of one sent in
+  parts, now carries a nonce of its own, which Discord enforces: it answers
+  a repeat sent within a few minutes with the message it already made.
+- **A message sent in parts is no longer hard-cut inside a character.** A
+  message longer than 1,900 UTF-16 code units is sent in parts, each cut at
+  a line break or a space late enough in its first 1,900 units, or else
+  hard, at the last character boundary at or before 1,900 units, so the
+  character begins the next part. The hard cut used to fall at 1,900 itself,
+  which could be inside a character: between the two halves of one outside
+  the Basic Multilingual Plane, such as most emoji, or between the code
+  points of what a reader sees as one character, such as an emoji's ZWJ
+  sequence, a flag's two regional indicators, or a letter and its combining
+  marks. A single character longer than 1,900 units is still cut inside,
+  never between the halves of a surrogate pair.
+- **Missing Permissions and a refused DM are explained, and a send tool
+  whose message fails says what posted.** A tool's error for Discord's
+  Missing Permissions (50013) now says that Discord refused the request
+  because this bot lacks a permission it needs, in the channel or server the
+  call named, and that calling again will be refused the same way until
+  someone who manages the server's permissions grants it. When the refused
+  request was a message post, it names what Discord documents a post needs:
+  Send Messages (Send Messages in Threads, in a thread); Read Message History
+  too when the part refused was a reply's first, which carries the reply;
+  and Attach Files too when the part refused carried files, saying that the
+  text alone may go through if Attach Files is all that's missing. Discord
+  doesn't say which of the permissions named is missing, so a refusal naming
+  more than one speaks of granting what's missing. Another request's refusal
+  names no permission, since which one it needs isn't known there. A DM
+  Discord won't deliver says so, naming the recipient when the call names
+  them, with each cause it may have and who can change it: 50278 is that the
+  recipient shares no server with this bot, which changes when they join one
+  this bot is in or this bot is added to one they're in; 50007 may be that,
+  or the recipient's DM setting or a block, which only they can change. A
+  message longer than 1,900 UTF-16 code units is sent in parts, with any
+  files on the last. When a part of a message sent in parts fails, the error
+  of `send_message`, `reply_message` or `send_dm` now says which parts posted,
+  with their message ids; whether Discord refused the part that failed or
+  its outcome is unknown (a 5xx, a timeout or a lost connection); where the
+  rest begins in the text as sent, by its first words, if that part didn't
+  post and, when its outcome is unknown, if it did; and that sending the
+  whole message again could post parts twice. When Discord refused the part,
+  it says to send only the rest when sending again, unless that part carried
+  the message's files, which may be what Discord refused; there, the Missing
+  Permissions explanation says the text may go through without them.
+  When the outcome is unknown, it says to check the channel's latest
+  messages first where `fetch_history` would show them: with its feature set
+  on, the channel filters admitting the channel, the channel's history cap
+  (`DISCORD_BACKSCROLL_CHANNELS`) above 0, and this bot holding Read Message
+  History there, without which Discord shows no messages. Otherwise
+  it says that this can't be checked from here, what sending again and not
+  sending each risk, and that someone who can see the channel can tell. A
+  message sent in one part whose outcome is unknown says the same. A first
+  part that Discord refused says that none of the message posted; a message
+  sent in one part that Discord refused gets no such note, since Discord's
+  refusal means it didn't make the message, and the error is that refusal.
+  After parts posted, the Missing Permissions explanation says that sending
+  what didn't post will be refused, rather than calling again, or, when the
+  part refused carried the files, that the permission missing is likely
+  Attach Files and the rest of the text may go through without them. A
+  host's `channels/publish` gets the nonces and the cut above, and its
+  errors are unchanged.
 
 ## 0.2.0 — 2026-10-13
 

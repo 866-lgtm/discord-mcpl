@@ -148,8 +148,8 @@ async function main(): Promise<void> {
 
   // Hot-reload: poll the filters file and apply changes live. Covers edits
   // from any source (human, ops tooling, the filters_update tool — which
-  // also applies its change directly; the poller is then an idempotent
-  // no-op re-apply). Parse failures keep the previous filters (fail-safe)
+  // also applies its change directly, so the poller's re-apply finds
+  // nothing new). Parse failures keep the previous filters (fail-safe)
   // and mark the whole plane's desired state invalid. A file missing for
   // two consecutive polls (one poll of grace for non-atomic editors) marks
   // the plane 'missing' — a deleted desired config must never keep
@@ -179,16 +179,11 @@ async function main(): Promise<void> {
         }
         return;
       }
-      const diff = discord.updateFilters(next);
-      server.filtersState.applyParsed(next);
+      const diff = server.applyReloadedFilters(next);
       console.error(
         `[discord-mcpl] filters hot-reloaded from ${filtersFile} ` +
           `(guilds +${diff.addedGuilds.length}/-${diff.removedGuilds.length})`,
       );
-      if (diff.addedGuilds.length) {
-        // Newly-allowed guilds: make their channels known to the host.
-        server.applyFilterChange();
-      }
     }, 3000);
     poll.unref();
   }

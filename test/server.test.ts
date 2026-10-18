@@ -89,6 +89,12 @@ class MockDiscordAdapter {
   historyIngressReason(): string | null {
     return null;
   }
+  /** No thread's channel here is stale, so the catch-up looks none up. */
+  async lookUpStaleParent(): Promise<void> {}
+  /** Every channel's facts here are known and current. */
+  ingressFactsNotCurrent(): string | null {
+    return null;
+  }
   onChannelCreate(handler: (channel: ChannelFacts) => void): void {
     this._channelCreateHandler = handler;
   }
@@ -520,7 +526,7 @@ describe('DiscordMcplServer', () => {
 
     // The enable didn't apply: history stays off, as the request before it left it.
     assert.equal(history?.isError, true);
-    assert.match(history?.content[0]?.text ?? '', /Feature set 'discord\.history' is not enabled/);
+    assert.match(history?.content[0]?.text ?? '', /^fetch_history is turned off here: this host has disabled the "discord\.history" feature set/);
     // Nor did the disable: messaging still works.
     assert.notEqual(reaction?.isError, true, `add_reaction was refused: ${reaction?.content[0]?.text}`);
     assert.deepEqual(discord.reactions.at(-1), { channelId: 'discord:g1:c1', messageId: 'm1', emoji: '👍' });
@@ -642,7 +648,7 @@ describe('DiscordMcplServer', () => {
 
     assert.equal(receipt?.accepted, true, 'the early policy was answered');
     assert.equal(history?.isError, true, "the policy's disable held past notifications/initialized");
-    assert.match(history?.content[0]?.text ?? '', /Feature set 'discord\.history' is not enabled/);
+    assert.match(history?.content[0]?.text ?? '', /^fetch_history is turned off here: this host has disabled the "discord\.history" feature set/);
   });
 
   it("a request whose handler throws something that isn't an Error is answered, and serving goes on", async (t) => {
@@ -651,6 +657,8 @@ describe('DiscordMcplServer', () => {
     (server as unknown as { handleChannelClose: () => never }).handleChannelClose = () => {
       throw undefined;
     };
+    // What the server answers with, as it hands it to its connection.
+    const sendError = t.mock.method(serverConn, 'sendError');
     const serverPromise = server.serve(serverConn);
     let refusal: unknown;
     let answered = false;
@@ -668,8 +676,7 @@ describe('DiscordMcplServer', () => {
 
     const { code, message } = refusal as { code?: number; message?: string };
     assert.equal(code, -32603, `answered with an internal error: ${String(message)}`);
-    // mcpl-core's RpcError prefixes the code to the server's message.
-    assert.match(String(message), /-32603: undefined$/, 'the thrown value as text');
+    assert.deepEqual(sendError.mock.calls.map((call) => call.arguments.slice(1)), [[-32603, 'undefined']], 'the thrown value as text');
     assert.equal(answered, true, 'the next request was answered');
   });
 
@@ -939,6 +946,8 @@ describe('DiscordMcplServer', () => {
     (server as unknown as { handleChannelClose: () => never }).handleChannelClose = () => {
       throw new Error('');
     };
+    // What the server answers with, as it hands it to its connection.
+    const sendError = t.mock.method(serverConn, 'sendError');
     const serverPromise = server.serve(serverConn);
     let refusal: unknown;
     try {
@@ -952,10 +961,9 @@ describe('DiscordMcplServer', () => {
       await serverPromise;
     }
 
-    const { code, message } = refusal as { code?: number; message?: string };
+    const { code } = refusal as { code?: number };
     assert.equal(code, -32603);
-    // mcpl-core's RpcError prefixes the code to the server's message.
-    assert.match(String(message), /-32603: Error$/, 'an empty message falls back to the value as text');
+    assert.deepEqual(sendError.mock.calls.map((call) => call.arguments.slice(1)), [[-32603, 'Error']], 'an empty message falls back to the value as text');
   });
 
   it('tools/list returns tool definitions', async () => {
