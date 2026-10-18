@@ -96,6 +96,13 @@ type ChannelOpenResponse = ChannelsOpenResult & {
   historyTruncated?: boolean;
 };
 
+/** What registering the channels the filters newly let be seen brought. */
+interface ChannelRefresh {
+  visible: number;
+  added: Array<{ id: string; label: string }>;
+  note: string;
+}
+
 interface ChannelAcknowledgeRequest {
   channelId: string;
   messageId: string;
@@ -2351,7 +2358,7 @@ export class DiscordMcplServer {
     // known-good again (we just wrote it atomically), and this keeps the
     // effective state and digest in sync with disk without waiting a poll.
     this.filtersState.applyParsed(next);
-    const refreshed = diff.addedGuilds.length ? this.refreshChannels() : null;
+    const refreshed = this.applyFilterChange(diff);
     console.error(
       `[discord-mcpl] filters updated via tool (guilds +${diff.addedGuilds.length}/-${diff.removedGuilds.length})`,
     );
@@ -2365,7 +2372,7 @@ export class DiscordMcplServer {
     const applied = this.discord.getFilters();
     if (diff.removedGuilds.length) {
       notes.push(
-        'Removed guilds stop delivering events immediately, but their channels stay listed on the host until restart.',
+        'Removed guilds stop delivering events immediately, but their channels stay listed on the host until restart, under their ids.',
       );
     }
     return {
@@ -2382,10 +2389,30 @@ export class DiscordMcplServer {
     };
   }
 
-  /** Re-register channels after an externally-driven filter change (the
-   *  filters-file hot-reload poller in index.ts). */
-  applyFilterChange(): void {
-    this.refreshChannels();
+  /** A changed filters file, as index.ts's poller reads it: applied as
+   *  filters_update applies the file it writes (applyFilterChange). */
+  applyReloadedFilters(next: DiscordFilters): ReturnType<DiscordAdapter['updateFilters']> {
+    const diff = this.discord.updateFilters(next);
+    this.filtersState.applyParsed(next);
+    this.applyFilterChange(diff);
+    return diff;
+  }
+
+  /**
+   * After any change of the filters, by filters_update or a reload of the
+   * file (applyReloadedFilters). When the change admits a new guild, every
+   * channel of a listed kind that the filters admit and that isn't
+   * registered yet is registered, in any admitted guild (refreshChannels).
+   * Then every registered channel is re-derived. Names resolve only among
+   * the channels the filters admit (nameView), so any change can give a
+   * registered label's name to another channel, give a channel back the
+   * name its label lacked (channelLabelFor), or, by removing its guild,
+   * leave a channel labelled by its id.
+   */
+  private applyFilterChange(diff: { addedGuilds: string[] }): ChannelRefresh | null {
+    const refreshed = diff.addedGuilds.length ? this.refreshChannels() : null;
+    this.rederiveChannels(this.channelManager.getAll());
+    return refreshed;
   }
 
   // ── Sticky-reply state mutators ──
@@ -2986,12 +3013,9 @@ export class DiscordMcplServer {
         );
         continue;
       }
-      if (lookupFailure) {
-        console.error(
-          `[discord-mcpl] Catch-up couldn't look up channel ${channelId} (${lookupFailure}). ` +
-            'Its missed messages are placed and filtered by what the cache knew of it, and may go out without its names.',
-        );
-      }
+      // A thread's channel whose facts may be older than Discord's is looked
+      // up too, as a live create's is: its category can admit the thread.
+      if (guildId) await this.discord.lookUpStaleParent(channelId);
 
       // The live ingress decision (guild, channel and thread parent, DM
       // author), evaluated now, after the fetch, so a filter change made
@@ -3005,6 +3029,33 @@ export class DiscordMcplServer {
         else if (reason) withheld.set(reason, (withheld.get(reason) ?? 0) + 1);
         return reason === null;
       });
+      // The channel filters' answer rests on what the cache knows of the
+      // channel, and of a thread's channel (ingressFactsNotCurrent). When the
+      // answer is to withhold and a fact it rests on isn't known or current
+      // after the lookups, it may be wrong, and moving past the messages
+      // would lose them for good: the channel is held back, its watermark
+      // untouched, as one whose identity can't be resolved is, and only the
+      // held line is printed for it. An answer that admits stands, as what
+      // the cache knew does (issue #28).
+      const filtered = withheld.get('channel-not-allowed');
+      const notCurrent = filtered ? this.discord.ingressFactsNotCurrent(channelId) : null;
+      if (notCurrent) {
+        dbg('sweep:held-facts-not-current', { channelId, filtered, notCurrent });
+        console.error(
+          `[discord-mcpl] Catch-up held back channel ${channelId}: the channel filters would withhold its ` +
+            `${filtered} missed message(s), but that answer rests on facts that aren't current ` +
+            `(${notCurrent}${lookupFailure ? `; channel ${channelId}'s own lookup failed: ${lookupFailure}` : ''}), so they were not ` +
+            'delivered. It is tried again at the next start, unless a message forwarded live in it before then ' +
+            'moves its watermark past them.',
+        );
+        continue;
+      }
+      if (lookupFailure) {
+        console.error(
+          `[discord-mcpl] Catch-up couldn't look up channel ${channelId} (${lookupFailure}). Its missed messages ` +
+            'are placed and filtered by what the cache knew of it, and any that are delivered may go out without its names.',
+        );
+      }
       // Refused DMs are decided alongside delivery, which doesn't wait for
       // them; the watermark only moves past this batch once all of them are
       // decided, or the wait for them runs out (advance). Their notices go
@@ -3593,11 +3644,7 @@ export class DiscordMcplServer {
    *  for "I was added to a channel/server but don't see it" — it doesn't rely
    *  on any specific gateway event having fired, so it covers cases the
    *  event handlers miss (missed events, eventual-consistency gaps, etc.). */
-  private refreshChannels(): {
-    visible: number;
-    added: Array<{ id: string; label: string }>;
-    note: string;
-  } {
+  private refreshChannels(): ChannelRefresh {
     const descriptors = this.discord.getPostingChannels().map((facts) => this.guildDescriptor(facts));
     const { added } = this.registerChannels(descriptors);
     dbg('refreshChannels', { visible: descriptors.length, added: added.length });

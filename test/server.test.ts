@@ -89,6 +89,12 @@ class MockDiscordAdapter {
   historyIngressReason(): string | null {
     return null;
   }
+  /** No thread's channel here is stale, so the catch-up looks none up. */
+  async lookUpStaleParent(): Promise<void> {}
+  /** Every channel's facts here are known and current. */
+  ingressFactsNotCurrent(): string | null {
+    return null;
+  }
   onChannelCreate(handler: (channel: ChannelFacts) => void): void {
     this._channelCreateHandler = handler;
   }

@@ -118,7 +118,46 @@ in the git log and PR descriptions.
   as a DM with "undefined". A file this process can't read is refused before
   any part of the message is sent: it failed at send time, after the parts
   before it had posted.
-
+- **A filters change re-derives the registered labels.** Names resolve only
+  among the channels the filters admit, and a `#name (server)` label is kept
+  only while its name resolves back to its channel. A change that admitted
+  or dropped a channel inside a server already admitted re-derived nothing,
+  so a label could reach another channel: admitting text `general` beside a
+  registered voice `General` left the voice channel labelled `#General
+  (server)`, which then resolved to the text channel, and dropping text
+  `general` from the filters file left its label resolving to the voice
+  channel. Every change, by `filters_update` or a reload of the filters
+  file, now re-derives every registered channel. A server the filters no
+  longer admit keeps its channels listed until restart, as before, now under
+  their ids, since discord-mcpl stopped resolving their names with the
+  removal. A host that resolves an agent's prose (`>>name`) from the labels
+  registered with it, as agent-framework does, follows the re-derived labels
+  after a filter change: prose by a name reaches the registered channel that
+  now holds the name, and bounces with "no channel matches" while none does.
+  A channel the change admitted isn't registered until something registers
+  it, such as a message from it, `refresh_channels` or a restart, and when
+  two channels of one kind now share a name, both are labelled by their ids.
+  Before, a label left stale kept carrying such prose to its old channel,
+  including one the filters no longer admit. Registering is as before: a
+  change that admits a new server registers every text, announcement, voice
+  or stage channel the filters admit that isn't registered yet, in any
+  admitted server, and any other change registers none.
+- **The catch-up looks a thread's stale channel up before it decides, and
+  holds back what it would withhold on facts that aren't current.** A thread
+  the channel filters admit only through its channel's category had every
+  missed message withheld when that channel's facts were stale at the
+  catch-up, since a stale channel's category admits none of its threads, and
+  the catch-up then moved its watermark past them, so no later start
+  delivered them. The catch-up now looks the thread's channel up first, as a
+  live message does. When the channel filters would withhold a channel's
+  messages and a fact that answer rests on isn't known or current after the
+  lookups (the channel's own, while it's stale, or for a thread, its
+  channel's, while that's stale or not known), the channel is held back with
+  its watermark untouched, and stderr says which fact. It's tried again at
+  the next start, so if the filters admit it by then, its messages arrive
+  then, where before they were skipped; a message forwarded live in it
+  before then moves its watermark past them, as for a channel whose identity
+  can't be resolved. An answer that admits the messages stands, as before.
 - **Thread fields name the thread a message was posted in.** They were read
   from discord.js `message.thread`, which is the thread a message *started*,
   so a message that had spawned a thread was tagged `chat:thread`, rendered
