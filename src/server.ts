@@ -177,6 +177,13 @@ function knowsLessThan(d: ChannelDescriptor, known: ChannelDescriptor): boolean 
   return (['channelName', 'guildName', 'parentName'] as const).some((k) => then[k] !== undefined && now[k] === undefined);
 }
 
+/** What registerGuildDelivery did with a delivery's channel: its MCPL id
+ *  when it's registered (`id`), and whether this delivery registered it
+ *  (`registered`), finding it live, admitted and unarchived, with its facts
+ *  current. A channel it withheld isn't `registered`, and is named only when
+ *  it was registered before. */
+type GuildDelivery = { id: string; registered: true } | { id: string | undefined; registered: false };
+
 interface SavedTally {
   anchorId: string;
   talliedThrough?: string;
@@ -405,6 +412,24 @@ function postedPartsNote(p: PostedParts, refused: boolean, history: boolean): st
  *  Match by prefix (`startsWith`) so trailing whitespace or auto-appended
  *  text doesn't slip through. Case-sensitive: a literal `m continue` only. */
 const CHX_NOOP_PREFIX = 'm continue';
+
+/** discord-mcpl's note on a push from a guild channel or thread where the
+ *  gate (shouldEnterContext) admits a message as it's posted only when it
+ *  addresses the agent: neither open, subscribed nor muted. It says what the
+ *  gate does there, and what opening adds, which only this server knows; the
+ *  host's invitation gives the call. It claims no more, so its words are
+ *  true on any push from such a channel: a message admitted while the
+ *  channel was open or subscribed can still be pushed after it was closed or
+ *  unsubscribed, and the catch-up after a restart delivers each missed
+ *  mention with the messages around it. closedChannelNote says which pushes
+ *  are given it. A message addresses the agent when it mentions the bot or
+ *  the role Discord created for it (convertMessage's mentionsBotRole), or
+ *  replies to one of its messages. */
+const CLOSED_CHANNEL_NOTE =
+  "<system>While this channel isn't open, a message from it reaches you as it's posted when it mentions you or the " +
+  'role Discord created for you, or replies to one of your messages. Opening it brings its other messages as they ' +
+  'arrive.</system>\n';
+
 const AGENT_TIME_ZONE = resolveAgentTimeZone();
 const AGENT_TIMESTAMP_STYLE = resolveTimestampStyle();
 
@@ -3163,8 +3188,9 @@ export class DiscordMcplServer {
       attrs.push(`channelId="${channelId}"`);
       if (meta?.guildName) attrs.push(`guild=${quotedValue(meta.guildName)}`);
       else if (isDM) attrs.push('dm="true"');
-      // count = number of actual mentions; lines = total delivered (mentions +
-      // their ±2min vicinity) so the agent knows how much is context vs ping.
+      // count = number of actual mentions; lines = total delivered (the
+      // mentions and the messages kept around each) so the agent knows how
+      // much is context vs ping.
       attrs.push(`count="${keepAll ? kept.length : mentionCount}"`);
       if (!keepAll) attrs.push(`lines="${kept.length}"`);
       attrs.push(`reason="${isDM ? 'dm' : hadMention ? 'mention' : 'backscroll'}"`);
@@ -3193,11 +3219,13 @@ export class DiscordMcplServer {
       // which can then neither open it nor tell where a reply would land.
       // The bot's own messages are filtered out above, so every kept message
       // in a DM is from the other party.
+      const guildDelivery = !isDM && guildId ? this.registerGuildDelivery(guildId, channelId) : undefined;
       const sweptMcplId = isDM
         ? this.registerDmDelivery(channelId, { id: kept[0].authorId, name: kept[0].authorName })
-        : guildId
-          ? this.registerGuildDelivery(guildId, channelId)
-          : undefined;
+        : guildDelivery?.id;
+      // A closed channel's block of mentions gets the note a live mention
+      // from there does, under the same rule.
+      const closedNote = guildDelivery && guildId ? this.closedChannelNote(guildId, channelId, guildDelivery) : '';
 
       try {
         await conn.sendRequest(method.PUSH_EVENT, {
@@ -3211,9 +3239,7 @@ export class DiscordMcplServer {
             guildName: meta?.guildName ?? undefined,
             // The composite id the host registers and routes by, as a live
             // push's origin carries it, named when the channel is registered
-            // (registerGuildDelivery says when it isn't: a thread archived
-            // since its missed messages, a channel deleted or a guild left
-            // meanwhile, or one its guild came back without).
+            // (registerGuildDelivery says when it isn't).
             ...(sweptMcplId ? { mcplChannelId: sweptMcplId } : {}),
             channelName: meta?.name ?? undefined,
             ...threadFields(thread),
@@ -3223,7 +3249,7 @@ export class DiscordMcplServer {
           // The place tag only: the block's messages share their channel, but
           // not whether each mentions the bot or who wrote it.
           ...(threadTags(thread).length > 0 ? { tags: threadTags(thread) } : {}),
-          payload: { content: [textContent(block)] },
+          payload: { content: [textContent(`${closedNote}${block}`)] },
         } satisfies PushEventParams);
       } catch (err) {
         dbg('sweep:send-failed', { channelId, error: errorText(err) });
@@ -3555,8 +3581,12 @@ export class DiscordMcplServer {
    * swept, edited or deleted), before the delivery names it, or re-derive
    * what's registered from what's known now (a rename, or a parent's or the
    * guild's name learned since). Returns the channel's MCPL id when it is
-   * registered, which is when the delivery names it (origin.mcplChannelId);
-   * undefined when it isn't.
+   * registered, which is when the delivery names it (origin.mcplChannelId),
+   * and whether this delivery registered it (`registered`), having found it
+   * live, admitted and unarchived, with its facts current. A channel it
+   * withholds isn't registered by it: one registered before keeps its
+   * registration, and is named, except where "Neither registered nor named"
+   * below says otherwise.
    *
    * The channel is described as the client's cache has it now: a thread the
    * client knows only partly by the partial it holds, labelled by its id
@@ -3601,16 +3631,16 @@ export class DiscordMcplServer {
     guildId: string,
     channelId: string,
     opts: { postedAt?: number } = {},
-  ): string | undefined {
-    const withheld = (reason: string, named?: string): string | undefined => {
+  ): GuildDelivery {
+    const withheld = (reason: string, named?: string): GuildDelivery => {
       dbg('registry:withheld', { guildId, channelId, reason, named: named !== undefined });
-      return named;
+      return { id: named, registered: false };
     };
     if (!this.discord.hasGuild(guildId)) return withheld('guild-left');
     if (this.deletedLately(guildId, channelId)) return withheld('deleted');
     const id = mcplChannelId(guildId, channelId);
     const facts = this.discord.getCachedChannelFacts(channelId);
-    if (facts && holdsNoMessages(facts.type)) return undefined;
+    if (facts && holdsNoMessages(facts.type)) return { id: undefined, registered: false };
     const named = this.channelManager.get(id) ? id : undefined;
     if (!facts) return withheld('uncached', named);
     if (this.discord.isStale(channelId)) return withheld('stale', named);
@@ -3618,7 +3648,32 @@ export class DiscordMcplServer {
     const unarchived = opts.postedAt !== undefined && facts.archivedAt !== undefined && opts.postedAt > facts.archivedAt;
     if (facts.archived && !unarchived) return withheld('archived', named);
     this.registerChannels([this.guildDescriptor(facts)]);
-    return id;
+    return { id, registered: true };
+  }
+
+  /**
+   * The closed channel's note (CLOSED_CHANNEL_NOTE) for a push from a guild
+   * channel or thread, or '' when it gets none. It goes on a push when this
+   * delivery registered the channel (registerGuildDelivery's `registered`),
+   * and the gate (shouldEnterContext) now admits a message from there only
+   * when it addresses the agent: neither in an open or subscribed channel,
+   * where ordinary messages enter too, nor in a muted one, where none do. A
+   * live push from there carries a message that addressed the agent, except
+   * in a race: a message that doesn't address it, admitted while the channel
+   * was open or subscribed, and pushed after it was closed or unsubscribed
+   * while its attachments were fetched. A catch-up block carries the
+   * channel's missed mentions with up to VICINITY messages on each side of
+   * each, or, from a channel subscribed when the block's fetch began, its
+   * backscroll. The note holds on all of them. Where the delivery withheld
+   * the channel, named or not, this server can't say that opening it brings
+   * anything: it's gone, archived, no longer admitted, not in the client's
+   * cache, or its facts may be older than Discord's.
+   */
+  private closedChannelNote(guildId: string, channelId: string, delivery: GuildDelivery): string {
+    return delivery.registered
+      && this.shouldEnterContext(channelId, { isMention: true, isDM: false, guildId })
+      && !this.shouldEnterContext(channelId, { isDM: false, guildId })
+      ? CLOSED_CHANNEL_NOTE : '';
   }
 
   /** Register the DM a message is delivered from, labelled with its other
@@ -4103,7 +4158,7 @@ export class DiscordMcplServer {
       );
     }
     return info?.guildId
-      ? this.registerGuildDelivery(info.guildId, channelId)
+      ? this.registerGuildDelivery(info.guildId, channelId).id
       : undefined;
   }
 
@@ -5028,9 +5083,12 @@ export class DiscordMcplServer {
     // after this message was posted stays archived, and a channel deleted, a
     // guild left, or a channel its guild came back without, while the
     // attachments were fetched, isn't registered.
-    const registeredId = isDM
-      ? this.registerDmDelivery(msg.channelId, { id: msg.authorId, name: msg.authorName })
+    const guildDelivery = isDM
+      ? undefined
       : this.registerGuildDelivery(guildId, msg.channelId, { postedAt: msg.timestamp.getTime() });
+    const registeredId = guildDelivery
+      ? guildDelivery.id
+      : this.registerDmDelivery(msg.channelId, { id: msg.authorId, name: msg.authorName });
     const channelIsOpen = this.channelManager.isOpen(channelMcplId);
     dbg('handleDiscordMessage:forwarding', {
       channelMcplId,
@@ -5061,6 +5119,13 @@ export class DiscordMcplServer {
 
     {
       const attachmentBytes = Buffer.byteLength(JSON.stringify(attachmentBlocks));
+      // Without the closed channel's note (below): the gate admits an edit,
+      // when it arrives, only while its channel is open or subscribed
+      // (forwardMessageEdit), so an edit that replaces this create normally
+      // comes once the note no longer holds. Admission is checked when an
+      // edit arrives, not when it's sent, so one admitted while the channel
+      // was open can follow a close during this create's attachment fetch,
+      // and replace a create pushed with the note.
       mem.render = {
         prefix: prefixBlock, replyMarker, location, authorName: msg.authorName,
         attachments: attachmentBytes <= RECENT_CREATE_ATTACHMENT_BYTES ? attachmentBlocks
@@ -5117,13 +5182,16 @@ export class DiscordMcplServer {
       //
       // Closed channel: attach the missed-ambient tally (when tracked) so the
       // host's closed-channel invitation can show what staying out has cost —
-      // "reply without joining" is only an informed choice when the invisible
+      // replying without opening the channel is only an informed choice when the invisible
       // traffic is visible as a number (2026-08-05: Sol answered four
       // #architecture mentions over four days while the follow-ups to her own
       // replies fell into the tally, with nothing surfacing that fact).
       // Counts exclude this (addressed) message and all prior mentions/DMs —
       // those were delivered.
       const missed = this.missedTally.get(msg.channelId);
+      // The note, for a guild channel this delivery registered, whose gate
+      // now admits a message only when it addresses the agent.
+      const closedNote = guildDelivery ? this.closedChannelNote(guildId, msg.channelId, guildDelivery) : '';
       const scope = this.coalesceChannelScope(msg.guildId, msg.channelId);
       mem.scope = scope ?? null;
       const pushParams: CoalescedPushEventParams = {
@@ -5147,11 +5215,9 @@ export class DiscordMcplServer {
           // form the host registers and routes replies to. Raw `channelId` above
           // is Discord-internal; DMs especially only ever arrive via push/event
           // (channel closed), so without this the host can't route a reply back
-          // to the DM (item-3 redux, DM sub-case). Named once registered, as
-          // every channel a message is posted in is, except one deleted,
-          // archived, or left out when its guild came back, or in a guild the
-          // bot left, while this message was on its way
-          // (registerGuildDelivery).
+          // to the DM (item-3 redux, DM sub-case). Named when the channel is
+          // registered (registerGuildDelivery and registerDmDelivery say when
+          // it isn't).
           ...(registeredId ? { mcplChannelId: registeredId } : {}),
           channelName: msg.channelName,
           // Display only; the composite channel id already names the thread.
@@ -5172,7 +5238,7 @@ export class DiscordMcplServer {
         } as Record<string, unknown>,
         tags: eventTags, // MCPL RFC-001 — the host routes/gates on these
         payload: {
-          content: [textContent(renderedContent), ...attachmentBlocks],
+          content: [textContent(`${closedNote}${renderedContent}`), ...attachmentBlocks],
         },
       };
 

@@ -53,6 +53,24 @@ in the git log and PR descriptions.
   carries `expiresAt` beside its `url`, and both tools' descriptions say
   what it means. A URL without a readable `ex` gets neither.
 
+- **A message that addresses the agent from a channel it hasn't opened says
+  what reaches it from there.** The push for a message posted in a guild
+  channel or thread that is neither open, subscribed nor muted, such as one
+  that mentions the bot or the role Discord created for it, or replies to
+  one of its messages, now begins with `<system>While this channel isn't
+  open, a message from it reaches you as it's posted when it mentions you or
+  the role Discord created for you, or replies to one of your messages.
+  Opening it brings its other messages as they arrive.</system>`, before the
+  message's own line. After a restart, a closed channel's catch-up block
+  gets the same note. A DM, a subscribed channel's message and an open
+  channel's `channels/incoming` carry no such note, and neither does an edit
+  that replaces the message, a reaction's push, which the agent turns on per
+  channel with `set_reaction_visibility`, a push from a channel muted while
+  the message was on its way, or one whose channel the delivery couldn't
+  register: deleted, archived, in a server the bot left, no longer admitted
+  by the channel filters, not held in the client's cache, or with facts that
+  may be older than Discord's.
+
 ### Changed
 
 - **These refusals, each given before the call sends or saves anything,
