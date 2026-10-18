@@ -145,11 +145,11 @@ export interface BatchView {
   adds: Counts;
   removals: Counts;
   unresolvedAttempts: number;
-  /** What a pre-journal ledger recorded about this batch's refs, all counts:
-   *  the refs it imported, those whose last recorded action was an add (a
-   *  removal) it saw applied, and the attempts whose outcome it never
-   *  recorded. */
-  legacy?: { entries: number; lastAddConfirmed: number; lastRemoveConfirmed: number; outcomesUnrecorded: number };
+  /** A batch imported from agent-framework 0.22.x's ledger: how many of its
+   *  messages 0.22.x's last attempt added a mark to with no error recorded.
+   *  The import records no attempts of its own, so such a batch's adds are
+   *  all zero, and this is the view's only count of what 0.22.x added. */
+  legacyAdded?: number;
 }
 
 /** One retract request (agent-framework's DiscordAwarenessRetractView). */
@@ -171,11 +171,10 @@ export interface CancelReceipt {
   target: string;
   kind: 'batch' | 'retract';
   cancelled: number;
-  inFlight: number;
-  unknown: number;
   confirmed: number;
+  /** Requests on the wire or with unknown outcome, counted once per request
+   *  sent: any may land. */
   unresolvedAttempts: number;
-  legacyOutcomesUnrecorded: number;
 }
 
 /** retract's receipt (agent-framework's DiscordAwarenessRetractReceipt). */
@@ -185,7 +184,6 @@ export interface RetractReceipt {
   addsSuperseded: number;
   keysWithUnresolvedAdds: number;
   unresolvedAddAttempts: number;
-  keysWithLegacyUncertainty: number;
 }
 
 /** Discord's limit on one reply. */
@@ -227,11 +225,6 @@ const counts = (c: Counts | undefined): string => {
 
 const when = (ms: number | undefined): string => (isNum(ms) ? `<t:${Math.floor(ms / 1000)}:f>` : 'unknown time');
 
-const legacyText = (l: NonNullable<BatchView['legacy']>): string =>
-  `imported history: ${plural(l.entries, 'entry', 'entries')}, of which ${l.lastAddConfirmed} last had an add confirmed ` +
-  `and ${l.lastRemoveConfirmed} a removal confirmed` +
-  (l.outcomesUnrecorded > 0 ? `; ${plural(l.outcomesUnrecorded, 'attempt')} with unrecorded outcomes — any may have landed` : '');
-
 /** One line per entry, for the paged list. */
 export function summaryLine(v: AwarenessView): string {
   const unresolved = v.unresolvedAttempts ? `; ${v.unresolvedAttempts} unresolved` : '';
@@ -239,7 +232,7 @@ export function summaryLine(v: AwarenessView): string {
     return `• retract \`${v.id}\` → ${v.target}${v.cancelled ? ' (cancelled)' : ''}: removals ${counts(v.removals)}${unresolved}`;
   }
   const state = v.cancelled ? `${v.status}, cancelled` : v.status;
-  const legacy = v.legacy ? `; imported history (${plural(v.legacy.outcomesUnrecorded, 'unrecorded outcome')})` : '';
+  const legacy = isNum(v.legacyAdded) ? `; 0.22.x recorded ${v.legacyAdded} added` : '';
   return `• batch \`${v.id}\` — ${state}, ${v.scope}, ${plural(v.refs, 'message')} (${v.agentName}): ` +
     `adds ${counts(v.adds)}; removals ${counts(v.removals)}${unresolved}${legacy}`;
 }
@@ -263,9 +256,8 @@ export function detailText(v: AwarenessView): string {
     if (v.cancelled) lines.push(`Cancelled ${when(v.cancelled.at)}${v.cancelled.by ? ` by ${v.cancelled.by}` : ''}.`);
     lines.push(`Adds: ${counts(v.adds)}. Removals on its messages: ${counts(v.removals)}.`);
     if (v.unresolvedAttempts) lines.push(`${plural(v.unresolvedAttempts, 'request')} on its messages on the wire or with unknown outcome — any may land.`);
-    if (v.legacy) {
-      const legacy = legacyText(v.legacy);
-      lines.push(`${legacy[0]!.toUpperCase()}${legacy.slice(1)}.`);
+    if (isNum(v.legacyAdded)) {
+      lines.push(`Imported from agent-framework 0.22.x, which recorded ${plural(v.legacyAdded, 'mark')} on these messages as added.`);
     }
   }
   return lines.join('\n');
@@ -348,8 +340,7 @@ export function isView(v: unknown): v is AwarenessView {
   if (v.kind === 'retract') return isStr(v.target) && isNum(v.at) && opt(v.by, isStr);
   return v.kind === 'batch' && isStr(v.status) && isStr(v.scope) && isStr(v.agentName) && isNum(v.createdAt) &&
     isNum(v.refs) && isCounts(v.adds) && opt(v.sourceBranch, isStr) && opt(v.targetBranch, isStr) &&
-    opt(v.unmarked, isNum) && opt(v.notRemoved, isNum) &&
-    opt(v.legacy, (l) => isObj(l) && allNums(l, ['entries', 'lastAddConfirmed', 'lastRemoveConfirmed', 'outcomesUnrecorded']));
+    opt(v.unmarked, isNum) && opt(v.notRemoved, isNum) && opt(v.legacyAdded, isNum);
 }
 
 /**
@@ -375,17 +366,20 @@ export function isMarkersReceipt(m: unknown): m is MarkersReceipt {
 
 export function isCancelReceipt(r: unknown): r is CancelReceipt {
   return isObj(r) && typeof r.target === 'string' && (r.kind === 'batch' || r.kind === 'retract') &&
-    allNums(r, ['cancelled', 'inFlight', 'unknown', 'confirmed', 'unresolvedAttempts', 'legacyOutcomesUnrecorded']);
+    allNums(r, ['cancelled', 'confirmed', 'unresolvedAttempts']);
 }
 
 export function isRetractReceipt(r: unknown): r is RetractReceipt {
   return isObj(r) && typeof r.requestId === 'string' &&
-    allNums(r, ['removalsQueued', 'addsSuperseded', 'keysWithUnresolvedAdds', 'unresolvedAddAttempts', 'keysWithLegacyUncertainty']);
+    allNums(r, ['removalsQueued', 'addsSuperseded', 'keysWithUnresolvedAdds', 'unresolvedAddAttempts']);
 }
 
 /** What a cancel stopped: its unsent requests, or none still waiting. */
 const stopped = (cancelled: number, fate: string): string =>
   cancelled === 0 ? 'no request was still waiting to be sent' : `${plural(cancelled, 'request')} ${fate}`;
+
+/** What a cancel couldn't stop: requests already sent whose outcome isn't known. */
+const mayLand = (unresolved: number): string => `${plural(unresolved, 'request')} on the wire or with unknown outcome may land`;
 
 /** cancel's reply: what will never be sent, and what cancel can't undo. */
 export function describeCancel(r: CancelReceipt): string {
@@ -393,12 +387,9 @@ export function describeCancel(r: CancelReceipt): string {
   const lines = [`✅ Cancelled ${what}: ${stopped(r.cancelled, 'will now never be sent')}.`];
   const limits: string[] = [];
   if (r.confirmed) limits.push(`${r.confirmed} already confirmed on Discord ${r.confirmed === 1 ? 'stays' : 'stay'} as ${r.confirmed === 1 ? 'it is' : 'they are'}`);
-  if (r.inFlight) limits.push(`${r.inFlight} on the wire may still land`);
-  if (r.unknown) limits.push(`${r.unknown} with unknown outcome may have landed`);
-  if (r.unresolvedAttempts) limits.push(`${plural(r.unresolvedAttempts, 'unresolved attempt')} in all`);
-  if (r.legacyOutcomesUnrecorded) limits.push(`${plural(r.legacyOutcomesUnrecorded, 'imported attempt')} with unrecorded outcomes may have landed`);
+  if (r.unresolvedAttempts) limits.push(mayLand(r.unresolvedAttempts));
   lines.push(`Cancel removes nothing from Discord${limits.length ? `: ${limits.join('; ')}.` : '.'}`);
-  if (r.kind === 'batch' && (r.confirmed || r.inFlight || r.unknown)) {
+  if (r.kind === 'batch' && (r.confirmed || r.unresolvedAttempts)) {
     lines.push(`To take marks down, \`/marks retract target:${r.target}\`.`);
   }
   return lines.join('\n');
@@ -413,9 +404,6 @@ export function describeRetract(r: RetractReceipt): string {
   if (r.keysWithUnresolvedAdds) {
     lines.push(`${plural(r.keysWithUnresolvedAdds, 'message')} ${r.keysWithUnresolvedAdds === 1 ? 'has' : 'have'} earlier add attempts still unresolved ` +
       `(${plural(r.unresolvedAddAttempts, 'attempt')}): such an add may land after its removal.`);
-  }
-  if (r.keysWithLegacyUncertainty) {
-    lines.push(`${plural(r.keysWithLegacyUncertainty, 'message')} ${r.keysWithLegacyUncertainty === 1 ? 'has' : 'have'} imported history with unrecorded outcomes.`);
   }
   lines.push(`\`/marks list target:${r.requestId}\` shows progress; \`/marks cancel target:${r.requestId}\` stops what hasn't been sent.`);
   return lines.join('\n');
@@ -452,33 +440,18 @@ export function summarizeControl(action: string, target: string | undefined, ans
   if (action === 'cancel' && isCancelReceipt(answer)) {
     // The short account keeps what cancel couldn't stop: requests that may
     // still land, or may already have landed.
-    const mayLand = [
-      ...(answer.inFlight ? [`${answer.inFlight} on the wire may still land`] : []),
-      ...(answer.unknown ? [`${answer.unknown} with unknown outcome may have landed`] : []),
-      ...(answer.legacyOutcomesUnrecorded
-        ? [`${plural(answer.legacyOutcomesUnrecorded, 'imported attempt')} with unrecorded outcomes may have landed`]
-        : []),
-    ];
     return `✅ Cancelled ${answer.kind} \`${answer.target}\`: ${stopped(answer.cancelled, 'will never be sent')}; ` +
-      `cancel removes nothing from Discord${mayLand.length ? `: ${mayLand.join('; ')}` : ''}.`;
+      `cancel removes nothing from Discord${answer.unresolvedAttempts ? `: ${mayLand(answer.unresolvedAttempts)}` : ''}.`;
   }
   if (action === 'retract' && isRetractReceipt(answer)) {
     // Like cancel's, it keeps what may still change Discord after it: an
-    // earlier add that may land after its removal, and imported history
-    // whose outcomes weren't recorded.
-    const after = [
-      ...(answer.keysWithUnresolvedAdds
-        ? [answer.keysWithUnresolvedAdds === 1
-          ? '1 message has an earlier add still unresolved, which may land after its removal'
-          : `${answer.keysWithUnresolvedAdds} messages have earlier adds still unresolved, which may land after their removal`]
-        : []),
-      ...(answer.keysWithLegacyUncertainty
-        ? [`${plural(answer.keysWithLegacyUncertainty, 'message')} ${answer.keysWithLegacyUncertainty === 1 ? 'has' : 'have'} ` +
-          'imported history with unrecorded outcomes']
-        : []),
-    ];
-    return `✅ Retract \`${answer.requestId}\`: ${plural(answer.removalsQueued, 'removal')} requested, not yet confirmed on Discord` +
-      `${after.length ? `; ${after.join('; ')}` : ''}.`;
+    // earlier add that may land after its removal.
+    const after = !answer.keysWithUnresolvedAdds
+      ? ''
+      : answer.keysWithUnresolvedAdds === 1
+        ? '; 1 message has an earlier add still unresolved, which may land after its removal'
+        : `; ${answer.keysWithUnresolvedAdds} messages have earlier adds still unresolved, which may land after their removal`;
+    return `✅ Retract \`${answer.requestId}\`: ${plural(answer.removalsQueued, 'removal')} requested, not yet confirmed on Discord${after}.`;
   }
   return `✅ The host accepted /marks ${action}${target ? ` \`${target}\`` : ''} (its receipt couldn't be read).`;
 }

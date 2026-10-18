@@ -25,6 +25,7 @@ import {
   paginate,
   renderListPage,
   REPLY_LIMIT,
+  summaryLine,
   type AwarenessView,
 } from '../src/awareness-marks.js';
 
@@ -641,7 +642,7 @@ describe('/hide and the marks choice', () => {
   });
 });
 
-// Shapes as agent-framework#250 at 15a822b6 produces them (receipts/af250-receipts-probe-15a822b6.txt):
+// Shapes as agent-framework#250's own outbox gives them when run at b79de626:
 // DiscordAwarenessBatchView / RetractView, and each action's receipt.
 const batch = (n: number, extra: Partial<Record<string, unknown>> = {}): AwarenessView => ({
   kind: 'batch',
@@ -669,12 +670,77 @@ const retractView = (at: number): AwarenessView => ({
   unresolvedAttempts: 1,
 });
 
+/** agent-framework#250's own answers at b79de626, run: a batch with one add confirmed, one on the wire and
+ *  one still requested, cancelled; a batch with one add answered unknown, retracted, and that retract
+ *  cancelled; a 0.22.x ledger shaped as in #250's own import test, imported and retracted; then a
+ *  retract of all. */
+const AF250 = {
+  cancel: { target: '791cd3f8-6760-4223-896a-c8c9dd5322c7', kind: 'batch', cancelled: 1, confirmed: 1, unresolvedAttempts: 1 },
+  cancelRetract: { target: '6f5dacb4-38a5-4933-bd0a-230e2dccedd6', kind: 'retract', cancelled: 2, confirmed: 0, unresolvedAttempts: 0 },
+  retract: { requestId: '6f5dacb4-38a5-4933-bd0a-230e2dccedd6', removalsQueued: 2, addsSuperseded: 2, keysWithUnresolvedAdds: 1, unresolvedAddAttempts: 1 },
+  retractImported: { requestId: 'fbda1c12-9657-4dbb-9597-5174cf1bccf6', removalsQueued: 3, addsSuperseded: 0, keysWithUnresolvedAdds: 0, unresolvedAddAttempts: 0 },
+  view: [
+    {
+      kind: 'batch', id: 'dd34b043', status: 'active', scope: 'legacy', agentName: 'resident', sourceBranch: 'main',
+      targetBranch: 'rollback/resident/1791358473307', emoji: '💤', createdAt: 1791358473400, refs: 3,
+      adds: { requested: 0, dispatching: 0, confirmed: 0, failed: 0, unknown: 0, cancelled: 0 },
+      removals: { requested: 6, dispatching: 0, confirmed: 0, failed: 0, unknown: 0, cancelled: 0 },
+      unresolvedAttempts: 0,
+      legacyAdded: 1,
+    },
+    {
+      kind: 'batch', id: 'pending-batch', status: 'active', scope: 'legacy', agentName: 'resident',
+      sourceBranch: 'main', targetBranch: 'rollback/resident/2', emoji: '💤', createdAt: 1791358473500, refs: 1,
+      adds: { requested: 0, dispatching: 0, confirmed: 0, failed: 0, unknown: 0, cancelled: 0 },
+      removals: { requested: 1, dispatching: 0, confirmed: 0, failed: 0, unknown: 0, cancelled: 0 },
+      unresolvedAttempts: 0,
+      legacyAdded: 0,
+    },
+    {
+      kind: 'batch', id: '791cd3f8-6760-4223-896a-c8c9dd5322c7', status: 'active', scope: 'all', agentName: 'cairn',
+      sourceBranch: 'main', targetBranch: 'rollback/cairn/1', emoji: '💤', createdAt: 1792301417458, refs: 3,
+      cancelled: { at: 1792301417509, by: 'probe' },
+      adds: { requested: 0, dispatching: 1, confirmed: 1, failed: 0, unknown: 0, cancelled: 1 },
+      removals: { requested: 3, dispatching: 0, confirmed: 0, failed: 0, unknown: 0, cancelled: 0 },
+      unresolvedAttempts: 1,
+    },
+    {
+      kind: 'batch', id: '0d92e02d-0dd4-4cff-9dcc-5ce1a662899b', status: 'active', scope: 'addressed',
+      agentName: 'cairn', sourceBranch: 'main', targetBranch: 'rollback/cairn/2', emoji: '💤',
+      createdAt: 1792301417517, refs: 2,
+      adds: { requested: 0, dispatching: 0, confirmed: 0, failed: 0, unknown: 1, cancelled: 1 },
+      removals: { requested: 2, dispatching: 0, confirmed: 0, failed: 0, unknown: 0, cancelled: 2 },
+      unresolvedAttempts: 1,
+    },
+    {
+      kind: 'retract', id: '6f5dacb4-38a5-4933-bd0a-230e2dccedd6', target: '0d92e02d-0dd4-4cff-9dcc-5ce1a662899b',
+      at: 1792301417545, by: 'probe',
+      cancelled: { at: 1792301417552, by: 'probe' },
+      removals: { requested: 0, dispatching: 0, confirmed: 0, failed: 0, unknown: 0, cancelled: 2 },
+      unresolvedAttempts: 0,
+    },
+    {
+      kind: 'retract', id: 'fbda1c12-9657-4dbb-9597-5174cf1bccf6', target: 'dd34b043', at: 1792301417559,
+      by: 'probe',
+      removals: { requested: 3, dispatching: 0, confirmed: 0, failed: 0, unknown: 0, cancelled: 0 },
+      unresolvedAttempts: 0,
+    },
+    {
+      kind: 'retract', id: '3fa0a8a0-f453-4ddb-8e04-12f380c92b4d', target: 'all', at: 1792301417565, by: 'probe',
+      removals: { requested: 9, dispatching: 0, confirmed: 0, failed: 0, unknown: 0, cancelled: 0 },
+      unresolvedAttempts: 0,
+    },
+  ] as AwarenessView[],
+};
+
 describe('/marks', () => {
   const listing = (views: AwarenessView[]) => (p: Sent) => (p.action === 'list' ? { ok: true, awareness: views } : { ok: true });
 
-  it('lists the journal newest first, ephemerally, keeping imported evidence', async () => {
+  it('lists the journal newest first, ephemerally, keeping what 0.22.x recorded of an imported batch', async () => {
     const views = [
-      batch(1, { legacy: { entries: 2, lastAddConfirmed: 1, lastRemoveConfirmed: 0, outcomesUnrecorded: 3 } }),
+      // An imported batch: scope legacy, no attempts of its own, and the
+      // marks 0.22.x recorded as added.
+      batch(1, { scope: 'legacy', adds: { requested: 0, dispatching: 0, confirmed: 0, failed: 0, unknown: 0, cancelled: 0 }, legacyAdded: 1 }),
       batch(2, { status: 'discarded', cancelled: { at: 1760000006000, by: 'Admin' } }),
       retractView(1760000009000),
     ];
@@ -688,7 +754,7 @@ describe('/marks', () => {
     assert.match(lines[0]!, /page 1 of 1, 3 entries, newest first/);
     assert.match(lines[1]!, /retract `retract-9f8e.*` → all: removals requested 2, confirmed 4, unknown 1; 1 unresolved/);
     assert.match(lines[2]!, /batch `batch-0002.*` — discarded, cancelled, all, 3 messages \(lena\): adds requested 1, confirmed 2; removals none$/);
-    assert.match(lines[3]!, /batch `batch-0001.*imported history \(3 unrecorded outcomes\)/);
+    assert.match(lines[3]!, /batch `batch-0001.*` — active, legacy, 3 messages \(lena\): adds none; removals none; 0\.22\.x recorded 1 added$/);
     assert.ok(reply.length <= REPLY_LIMIT);
   });
 
@@ -722,7 +788,7 @@ describe('/marks', () => {
   it('shows one entry in full by id, cutting a long one visibly with the record attached', async () => {
     const long = batch(5, {
       agentName: 'r'.repeat(2500),
-      legacy: { entries: 1, lastAddConfirmed: 1, lastRemoveConfirmed: 0, outcomesUnrecorded: 2 },
+      legacyAdded: 2,
     });
     const views = [batch(4), long];
     const h = host({ marksVerb: 'yes', answer: listing(views) });
@@ -740,7 +806,7 @@ describe('/marks', () => {
     assert.match(reply, /cut to fit one message; the whole answer is attached as JSON/);
     const attached = JSON.parse(i.out.files.at(-1)![0]!.attachment.toString('utf8'));
     assert.equal(attached[0].agentName.length, 2500);
-    assert.deepEqual(attached[0].legacy, { entries: 1, lastAddConfirmed: 1, lastRemoveConfirmed: 0, outcomesUnrecorded: 2 });
+    assert.equal(attached[0].legacyAdded, 2);
 
     const missing = interaction('marks', { action: 'list', target: 'nope' });
     await asAdmin(() => server.handleSlashCommand(missing.value));
@@ -748,7 +814,7 @@ describe('/marks', () => {
   });
 
   it("renders cancel's receipt, keeping what cancel can't undo", async () => {
-    const receipt = { target: 'batch-1', kind: 'batch', cancelled: 2, inFlight: 1, unknown: 1, confirmed: 3, unresolvedAttempts: 2, legacyOutcomesUnrecorded: 1 };
+    const receipt = { target: 'batch-1', kind: 'batch', cancelled: 2, confirmed: 0, unresolvedAttempts: 2 };
     const h = host({ marksVerb: 'yes', answer: (p) => (p.action === 'cancel' ? { ok: true, awareness: receipt } : { ok: true }) });
     const { server } = serverWith(h.conn);
     const missing = interaction('marks', { action: 'cancel' });
@@ -760,14 +826,15 @@ describe('/marks', () => {
     assert.equal(h.commands()[0]!.target, 'batch-1');
     const reply = i.out.replies.at(-1)!;
     assert.match(reply, /Cancelled batch `batch-1`: 2 requests will now never be sent\./);
-    assert.match(reply, /Cancel removes nothing from Discord: 3 already confirmed on Discord stay as they are; 1 on the wire may still land; 1 with unknown outcome may have landed; 2 unresolved attempts in all; 1 imported attempt with unrecorded outcomes may have landed\./);
-    assert.match(reply, /`\/marks retract target:batch-1`/);
+    assert.match(reply, /\nCancel removes nothing from Discord: 2 requests on the wire or with unknown outcome may land\.\n/);
+    // Nothing confirmed yet, but what may land is reason enough to retract.
+    assert.match(reply, /\nTo take marks down, `\/marks retract target:batch-1`\.$/);
   });
 
   it('says so when a cancel found no request still waiting to be sent, keeping its heading', async () => {
     // agent-framework#250 journals a first cancel whatever its count: the
     // batch is cancelled, and retries on the wire or unknown are stopped.
-    const receipt = { target: 'batch-2', kind: 'batch', cancelled: 0, inFlight: 0, unknown: 0, confirmed: 3, unresolvedAttempts: 0, legacyOutcomesUnrecorded: 0 };
+    const receipt = { target: 'batch-2', kind: 'batch', cancelled: 0, confirmed: 3, unresolvedAttempts: 0 };
     const h = host({ marksVerb: 'yes', answer: (p) => (p.action === 'cancel' ? { ok: true, awareness: receipt } : { ok: true }) });
     const { server } = serverWith(h.conn);
     const i = interaction('marks', { action: 'cancel', target: 'batch-2' });
@@ -781,7 +848,7 @@ describe('/marks', () => {
   });
 
   it("renders retract's receipt as requested, not confirmed", async () => {
-    const retract = { requestId: 'r-1', removalsQueued: 4, addsSuperseded: 1, keysWithUnresolvedAdds: 2, unresolvedAddAttempts: 3, keysWithLegacyUncertainty: 1 };
+    const retract = { requestId: 'r-1', removalsQueued: 4, addsSuperseded: 1, keysWithUnresolvedAdds: 2, unresolvedAddAttempts: 3 };
     const h = host({ marksVerb: 'yes', answer: (p) => (p.action === 'retract' ? { ok: true, awareness: retract } : { ok: true }) });
     const { server } = serverWith(h.conn);
 
@@ -799,7 +866,6 @@ describe('/marks', () => {
     const rr = r.out.replies.at(-1)!;
     assert.match(rr, /Retract `r-1`: 4 💤 removals requested — not yet confirmed on Discord; 1 unsent add superseded\./);
     assert.match(rr, /2 messages have earlier add attempts still unresolved \(3 attempts\): such an add may land after its removal\./);
-    assert.match(rr, /1 message has imported history with unrecorded outcomes\./);
   });
 
   it('shows a shape it cannot read as sent, bounded, never misread', async () => {
@@ -812,6 +878,72 @@ describe('/marks', () => {
     assert.match(reply, /answered \/marks cancel in a shape this server can't read/);
     assert.ok(reply.length <= REPLY_LIMIT);
     assert.deepEqual(JSON.parse(i.out.files.at(-1)![0]!.attachment.toString('utf8')), odd);
+  });
+
+  it('shows a cancel or retract receipt missing a count it reads as sent, never reading the count as zero', async () => {
+    const cases: Array<['cancel' | 'retract', Record<string, unknown>, string[]]> = [
+      ['cancel', AF250.cancel, ['cancelled', 'confirmed', 'unresolvedAttempts']],
+      ['retract', AF250.retract, ['removalsQueued', 'addsSuperseded', 'keysWithUnresolvedAdds', 'unresolvedAddAttempts']],
+    ];
+    for (const [action, whole, counts] of cases) {
+      for (const left of counts) {
+        const receipt = Object.fromEntries(Object.entries(whole).filter(([k]) => k !== left));
+        const h = host({ marksVerb: 'yes', answer: (p) => (p.action === action ? { ok: true, awareness: receipt } : { ok: true }) });
+        const { server } = serverWith(h.conn);
+        const i = interaction('marks', { action, target: 'b-1' });
+        await asAdmin(() => server.handleSlashCommand(i.value));
+        assert.match(i.out.replies.at(-1)!, new RegExp(`answered /marks ${action} in a shape this server can't read`), `${action} without ${left}`);
+      }
+    }
+  });
+
+  it("reads agent-framework#250's own answers at b79de626: cancels, retracts and the journal, imported batches included", async () => {
+    const replyTo = async (opts: Record<string, string | number | undefined>) => {
+      const h = host({
+        marksVerb: 'yes',
+        answer: (p) => ({
+          ok: true,
+          awareness: p.action === 'list' ? AF250.view
+            : p.action === 'cancel' ? (p.target === AF250.cancel.target ? AF250.cancel : AF250.cancelRetract)
+              : p.target === 'dd34b043' ? AF250.retractImported : AF250.retract,
+        }),
+      });
+      const { server } = serverWith(h.conn);
+      const i = interaction('marks', opts);
+      await asAdmin(() => server.handleSlashCommand(i.value));
+      return i.out.replies.at(-1)!;
+    };
+    const a = AF250.cancel.target;
+    assert.equal(
+      await replyTo({ action: 'cancel', target: a }),
+      `✅ Cancelled batch \`${a}\`: 1 request will now never be sent.\n` +
+        'Cancel removes nothing from Discord: 1 already confirmed on Discord stays as it is; 1 request on the wire or with unknown ' +
+        `outcome may land.\nTo take marks down, \`/marks retract target:${a}\`.`,
+    );
+    const r = AF250.retract.requestId;
+    assert.equal(
+      await replyTo({ action: 'cancel', target: r }),
+      `✅ Cancelled retract \`${r}\`: 2 requests will now never be sent.\nCancel removes nothing from Discord.`,
+    );
+    assert.equal(
+      await replyTo({ action: 'retract', target: AF250.view[3]!.id }),
+      `✅ Retract \`${r}\`: 2 💤 removals requested — not yet confirmed on Discord; 2 unsent adds superseded.\n` +
+        '1 message has earlier add attempts still unresolved (1 attempt): such an add may land after its removal.\n' +
+        `\`/marks list target:${r}\` shows progress; \`/marks cancel target:${r}\` stops what hasn't been sent.`,
+    );
+    const ri = AF250.retractImported.requestId;
+    assert.equal(
+      await replyTo({ action: 'retract', target: 'dd34b043' }),
+      `✅ Retract \`${ri}\`: 3 💤 removals requested — not yet confirmed on Discord.\n` +
+        `\`/marks list target:${ri}\` shows progress; \`/marks cancel target:${ri}\` stops what hasn't been sent.`,
+    );
+    const list = await replyTo({ action: 'list' });
+    assert.match(list, /\n• batch `dd34b043` — active, legacy, 3 messages \(resident\): adds none; removals requested 6; 0\.22\.x recorded 1 added\n/);
+    assert.match(list, /\n• batch `pending-batch` — active, legacy, 1 message \(resident\): adds none; removals requested 1; 0\.22\.x recorded 0 added\n/);
+    assert.match(
+      await replyTo({ action: 'list', target: 'dd34b043' }),
+      /\nAdds: none\. Removals on its messages: requested 6\.\nImported from agent-framework 0\.22\.x, which recorded 1 mark on these messages as added\.$/,
+    );
   });
 
   it('shows an accepted answer that left out its journal or receipt whole, never as "undefined"', async () => {
@@ -860,8 +992,8 @@ describe('/marks', () => {
   });
 
   it('keeps what an accepted control requested when its reply is refused', async () => {
-    const retract = { requestId: 'r-1', removalsQueued: 4, addsSuperseded: 0, keysWithUnresolvedAdds: 0, unresolvedAddAttempts: 0, keysWithLegacyUncertainty: 0 };
-    const cancel = { target: 'b-2', kind: 'batch', cancelled: 3, inFlight: 0, unknown: 0, confirmed: 1, unresolvedAttempts: 0, legacyOutcomesUnrecorded: 0 };
+    const retract = { requestId: 'r-1', removalsQueued: 4, addsSuperseded: 0, keysWithUnresolvedAdds: 0, unresolvedAddAttempts: 0 };
+    const cancel = { target: 'b-2', kind: 'batch', cancelled: 3, confirmed: 1, unresolvedAttempts: 0 };
     const h = host({ marksVerb: 'yes', answer: (p) => (p.action === 'retract' ? { ok: true, awareness: retract } : p.action === 'cancel' ? { ok: true, awareness: cancel } : { ok: true }) });
     const { server } = serverWith(h.conn);
     const r = interaction('marks', { action: 'retract', target: 'b-1' }, { rejectEdits: 1 });
@@ -874,13 +1006,14 @@ describe('/marks', () => {
 
   it("keeps a retract's caveats in its short account, and says when a cancel found nothing still waiting", async () => {
     const receipts: Array<[string, unknown, string]> = [
-      ['retract', { requestId: 'r-2', removalsQueued: 3, addsSuperseded: 0, keysWithUnresolvedAdds: 1, unresolvedAddAttempts: 2, keysWithLegacyUncertainty: 0 },
+      ['retract', { requestId: 'r-2', removalsQueued: 3, addsSuperseded: 0, keysWithUnresolvedAdds: 1, unresolvedAddAttempts: 2 },
         '✅ Retract `r-2`: 3 removals requested, not yet confirmed on Discord; 1 message has an earlier add still unresolved, which may land after its removal.'],
-      ['retract', { requestId: 'r-3', removalsQueued: 5, addsSuperseded: 1, keysWithUnresolvedAdds: 2, unresolvedAddAttempts: 3, keysWithLegacyUncertainty: 1 },
+      ['retract', { requestId: 'r-3', removalsQueued: 5, addsSuperseded: 1, keysWithUnresolvedAdds: 2, unresolvedAddAttempts: 3 },
         '✅ Retract `r-3`: 5 removals requested, not yet confirmed on Discord; 2 messages have earlier adds still unresolved, which may land ' +
-          'after their removal; 1 message has imported history with unrecorded outcomes.'],
-      ['cancel', { target: 'b-4', kind: 'batch', cancelled: 0, inFlight: 1, unknown: 0, confirmed: 2, unresolvedAttempts: 1, legacyOutcomesUnrecorded: 0 },
-        '✅ Cancelled batch `b-4`: no request was still waiting to be sent; cancel removes nothing from Discord: 1 on the wire may still land.'],
+          'after their removal.'],
+      ['cancel', { target: 'b-4', kind: 'batch', cancelled: 0, confirmed: 2, unresolvedAttempts: 1 },
+        '✅ Cancelled batch `b-4`: no request was still waiting to be sent; cancel removes nothing from Discord: 1 request on the wire ' +
+          'or with unknown outcome may land.'],
     ];
     for (const [action, receipt, short] of receipts) {
       const h = host({ marksVerb: 'yes', answer: () => ({ ok: true, awareness: receipt }) });
@@ -892,15 +1025,15 @@ describe('/marks', () => {
   });
 
   it("keeps a cancel's limits in its short account: what may still land, or may have landed", async () => {
-    const cancel = { target: 'b-3', kind: 'batch', cancelled: 2, inFlight: 1, unknown: 2, confirmed: 1, unresolvedAttempts: 3, legacyOutcomesUnrecorded: 1 };
+    const cancel = { target: 'b-3', kind: 'batch', cancelled: 2, confirmed: 1, unresolvedAttempts: 3 };
     const h = host({ marksVerb: 'yes', answer: () => ({ ok: true, awareness: cancel }) });
     const { server } = serverWith(h.conn);
     const c = interaction('marks', { action: 'cancel', target: 'b-3' }, { rejectEdits: 1 });
     await asAdmin(() => server.handleSlashCommand(c.value));
     assert.equal(
       c.out.replies.at(-1),
-      '✅ Cancelled batch `b-3`: 2 requests will never be sent; cancel removes nothing from Discord: 1 on the wire may still land; ' +
-        "2 with unknown outcome may have landed; 1 imported attempt with unrecorded outcomes may have landed. (The full reply couldn't be shown: Unknown interaction.)",
+      '✅ Cancelled batch `b-3`: 2 requests will never be sent; cancel removes nothing from Discord: 3 requests on the wire or with ' +
+        "unknown outcome may land. (The full reply couldn't be shown: Unknown interaction.)",
     );
   });
 
@@ -947,10 +1080,14 @@ describe('rendering', () => {
     assert.doesNotMatch(detailText(batch(1)), /Left unmarked/);
   });
 
-  it("reads imported history's confirmations as the counts they are, and says what may have landed only when some outcome is unrecorded", () => {
-    const legacy = (outcomesUnrecorded: number) => detailText(batch(1, { legacy: { entries: 3, lastAddConfirmed: 2, lastRemoveConfirmed: 1, outcomesUnrecorded } }));
-    assert.match(legacy(4), /\nImported history: 3 entries, of which 2 last had an add confirmed and 1 a removal confirmed; 4 attempts with unrecorded outcomes — any may have landed\.$/);
-    assert.match(legacy(0), /\nImported history: 3 entries, of which 2 last had an add confirmed and 1 a removal confirmed\.$/);
+  it('says how many marks 0.22.x recorded as added for an imported batch, none included, and nothing for a journal batch', () => {
+    const imported = (legacyAdded: number) => detailText(batch(1, { scope: 'legacy', legacyAdded }));
+    assert.match(imported(2), /\nImported from agent-framework 0\.22\.x, which recorded 2 marks on these messages as added\.$/);
+    assert.match(imported(1), /\nImported from agent-framework 0\.22\.x, which recorded 1 mark on these messages as added\.$/);
+    assert.match(imported(0), /\nImported from agent-framework 0\.22\.x, which recorded 0 marks on these messages as added\.$/);
+    assert.doesNotMatch(detailText(batch(1)), /Imported|0\.22\.x/);
+    assert.match(summaryLine(batch(1, { scope: 'legacy', legacyAdded: 0 })), /; 0\.22\.x recorded 0 added$/);
+    assert.doesNotMatch(summaryLine(batch(1)), /0\.22\.x/);
   });
 
   it('cuts between code points, never through an emoji', () => {
@@ -1001,7 +1138,7 @@ describe('rendering', () => {
     assert.ok(isView(later));
     assert.match(renderListPage([later], 1), /— staged, legacy, 3 messages \(lena\): adds requested 1, superseded 2;/);
     const entries: Array<[string, unknown]> = [
-      ['imported history missing its counts', batch(1, { legacy: { entries: 1 } })],
+      ['an imported count that is not a number', batch(1, { legacyAdded: '1' })],
       ['a count that is not a number', batch(1, { adds: { requested: '3' } })],
       ['removals that are not counts', batch(1, { removals: [] })],
       ['a cancellation with no time', batch(1, { cancelled: { by: 'Admin' } })],

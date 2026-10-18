@@ -80,8 +80,9 @@ in the git log and PR descriptions.
   cancel|retract target`, shows the host's journal and acts on it,
   ephemerally:
   - `list` pages the journal newest first, each page within one Discord
-    reply. `list target:<id>` shows one batch or retract in full, imported
-    history included.
+    reply. `list target:<id>` shows one batch or retract in full. A batch
+    imported from agent-framework 0.22.x's ledger has no adds of its own,
+    so both say how many marks 0.22.x recorded as added.
   - cancel and retract each answer with what that action's receipt says.
     Cancel keeps its limits: confirmed marks stay, and in-flight or unknown
     requests may still land.
