@@ -16,7 +16,7 @@ In the Connectome stack, [connectome-host](https://github.com/anima-research/con
   - `/undo [messages] [marks]` removes the last messages from the agent's context (1 by default, at most 50).
   - `/hide message [to] [marks]` removes a message, or the range from it through `to`, from the agent's context. Both take a message link or ID.
   - `marks`, on either command, chooses which removed messages get a 💤 awareness mark: `none`, the default, `addressed`, those that addressed the agent, or `all`. It needs a host whose agent framework has the `marks` host command (anima-research/agent-framework#250). On an older host, `/undo` is refused, and so is a `/hide` that chooses marks.
-  - `/marks list [target] [page]` shows the host's journal of the marks it scheduled, `/marks cancel target` stops what it hasn't sent, and `/marks retract target` takes marks down. It needs the same host.
+  - `/marks action:list [target:<id>] [page:<n>]` shows the host's journal of the marks it scheduled, `/marks action:cancel target:<id>` stops what it hasn't sent, and `/marks action:retract target:<id>` takes marks down. It needs the same host.
   - `/nudge` runs the agent on its current context, with no new event.
   - `/unstick [max]` rewinds the turns behind a refusal and runs the agent again until the model stops refusing, at most `max` times.
 - **Voice.** Optionally, discord-mcpl joins a voice channel and speaks the agent's replies through ElevenLabs as the host streams them. It waits for silence before it speaks, stops when a person talks over it, and tells the agent what went unheard. It doesn't transcribe speech.

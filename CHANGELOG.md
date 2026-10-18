@@ -15,8 +15,8 @@ in the git log and PR descriptions.
   `/undo`, and marking what `/hide` removes, from Discord until the host
   upgrades. Each command asks the host, so both work again once the upgraded
   host is connected. To tell whether a host has the command, run `/marks
-  list`: on a host without it, the reply says the host has no awareness-mark
-  controls.
+  action:list`: on a host without it, the reply says the host has no
+  awareness-mark controls.
 - **`/undo` and `/hide` mark nothing unless `marks` is chosen.** `/hide`
   used to react 💤 on every hidden message by default; on a host with the
   `marks` command, choose `marks: all` for that. The admin commands' entry
@@ -111,22 +111,25 @@ in the git log and PR descriptions.
   places the marks and returns a `markers` receipt, and the reply says what
   it scheduled: requested, not yet confirmed on Discord, with the receipt's
   warning when the host's journal couldn't be synced after recording them. A
-  new admin command, `/marks list [target] [page]` and `/marks
-  cancel|retract target`, shows the host's journal and acts on it,
-  ephemerally:
-  - `list` pages the journal newest first, each page within one Discord
-    reply. `list target:<id>` shows one batch or retract in full. A batch
-    imported from agent-framework 0.22.x's ledger has no adds of its own,
-    so both say how many marks 0.22.x recorded as added.
+  new admin command, `/marks action:list [target:<id>] [page:<n>]` and
+  `/marks action:cancel|retract target:<id>`, shows the host's journal and
+  acts on it, ephemerally:
+  - `action:list` pages the journal newest first, each page within one
+    Discord reply. `action:list target:<id>` shows one batch or retract in
+    full. A batch imported from agent-framework 0.22.x's ledger has no adds
+    of its own, so both say how many marks 0.22.x recorded as added, and the
+    entry in full says that marks it placed may still be on Discord, and how
+    to take them down.
   - cancel and retract each answer with what that action's receipt says.
     Cancel keeps its limits: confirmed marks stay, and in-flight or unknown
-    requests may still land.
+    requests may still land. A batch's cancel also says how to take its
+    marks down.
   - A reply too long for one message is cut visibly, with what it shows
-    attached in full: the host's answer, or for `list target:` the entry. An
-    answer in a shape this server can't read is shown as sent. Only the
-    host's `ok: false` reads as a failure: any other answer to `/undo`,
-    `/hide` or a `/marks` control is shown with a warning that it may have
-    been applied.
+    attached in full: the host's answer, or for `action:list target:` the
+    entry. An answer in a shape this server can't read is shown as sent.
+    Only the host's `ok: false` reads as a failure: any other answer to
+    `/undo`, `/hide` or a `/marks` control is shown with a warning that it
+    may have been applied.
 
   To learn which kind of host it has, a command asks with a `marks` request
   that names no action, which the host answers without reading its journal.
@@ -145,8 +148,8 @@ in the git log and PR descriptions.
     they can be listed, cancelled and retracted. With no choice, the hide goes
     through and nothing is marked, where `/hide` used to react 💤 on every
     hidden message. A host with the verb that omits its receipt is reported as
-    such, with a pointer to `/marks list`, and never supplemented, since
-    reactions placed here would bypass its journal and its cancel.
+    such, with a pointer to `/marks action:list`, and never supplemented,
+    since reactions placed here would bypass its journal and its cancel.
 
 ### Fixed
 

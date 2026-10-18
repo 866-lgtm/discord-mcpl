@@ -1208,7 +1208,7 @@ export class DiscordMcplServer {
   }
 
   /**
-   * `/marks list [target] [page]` and `/marks cancel|retract target` — the
+   * `/marks action:list [target] [page]` and `/marks action:cancel|retract target` — the
    * awareness journal's operator controls (agent-framework `host/command`
    * `marks`). list shows the journal newest first, a page at a time, or one
    * entry in full by its id; cancel and retract each answer with what the
@@ -1228,8 +1228,8 @@ export class DiscordMcplServer {
     if (action !== 'list' && !target) {
       await interaction.reply({
         content: action === 'retract'
-          ? '`/marks retract` needs a target: a batch id, or `all`.'
-          : '`/marks cancel` needs a target: a batch id or a retract request id.',
+          ? '`/marks action:retract` needs a target: a batch id, or `all`.'
+          : '`/marks action:cancel` needs a target: a batch id or a retract request id.',
         flags: MessageFlags.Ephemeral,
       });
       return;
@@ -1263,7 +1263,7 @@ export class DiscordMcplServer {
       // A read that failed changed nothing. A control may have reached the
       // host first: its outcome is unknown, never "failed".
       if (action === 'list') {
-        await this.acknowledge(interaction, boundedReply(`⚠️ /marks list failed: ${errorText(err)}`));
+        await this.acknowledge(interaction, boundedReply(`⚠️ /marks action:list failed: ${errorText(err)}`));
       } else {
         await this.acknowledge(
           interaction,
@@ -1277,12 +1277,12 @@ export class DiscordMcplServer {
     // boolean `ok` is shown as sent: a control may have been applied.
     const response: Record<string, unknown> = isJsonObject(result) ? result : {};
     if (response.ok === false) {
-      await this.acknowledge(interaction, boundedReply(hostRefusal(`/marks ${action}`, response)));
+      await this.acknowledge(interaction, boundedReply(hostRefusal(`/marks action:${action}`, response)));
       return;
     }
     if (response.ok !== true) {
       if (action === 'list') {
-        await this.acknowledge(interaction, boundedReply(unreadable('/marks list', result), result));
+        await this.acknowledge(interaction, boundedReply(unreadable('/marks action:list', result), result));
       } else {
         await this.acknowledge(
           interaction,
@@ -1299,7 +1299,7 @@ export class DiscordMcplServer {
     if (action === 'list') {
       const views = Array.isArray(answer) && answer.every(isView) ? answer : null;
       if (!views) {
-        await this.acknowledge(interaction, boundedReply(unreadable(whole ? '/marks list' : 'the journal', answer), answer));
+        await this.acknowledge(interaction, boundedReply(unreadable(whole ? '/marks action:list' : 'the journal', answer), answer));
         return;
       }
       if (target) {
@@ -1314,7 +1314,7 @@ export class DiscordMcplServer {
       ? describeCancel(answer)
       : action === 'retract' && isRetractReceipt(answer)
         ? describeRetract(answer)
-        : unreadable(`/marks ${action}`, answer);
+        : unreadable(`/marks action:${action}`, answer);
     // The control is accepted: a reply that can't be shown still says what was requested.
     await this.acknowledge(interaction, boundedReply(text, answer), summarizeControl(action, target, answer));
   }

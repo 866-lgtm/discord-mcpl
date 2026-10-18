@@ -63,7 +63,7 @@ export const markersReported = (markers: unknown): boolean => markers !== undefi
  */
 export function describeMarkers(markers: unknown): string {
   if (!markersReported(markers)) {
-    return 'Marks: this host reported nothing about 💤 marks; `/marks list` shows whether it scheduled any.';
+    return 'Marks: this host reported nothing about 💤 marks; `/marks action:list` shows whether it scheduled any.';
   }
   if (!isMarkersReceipt(markers)) {
     return `Marks: the host's receipt is in a shape this server can't read; here it is as sent:\n${asSent(markers)}`;
@@ -84,14 +84,14 @@ export function describeMarkers(markers: unknown): string {
         : `Marks: none placed — nothing removed fell within "${markers.scope}".${tail}`;
     case 'queued':
       return `Marks: ${plural(markers.queued, '💤 mark')} requested (${markers.scope}; batch \`${markers.batchId}\`) — ` +
-        `not yet confirmed on Discord; \`/marks list\` shows progress.${tail}` + (markers.error === undefined ? '' :
+        `not yet confirmed on Discord; \`/marks action:list\` shows progress.${tail}` + (markers.error === undefined ? '' :
           ` The host's journal couldn't be synced after recording them (${markers.error}), so an operating system crash ` +
           'or a power failure before its next sync could lose them.');
     case 'not-scheduled':
       return `Marks: not scheduled — ${markers.error}. None will be placed.${tail}`;
     case 'unresolved':
       return `Marks: unresolved — ${markers.error}. Batch \`${markers.batchId}\` may still be delivered later; ` +
-        `check \`/marks list\`.${tail}`;
+        `check \`/marks action:list\`.${tail}`;
   }
 }
 
@@ -104,8 +104,8 @@ const SHORT_TEXT_MAX = 100;
  * scheduled and the batch to find it by, never what Discord confirmed.
  */
 export function summarizeMarkers(markers: unknown): string {
-  if (!markersReported(markers)) return 'Marks: the host reported nothing about them; `/marks list` shows whether it scheduled any.';
-  if (!isMarkersReceipt(markers)) return "Marks: the host's receipt couldn't be read; `/marks list` shows the journal.";
+  if (!markersReported(markers)) return 'Marks: the host reported nothing about them; `/marks action:list` shows whether it scheduled any.';
+  if (!isMarkersReceipt(markers)) return "Marks: the host's receipt couldn't be read; `/marks action:list` shows the journal.";
   const batch = (id: string): string => `batch \`${clip(id, SHORT_TEXT_MAX)}\``;
   switch (markers.status) {
     case 'none':
@@ -117,7 +117,7 @@ export function summarizeMarkers(markers: unknown): string {
     case 'not-scheduled':
       return `Marks: not scheduled — ${clip(markers.error, SHORT_TEXT_MAX)}.`;
     case 'unresolved':
-      return `Marks: unresolved — ${clip(markers.error, SHORT_TEXT_MAX)} (${batch(markers.batchId)}); check \`/marks list\`.`;
+      return `Marks: unresolved — ${clip(markers.error, SHORT_TEXT_MAX)} (${batch(markers.batchId)}); check \`/marks action:list\`.`;
   }
 }
 
@@ -258,7 +258,7 @@ export function detailText(v: AwarenessView): string {
     if (v.unresolvedAttempts) lines.push(`${plural(v.unresolvedAttempts, 'request')} on its messages on the wire or with unknown outcome — any may land.`);
     if (isNum(v.legacyAdded)) {
       lines.push(`Imported from agent-framework 0.22.x, which recorded ${plural(v.legacyAdded, 'mark')} on these messages as added. ` +
-        `Marks it placed may still be on Discord: \`/marks retract target:${v.id}\` takes them down.`);
+        `Marks it placed may still be on Discord: \`/marks action:retract target:${v.id}\` takes them down.`);
     }
   }
   return lines.join('\n');
@@ -296,7 +296,7 @@ export function paginate(views: AwarenessView[], budget = REPLY_LIMIT): string[]
 
 const HEADING_RESERVE = 220;
 
-/** One page of `/marks list`, heading and footer included, within one reply. */
+/** One page of `/marks action:list`, heading and footer included, within one reply. */
 export function renderListPage(views: AwarenessView[], pageNumber: number, budget = REPLY_LIMIT): string {
   if (views.length === 0) return 'No awareness-mark batches or retracts in the journal.';
   const pages = paginate(views, budget);
@@ -306,8 +306,8 @@ export function renderListPage(views: AwarenessView[], pageNumber: number, budge
   const lines = pages[pageNumber - 1]!;
   const heading = `Awareness journal — page ${pageNumber} of ${pages.length}, ${plural(views.length, 'entry', 'entries')}, newest first.`;
   const footer = pages.length > 1
-    ? `\`/marks list page:${pageNumber < pages.length ? pageNumber + 1 : 1}\` for ${pageNumber < pages.length ? 'the next page' : 'the first page'}; \`/marks list target:<id>\` shows one entry in full.`
-    : '`/marks list target:<id>` shows one entry in full.';
+    ? `\`/marks action:list page:${pageNumber < pages.length ? pageNumber + 1 : 1}\` for ${pageNumber < pages.length ? 'the next page' : 'the first page'}; \`/marks action:list target:<id>\` shows one entry in full.`
+    : '`/marks action:list target:<id>` shows one entry in full.';
   return clip([heading, ...lines, footer].join('\n'), budget);
 }
 
@@ -392,7 +392,7 @@ export function describeCancel(r: CancelReceipt): string {
   lines.push(`Cancel removes nothing from Discord${limits.length ? `: ${limits.join('; ')}.` : '.'}`);
   // Every batch's: its receipt can't see marks an import brought, or marks
   // another batch placed on the same messages, which a retract takes off too.
-  if (r.kind === 'batch') lines.push(`If any of its marks are on Discord, \`/marks retract target:${r.target}\` takes them down.`);
+  if (r.kind === 'batch') lines.push(`If any of its marks are on Discord, \`/marks action:retract target:${r.target}\` takes them down.`);
   return lines.join('\n');
 }
 
@@ -406,7 +406,7 @@ export function describeRetract(r: RetractReceipt): string {
     lines.push(`${plural(r.keysWithUnresolvedAdds, 'message')} ${r.keysWithUnresolvedAdds === 1 ? 'has' : 'have'} earlier add attempts still unresolved ` +
       `(${plural(r.unresolvedAddAttempts, 'attempt')}): such an add may land after its removal.`);
   }
-  lines.push(`\`/marks list target:${r.requestId}\` shows progress; \`/marks cancel target:${r.requestId}\` stops what hasn't been sent.`);
+  lines.push(`\`/marks action:list target:${r.requestId}\` shows progress; \`/marks action:cancel target:${r.requestId}\` stops what hasn't been sent.`);
   return lines.join('\n');
 }
 
@@ -454,7 +454,7 @@ export function summarizeControl(action: string, target: string | undefined, ans
         : `; ${answer.keysWithUnresolvedAdds} messages have earlier adds still unresolved, which may land after their removal`;
     return `✅ Retract \`${answer.requestId}\`: ${plural(answer.removalsQueued, 'removal')} requested, not yet confirmed on Discord${after}.`;
   }
-  return `✅ The host accepted /marks ${action}${target ? ` \`${target}\`` : ''} (its receipt couldn't be read).`;
+  return `✅ The host accepted /marks action:${action}${target ? ` \`${target}\`` : ''} (its receipt couldn't be read).`;
 }
 
 /**
@@ -463,11 +463,11 @@ export function summarizeControl(action: string, target: string | undefined, ans
  */
 export function controlOutcomeUnknown(action: string, target: string | undefined, error?: string): string {
   const effect = action === 'cancel' ? 'already have cancelled it' : 'already have queued the removals';
-  return `⚠️ /marks ${action} outcome unknown${error ? ` (${error})` : ''}: the host may ${effect}. ${controlCheck(target)}`;
+  return `⚠️ /marks action:${action} outcome unknown${error ? ` (${error})` : ''}: the host may ${effect}. ${controlCheck(target)}`;
 }
 
 const controlCheck = (target: string | undefined): string =>
-  `Check ${target && target !== 'all' ? `\`/marks list target:${target}\`` : '`/marks list`'} before trying again.`;
+  `Check ${target && target !== 'all' ? `\`/marks action:list target:${target}\`` : '`/marks action:list`'} before trying again.`;
 
 /**
  * After a probe whose request failed: what can make running the command
@@ -481,7 +481,7 @@ export const PROBE_AGAIN = 'Running it again can work after a timeout, or once t
 /** Before retrying an /undo or /hide that may have been applied: the agent's
  *  context, and, when marks were chosen, the journal for a batch it scheduled. */
 const surgeryCheck = (marksChosen: boolean): string =>
-  `Check the agent's context${marksChosen ? ', and `/marks list` for a 💤 batch it may have scheduled,' : ''} before trying again.`;
+  `Check the agent's context${marksChosen ? ', and `/marks action:list` for a 💤 batch it may have scheduled,' : ''} before trying again.`;
 
 /**
  * An /undo or /hide whose request failed in transit: the host may have
@@ -504,7 +504,7 @@ export function unreadableSurgery(command: 'undo' | 'hide', answer: unknown, mar
 
 /** A /marks control's answer without a boolean `ok`, as unreadableSurgery. */
 export function unreadableControl(action: string, target: string | undefined, answer: unknown): string {
-  return `⚠️ The host answered /marks ${action} in a shape this server can't read, so it may have been applied; ` +
+  return `⚠️ The host answered /marks action:${action} in a shape this server can't read, so it may have been applied; ` +
     `here it is as sent:\n${asSent(answer)}\n${controlCheck(target)}`;
 }
 
