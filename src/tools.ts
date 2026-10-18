@@ -76,7 +76,7 @@ export const toolDefinitions: ToolDefinition[] = [
       type: 'object',
       properties: {
         channelId: { type: 'string', description: CHANNEL_ID_DESC },
-        content: { type: 'string', description: 'Message content (optional if files are attached)' },
+        content: { type: 'string', description: 'The message text. Required unless files are attached — a call with only channelId is rejected as empty.' },
         files: FILES_PROP,
       },
       required: ['channelId'],
@@ -91,7 +91,7 @@ export const toolDefinitions: ToolDefinition[] = [
         channelId: { type: 'string', description: CHANNEL_ID_DESC },
         messageId: { type: ['string', 'null'], description: TARGET_RULE + 'Message to reply to. ' + MESSAGE_ID_KIND },
         latestFrom: { type: ['string', 'null'], description: TARGET_RULE + LATEST_FROM_DESC },
-        content: { type: 'string', description: 'Reply content (optional if files are attached)' },
+        content: { type: 'string', description: "The reply's text. Required unless files are attached — a call with only channelId and its target (messageId or latestFrom) is rejected as empty." },
         files: FILES_PROP,
       },
       required: ['channelId'],
@@ -99,7 +99,7 @@ export const toolDefinitions: ToolDefinition[] = [
   },
   {
     name: 'send_dm',
-    description: "Send a direct message to a Discord user, identified by @username / display name (of someone in a shared server or who has DMed the bot) or by numeric user ID. To reply to a DM you received, pass the sender's name or id. Optionally include file attachments." + RECEIPT_PROVENANCE,
+    description: "Send a direct message to a Discord user, identified by @username / display name (of someone in a shared server or who has DMed the bot) or by numeric user ID. To reply to a DM you received, pass the sender's name or id as `userId` and your reply as `content`. Optionally include file attachments." + RECEIPT_PROVENANCE,
     inputSchema: {
       type: 'object',
       properties: {

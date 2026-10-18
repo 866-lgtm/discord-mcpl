@@ -11,6 +11,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { DiscordAdapter } from '../src/discord-adapter.js';
 import { DiscordMcplServer } from '../src/server.js';
+import { toolDefinitions } from '../src/tools.js';
 
 type ToolResult = { isError?: boolean; content: Array<{ text?: string }> };
 type Server = {
@@ -132,6 +133,33 @@ describe('tool refusals say what did not happen', () => {
       assert.equal(r.isError, true, tool);
       assert.equal(r.content[0].text, 'Nothing was sent: the message is empty. Give it "content", "files", or both.', tool);
     }
+  });
+
+  it("each send tool's content text matches its row, and a call with only that row's fields is refused as empty", async (t) => {
+    const s = server(t);
+    const content = (tool: string) => {
+      const def = toolDefinitions.find((d) => d.name === tool)!;
+      return (def.inputSchema.properties as Record<string, { description?: string }>).content!.description;
+    };
+    for (const [tool, args, text] of [
+      ['send_message', { channelId: '123456789012345678' },
+        'The message text. Required unless files are attached — a call with only channelId is rejected as empty.'],
+      ['reply_message', { channelId: '123456789012345678', messageId: '1' },
+        "The reply's text. Required unless files are attached — a call with only channelId and its target (messageId or latestFrom) is rejected as empty."],
+      ['reply_message', { channelId: '123456789012345678', latestFrom: 'someone' },
+        "The reply's text. Required unless files are attached — a call with only channelId and its target (messageId or latestFrom) is rejected as empty."],
+      ['send_dm', { userId: '123456789012345678' },
+        'The message text. Required unless files are attached — a call with only userId is rejected as empty.'],
+    ] as const) {
+      assert.equal(content(tool), text, tool);
+      const r = await s.handleToolCall(tool, args);
+      assert.equal(r.isError, true, tool);
+      assert.equal(r.content[0].text, 'Nothing was sent: the message is empty. Give it "content", "files", or both.', tool);
+    }
+    // A DM reply after the first has no hint of its own, so send_dm's
+    // description is what says where the reply's text goes.
+    const dm = toolDefinitions.find((d) => d.name === 'send_dm')!.description;
+    assert.match(dm, /To reply to a DM you received, pass the sender's name or id as `userId` and your reply as `content`\./);
   });
 
   it('a send whose content is given but is not a string says nothing was sent, and what content takes', async (t) => {
@@ -360,6 +388,25 @@ describe('a send refused for its files says nothing was sent, and what to send i
         'Give the path of a file there that it can read.',
     });
     assert.deepEqual(sends, []);
+  });
+
+  it('a reply with files and its content left out goes as one reply of files alone, with its reply reference', async (t) => {
+    const s = server(t);
+    const adapter = (s as unknown as { discord: DiscordAdapter }).discord;
+    const sends: Array<{ content?: unknown; files?: Array<{ name?: string }>; reply?: unknown }> = [];
+    const channel = {
+      id: '123456789012345678',
+      send: async (p: { content?: unknown; files?: Array<{ name?: string }>; reply?: unknown }) => {
+        sends.push({ content: p.content, files: p.files?.map((f) => ({ name: f.name })), reply: p.reply });
+        return { id: `sent-${sends.length}` };
+      },
+    };
+    (adapter.rawClient as unknown as { channels: { fetch: unknown } }).channels.fetch = async () => channel;
+    const path = join(tempDir(t), 'a.txt');
+    writeFileSync(path, 'x');
+    const r = await s.handleToolCall('reply_message', { channelId: channel.id, messageId: '223456789012345678', files: [{ path }] });
+    assert.notEqual(r.isError, true, r.content[0].text);
+    assert.deepEqual(sends, [{ content: undefined, files: [{ name: 'a.txt' }], reply: { messageReference: '223456789012345678' } }]);
   });
 
   it('files with content left out, null or false go as one message of files alone, through the real sendMessage and sendDM', async (t) => {
