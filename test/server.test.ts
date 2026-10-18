@@ -1242,8 +1242,12 @@ describe('DiscordMcplServer', () => {
       // …plus an explicit, in-context reply affordance so the agent knows it can
       // reply by name/id rather than needing the bot's own user id (the complaint).
       assert.ok(text.includes('Direct message from @Alice'), 'DM should announce the sender');
-      assert.ok(text.includes('send_dm("Alice")'), 'DM should suggest replying by sender name');
-      assert.ok(text.includes('send_dm("u_alice")'), 'DM should offer the id fallback');
+      assert.ok(text.includes('send_dm("Alice", content='), 'DM should suggest replying by sender name');
+      assert.ok(text.includes('send_dm("u_alice", content='), 'DM should offer the id fallback');
+      // The affordance must show the full call form: an agent copying
+      // send_dm("Alice") alone produces an empty send that the server
+      // rejects (seen in the wild — GLM-5.2 agent retry loops).
+      assert.ok(text.includes('"content" parameter'), 'DM affordance should name the content parameter');
       // The chat:dm tags still ride along for the host gate.
       assert.ok(p.tags?.includes('chat:dm'), 'DM should carry the chat:dm tag');
       client.sendResponse(pushMsg.request.id, { accepted: true });
