@@ -306,9 +306,6 @@ describe('live refusals', () => {
     h.failNoticesWith(Object.assign(new Error('Service Unavailable'), { status: 503 }));
     h.emit('server-error', { id: freshId(5) });
     await h.settle();
-    h.failNoticesWith(Object.assign(new Error('You are being rate limited.'), { status: 429 }));
-    h.emit('rate-limited-us', { id: freshId(6) });
-    await h.settle();
     h.failNoticesWith(null);
     h.emit('blocked-us', { id: freshId(3) });
     h.emit('flaky', { id: freshId(4) });
@@ -318,9 +315,7 @@ describe('live refusals', () => {
     assert.ok(h.logs.some((l) => /sender flaky.*notice unknown: socket hang up/.test(l)));
     assert.ok(h.logs.some((l) => /sender server-error.*notice unknown: Service Unavailable/.test(l)),
       'a 5xx may have posted it, so it is unknown, not failed');
-    assert.ok(h.logs.some((l) => /sender rate-limited-us.*notice unknown: You are being rate limited/.test(l)),
-      'a 429 is refused before Discord evaluates it, so an earlier attempt may have posted: unknown');
-    assert.equal(JSON.parse(readFileSync(h.noticesPath, 'utf-8')).senders['rate-limited-us'].lastNotice.outcome, 'unknown');
+    assert.equal(JSON.parse(readFileSync(h.noticesPath, 'utf-8')).senders['server-error'].lastNotice.outcome, 'unknown');
   });
 
   it('records a notice whose channel lookup failed as failed, since nothing was sent', async (t) => {

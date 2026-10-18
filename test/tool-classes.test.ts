@@ -20,14 +20,14 @@ import {
 const listed = toolDefinitions.map((t) => t.name);
 
 /** Tool names the server dispatches: the `case '…':` labels in
- *  executeToolCall's switch, up to its `Unknown tool` default. This is what
+ *  executeToolCall's switch, up to its default's "There's no Discord tool". This is what
  *  catches tools that are callable but not listed. */
 function dispatchedToolNames(): string[] {
   const src = readFileSync(new URL('../src/server.ts', import.meta.url), 'utf8');
   const start = src.indexOf('private async executeToolCall(');
   assert.ok(start >= 0, 'executeToolCall not found in src/server.ts');
-  const end = src.indexOf('Unknown tool:', start);
-  assert.ok(end > start, "executeToolCall's Unknown tool default not found");
+  const end = src.indexOf("There's no Discord tool", start);
+  assert.ok(end > start, "executeToolCall's default (There's no Discord tool) not found");
   return [...src.slice(start, end).matchAll(/case '([^']+)':/g)].map((m) => m[1]);
 }
 
