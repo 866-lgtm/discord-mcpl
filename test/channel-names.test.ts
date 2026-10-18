@@ -6,8 +6,10 @@ import {
   channelLabel,
   formatThreadLabel,
   isSnowflake,
+  isThreadLabelShape,
   parseChannelRef,
   resolveChannelName,
+  threadLabelRefusal,
   type ChannelCandidate,
   type GuildLike,
 } from '../src/channel-names.js';
@@ -22,6 +24,8 @@ const SEPARATRIX_GENERAL = ch('100000000000000001', 'general', 'g1', 'Separatrix
 const ANIMA_GENERAL = ch('100000000000000002', 'general', 'g2', 'Anima Mundi');
 const KITCHEN = ch('100000000000000003', 'kitchen-table', 'g1', 'Separatrix');
 const CANDIDATES = [SEPARATRIX_GENERAL, ANIMA_GENERAL, KITCHEN];
+const BY_ID = "list_channels shows a server's channels with their ids, and a channel of any other kind, such as a " +
+  'category or a forum, is given by its id instead.';
 
 describe('isSnowflake', () => {
   it('accepts 17-20 digit ids', () => {
@@ -124,16 +128,30 @@ describe('resolveChannelName', () => {
 
   it('distinguishes wrong-guild from no-such-channel', () => {
     const r = resolveChannelName({ name: 'general', guild: 'Nowhere' }, CANDIDATES);
-    assert.ok(!r.ok);
-    assert.equal(r.reason, 'not-found');
-    assert.match(r.message, /exists elsewhere/);
-    assert.match(r.message, /Separatrix/);
+    assert.deepEqual(r, {
+      ok: false,
+      reason: 'not-found',
+      message: 'No text, announcement, voice or stage channel that the configured channel filters allow is named #general ' +
+        'in a guild named "Nowhere", and a #name reaches only those. That name exists elsewhere: ' +
+        `#general (Separatrix), #general (Anima Mundi). ${BY_ID}`,
+    });
   });
 
-  it('reports not-found for an unknown name', () => {
-    const r = resolveChannelName({ name: 'no-such-room' }, CANDIDATES);
-    assert.ok(!r.ok);
-    assert.equal(r.reason, 'not-found');
+  it('reports not-found for an unknown name, saying what a #name reaches and how other channels are given', () => {
+    // A typo, and a name in a guild that has none by it, among the
+    // candidates, which are only channels a #name reaches.
+    assert.deepEqual(resolveChannelName({ name: 'genral' }, CANDIDATES), {
+      ok: false,
+      reason: 'not-found',
+      message: 'No text, announcement, voice or stage channel that the configured channel filters allow is named #genral, ' +
+        `and a #name reaches only those. ${BY_ID}`,
+    });
+    assert.deepEqual(resolveChannelName({ name: 'plans', guild: 'Separatrix' }, CANDIDATES), {
+      ok: false,
+      reason: 'not-found',
+      message: 'No text, announcement, voice or stage channel that the configured channel filters allow is named #plans ' +
+        `in "Separatrix", and a #name reaches only those. ${BY_ID}`,
+    });
   });
 
   it('does no fuzzy matching', () => {
@@ -203,13 +221,10 @@ describe('resolveChannelName', () => {
     assert.match(r.message, /\[voice\]/);
   });
 
-  it('REFUSES a pasted thread label, even where a voice room carries its name', () => {
-    // A thread's label is display-only (formatThreadLabel). A voice channel's
-    // name may hold spaces and ›: matched as a name, the label would send to
-    // a voice room named `general › design-chat`.
-    const lookalike = ch('100000000000000009', 'general › design-chat', 'g1', 'Separatrix', 'voice');
-    const parentless = ch('100000000000000010', '› design-chat', 'g1', 'Separatrix', 'voice');
-    const world = [...CANDIDATES, lookalike, parentless];
+  it("a pasted thread label's refusal quotes it as given and says where its id is", () => {
+    // A thread's label is display-only (formatThreadLabel). The resolver
+    // refuses one by its shape before anything else (thread-registration's
+    // tests drive it, beside a voice room carrying the label's name).
     for (const label of [
       formatThreadLabel('general', 'design-chat', 'Separatrix'),
       formatThreadLabel(null, 'design-chat', 'Separatrix'),
@@ -218,11 +233,15 @@ describe('resolveChannelName', () => {
       '› design-chat',
     ]) {
       const parsed = parseChannelRef(label);
-      assert.ok(parsed?.kind === 'name', label);
-      const r = resolveChannelName(parsed, world);
-      assert.ok(!r.ok, `${label} must not resolve`);
-      assert.equal(r.reason, 'thread-label', label);
-      assert.match(r.message, /by its id/, label);
+      assert.ok(parsed?.kind === 'name' && isThreadLabelShape(parsed.name), label);
+      assert.deepEqual(threadLabelRefusal(label), {
+        ok: false,
+        reason: 'thread-label',
+        message: `Nothing was done: "${label}" has a thread label's shape (#parent › thread), and thread labels are ` +
+        'display-only, never matched as names. Address the thread by its id instead, discord:<server id>:<thread id> ' +
+        'or its numeric id, which is shown with the label wherever the label is. A channel whose name has this ' +
+        'shape is addressed by id too.',
+      }, label);
     }
   });
 
@@ -235,10 +254,7 @@ describe('resolveChannelName', () => {
       assert.ok(r.ok, `${name}: ${JSON.stringify(r)}`);
       assert.equal(r.id, c.id, name);
     }
-    for (const name of ['› room', 'ops › room']) {
-      const r = resolveChannelName({ name }, CANDIDATES);
-      assert.ok(!r.ok && r.reason === 'thread-label', name);
-    }
+    for (const name of ['› room', 'ops › room']) assert.ok(isThreadLabelShape(name), name);
   });
 });
 

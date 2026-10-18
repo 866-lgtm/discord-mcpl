@@ -89,6 +89,12 @@ class MockDiscordAdapter {
   historyIngressReason(): string | null {
     return null;
   }
+  /** No thread's channel here is stale, so the catch-up looks none up. */
+  async lookUpStaleParent(): Promise<void> {}
+  /** Every channel's facts here are known and current. */
+  ingressFactsNotCurrent(): string | null {
+    return null;
+  }
   onChannelCreate(handler: (channel: ChannelFacts) => void): void {
     this._channelCreateHandler = handler;
   }
@@ -520,7 +526,7 @@ describe('DiscordMcplServer', () => {
 
     // The enable didn't apply: history stays off, as the request before it left it.
     assert.equal(history?.isError, true);
-    assert.match(history?.content[0]?.text ?? '', /Feature set 'discord\.history' is not enabled/);
+    assert.match(history?.content[0]?.text ?? '', /^fetch_history is turned off here: this host has disabled the "discord\.history" feature set/);
     // Nor did the disable: messaging still works.
     assert.notEqual(reaction?.isError, true, `add_reaction was refused: ${reaction?.content[0]?.text}`);
     assert.deepEqual(discord.reactions.at(-1), { channelId: 'discord:g1:c1', messageId: 'm1', emoji: '👍' });
@@ -642,7 +648,7 @@ describe('DiscordMcplServer', () => {
 
     assert.equal(receipt?.accepted, true, 'the early policy was answered');
     assert.equal(history?.isError, true, "the policy's disable held past notifications/initialized");
-    assert.match(history?.content[0]?.text ?? '', /Feature set 'discord\.history' is not enabled/);
+    assert.match(history?.content[0]?.text ?? '', /^fetch_history is turned off here: this host has disabled the "discord\.history" feature set/);
   });
 
   it("a request whose handler throws something that isn't an Error is answered, and serving goes on", async (t) => {
@@ -651,6 +657,8 @@ describe('DiscordMcplServer', () => {
     (server as unknown as { handleChannelClose: () => never }).handleChannelClose = () => {
       throw undefined;
     };
+    // What the server answers with, as it hands it to its connection.
+    const sendError = t.mock.method(serverConn, 'sendError');
     const serverPromise = server.serve(serverConn);
     let refusal: unknown;
     let answered = false;
@@ -668,8 +676,7 @@ describe('DiscordMcplServer', () => {
 
     const { code, message } = refusal as { code?: number; message?: string };
     assert.equal(code, -32603, `answered with an internal error: ${String(message)}`);
-    // mcpl-core's RpcError prefixes the code to the server's message.
-    assert.match(String(message), /-32603: undefined$/, 'the thrown value as text');
+    assert.deepEqual(sendError.mock.calls.map((call) => call.arguments.slice(1)), [[-32603, 'undefined']], 'the thrown value as text');
     assert.equal(answered, true, 'the next request was answered');
   });
 
@@ -939,6 +946,8 @@ describe('DiscordMcplServer', () => {
     (server as unknown as { handleChannelClose: () => never }).handleChannelClose = () => {
       throw new Error('');
     };
+    // What the server answers with, as it hands it to its connection.
+    const sendError = t.mock.method(serverConn, 'sendError');
     const serverPromise = server.serve(serverConn);
     let refusal: unknown;
     try {
@@ -952,10 +961,9 @@ describe('DiscordMcplServer', () => {
       await serverPromise;
     }
 
-    const { code, message } = refusal as { code?: number; message?: string };
+    const { code } = refusal as { code?: number };
     assert.equal(code, -32603);
-    // mcpl-core's RpcError prefixes the code to the server's message.
-    assert.match(String(message), /-32603: Error$/, 'an empty message falls back to the value as text');
+    assert.deepEqual(sendError.mock.calls.map((call) => call.arguments.slice(1)), [[-32603, 'Error']], 'an empty message falls back to the value as text');
   });
 
   it('tools/list returns tool definitions', async () => {
@@ -1234,8 +1242,12 @@ describe('DiscordMcplServer', () => {
       // …plus an explicit, in-context reply affordance so the agent knows it can
       // reply by name/id rather than needing the bot's own user id (the complaint).
       assert.ok(text.includes('Direct message from @Alice'), 'DM should announce the sender');
-      assert.ok(text.includes('send_dm("Alice")'), 'DM should suggest replying by sender name');
-      assert.ok(text.includes('send_dm("u_alice")'), 'DM should offer the id fallback');
+      assert.ok(text.includes('send_dm("Alice", content='), 'DM should suggest replying by sender name');
+      assert.ok(text.includes('send_dm("u_alice", content='), 'DM should offer the id fallback');
+      // The affordance must show the full call form: an agent copying
+      // send_dm("Alice") alone produces an empty send that the server
+      // rejects (seen in the wild — GLM-5.2 agent retry loops).
+      assert.ok(text.includes('"content" parameter'), 'DM affordance should name the content parameter');
       // The chat:dm tags still ride along for the host gate.
       assert.ok(p.tags?.includes('chat:dm'), 'DM should carry the chat:dm tag');
       client.sendResponse(pushMsg.request.id, { accepted: true });
@@ -2224,6 +2236,60 @@ describe('DiscordMcplServer', () => {
       assert.equal(pushed.request.method, 'push/event');
       client.sendResponse(pushed.request.id, { accepted: true });
     }
+
+    client.close();
+    await serverPromise;
+  });
+
+  it('handles a channels/close sent while an open waits for its history after that open, so the close stands', { timeout: 10_000 }, async (t: TestContext) => {
+    const { client, serverConn, discord } = await createTestPair();
+    const server = new DiscordMcplServer(discord as unknown as DiscordAdapter);
+    const serverPromise = server.serve(serverConn);
+
+    await mcplHandshake(client);
+    const regMsg = await client.nextMessage();
+    if (regMsg.type === 'request') client.sendResponse(regMsg.request.id, {});
+
+    // Hold the open's history fetch until the close has been sent and has had
+    // time to reach the server.
+    let entered!: () => void;
+    const fetchEntered = new Promise<void>((resolve) => { entered = resolve; });
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    // A failed assertion mustn't leave the fetch held and the connection open.
+    t.after(() => {
+      release();
+      if (!client.isClosed) client.close();
+    });
+    discord.fetchHistory = async () => {
+      entered();
+      await held;
+      return discord.historyToReturn;
+    };
+
+    const settled: string[] = [];
+    const open = client.sendRequest('channels/open', {
+      channelId: 'discord:g1:c1',
+      type: 'discord',
+      address: { guildId: 'g1', channelId: 'c1' },
+      history: { limit: 10 },
+    }, 5_000).then((result) => { settled.push('open'); return result as ChannelsOpenResult; });
+    await fetchEntered;
+    const close = client.sendRequest('channels/close', { channelId: 'discord:g1:c1' }, 5_000)
+      .then((result) => { settled.push('close'); return result as { closed: boolean }; });
+
+    // A server that handled requests concurrently would answer the close now.
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    assert.deepEqual(settled, [], 'nothing is answered while the open waits for its history');
+
+    release();
+    const opened = await open;
+    const closed = await close;
+    assert.deepEqual(settled, ['open', 'close'], 'the open is answered first, then the close');
+    assert.equal(opened.channel.id, 'discord:g1:c1');
+    assert.equal(closed.closed, true);
+    const channels = (server as unknown as { channelManager: { isOpen(id: string): boolean } }).channelManager;
+    assert.equal(channels.isOpen('discord:g1:c1'), false, 'the close stands');
 
     client.close();
     await serverPromise;

@@ -88,10 +88,11 @@ export function formatChannelLabel(name: string, guildName: string): string {
  *
  * Pasted back, it must fail loudly, and its shape alone doesn't ensure that:
  * a voice or stage channel's name may hold spaces and `›`, so a voice room
- * named `general › design-chat` would match the label as a name. So
- * `resolveChannelName` refuses a name in this shape before matching anything,
- * and such a voice room is labelled by its id instead (channelLabelFor in
- * channels.ts), since its `#name (Guild)` would be refused too.
+ * named `general › design-chat` would match the label as a name. So the
+ * resolver (DiscordAdapter.resolveChannelRef) refuses a name in this shape
+ * before anything else about it (threadLabelRefusal), and such a voice room
+ * is labelled by its id instead (channelLabelFor in channels.ts), since its
+ * `#name (Guild)` would be refused too.
  */
 export function formatThreadLabel(parentName: string | null | undefined, threadName: string, guildName: string): string {
   return `${parentName ? `#${parentName} ` : ''}› ${threadName} (${guildName})`;
@@ -182,8 +183,24 @@ export type ResolveResult =
    *  thing less legibly. */
   | { ok: true; id: string; matched?: ChannelCandidate }
   /** `thread-label`: the name had a thread label's shape, which is refused
-   *  before matching (formatThreadLabel says why). */
+   *  before anything else about it (formatThreadLabel says why). */
   | { ok: false; reason: 'not-found' | 'ambiguous' | 'thread-label'; message: string };
+
+/** The refusal of a reference whose name has a thread label's shape
+ *  (isThreadLabelShape), quoting the reference as it was given. A label's
+ *  shape says nothing about any server, so the refusal is the same whatever
+ *  is known of them. */
+export function threadLabelRefusal(given: string): ResolveResult {
+  return {
+    ok: false,
+    reason: 'thread-label',
+    message:
+      `Nothing was done: "${given}" has a thread label's shape (#parent › thread), and thread labels are ` +
+      'display-only, never matched as names. Address the thread by its id instead, discord:<server id>:<thread id> ' +
+      'or its numeric id, which is shown with the label wherever the label is. A channel whose name has this shape ' +
+      'is addressed by id too.',
+  };
+}
 
 /**
  * Resolve a parsed name against live candidates.
@@ -191,26 +208,14 @@ export type ResolveResult =
  * The caller MUST have already applied the channel allowlist — disallowed
  * channels must not reach here, both so a name cannot address a channel the
  * allowlist excludes, and so a forbidden `#general` cannot manufacture a
- * spurious collision with a permitted one.
+ * spurious collision with a permitted one. It MUST also have refused a name
+ * with a thread label's shape (threadLabelRefusal), which as a name could
+ * reach a voice or stage room whose name has the same shape.
  */
 export function resolveChannelName(
   ref: { name: string; guild?: string },
   candidates: ChannelCandidate[],
 ): ResolveResult {
-  // A pasted thread label, refused before matching: as a name it could reach
-  // a voice room whose name has the same shape.
-  if (isThreadLabelShape(ref.name)) {
-    return {
-      ok: false,
-      reason: 'thread-label',
-      message:
-        `"${ref.name}" has a thread label's shape (#parent › thread), and thread labels ` +
-        `are display-only, never matched as names. Address the thread by its id: the ` +
-        `discord:<guild>:<thread> id it is registered under, or its numeric id. A channel ` +
-        `whose name has this shape is addressed by id too.`,
-    };
-  }
-
   const wantName = ref.name.toLowerCase();
   const wantGuild = ref.guild?.toLowerCase();
 
@@ -235,6 +240,17 @@ export function resolveChannelName(
   if (matches.length === 1) return { ok: true, id: matches[0].id, matched: matches[0] };
 
   if (matches.length === 0) {
+    // Candidates are only the SENDABLE kinds, so a channel of another kind,
+    // such as a category or a forum, may well have this name. The text says
+    // what a #name reaches, named from SENDABLE so it follows the rule, and
+    // how any other channel is given.
+    const kinds = [...SENDABLE];
+    const reached = `${kinds.slice(0, -1).join(', ')} or ${kinds[kinds.length - 1]} channel`;
+    const none = (where: string) =>
+      `No ${reached} that the configured channel filters allow is named #${ref.name}${where}, ` +
+      'and a #name reaches only those.';
+    const byId = "list_channels shows a server's channels with their ids, and a channel of any other kind, such as a " +
+      'category or a forum, is given by its id instead.';
     const near = candidates.filter((c) => c.name.toLowerCase() === wantName);
     if (wantGuild && near.length) {
       // The name exists, but not in the guild asked for. Say so precisely —
@@ -244,17 +260,14 @@ export function resolveChannelName(
         ok: false,
         reason: 'not-found',
         message:
-          `No channel #${ref.name} in a guild named "${ref.guild}". ` +
-          `That name exists elsewhere: ${near.map(channelLabel).join(', ')}`,
+          `${none(` in a guild named "${ref.guild}"`)} ` +
+          `That name exists elsewhere: ${near.map(channelLabel).join(', ')}. ${byId}`,
       };
     }
     return {
       ok: false,
       reason: 'not-found',
-      message:
-        `No visible channel named #${ref.name}` +
-        (ref.guild ? ` in "${ref.guild}"` : '') +
-        `. Use list_channels to see what is addressable.`,
+      message: `${none(ref.guild ? ` in "${ref.guild}"` : '')} ${byId}`,
     };
   }
 

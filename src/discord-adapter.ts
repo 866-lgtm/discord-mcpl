@@ -16,6 +16,7 @@ import {
   ChannelType,
   MessageType,
   AttachmentBuilder,
+  SnowflakeUtil,
   type Message,
   type PartialMessage,
   type Channel,
@@ -31,8 +32,8 @@ import {
   type ApplicationCommandDataResolvable,
   type GatewayThreadListSyncDispatchData,
 } from 'discord.js';
-import { existsSync, statSync } from 'node:fs';
-import { basename } from 'node:path';
+import { accessSync, constants as fsConstants, statSync } from 'node:fs';
+import { basename, resolve as resolvePath } from 'node:path';
 import { dbg } from './debug-log.js';
 
 import {
@@ -40,13 +41,15 @@ import {
   formatChannelLabel,
   isNameAddressableKind,
   isSnowflake,
+  isThreadLabelShape,
   parseChannelRef,
   resolveChannelName,
+  threadLabelRefusal,
   type ChannelCandidate,
   type ResolveResult,
 } from './channel-names.js';
 import { channelLabelFor, mcplChannelId } from './channels.js';
-import { UNKNOWN_CHANNEL } from './discord-errors.js';
+import { INVALID_FORM_BODY, MISSING_ACCESS, UNKNOWN_CHANNEL } from './discord-errors.js';
 
 /** The channels a name resolves among (nameView), with the guilds where
  *  no name resolves while a channel there is stale (uncertainGuildNames),
@@ -94,6 +97,28 @@ export type ThreadsSyncedHandler = (
 /** Maximum attachments Discord accepts on a single message. */
 const MAX_DISCORD_ATTACHMENTS = 10;
 
+/** Graphemes: what a reader takes as one character, such as an emoji's ZWJ
+ *  sequence, a flag's two regional indicators, or a letter and its combining
+ *  marks. */
+const GRAPHEMES = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
+
+/** Where to cut `text` hard at `limit` UTF-16 units: the last grapheme
+ *  boundary at or before it, so this cut parts no character between two
+ *  parts. splitForDiscord's line-break and space cuts don't look at
+ *  graphemes. When a single grapheme runs past the limit from the start,
+ *  there's no such boundary, so the cut falls inside it, moved back one unit
+ *  if it would part a surrogate pair. */
+function hardCut(text: string, limit: number): number {
+  let cut = 0;
+  for (const { index } of GRAPHEMES.segment(text)) {
+    if (index > limit) break;
+    cut = index;
+  }
+  if (cut > 0) return cut;
+  const unit = text.charCodeAt(limit - 1);
+  return unit >= 0xd800 && unit <= 0xdbff ? limit - 1 : limit;
+}
+
 /** What a sendDM failure carries once its DM channel was resolved. */
 export interface DmSendFailure {
   dmChannel?: { id: string; recipientName: string };
@@ -114,29 +139,90 @@ export interface OutgoingFile {
 }
 
 /**
- * Turn `OutgoingFile[]` specs into discord.js `AttachmentBuilder`s, validating
- * each path up front so a bad path yields a clear error rather than an opaque
- * discord.js failure mid-send. discord.js reads the path lazily at send time.
+ * Turn `OutgoingFile[]` specs into discord.js `AttachmentBuilder`s, checking
+ * every file before any part of the message is sent. discord.js reads each
+ * path lazily, at send time, so a file it can't read would fail after the
+ * parts before it posted. Tool arguments aren't checked against their
+ * schema, so `files` may arrive as anything. Paths are read on the machine
+ * running discord-mcpl, a relative one against its working directory.
  */
-function buildAttachments(files?: OutgoingFile[]): AttachmentBuilder[] {
-  if (!files || files.length === 0) return [];
-  if (files.length > MAX_DISCORD_ATTACHMENTS) {
+function buildAttachments(files?: unknown): AttachmentBuilder[] {
+  // No files: left out, or a value that says none (null, "", false, 0), as before.
+  if (!files) return [];
+  if (!Array.isArray(files)) {
     throw new Error(
-      `Too many files: ${files.length} (Discord allows up to ${MAX_DISCORD_ATTACHMENTS} per message)`,
+      `Nothing was sent: "files" must be a list of files, each as {"path": "<its path>"}, and this call gave ` +
+        `${kindOfValue(files)}.`,
     );
   }
-  return files.map((f) => {
-    if (!f || typeof f.path !== 'string' || !f.path.trim()) {
-      throw new Error('Each file must have a non-empty string "path"');
+  if (files.length > MAX_DISCORD_ATTACHMENTS) {
+    throw new Error(
+      `Nothing was sent: this call gave ${files.length} files, and Discord takes at most ${MAX_DISCORD_ATTACHMENTS} ` +
+        `in one message. Send ${MAX_DISCORD_ATTACHMENTS} or fewer, and the rest in another message.`,
+    );
+  }
+  return files.map((f: unknown, i) => {
+    const file = (f && typeof f === 'object' ? f : {}) as Partial<OutgoingFile>;
+    if (typeof file.path !== 'string' || !file.path.trim()) {
+      // A bare path, given as the entry itself, is the likely meaning of a
+      // string; an entry that isn't an object is named by its kind.
+      const hint = typeof f === 'string'
+        ? f.trim() ? `: give it as {"path": ${JSON.stringify(f.trim())}}` : ', and this one is blank'
+        : f && typeof f === 'object' && !Array.isArray(f) ? '' : `, and this call gave ${kindOfValue(f)}`;
+      throw new Error(
+        `Nothing was sent: files[${i}] needs "path", the path of a file on the machine running discord-mcpl, as a ` +
+          `non-empty string${hint}.`,
+      );
     }
-    if (!existsSync(f.path) || !statSync(f.path).isFile()) {
-      throw new Error(`File not found (or not a regular file): ${f.path}`);
+    // A name or description that says none (left out, null, "", false, 0)
+    // is left out, as before. A description given as a number or as true is
+    // sent as its text, such as "42". Any other value that isn't a string is
+    // refused rather than turned into text: its text form ("[object Object]"
+    // for an object, its items joined by commas for a list) would be a guess
+    // at the description the caller meant.
+    for (const key of ['name', 'description'] as const) {
+      const value: unknown = file[key];
+      const asText = key === 'description' && (typeof value === 'number' || value === true);
+      if (value && typeof value !== 'string' && !asText) {
+        throw new Error(
+          `Nothing was sent: files[${i}].${key} must be a string, and this call gave ${kindOfValue(value)}. Give it in quotes, ` +
+            `or leave it out${key === 'name' ? ' to use the file\'s own name' : ''}.`,
+        );
+      }
     }
-    const name = f.name && f.name.trim() ? f.name : basename(f.path);
-    const attachment = new AttachmentBuilder(f.path, { name });
-    if (f.description) attachment.setDescription(f.description);
+    const read = resolvePath(file.path);
+    const problem = unattachable(read);
+    if (problem) {
+      throw new Error(
+        `Nothing was sent: ${JSON.stringify(file.path)}${read === file.path ? '' : ` (read as ${read})`} ${problem} ` +
+          'on the machine running discord-mcpl. Give the path of a file there that it can read.',
+      );
+    }
+    const name = file.name && file.name.trim() ? file.name : basename(file.path);
+    const attachment = new AttachmentBuilder(file.path, { name });
+    if (file.description) attachment.setDescription(String(file.description));
     return attachment;
   });
+}
+
+/** How a refusal names a value of the wrong kind: "a number", "a list", "an
+ *  object", "null". Tool arguments aren't checked against their schema, so
+ *  a value can be anything. */
+export function kindOfValue(value: unknown): string {
+  return Array.isArray(value) ? 'a list' : value === null ? 'null' : typeof value === 'object' ? 'an object' : `a ${typeof value}`;
+}
+
+/** Why a path can't be attached, or null when it can: it must be a regular
+ *  file this process can read. */
+function unattachable(path: string): string | null {
+  try {
+    if (!statSync(path).isFile()) return "isn't a file";
+    accessSync(path, fsConstants.R_OK);
+    return null;
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    return code === 'ENOENT' || code === 'ENOTDIR' ? "doesn't exist" : `can't be read (${code ?? (err as Error).message})`;
+  }
 }
 
 // ── Public Types ──
@@ -282,10 +368,8 @@ export interface DiscordChannelInfo {
    *  (channelLabelFor): `#name (GuildName)` where that name resolves back to
    *  it, otherwise its id, `discord:<guild>:<channel>`. Either form is a
    *  string the channelId argument accepts. Returned so listings hand back
-   *  something PASTEABLE: the not-found error tells agents to "use
-   *  list_channels to see what is addressable", which was only true once this
-   *  field existed. Both forms are present on purpose — label to compose a
-   *  send now, id to store. */
+   *  something PASTEABLE. Both forms are present on purpose — label to
+   *  compose a send now, id to store. */
   label: string;
 }
 
@@ -1058,6 +1142,45 @@ export class DiscordAdapter {
     return this.isStale(thread.parentId) ? thread.parentId : null;
   }
 
+  /** The catch-up's lookup of a thread's channel when it's stale, before
+   *  the filters decide on the thread's missed messages, as a live event's
+   *  is (staleParentOf), in a guild the filters admit. A lookup Discord
+   *  answers with Unknown Channel reports the channel deleted; one that
+   *  fails otherwise is logged and leaves the channel stale (lookUpChannel). */
+  async lookUpStaleParent(channelId: string): Promise<void> {
+    const thread = this.client.channels.cache.get(channelId) as { guildId?: string | null } | undefined;
+    const guildId = thread?.guildId ?? null;
+    const staleParent = guildId && this.guildAdmitted(guildId) ? this.staleParentOf(thread) : null;
+    if (guildId && staleParent) await this.lookUpChannel(guildId, staleParent);
+  }
+
+  /** What the channel filters' answer for a channel rests on that the cache
+   *  doesn't know or hold current (channelAllowed), in words for the
+   *  catch-up's held line, or null when the answer rests on current facts.
+   *  For a thread, that's its channel, whose category can admit it: not
+   *  known by id, or stale. The thread's own stale mark doesn't count, since
+   *  Discord doesn't move a thread to another channel. The server's
+   *  threadAdmissionKnown reads a thread's channel's mark the same way, but
+   *  counts a thread without a channel id as known, where the catch-up's
+   *  answer for one rests on no channel at all. A thread's channel the cache
+   *  doesn't hold counts as known: channelAllowed excludes through it, as
+   *  the live paths do, and holding the thread back would hold it at every
+   *  start for as long as the cache lacks it. For any other channel, it's
+   *  the channel itself, while it's stale, since a stale channel's category
+   *  may no longer be its own. That includes a channel the cache no longer
+   *  holds, which something removed during the catch-up, such as a deletion,
+   *  which also drops its watermark. */
+  ingressFactsNotCurrent(channelId: string): string | null {
+    const channel = this.client.channels.cache.get(channelId) as
+      | { isThread?: () => boolean; parentId?: string | null }
+      | undefined;
+    if (channel?.isThread?.()) {
+      if (channel.parentId == null) return "its channel isn't known";
+      return this.isStale(channel.parentId) ? `its channel ${channel.parentId} is still stale after its lookup` : null;
+    }
+    return this.isStale(channelId) ? "it's still stale after its lookup" : null;
+  }
+
   /** Whether the guild filter (guildIds) admits a guild. */
   private guildAdmitted(guildId: string): boolean {
     return !this.guildIds?.length || this.guildIds.includes(guildId);
@@ -1104,9 +1227,11 @@ export class DiscordAdapter {
 
   // ── Operations ──
 
-  /** Split text into Discord-safe chunks (<=1900 chars), preferring newline then
-   *  space boundaries; hard-splits over-long runs. Discord rejects content over
-   *  the per-message limit (DiscordAPIError 50035). */
+  /** Split text into Discord-safe chunks (<=1900 UTF-16 units), preferring
+   *  newline then space boundaries; hard-splits over-long runs at a character
+   *  boundary, unless one character is itself longer than the limit
+   *  (hardCut). Discord rejects content over the per-message limit
+   *  (DiscordAPIError 50035). */
   private splitForDiscord(text: string, limit = 1900): string[] {
     if (!text) return [];
     if (text.length <= limit) return [text];
@@ -1115,7 +1240,7 @@ export class DiscordAdapter {
     while (rest.length > limit) {
       let cut = rest.lastIndexOf('\n', limit);
       if (cut < limit * 0.5) cut = rest.lastIndexOf(' ', limit);
-      if (cut < limit * 0.5) cut = limit;
+      if (cut < limit * 0.5) cut = hardCut(rest, limit);
       chunks.push(rest.slice(0, cut));
       rest = rest.slice(cut).replace(/^\s+/, '');
     }
@@ -1128,7 +1253,8 @@ export class DiscordAdapter {
    *  enforced, so the REST layer's own retries after a lost response can't
    *  post a second copy (Discord returns the first instead). An error that
    *  carries `notPosted: true` was raised before anything was sent: the
-   *  channel lookup failed or found no text channel. */
+   *  channel lookup failed, gave no channel, or gave one that holds no
+   *  messages. */
   async sendDmNotice(channelId: string, content: string, nonce: string): Promise<{ messageId: string }> {
     const channel = await this.channelById(channelId).catch((err: unknown) => {
       throw Object.assign(
@@ -1136,8 +1262,11 @@ export class DiscordAdapter {
         { notPosted: true },
       );
     });
-    if (!channel || !('send' in channel)) {
-      throw Object.assign(new Error(`Channel ${channelId} not found or not a text channel`), { notPosted: true });
+    // A DM has no server, so discord.js returns null for one only when it
+    // can't build its kind: that one cause, and nothing retries the notice.
+    if (!channel) throw Object.assign(unhandledKind(channelId, 'nothing was sent'), { notPosted: true });
+    if (!('send' in channel)) {
+      throw Object.assign(noMessagesHere(channel, channelId, 'nothing was sent'), { notPosted: true });
     }
     const sent = await (channel as DMChannel).send({
       content,
@@ -1154,15 +1283,15 @@ export class DiscordAdapter {
     options?: { replyTo?: string; files?: OutgoingFile[]; requireReplyTarget?: boolean },
   ): Promise<{ messageId: string }> {
     const channel = await this.channelById(channelId);
-    if (!channel || !('send' in channel)) {
-      throw new Error(`Channel ${channelId} not found or not a text channel`);
-    }
+    if (!channel) throw channelUnusable(channelId, 'nothing was sent');
+    if (!('send' in channel)) throw noMessagesHere(channel, channelId, 'nothing was sent');
     const resolved = await this.resolveOutgoingMentions(channel, content);
     const attachments = buildAttachments(options?.files);
     const chunks = this.splitForDiscord(resolved);
     // Files-only message (no text): still send one message carrying the files.
     if (chunks.length === 0 && attachments.length > 0) chunks.push('');
     let lastId = '';
+    const posted: string[] = [];
     for (let i = 0; i < chunks.length; i++) {
       // Attach files to the LAST chunk so they render after the full text.
       const isLast = i === chunks.length - 1;
@@ -1178,7 +1307,17 @@ export class DiscordAdapter {
           ? { messageReference: options.replyTo, ...(options.requireReplyTarget ? { failIfNotExists: true } : {}) }
           : undefined,
         files: isLast && attachments.length > 0 ? attachments : undefined,
+        // Each part carries a nonce of its own that Discord enforces: the REST
+        // client sends a part again after a 5xx, a timeout or a reset
+        // connection, and if the first attempt posted, Discord answers a
+        // repeat sent within a few minutes with that message instead of
+        // posting another.
+        nonce: SnowflakeUtil.generate().toString(),
+        enforceNonce: true,
+      }).catch((err: unknown) => {
+        throw withPostedParts(err, posted, chunks, attachments.length > 0, Boolean(options?.replyTo));
       });
+      posted.push(sent.id);
       lastId = sent.id;
     }
     return { messageId: lastId };
@@ -1262,12 +1401,19 @@ export class DiscordAdapter {
       const chunks = this.splitForDiscord(resolved);
       if (chunks.length === 0 && attachments.length > 0) chunks.push('');
       let lastId = '';
+      const posted: string[] = [];
       for (let i = 0; i < chunks.length; i++) {
         const isLast = i === chunks.length - 1;
         const sent = await user.send({
           content: chunks[i] || undefined,
           files: isLast && attachments.length > 0 ? attachments : undefined,
+          // An enforced nonce for each part, as sendMessage gives.
+          nonce: SnowflakeUtil.generate().toString(),
+          enforceNonce: true,
+        }).catch((err: unknown) => {
+          throw withPostedParts(err, posted, chunks, attachments.length > 0, false);
         });
+        posted.push(sent.id);
         lastId = sent.id;
       }
       return { messageId: lastId, channelId: dm.id, recipientName };
@@ -1295,9 +1441,8 @@ export class DiscordAdapter {
 
   async editMessage(channelId: string, messageId: string, content: string): Promise<void> {
     const channel = await this.channelById(channelId);
-    if (!channel || !('messages' in channel)) {
-      throw new Error(`Channel ${channelId} not found`);
-    }
+    if (!channel) throw channelUnusable(channelId, 'nothing was edited');
+    if (!('messages' in channel)) throw noMessagesHere(channel, channelId, 'nothing was edited');
     const msg = await (channel as TextChannel).messages.fetch(messageId);
     const resolved = await this.resolveOutgoingMentions(channel, content);
     await msg.edit(resolved);
@@ -1376,27 +1521,24 @@ export class DiscordAdapter {
 
   async deleteMessage(channelId: string, messageId: string): Promise<void> {
     const channel = await this.channelById(channelId);
-    if (!channel || !('messages' in channel)) {
-      throw new Error(`Channel ${channelId} not found`);
-    }
+    if (!channel) throw channelUnusable(channelId, 'nothing was deleted');
+    if (!('messages' in channel)) throw noMessagesHere(channel, channelId, 'nothing was deleted');
     const msg = await (channel as TextChannel).messages.fetch(messageId);
     await msg.delete();
   }
 
   async addReaction(channelId: string, messageId: string, emoji: string): Promise<void> {
     const channel = await this.channelById(channelId);
-    if (!channel || !('messages' in channel)) {
-      throw new Error(`Channel ${channelId} not found`);
-    }
+    if (!channel) throw channelUnusable(channelId, 'no reaction was added');
+    if (!('messages' in channel)) throw noMessagesHere(channel, channelId, 'no reaction was added');
     const msg = await (channel as TextChannel).messages.fetch(messageId);
     await msg.react(this.resolveReactionEmoji(emoji, msg.guild));
   }
 
   async removeReaction(channelId: string, messageId: string, emoji: string): Promise<void> {
     const channel = await this.channelById(channelId);
-    if (!channel || !('messages' in channel)) {
-      throw new Error(`Channel ${channelId} not found`);
-    }
+    if (!channel) throw channelUnusable(channelId, 'no reaction was removed');
+    if (!('messages' in channel)) throw noMessagesHere(channel, channelId, 'no reaction was removed');
     const msg = await (channel as TextChannel).messages.fetch(messageId);
     const selfId = this.client.user?.id;
     if (!selfId) throw new Error('Discord bot user is not ready');
@@ -1494,14 +1636,17 @@ export class DiscordAdapter {
     }
   }
 
+  /** A channel's messages, newest first. When the channel can't be read,
+   *  its error says what didn't happen in the caller's words (`nothing`),
+   *  'nothing was read' by default. */
   async fetchHistory(
     channelId: string,
-    options?: { limit?: number; before?: string; after?: string },
+    options?: { limit?: number; before?: string; after?: string; nothing?: string },
   ): Promise<HistoryMessage[]> {
+    const nothing = options?.nothing ?? 'nothing was read';
     const channel = await this.channelById(channelId);
-    if (!channel || !('messages' in channel)) {
-      throw new Error(`Channel ${channelId} not found`);
-    }
+    if (!channel) throw channelUnusable(channelId, nothing);
+    if (!('messages' in channel)) throw noMessagesHere(channel, channelId, nothing);
     // Discord's REST endpoint caps a single fetch at 100 messages and
     // discord.js does not auto-paginate. To support backscroll requests
     // larger than 100 (we want up to 300), walk backwards page-by-page
@@ -1578,9 +1723,8 @@ export class DiscordAdapter {
     limit = 50,
   ): Promise<HistoryMessage[]> {
     const channel = await this.channelById(channelId);
-    if (!channel || !('messages' in channel)) {
-      throw new Error(`Channel ${channelId} not found`);
-    }
+    if (!channel) throw channelUnusable(channelId, 'nothing was read');
+    if (!('messages' in channel)) throw noMessagesHere(channel, channelId, 'nothing was read');
     const pageLimit = Math.min(100, Math.max(1, limit));
     const page = await (channel as TextChannel).messages.fetch({
       around: messageId,
@@ -1606,6 +1750,80 @@ export class DiscordAdapter {
     // discord.js returns the `around` window unsorted; present oldest → newest.
     collected.sort((a, b) => a.id.localeCompare(b.id, 'en-US-u-kn-true'));
     return collected;
+  }
+
+  /**
+   * The channel an exact channels/open selector names, when this server
+   * serves it, for one the registry doesn't hold yet (a DM or thread after a
+   * restart, say). `guildSegment` is the MCPL id's middle part: a guild id,
+   * or `dm`.
+   *
+   * Served means a channel the registry's own paths would register: in that
+   * guild, a channel messages are posted in (isListedKind: text,
+   * announcement, voice, stage) or a thread, which the guild filter and the
+   * channel list admit (a thread through its channel); or a DM whose
+   * recipient the DM list admits. Anything else is null: a category or
+   * forum, which hold no messages, a kind this server doesn't know, another
+   * guild, a channel the filters refuse, an id Discord refuses, and a lookup
+   * that finds nothing. A guild channel comes back as the facts its
+   * descriptor is made from. A DM's recipient is its other party as the DM
+   * list reads it (dmOtherParty): when the cache can't name one, Discord is
+   * asked again, past the cache, by the freshness rule, and a DM whose other
+   * party that answer doesn't name either is null.
+   *
+   * The channel is read as the tools read one (channelById): from the cache
+   * when it holds the channel whole and current, else from Discord by the
+   * freshness rule, so Unknown Channel there is a deletion (channelGone). A
+   * thread's stale channel is looked up first, as a delivery's is, since its
+   * category may be what admits the thread. A channel that is still stale
+   * then, or a thread whose channel is, comes back as `uncertain`, and so
+   * does a lookup Discord gives no answer to: its facts decide no
+   * registration until a fresh fetch.
+   */
+  async lookUpServedChannel(guildSegment: string, channelId: string): Promise<
+    | { kind: 'guild'; facts: ChannelFacts }
+    | { kind: 'dm'; recipientId: string; recipientName: string }
+    | { kind: 'uncertain' }
+    | null
+  > {
+    let channel: Channel | null;
+    try {
+      channel = await this.channelById(channelId);
+    } catch (err) {
+      return lookUpFailure(channelId, err);
+    }
+    if (!channel) return null;
+    if (guildSegment === 'dm') {
+      if (channel.type !== ChannelType.DM) return null;
+      // discord.js holds a DM it has seen a message in as whole, whatever
+      // recipients it recorded, and when the bot's own message was the first
+      // it saw there, it recorded only the bot. Its recipientId getter then
+      // gives the bot's id, so the other party is read as the DM list reads
+      // it.
+      let recipientId = this.dmOtherParty(channel);
+      if (!recipientId) {
+        try {
+          recipientId = this.dmOtherParty(await this.refetchChannel(channelId));
+        } catch (err) {
+          return lookUpFailure(channelId, err);
+        }
+      }
+      if (!recipientId || (this.dmUsers && !this.dmUsers.has(recipientId))) return null;
+      // The username, as an inbound DM's descriptor is labelled.
+      const recipient = this.client.users.resolve(recipientId) ?? (await this.client.users.fetch(recipientId).catch(() => null));
+      // The DM list may have changed while the name was fetched.
+      if (this.dmUsers && !this.dmUsers.has(recipientId)) return null;
+      return { kind: 'dm', recipientId, recipientName: recipient?.username ?? recipientId };
+    }
+    if (!('guildId' in channel) || channel.guildId !== guildSegment) return null;
+    const staleParent = this.staleParentOf(channel);
+    if (staleParent) await this.lookUpChannel(channel.guildId, staleParent);
+    if (this.isStale(channelId) || (staleParent !== null && this.isStale(staleParent))) return { kind: 'uncertain' };
+    const facts = this.channelFacts(channel);
+    if (!facts) return null;
+    if (!isListedKind(facts.type) && facts.type !== 'thread') return null;
+    if (!this.channelAdmitted(facts.guildId, facts.id, facts.parentId ?? null)) return null;
+    return { kind: 'guild', facts };
   }
 
   /** Resolve display metadata for a channel by ID — used by the reconnect
@@ -1906,7 +2124,10 @@ export class DiscordAdapter {
     if (!guild?.channels) {
       throw new Error(`Guild ${guildId} not found`);
     }
-    const unavailable = () => new Error(`Guild ${guildId} is unavailable (a Discord outage); its channels can't be listed until it's back`);
+    const unavailable = () => new Error(
+      `Nothing was listed: server ${guildId} is unavailable in a Discord outage, so its channels can't be listed until ` +
+        "it's back. The same call can list them then.",
+    );
     if (!guild.available) throw unavailable();
     await this.refreshStale(guildId);
     // An outage can begin while those fetches are out.
@@ -1952,10 +2173,12 @@ export class DiscordAdapter {
    * 2. Applies `channelAllowed` BEFORE matching, so a name can never address a
    *    channel the allowlist excludes, and an excluded `#general` cannot
    *    manufacture a spurious collision with a permitted one.
-   * 3. Excludes categories and threads. Categories are not sendable. Thread
+   * 3. Matches only the sendable kinds: text, announcement, voice and
+   *    stage channels (SENDABLE in channel-names.ts). Categories, forums,
+   *    media and directory channels, and threads, are given by id. Thread
    *    names are not unique — not even within one channel — so including them
    *    would make the ambiguity error fire constantly and render the feature
-   *    unusable. Threads remain addressable by id.
+   *    unusable.
    */
   resolveChannelRef(ref: string): ResolveResult {
     return this.resolveAmong(ref, this.nameView());
@@ -1970,6 +2193,10 @@ export class DiscordAdapter {
       return { ok: false, reason: 'not-found', message: `Unusable channel reference: "${ref}"` };
     }
     if (parsed.kind === 'id') return { ok: true, id: parsed.id };
+    // A pasted thread label is refused by its shape, which no fact about a
+    // server changes, so before what follows: as a name it could reach a
+    // voice or stage room whose name has the same shape (formatThreadLabel).
+    if (isThreadLabelShape(parsed.name)) return threadLabelRefusal(ref);
     // A stale channel's current name isn't known: Discord may have renamed
     // it to any name, this one included, so no name in its guild resolves
     // while it's stale, whichever channel holds the name in the cache, and
@@ -1982,7 +2209,7 @@ export class DiscordAdapter {
       const where = parsed.guild === undefined ? 'a server this name could mean' : 'that server';
       return {
         ok: false, reason: 'ambiguous',
-        message: `${ref} can't be resolved by name right now: Discord's current facts for a channel in ${where} aren't known (its latest fetch failed or was overtaken by a change), so its current name may be this one. Address the channel by its id instead: meanwhile the registered label of each channel a name addresses there is its id, and list_channels gives the id of each channel whose facts are current.`,
+        message: `Nothing was done: ${ref} can't be resolved by name right now, since Discord's current facts for a channel in ${where} aren't known (its latest fetch failed or was overtaken by a change), so its current name may be this one. Address the channel by its id instead: until that fetch succeeds, each channel the name could mean there is shown by its id wherever its label would be, and list_channels lists the others with their ids.`,
       };
     }
     return resolveChannelName(parsed, names(parsed.name));
@@ -2073,7 +2300,7 @@ export class DiscordAdapter {
     opts: { cap?: boolean; withPermission?: bigint; warmups?: Map<string, boolean> } = {},
   ): Promise<DiscordChannelMembers> {
     const channel = await this.channelById(channelId);
-    if (!channel) throw new Error(`Channel ${channelId} not found`);
+    if (!channel) throw channelUnusable(channelId, 'no members were listed');
     const warm = async (guild: Guild): Promise<boolean> => {
       let warmed = opts.warmups?.get(guild.id);
       if (warmed === undefined) {
@@ -2225,11 +2452,13 @@ export class DiscordAdapter {
     const bare = raw.replace(/^@/, '').trim();
     if (!bare) return { ok: false, message: 'latestFrom names no one; nothing was done.' };
     const channel = await this.channelById(channelId);
-    if (!channel) throw new Error(`Channel ${channelId} not found`);
+    if (!channel) throw channelUnusable(channelId, 'nothing was done');
     const refused = await this.latestFromFilterRefusal(channel, channelId);
     if (refused) return { ok: false, message: refused };
     const guildId = 'guildId' in channel && channel.guildId ? channel.guildId : null;
-    const window = await this.fetchHistory(channelId, { limit: LATEST_FROM_WINDOW });
+    // A channel without messages is refused there, saying, as this call's
+    // other refusals do, that nothing was done.
+    const window = await this.fetchHistory(channelId, { limit: LATEST_FROM_WINDOW, nothing: 'nothing was done' });
     if (window.length === 0) {
       return { ok: false, message: 'This channel has no messages, so latestFrom has nothing to choose from; nothing was done.' };
     }
@@ -2439,7 +2668,10 @@ export class DiscordAdapter {
       // Discord says the new channel is gone already: deleted since, which
       // refetchChannel reported (channelGone).
       if ((err as { code?: unknown } | null)?.code === UNKNOWN_CHANNEL) {
-        throw new Error(`Channel ${created.id} was created, but Discord says it no longer exists`);
+        throw new Error(
+          `Channel ${created.id} was created, but Discord says it no longer exists: it was deleted since, so there's ` +
+            'no channel to use. create_text_channel can make it again.',
+        );
       }
       // The channel was made, but its facts aren't verified: it's marked
       // stale, labelled by its id, until a fresh fetch.
@@ -2463,7 +2695,7 @@ export class DiscordAdapter {
 
   async deleteChannel(channelId: string): Promise<void> {
     const channel = await this.channelById(channelId);
-    if (!channel) throw new Error(`Channel ${channelId} not found`);
+    if (!channel) throw channelUnusable(channelId, 'nothing was deleted');
     if ('delete' in channel) {
       await (channel as TextChannel).delete();
     } else {
@@ -3281,9 +3513,9 @@ export class DiscordAdapter {
    *  bound delivery, not reads. */
   async inspectionRefusal(channelId: string): Promise<string | null> {
     const channel = await this.channelById(channelId);
-    // A lookup that finds nothing can't be placed, so it fails closed, with
-    // the not-found error the read itself would give.
-    if (!channel) throw new Error(`Channel ${channelId} not found`);
+    // A channel discord.js returns nothing for can't be placed, so it fails
+    // closed, with the error the read itself would give.
+    if (!channel) throw channelUnusable(channelId, 'nothing was read');
     // A DM passes: the DM list filters incoming DMs only.
     if (channel.isDMBased()) return null;
     const guildId = 'guildId' in channel ? channel.guildId : null;
@@ -3293,6 +3525,22 @@ export class DiscordAdapter {
       `Channel ${channelId} is outside this residence's configured channel filters — ` +
       'filters bound inspection as well as delivery. Nothing was read.'
     );
+  }
+
+  /** Whether Discord would show this bot a channel's messages: a DM's
+   *  always, and a server channel's, a thread's included, when discord.js's
+   *  cached permissions give this bot Read Message History there (a
+   *  thread's are its parent's). Without it Discord answers a read of the
+   *  channel's messages with none, not a refusal. A channel discord.js
+   *  returns nothing for, or a bot member the cache doesn't hold, counts as
+   *  not shown. */
+  async readsMessageHistory(channelId: string): Promise<boolean> {
+    const channel = await this.channelById(channelId);
+    if (!channel) return false;
+    if (channel.isDMBased()) return true;
+    const me = channel.guild.members.me;
+    return me !== null && (channel as GuildBasedChannel & { permissionsFor(m: GuildMember): Readonly<PermissionsBitField> | null })
+      .permissionsFor(me)?.has(PermissionsBitField.Flags.ReadMessageHistory) === true;
   }
 
   private messageFilterReason(message: Message): string | null {
@@ -3346,6 +3594,13 @@ export class DiscordAdapter {
    */
   private dmUserRefused(userId: string | undefined): boolean {
     return !!this.dmUsers && (!userId || !this.dmUsers.has(userId));
+  }
+
+  /** Whether the DM list admits this user as a DM's other party, as it
+   *  stands now: a channels/open that looked a DM up checks again at its
+   *  commit, since the filters file can be reloaded during the open. */
+  dmUserAdmitted(userId: string): boolean {
+    return !this.dmUserRefused(userId);
   }
 
   /** Ingress decision for a message fetched from history (the catch-up
@@ -3477,6 +3732,51 @@ export function attachmentUrlExpiry(url: string): Date | null {
   return Number.isFinite(expiry.getTime()) ? expiry : null;
 }
 
+/** Where a message stood when the send of one of its parts failed, a
+ *  message sent in one part included, carried on the error so the send
+ *  tools can say so: the agent would otherwise read the failure as nothing
+ *  sent, and sending the whole message again could post parts twice. The
+ *  parts' texts are as sent, after mentions are rewritten, so the agent
+ *  finds where the rest begins by its words, not by a position it would
+ *  have to count to. */
+export interface PostedParts {
+  /** The ids of the parts that posted, in order: none when the first failed. */
+  ids: string[];
+  /** How many parts the message was split into. */
+  of: number;
+  /** The text of the part that failed: '' for a message of files alone. */
+  failed: string;
+  /** The text of the part after it, unless it was the last. */
+  next?: string;
+  /** Whether the message carried files, which go with its last part. */
+  files: boolean;
+  /** Whether the message replied to one, which its first part carries. */
+  reply: boolean;
+}
+
+/** Carries what a failed send posted, on any send's error, a message sent
+ *  in one part included: whether that part posted is as unknown as a later
+ *  part's when Discord didn't refuse it. Attached only here, where
+ *  sendMessage or sendDM's post of a part throws, so it also says that post
+ *  was the request that failed. The DM notice's post (sendDmNotice) attaches
+ *  none: its errors stay with the notice's own outcome. */
+function withPostedParts(err: unknown, posted: string[], chunks: string[], files: boolean, reply: boolean): unknown {
+  if (err && typeof err === 'object') {
+    const k = posted.length;
+    Object.assign(err, {
+      postedParts: {
+        ids: [...posted],
+        of: chunks.length,
+        failed: chunks[k],
+        ...(k + 1 < chunks.length ? { next: chunks[k + 1] } : {}),
+        files,
+        reply,
+      } satisfies PostedParts,
+    });
+  }
+  return err;
+}
+
 /** A message's own attachments plus any carried by forwarded snapshots.
  *  Snapshot attachments keep their original CDN URLs (signed like any other),
  *  so merging them here gives a forward's media the same handling as a native
@@ -3510,6 +3810,22 @@ export function mapAllAttachments(m: {
   return out;
 }
 
+/** What an exact open's lookup makes of a fetch that failed. Discord refusing
+ *  the id means this server doesn't serve it: Unknown Channel, Missing
+ *  Access, a malformed id's Invalid Form Body, or any other 403 or 404.
+ *  Anything else leaves its facts unknown, and another open fetches it
+ *  again: no answer (a 5xx, a timeout, a dropped connection, or a rejection
+ *  that isn't Discord's), and a refusal that isn't about the id, such as a
+ *  401 after the bot's token changed. */
+function lookUpFailure(channelId: string, err: unknown): null | { kind: 'uncertain' } {
+  const status = (err as { status?: unknown } | null)?.status;
+  const code = (err as { code?: unknown } | null)?.code;
+  const refused = code === UNKNOWN_CHANNEL || code === MISSING_ACCESS || code === INVALID_FORM_BODY
+    || status === 403 || status === 404;
+  dbg('lookUpServedChannel:failed', { channelId, refused, error: err instanceof Error ? err.message : String(err) });
+  return refused ? null : { kind: 'uncertain' };
+}
+
 /** The kinds of guild channel registered by listing them (at boot, when one
  *  is created, changed or the bot joins its guild, and by refresh_channels):
  *  those messages are posted in, a voice or stage channel's text chat
@@ -3530,6 +3846,80 @@ export function holdsNoMessages(type: DiscordChannelInfo['type']): boolean {
  *  it. Its name is in each post's label. */
 export function holdsPosts(type: ChannelType | undefined): boolean {
   return type === ChannelType.GuildForum || type === ChannelType.GuildMedia;
+}
+
+/** The errors a call gets when discord.js returns no channel for an id, with
+ *  what didn't happen (`nothing`, from the call). Discord answered for the id
+ *  (an id it doesn't know throws Unknown Channel, which explainDiscordError
+ *  explains), but discord.js couldn't build a channel from the answer: a type
+ *  it has no class for, which only an update of the adapter changes, or a
+ *  server channel whose server isn't in its cache. In discord.js 14.26.5,
+ *  READY puts every server the bot is in into that cache, unavailable ones
+ *  included, and GUILD_CREATE adds one it joins later, so a server is
+ *  missing only until the gateway delivers it, and the same call may work a
+ *  moment later. Telling the two causes apart would take a second lookup,
+ *  whose channel would need every check a normal lookup gets, for a rare
+ *  case, so channelUnusable names both, with the retry hint on the second.
+ *  A DM has no server, so only the first cause applies to one, but at a null
+ *  the adapter can't tell a DM's id from a server channel's: every call gets
+ *  both causes except sendDmNotice, which knows its channel is a DM and uses
+ *  unhandledKind, naming the first alone. */
+function channelUnusable(channelId: string, nothing: string): Error {
+  return new Error(
+    `Channel ${channelId} exists, but this adapter can't use it, so ${nothing}. Either it's a kind of channel ` +
+      "this version of the adapter can't handle, which only an operator updating the adapter can change, or its " +
+      'server is still loading on this connection, in which case the same call may work in a moment.',
+  );
+}
+
+function unhandledKind(channelId: string, nothing: string): Error {
+  return new Error(
+    `Channel ${channelId} exists, but it's a kind of channel this version of the adapter can't handle, so ${nothing}. ` +
+      'Only an operator updating the adapter can change that.',
+  );
+}
+
+/** What the kinds of channel that hold no messages of their own are called,
+ *  by Discord type number, in the errors that name them (noMessagesHere).
+ *  holdsNoMessages answers another question, for registration: which of
+ *  mapChannelType's kinds no delivery is registered from. It takes the
+ *  mapped kind, so it can't name a directory or a media channel, which
+ *  both map to unknown. */
+const HOLDS_NO_MESSAGES: Record<number, string> = {
+  4: 'a category',
+  14: 'a directory channel',
+  15: 'a forum',
+  16: 'a media channel',
+};
+
+/** The error for a channel this adapter can't read or send to, naming what
+ *  it is and what didn't happen (`nothing`, from the call), then where its
+ *  messages are or plainly that nothing here can use it. A category's
+ *  channels are the ones list_channels shows for its server with it as their
+ *  parent, as far as the channel filters allow. A forum's or media channel's
+ *  posts are threads, which no tool here lists, so a post's id comes only
+ *  from a message posted in it or a link to it. Its messages are written
+ *  through that id, and read through it as far as the channel filters
+ *  allow, since the filters bound reads but not sends. A directory channel
+ *  lists servers. A kind this table doesn't name, such as one a later
+ *  discord.js builds, is named by its type number, without a claim that it
+ *  holds no messages, and only an operator updating the adapter can change
+ *  that this adapter can't use it. */
+function noMessagesHere(channel: { type: number; guildId?: string | null }, channelId: string, nothing: string): Error {
+  const kind = HOLDS_NO_MESSAGES[channel.type];
+  if (!kind) {
+    return new Error(
+      `Channel ${channelId} is a kind of channel (type ${channel.type}) that this adapter can't read or send to, so ${nothing}. ` +
+        'Only an operator updating the adapter can change that.',
+    );
+  }
+  const after = holdsPosts(channel.type)
+    ? " Its posts are threads, and no tool here lists them, so a post's id comes only from a message posted in it or a link to it. " +
+      "A post's messages are written through that id, and read through it where the configured channel filters allow."
+    : channel.type === 4
+      ? ` The channels in it that the configured channel filters allow are the ones list_channels for server ${channel.guildId} shows with ${channelId} as their parent.`
+      : ' It lists servers, and nothing here can read it or send to it.';
+  return new Error(`Channel ${channelId} is ${kind}, which holds no messages, so ${nothing}.${after}`);
 }
 
 /**
