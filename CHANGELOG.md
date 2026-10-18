@@ -5,6 +5,8 @@ in the git log and PR descriptions.
 
 ## Unreleased
 
+## 0.3.0 — 2026-10-18
+
 ### Upgrade notes
 
 - **discord-mcpl now needs Node.js 22.12.0 or later.** If you run it on
