@@ -5,6 +5,27 @@ in the git log and PR descriptions.
 
 ## Unreleased
 
+### Fixed
+
+- **A message the host refuses is no longer reported as sent, and one
+  refused for a large inline image still reaches the agent as text.** A
+  forwarded message's answer is now read: `channels/incoming`'s per-message
+  `results[]`, `push/event`'s `{accepted, reason}`, and a -32602 error. A
+  refusal logs `[discord-mcpl] host rejected message <id> in <channel>:
+  <reason>` on stderr and `handleDiscordMessage:rejected` in the debug log,
+  with what the message carried inline; `handleDiscordMessage:sent` now
+  means the host accepted it (or answered without a per-message verdict)
+  and carries `result`. A message refused for its content while it carried
+  inline images or audio is sent once more with each inline block replaced
+  by a text note, under a fresh occurrence id (`<eventId>_media_omitted`)
+  on the same coalescing subject; its outcome is logged, and it is never
+  resent again. A host before agent-framework #266 refused a coalesced
+  message whose content, inline base64 included, passed 1 MiB, so a
+  message with a large screenshot, text and all, was lost while this server
+  logged it as sent. A refused edit or delete is logged too
+  (`[discord-mcpl] host rejected edit of message <id> in <channel>:
+  <reason>`).
+
 ## 0.3.0 — 2026-10-18
 
 ### Upgrade notes
