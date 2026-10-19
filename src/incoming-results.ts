@@ -7,12 +7,13 @@
  * (`code`, `message`). A refused message never reaches the agent, so the
  * refusal has to be read and reported here: sending is not delivering.
  *
- * The case this exists for: a host before agent-framework #266 checked a
- * coalesced message's whole content against a 1 MiB budget, inline base64
- * images included, and refused a message carrying a large screenshot as
- * `coalesce_invalid` (channels/incoming) or with a -32602 error
- * (push/event). Nothing on either side logged it. The message, its text
- * included, was lost.
+ * The case this exists for: agent-framework's coalescing hosts before 0.22.2,
+ * its 0.21 line included, check a coalesced message's whole content against
+ * a 1 MiB budget, inline base64 images included (agent-framework #266; #267
+ * removed the budget in 0.22.2). They refuse a message carrying a large
+ * screenshot as `coalesce_invalid` (channels/incoming) or with a -32602 error
+ * (push/event), and the host logs nothing about it. The message, its text
+ * included, never reaches the agent.
  */
 
 import type { ContentBlock } from '@animalabs/mcpl-core';
@@ -59,34 +60,51 @@ export function pushOutcome(response: unknown): ForwardOutcome {
   return { kind: 'no-result' };
 }
 
-/** A JSON-RPC error that is the host refusing this content (as opposed to a
- *  timeout, a closed connection, or a host fault): -32602, invalid params,
- *  is what a host answers for content it will not admit. */
+/**
+ * The host's refusal in the error a request was rejected with, or undefined
+ * when the error isn't a verdict on this message:
+ * - no code: a closed connection;
+ * - -32000: mcpl-core's own timeout (0.2.1's RpcError, and the
+ *   ConnectionTimeoutError of later versions), or the host's own failure,
+ *   such as agent-framework's "host could not persist the acceptance; retry",
+ *   which it can answer after it has already delivered the message;
+ * - -32603: the host's internal error.
+ *
+ * Any other code is the host refusing this request: agent-framework answers
+ * codes such as -32602 for content or params it won't admit, -32001 and
+ * -32003 for a feature set, and -32017 and -32023 for a channel. This is the
+ * line agent-framework draws itself (coalesceRejectionReason in its
+ * push-coalescer.ts, since 0.22.2): -32000 and -32603 are the host's own
+ * failure, and every other answer is the sender's.
+ *
+ * channels/incoming answers each message as a result without a code, so the
+ * host's own failure there comes back as a reason that reads like a refusal.
+ */
 export function errorRejection(err: unknown): HostRejection | undefined {
   const e = err as { code?: unknown; message?: unknown } | null | undefined;
   if (!e || typeof e.code !== 'number') return undefined;
-  if (e.code !== -32602) return undefined;
-  return { reason: typeof e.message === 'string' && e.message ? e.message : 'invalid params', code: e.code };
+  if (e.code === -32000 || e.code === -32603) return undefined;
+  const message = typeof e.message === 'string' ? e.message : '';
+  // mcpl-core 0.2.1 puts "RPC error <code>: " in front of the host's message,
+  // and later versions don't. The reason is the host's own words.
+  const prefix = `RPC error ${e.code}: `;
+  const reason = message.startsWith(prefix) ? message.slice(prefix.length) : message;
+  return { reason: reason || 'unspecified', code: e.code };
 }
 
 /**
  * Whether a refusal is about the message's CONTENT, so that the same message
- * without its inline media might be admitted.
- *
- * Reasons a host gives (agent-framework channel-registry / push-handler):
- * `coalesce_invalid` (a coalesced item's content or coalesce member failed
- * validation — before #266 that included the 1 MiB content budget), the
- * error text "content exceeds host byte limit", and -32602 errors. Other
- * reasons (`empty_content`, `unknown channel …`, `duplicate`, "host could not
- * persist the acceptance; retry", identity errors) are not about size, and
- * resending without media would not change them.
+ * without its inline media might be admitted: a -32602 error, or the item
+ * reason `coalesce_invalid`. Those are the two answers agent-framework gives a
+ * coalesced message over its 1 MiB content budget (push/event and
+ * channels/incoming, on the hosts before 0.22.2 that have one). The host
+ * gives them for malformed content or a malformed coalesce member too, which
+ * this server doesn't send. Every other refusal, such as `empty_content`,
+ * `duplicate`, `unknown channel …` or a feature-set error, isn't one the
+ * media caused, so it isn't resent without it.
  */
 export function isContentRejection(rejection: HostRejection): boolean {
-  if (rejection.code === -32602) return true;
-  const reason = rejection.reason.toLowerCase();
-  if (reason === 'coalesce_invalid') return true;
-  return /\b(byte|bytes|size|too large|limit|content block|payload\.content)\b/.test(reason)
-    && !/empty/.test(reason);
+  return rejection.code === -32602 || rejection.reason === 'coalesce_invalid';
 }
 
 /** Inline media blocks: an image or audio block that carries its bytes. */
@@ -128,10 +146,7 @@ function fmtBytes(n: number): string {
  * agent. The attachment line that follows each inline image (name and link)
  * is kept as it is. `replaced` is 0 when there was nothing to replace.
  */
-export function withoutInlineMedia(
-  content: ContentBlock[],
-  hostReason: string,
-): { content: ContentBlock[]; replaced: number } {
+export function withoutInlineMedia(content: ContentBlock[]): { content: ContentBlock[]; replaced: number } {
   let replaced = 0;
   const out = content.map((b): ContentBlock => {
     if (!isInlineMedia(b)) return b;
@@ -140,10 +155,12 @@ export function withoutInlineMedia(
     // base64 → bytes: 3 bytes per 4 characters.
     const approx = Math.floor((block.data.length * 3) / 4);
     const what = block.type === 'audio' ? 'audio' : 'image';
+    // The host's reason is the operator's (the refusal line on stderr); the
+    // agent is told what it is missing and where to find it.
     return {
       type: 'text',
       text: `[${what} omitted: the host refused this message with the ${what} inline `
-        + `(${block.mimeType || what}, ~${fmtBytes(approx)}; host said: ${hostReason}). `
+        + `(${block.mimeType || what}, ~${fmtBytes(approx)}). `
         + `The attachment line below names it and links to it.]`,
     } as ContentBlock;
   });
