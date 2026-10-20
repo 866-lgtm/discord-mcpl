@@ -63,12 +63,12 @@ import {
   describeMarkers,
   describeRetract,
   hostCount,
+  HIDE_MARKS_OPTION,
   hostRefusal,
   isCancelReceipt,
   isRetractReceipt,
   isView,
   MARKS_OPTION,
-  markersReported,
   PROBE_AGAIN,
   readMarksChoice,
   renderEntry,
@@ -969,7 +969,7 @@ export class DiscordMcplServer {
             description: 'End of range: a second message link/ID (inclusive)',
             required: false,
           },
-          MARKS_OPTION,
+          HIDE_MARKS_OPTION,
         ],
       },
       {
@@ -996,7 +996,7 @@ export class DiscordMcplServer {
           {
             type: 4, // INTEGER
             name: 'page',
-            description: 'list: which page of the journal (newest first; default 1)',
+            description: 'list: which page of the ledger (newest first; default 1)',
             required: false,
             min_value: 1,
           },
@@ -1209,8 +1209,8 @@ export class DiscordMcplServer {
 
   /**
    * `/marks action:list [target] [page]` and `/marks action:cancel|retract target` — the
-   * awareness journal's operator controls (agent-framework `host/command`
-   * `marks`). list shows the journal newest first, a page at a time, or one
+   * awareness ledger's operator controls (agent-framework `host/command`
+   * `marks`). list shows the ledger newest first, a page at a time, or one
    * entry in full by its id; cancel and retract each answer with what the
    * host's receipt says. Every reply fits one Discord
    * message: a longer one is cut visibly with the full answer attached.
@@ -1292,14 +1292,14 @@ export class DiscordMcplServer {
       }
       return;
     }
-    // An accepted answer that left out its journal or receipt is shown whole,
+    // An accepted answer that left out its ledger or receipt is shown whole,
     // never as "undefined".
     const whole = response.awareness === undefined;
     const answer = whole ? result : response.awareness;
     if (action === 'list') {
       const views = Array.isArray(answer) && answer.every(isView) ? answer : null;
       if (!views) {
-        await this.acknowledge(interaction, boundedReply(unreadable(whole ? '/marks action:list' : 'the journal', answer), answer));
+        await this.acknowledge(interaction, boundedReply(unreadable(whole ? '/marks action:list' : 'the ledger', answer), answer));
         return;
       }
       if (target) {
@@ -1357,35 +1357,17 @@ export class DiscordMcplServer {
       toMessageId = parsed;
     }
 
-    const marks = readMarksChoice(interaction);
-    const marksChosen = marks === 'addressed' || marks === 'all';
+    // A hide's 💤 is this server's own: the host places none for a hide and
+    // refuses a choice there, so the request carries none, on any host.
+    const marking = readMarksChoice(interaction) === 'all';
     const conn = this.conn;
     if (!conn) {
       await interaction.reply({ content: 'Host is not connected — cannot hide.', flags: MessageFlags.Ephemeral });
       return;
     }
 
-    dbg('slash:hide', { fromMessageId, toMessageId, marks, userId: interaction.user.id });
+    dbg('slash:hide', { fromMessageId, toMessageId, marking, userId: interaction.user.id });
     await interaction.deferReply();
-
-    // Only a marks choice needs to know the host. With none, the request is
-    // the plain hide, and both kinds of host mark nothing for it. With one,
-    // a host with the `marks` verb places the chosen marks, journals them and
-    // reports them. An older host keeps no journal, so marks there would have
-    // no list, cancel or retract: the choice is refused before anything is
-    // sent, as /undo is on such a host.
-    if (marksChosen) {
-      const support = await this.hostMarksSupport(conn);
-      if (support !== true) {
-        await this.acknowledge(interaction, boundedReply(support === false
-          ? "⚠️ Hide not sent: this host can't place awareness marks (no `marks` host command), so a marks choice " +
-            "isn't available here. Upgrade the host (an agent framework with the `marks` host command) to mark " +
-            'hidden messages, or leave marks out.'
-          : `⚠️ Hide not sent: couldn't learn whether this host makes awareness marks a choice (${support.reason}). ` +
-            `Nothing was changed. ${PROBE_AGAIN}`));
-        return;
-      }
-    }
 
     let result: unknown;
     try {
@@ -1395,7 +1377,6 @@ export class DiscordMcplServer {
           command: 'hide',
           fromMessageId,
           toMessageId,
-          ...(marksChosen ? { marks } : {}),
           requesterId: interaction.user.id,
           requesterName: interaction.user.username,
         },
@@ -1405,8 +1386,8 @@ export class DiscordMcplServer {
       dbg('slash:hide-failed', { error: errorText(err) });
       await this.acknowledge(
         interaction,
-        boundedReply(surgeryOutcomeUnknown('Hide', marksChosen, errorText(err))),
-        surgeryOutcomeUnknown('Hide', marksChosen),
+        boundedReply(surgeryOutcomeUnknown('Hide', false, errorText(err))),
+        surgeryOutcomeUnknown('Hide', false),
       );
       return;
     }
@@ -1421,8 +1402,8 @@ export class DiscordMcplServer {
     if (answer.ok !== true) {
       await this.acknowledge(
         interaction,
-        boundedReply(unreadableSurgery('hide', result, marksChosen), result),
-        surgeryOutcomeUnknown('Hide', marksChosen),
+        boundedReply(unreadableSurgery('hide', result, false), result),
+        surgeryOutcomeUnknown('Hide', false),
       );
       return;
     }
@@ -1430,30 +1411,49 @@ export class DiscordMcplServer {
     // The hide is applied, so a reply always goes out: each field is read
     // only once its type is checked, and a reply that can't be shown never
     // reads as the hide's failure.
-    //
-    // Any receipt the host sent, even one this server can't read, is its
-    // account of marks, shown and never supplemented; and a host that was
-    // sent a choice, which has the verb, is reported as having said nothing
-    // when it sent none. This server places no marks itself: they would
-    // bypass the host's journal and its cancel.
-    const reported = markersReported(answer.markers) || marksChosen;
-    const marksFull = reported ? describeMarkers(answer.markers) : 'Marks: none.';
-    const marksShort = reported ? summarizeMarkers(answer.markers) : 'Marks: none.';
-
+    const marks = marking ? await this.markHidden(answer.hiddenRefs) : undefined;
     const n = hostCount(answer.hidden);
     const lines = [
       n === undefined
         ? "🙈 Hide applied (redacted in place); the number of messages removed from the agent's context was not given."
         : `🙈 Removed **${n}** message${n === 1 ? '' : 's'} from the agent's context (redacted in place).`,
-      marksFull,
+      ...(marks ? [marks] : []),
       ...lastVisibleLines(answer.lastVisible),
     ];
     await this.acknowledge(
       interaction,
       boundedReply(lines.join('\n'), result),
-      `🙈 Hide applied: ${n === undefined ? 'the number of messages removed was not given' : `removed ${n} message${n === 1 ? '' : 's'} from the agent's context`}. ` +
-        marksShort,
+      `🙈 Hide applied: ${n === undefined ? 'the number of messages removed was not given' : `removed ${n} message${n === 1 ? '' : 's'} from the agent's context`}.` +
+        (marks ? ` ${marks}` : ''),
     );
+  }
+
+  /**
+   * A chosen /hide's 💤, added by this server to each message the host says
+   * it hid, as every /hide did before the choice. Best-effort and in
+   * parallel: discord.js's REST queue sends one channel's reaction requests
+   * one at a time, within Discord's limits. The marks are outside the
+   * host's awareness ledger, which is why the reply says `/marks` can't take
+   * them back.
+   */
+  private async markHidden(hiddenRefs: unknown): Promise<string> {
+    if (!Array.isArray(hiddenRefs)) {
+      return 'Marks: the host named no hidden messages, so none was marked with 💤.';
+    }
+    let added = 0;
+    await Promise.all(hiddenRefs.map(async (ref: unknown) => {
+      if (!isJsonObject(ref) || typeof ref.channelId !== 'string' || typeof ref.messageId !== 'string') return;
+      // channelId may be raw or the "discord:guild:channel" composite.
+      const parsed = parseMcplChannelId(ref.channelId);
+      try {
+        await this.discord.addReaction(parsed ? parsed.channelId : ref.channelId, ref.messageId, '💤');
+        added++;
+      } catch (err) {
+        dbg('slash:hide-react-failed', { messageId: ref.messageId, error: errorText(err) });
+      }
+    }));
+    return `Marks: 💤 added to ${added} of ${hiddenRefs.length} hidden message${hiddenRefs.length === 1 ? '' : 's'}. ` +
+      "They're this server's own, outside the host's awareness ledger, so `/marks` doesn't list, cancel or retract them.";
   }
 
   /**

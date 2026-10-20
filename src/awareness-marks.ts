@@ -1,20 +1,22 @@
 /**
- * The host's 💤 awareness marks, as the admin slash commands present them.
+ * The 💤 awareness marks, as the admin slash commands present them.
  *
- * Marks are the framework's: an agent framework with the `marks` host
- * command (anima-research/agent-framework#250) places them for an /undo or
- * /hide only when the operator chooses a scope (`addressed` or `all`), keeps
- * a journal of what it asked Discord to do, and returns a `markers` receipt
- * describing what it scheduled. This server places none itself. This module
- * turns those answers into the operator's replies and reads the operator's
- * choice from an interaction.
+ * An /undo's marks are the framework's: an agent framework with the `marks`
+ * host command (anima-research/agent-framework#250) places them only when
+ * the operator chooses a scope (`addressed` or `all`), keeps them in its
+ * awareness ledger, and returns a `markers` receipt describing what it
+ * scheduled. A /hide's marks are this server's own: the host places none
+ * for a hide and refuses a choice there, so this server adds 💤 to the
+ * hidden messages itself when the operator chooses `all`, outside the
+ * ledger. This module turns the host's answers into the operator's replies
+ * and reads the operator's choice from an interaction.
  */
 import type { ChatInputCommandInteraction } from 'discord.js';
 
 /** The operator's choice of which removed messages get a 💤 mark. */
 export type MarksChoice = 'none' | 'addressed' | 'all';
 
-/** The `marks` option /undo and /hide take. Omitted means none. */
+/** The `marks` option /undo takes. Omitted means none. */
 export const MARKS_OPTION = {
   type: 3, // STRING
   name: 'marks',
@@ -23,6 +25,20 @@ export const MARKS_OPTION = {
   choices: [
     { name: 'none', value: 'none' },
     { name: 'addressed', value: 'addressed' },
+    { name: 'all', value: 'all' },
+  ],
+} as const;
+
+/** The `marks` option /hide takes. Omitted means none. A hide's marks are
+ *  this server's own, and the host's answer names the hidden messages
+ *  without saying which addressed the agent, so `addressed` isn't offered. */
+export const HIDE_MARKS_OPTION = {
+  type: 3, // STRING
+  name: 'marks',
+  description: 'Mark hidden messages with 💤: none (default) or all',
+  required: false,
+  choices: [
+    { name: 'none', value: 'none' },
     { name: 'all', value: 'all' },
   ],
 } as const;
@@ -41,9 +57,8 @@ export type MarkersReceipt = {
   notRemoved: number;
 } & (
   | { status: 'none'; queued: 0 }
-  | { status: 'queued'; queued: number; batchId: string; error?: string }
+  | { status: 'queued'; queued: number; batchId: string }
   | { status: 'not-scheduled'; queued: 0; error: string }
-  | { status: 'unresolved'; queued: 0; batchId: string; error: string }
 );
 
 const plural = (n: number, one: string, many = `${one}s`): string => `${n} ${n === 1 ? one : many}`;
@@ -84,14 +99,9 @@ export function describeMarkers(markers: unknown): string {
         : `Marks: none placed — nothing removed fell within "${markers.scope}".${tail}`;
     case 'queued':
       return `Marks: ${plural(markers.queued, '💤 mark')} requested (${markers.scope}; batch \`${markers.batchId}\`) — ` +
-        `not yet confirmed on Discord; \`/marks action:list\` shows progress.${tail}` + (markers.error === undefined ? '' :
-          ` The host's journal couldn't be synced after recording them (${markers.error}), so an operating system crash ` +
-          'or a power failure before its next sync could lose them.');
+        `not yet confirmed on Discord; \`/marks action:list\` shows progress.${tail}`;
     case 'not-scheduled':
       return `Marks: not scheduled — ${markers.error}. None will be placed.${tail}`;
-    case 'unresolved':
-      return `Marks: unresolved — ${markers.error}. Batch \`${markers.batchId}\` may still be delivered later; ` +
-        `check \`/marks action:list\`.${tail}`;
   }
 }
 
@@ -105,32 +115,34 @@ const SHORT_TEXT_MAX = 100;
  */
 export function summarizeMarkers(markers: unknown): string {
   if (!markersReported(markers)) return 'Marks: the host reported nothing about them; `/marks action:list` shows whether it scheduled any.';
-  if (!isMarkersReceipt(markers)) return "Marks: the host's receipt couldn't be read; `/marks action:list` shows the journal.";
+  if (!isMarkersReceipt(markers)) return "Marks: the host's receipt couldn't be read; `/marks action:list` shows the ledger.";
   const batch = (id: string): string => `batch \`${clip(id, SHORT_TEXT_MAX)}\``;
   switch (markers.status) {
     case 'none':
       return markers.scope === 'none' ? 'Marks: none.' : 'Marks: none placed.';
     case 'queued':
-      return `Marks: ${plural(markers.queued, '💤 mark')} requested (${batch(markers.batchId)})` +
-        (markers.error === undefined ? '.' : "; the host's journal sync failed after recording them, so an operating system " +
-          'crash or a power failure before its next sync could lose them.');
+      return `Marks: ${plural(markers.queued, '💤 mark')} requested (${batch(markers.batchId)}).`;
     case 'not-scheduled':
       return `Marks: not scheduled — ${clip(markers.error, SHORT_TEXT_MAX)}.`;
-    case 'unresolved':
-      return `Marks: unresolved — ${clip(markers.error, SHORT_TEXT_MAX)} (${batch(markers.batchId)}); check \`/marks action:list\`.`;
   }
 }
 
-/** An operation's status in the journal (agent-framework's DiscordAwarenessOpStatus). */
-export type OpStatus = 'requested' | 'dispatching' | 'confirmed' | 'failed' | 'unknown' | 'cancelled';
-type Counts = Partial<Record<OpStatus, number>>;
+/**
+ * Reactions counted by state (agent-framework's DiscordAwarenessReactionState):
+ * queued (a request owed, not yet sent), sending (on the wire), present or
+ * absent (nothing owed, and Discord's last answer), unknown (nothing owed,
+ * and the last request went unanswered), failed (it ended unconfirmed) and
+ * untouched (never asked). Shown as the host names them, so a state a later
+ * host adds still reads.
+ */
+type Reactions = Record<string, number>;
 
-/** One batch, as the journal lists it (agent-framework's DiscordAwarenessBatchView). */
+/** One batch, as the ledger lists it (agent-framework's DiscordAwarenessBatchView). */
 export interface BatchView {
   kind: 'batch';
   id: string;
-  /** prepared, active or discarded at agent-framework#250; shown as the host
-   *  names it, so a state a later host adds still reads. */
+  /** prepared, active or retired at agent-framework#250; shown as the host
+   *  names it. */
   status: string;
   scope: string;
   agentName: string;
@@ -142,13 +154,14 @@ export interface BatchView {
   unmarked?: number;
   notRemoved?: number;
   cancelled?: { at: number; by?: string };
-  adds: Counts;
-  removals: Counts;
-  unresolvedAttempts: number;
+  /** Its messages' reactions, by state, whichever act wants them now. */
+  reactions: Reactions;
+  /** Of those, the ones with a request on the wire or one never answered. */
+  mayStillLand: number;
   /** A batch imported from agent-framework 0.22.x's ledger: how many of its
    *  messages 0.22.x's last attempt added a mark to with no error recorded.
-   *  The import records no attempts of its own, so such a batch's adds are
-   *  all zero, and this is the view's only count of what 0.22.x added. */
+   *  Nothing an import brings is ever sent, so this is the view's only count
+   *  of what 0.22.x added. */
   legacyAdded?: number;
 }
 
@@ -160,8 +173,12 @@ export interface RetractView {
   at: number;
   by?: string;
   cancelled?: { at: number; by?: string };
-  removals: Counts;
-  unresolvedAttempts: number;
+  /** The removals it queued. */
+  keys: number;
+  /** The reactions it still wants absent, by state. */
+  reactions: Reactions;
+  /** Of those, the ones with a request on the wire or one never answered. */
+  mayStillLand: number;
 }
 
 export type AwarenessView = BatchView | RetractView;
@@ -170,11 +187,12 @@ export type AwarenessView = BatchView | RetractView;
 export interface CancelReceipt {
   target: string;
   kind: 'batch' | 'retract';
+  /** Its reactions left with nothing owed before any request went out. */
   cancelled: number;
+  /** Its reactions whose last answer from Discord is what it wanted. */
   confirmed: number;
-  /** Requests on the wire or with unknown outcome, counted once per request
-   *  sent: any may land. */
-  unresolvedAttempts: number;
+  /** Its reactions with a request on the wire or one never answered: any may land. */
+  mayStillLand: number;
 }
 
 /** retract's receipt (agent-framework's DiscordAwarenessRetractReceipt). */
@@ -182,8 +200,9 @@ export interface RetractReceipt {
   requestId: string;
   removalsQueued: number;
   addsSuperseded: number;
+  /** Reactions with an add on the wire or one never answered, which may land
+   *  after the removal. */
   keysWithUnresolvedAdds: number;
-  unresolvedAddAttempts: number;
 }
 
 /** Discord's limit on one reply. */
@@ -218,24 +237,32 @@ export function unreadable(what: string, value: unknown): string {
   return `The host answered ${what} in a shape this server can't read; here it is as sent:\n${asSent(value)}`;
 }
 
-const counts = (c: Counts | undefined): string => {
+const counts = (c: Reactions | undefined): string => {
   const parts = Object.entries(c ?? {}).filter(([, n]) => isNum(n) && n > 0).map(([k, n]) => `${k} ${n}`);
   return parts.length ? parts.join(', ') : 'none';
 };
 
 const when = (ms: number | undefined): string => (isNum(ms) ? `<t:${Math.floor(ms / 1000)}:f>` : 'unknown time');
 
+/** What may still land, when anything may. */
+const mayStillLand = (n: number): string => (n ? `; ${n} may still land` : '');
+
 /** One line per entry, for the paged list. */
 export function summaryLine(v: AwarenessView): string {
-  const unresolved = v.unresolvedAttempts ? `; ${v.unresolvedAttempts} unresolved` : '';
   if (v.kind === 'retract') {
-    return `• retract \`${v.id}\` → ${v.target}${v.cancelled ? ' (cancelled)' : ''}: removals ${counts(v.removals)}${unresolved}`;
+    return `• retract \`${v.id}\` → ${v.target}${v.cancelled ? ' (cancelled)' : ''}: ${plural(v.keys, 'removal')}; ` +
+      `reactions ${counts(v.reactions)}${mayStillLand(v.mayStillLand)}`;
   }
   const state = v.cancelled ? `${v.status}, cancelled` : v.status;
   const legacy = isNum(v.legacyAdded) ? `; 0.22.x recorded ${plural(v.legacyAdded, 'mark')} as added` : '';
   return `• batch \`${v.id}\` — ${state}, ${v.scope}, ${plural(v.refs, 'message')} (${v.agentName}): ` +
-    `adds ${counts(v.adds)}; removals ${counts(v.removals)}${unresolved}${legacy}`;
+    `reactions ${counts(v.reactions)}${mayStillLand(v.mayStillLand)}${legacy}`;
 }
+
+/** What the reaction states mean, once in an entry shown in full. */
+const STATES = 'States: queued, a request owed and not yet sent; sending, on the wire; present or absent, ' +
+  "Discord's last answer, with nothing owed; unknown, the last request went unanswered; failed, it ended unconfirmed; " +
+  'untouched, never asked.';
 
 /** One entry in full (the caller fits it into a reply). */
 export function detailText(v: AwarenessView): string {
@@ -243,8 +270,8 @@ export function detailText(v: AwarenessView): string {
   if (v.kind === 'retract') {
     lines.push(`**Retract \`${v.id}\`** of ${v.target === 'all' ? 'every marked message' : `batch \`${v.target}\``}, ${when(v.at)}${v.by ? ` by ${v.by}` : ''}.`);
     if (v.cancelled) lines.push(`Cancelled ${when(v.cancelled.at)}${v.cancelled.by ? ` by ${v.cancelled.by}` : ''}.`);
-    lines.push(`Removals: ${counts(v.removals)}.`);
-    if (v.unresolvedAttempts) lines.push(`${plural(v.unresolvedAttempts, 'request')} on the wire or with unknown outcome — any may land.`);
+    lines.push(`${plural(v.keys, 'removal')} queued. The reactions it still wants absent: ${counts(v.reactions)}.`);
+    if (v.mayStillLand) lines.push(`${plural(v.mayStillLand, 'reaction')} with a request on the wire or one never answered — any may land.`);
   } else {
     lines.push(`**Batch \`${v.id}\`** — ${v.status}; ${v.scope} for ${v.agentName}; ${plural(v.refs, 'message')}; created ${when(v.createdAt)}.`);
     if (v.sourceBranch || v.targetBranch) lines.push(`Branches: ${v.sourceBranch ?? '?'} → ${v.targetBranch ?? '?'}.`);
@@ -254,26 +281,27 @@ export function detailText(v: AwarenessView): string {
       lines.push(`Left unmarked: ${v.unmarked ?? 0} outside the scope; ${v.notRemoved ?? 0} chosen but not removed.`);
     }
     if (v.cancelled) lines.push(`Cancelled ${when(v.cancelled.at)}${v.cancelled.by ? ` by ${v.cancelled.by}` : ''}.`);
-    lines.push(`Adds: ${counts(v.adds)}. Removals on its messages: ${counts(v.removals)}.`);
-    if (v.unresolvedAttempts) lines.push(`${plural(v.unresolvedAttempts, 'request')} on its messages on the wire or with unknown outcome — any may land.`);
+    lines.push(`Its messages' reactions: ${counts(v.reactions)}.`);
+    if (v.mayStillLand) lines.push(`${plural(v.mayStillLand, 'reaction')} with a request on the wire or one never answered — any may land.`);
     if (isNum(v.legacyAdded)) {
       lines.push(`Imported from agent-framework 0.22.x, which recorded ${plural(v.legacyAdded, 'mark')} on these messages as added. ` +
         `Marks it placed may still be on Discord: \`/marks action:retract target:${v.id}\` takes them down.`);
     }
   }
+  lines.push(STATES);
   return lines.join('\n');
 }
 
 const entryTime = (v: AwarenessView): number => (v.kind === 'batch' ? v.createdAt : v.at) ?? 0;
 
 /**
- * The journal, newest first, cut into pages that each fit one reply with
+ * The ledger, newest first, cut into pages that each fit one reply with
  * their heading. Every entry is on some page; a line too long for a page
  * alone is clipped (its entry still opens in full with `target:`).
  */
 export function paginate(views: AwarenessView[], budget = REPLY_LIMIT): string[][] {
   const ordered = [...views].sort((a, b) => entryTime(b) - entryTime(a));
-  // Room for the heading ("Awareness journal — page 999 of 999, …"), its
+  // Room for the heading ("Awareness ledger — page 999 of 999, …"), its
   // newline, and the footer pointing at target:.
   const room = budget - HEADING_RESERVE;
   const pages: string[][] = [];
@@ -298,23 +326,23 @@ const HEADING_RESERVE = 220;
 
 /** One page of `/marks action:list`, heading and footer included, within one reply. */
 export function renderListPage(views: AwarenessView[], pageNumber: number, budget = REPLY_LIMIT): string {
-  if (views.length === 0) return 'No awareness-mark batches or retracts in the journal.';
+  if (views.length === 0) return 'No awareness-mark batches or retracts in the ledger.';
   const pages = paginate(views, budget);
   if (pageNumber < 1 || pageNumber > pages.length) {
-    return `The journal has ${plural(views.length, 'entry', 'entries')} on ${plural(pages.length, 'page')}; there is no page ${pageNumber}.`;
+    return `The ledger has ${plural(views.length, 'entry', 'entries')} on ${plural(pages.length, 'page')}; there is no page ${pageNumber}.`;
   }
   const lines = pages[pageNumber - 1]!;
-  const heading = `Awareness journal — page ${pageNumber} of ${pages.length}, ${plural(views.length, 'entry', 'entries')}, newest first.`;
+  const heading = `Awareness ledger — page ${pageNumber} of ${pages.length}, ${plural(views.length, 'entry', 'entries')}, newest first.`;
   const footer = pages.length > 1
     ? `\`/marks action:list page:${pageNumber < pages.length ? pageNumber + 1 : 1}\` for ${pageNumber < pages.length ? 'the next page' : 'the first page'}; \`/marks action:list target:<id>\` shows one entry in full.`
     : '`/marks action:list target:<id>` shows one entry in full.';
   return clip([heading, ...lines, footer].join('\n'), budget);
 }
 
-/** One entry of the journal by id, in full, or why not. */
+/** One entry of the ledger by id, in full, or why not. */
 export function renderEntry(views: AwarenessView[], id: string): string {
   const found = views.filter((v) => v.id === id);
-  if (found.length === 0) return `No batch or retract \`${clip(id, 100)}\` in the journal.`;
+  if (found.length === 0) return `No batch or retract \`${clip(id, 100)}\` in the ledger.`;
   return found.map(detailText).join('\n\n');
 }
 
@@ -322,25 +350,25 @@ const isStr = (v: unknown): v is string => typeof v === 'string';
 /** An optional field: absent, or what `is` accepts. */
 const opt = (v: unknown, is: (x: unknown) => boolean): boolean => v === undefined || is(v);
 const allNums = (o: Record<string, unknown>, keys: string[]): boolean => keys.every((k) => isNum(o[k]));
-/** Operations by status: a status is shown as the host names it, and every count is a number. */
+/** Reactions by state: a state is shown as the host names it, and every count is a number. */
 const isCounts = (v: unknown): boolean => isObj(v) && Object.values(v).every(isNum);
 /** When something was cancelled, and by whom if known. */
 const isStamp = (v: unknown): boolean => isObj(v) && isNum(v.at) && opt(v.by, isStr);
 
 /**
- * A journal entry the formatters can show without misreading it: every field
+ * A ledger entry the formatters can show without misreading it: every field
  * they read has the type they read it as, optional ones when present. `status`
  * and `scope` are shown as the host names them, so they need only be text; a
  * field nothing here reads isn't checked, so a host's change there doesn't
- * make the journal unreadable.
+ * make the ledger unreadable.
  */
 export function isView(v: unknown): v is AwarenessView {
-  if (!isObj(v) || !isStr(v.id) || !isCounts(v.removals) || !isNum(v.unresolvedAttempts) || !opt(v.cancelled, isStamp)) {
+  if (!isObj(v) || !isStr(v.id) || !isCounts(v.reactions) || !isNum(v.mayStillLand) || !opt(v.cancelled, isStamp)) {
     return false;
   }
-  if (v.kind === 'retract') return isStr(v.target) && isNum(v.at) && opt(v.by, isStr);
+  if (v.kind === 'retract') return isStr(v.target) && isNum(v.at) && opt(v.by, isStr) && isNum(v.keys);
   return v.kind === 'batch' && isStr(v.status) && isStr(v.scope) && isStr(v.agentName) && isNum(v.createdAt) &&
-    isNum(v.refs) && isCounts(v.adds) && opt(v.sourceBranch, isStr) && opt(v.targetBranch, isStr) &&
+    isNum(v.refs) && opt(v.sourceBranch, isStr) && opt(v.targetBranch, isStr) &&
     opt(v.unmarked, isNum) && opt(v.notRemoved, isNum) && opt(v.legacyAdded, isNum);
 }
 
@@ -355,11 +383,9 @@ export function isMarkersReceipt(m: unknown): m is MarkersReceipt {
     case 'none':
       return true;
     case 'queued':
-      return isNum(m.queued) && isStr(m.batchId) && opt(m.error, isStr);
+      return isNum(m.queued) && isStr(m.batchId);
     case 'not-scheduled':
       return isStr(m.error);
-    case 'unresolved':
-      return isStr(m.batchId) && isStr(m.error);
     default:
       return false;
   }
@@ -367,28 +393,29 @@ export function isMarkersReceipt(m: unknown): m is MarkersReceipt {
 
 export function isCancelReceipt(r: unknown): r is CancelReceipt {
   return isObj(r) && typeof r.target === 'string' && (r.kind === 'batch' || r.kind === 'retract') &&
-    allNums(r, ['cancelled', 'confirmed', 'unresolvedAttempts']);
+    allNums(r, ['cancelled', 'confirmed', 'mayStillLand']);
 }
 
 export function isRetractReceipt(r: unknown): r is RetractReceipt {
   return isObj(r) && typeof r.requestId === 'string' &&
-    allNums(r, ['removalsQueued', 'addsSuperseded', 'keysWithUnresolvedAdds', 'unresolvedAddAttempts']);
+    allNums(r, ['removalsQueued', 'addsSuperseded', 'keysWithUnresolvedAdds']);
 }
 
-/** What a cancel stopped: its unsent requests, or none still waiting. */
+/** What a cancel stopped: the reactions it left with nothing owed before
+ *  any request went out, or none still waiting. */
 const stopped = (cancelled: number, fate: string): string =>
-  cancelled === 0 ? 'no request was still waiting to be sent' : `${plural(cancelled, 'request')} ${fate}`;
+  cancelled === 0 ? 'nothing it asked for was still waiting to be sent' : `${plural(cancelled, 'reaction')} ${fate}`;
 
-/** What a cancel couldn't stop: requests already sent whose outcome isn't known. */
-const mayLand = (unresolved: number): string => `${plural(unresolved, 'request')} on the wire or with unknown outcome may land`;
+/** What a cancel couldn't stop: reactions with a request already on the wire or never answered. */
+const mayLand = (n: number): string => `${plural(n, 'reaction')} with a request on the wire or one never answered may land`;
 
 /** cancel's reply: what will never be sent, and what cancel can't undo. */
 export function describeCancel(r: CancelReceipt): string {
   const what = r.kind === 'batch' ? `batch \`${r.target}\`` : `retract \`${r.target}\``;
-  const lines = [`✅ Cancelled ${what}: ${stopped(r.cancelled, 'will now never be sent')}.`];
+  const lines = [`✅ Cancelled ${what}: ${stopped(r.cancelled, 'will now never be requested')}.`];
   const limits: string[] = [];
   if (r.confirmed) limits.push(`${r.confirmed} already confirmed on Discord ${r.confirmed === 1 ? 'stays' : 'stay'} as ${r.confirmed === 1 ? 'it is' : 'they are'}`);
-  if (r.unresolvedAttempts) limits.push(mayLand(r.unresolvedAttempts));
+  if (r.mayStillLand) limits.push(mayLand(r.mayStillLand));
   lines.push(`Cancel removes nothing from Discord${limits.length ? `: ${limits.join('; ')}.` : '.'}`);
   // Every batch's: its receipt can't see marks an import brought, or marks
   // another batch placed on the same messages, which a retract takes off too.
@@ -403,8 +430,8 @@ export function describeRetract(r: RetractReceipt): string {
     `✅ Retract \`${r.requestId}\`: ${plural(r.removalsQueued, '💤 removal')} requested — not yet confirmed on Discord${superseded}.`,
   ];
   if (r.keysWithUnresolvedAdds) {
-    lines.push(`${plural(r.keysWithUnresolvedAdds, 'message')} ${r.keysWithUnresolvedAdds === 1 ? 'has' : 'have'} earlier add attempts still unresolved ` +
-      `(${plural(r.unresolvedAddAttempts, 'attempt')}): such an add may land after its removal.`);
+    lines.push(`${plural(r.keysWithUnresolvedAdds, 'message')} ${r.keysWithUnresolvedAdds === 1 ? 'has' : 'have'} an add on the wire ` +
+      'or one never answered: such an add may land after its removal.');
   }
   lines.push(`\`/marks action:list target:${r.requestId}\` shows progress; \`/marks action:cancel target:${r.requestId}\` stops what hasn't been sent.`);
   return lines.join('\n');
@@ -441,8 +468,8 @@ export function summarizeControl(action: string, target: string | undefined, ans
   if (action === 'cancel' && isCancelReceipt(answer)) {
     // The short account keeps what cancel couldn't stop: requests that may
     // still land, or may already have landed.
-    return `✅ Cancelled ${answer.kind} \`${answer.target}\`: ${stopped(answer.cancelled, 'will never be sent')}; ` +
-      `cancel removes nothing from Discord${answer.unresolvedAttempts ? `: ${mayLand(answer.unresolvedAttempts)}` : ''}.`;
+    return `✅ Cancelled ${answer.kind} \`${answer.target}\`: ${stopped(answer.cancelled, 'will never be requested')}; ` +
+      `cancel removes nothing from Discord${answer.mayStillLand ? `: ${mayLand(answer.mayStillLand)}` : ''}.`;
   }
   if (action === 'retract' && isRetractReceipt(answer)) {
     // Like cancel's, it keeps what may still change Discord after it: an
@@ -450,8 +477,8 @@ export function summarizeControl(action: string, target: string | undefined, ans
     const after = !answer.keysWithUnresolvedAdds
       ? ''
       : answer.keysWithUnresolvedAdds === 1
-        ? '; 1 message has an earlier add still unresolved, which may land after its removal'
-        : `; ${answer.keysWithUnresolvedAdds} messages have earlier adds still unresolved, which may land after their removal`;
+        ? '; 1 message has an add on the wire or never answered, which may land after its removal'
+        : `; ${answer.keysWithUnresolvedAdds} messages have adds on the wire or never answered, which may land after their removal`;
     return `✅ Retract \`${answer.requestId}\`: ${plural(answer.removalsQueued, 'removal')} requested, not yet confirmed on Discord${after}.`;
   }
   return `✅ The host accepted /marks action:${action}${target ? ` \`${target}\`` : ''} (its receipt couldn't be read).`;
@@ -479,7 +506,8 @@ export const PROBE_AGAIN = 'Running it again can work after a timeout, or once t
   'If the host refuses host commands, whoever runs it has to allow them for this server (`allowHostCommands`).';
 
 /** Before retrying an /undo or /hide that may have been applied: the agent's
- *  context, and, when marks were chosen, the journal for a batch it scheduled. */
+ *  context, and, when an /undo's marks were chosen, the ledger for a batch it
+ *  scheduled. */
 const surgeryCheck = (marksChosen: boolean): string =>
   `Check the agent's context${marksChosen ? ', and `/marks action:list` for a 💤 batch it may have scheduled,' : ''} before trying again.`;
 
