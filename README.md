@@ -16,7 +16,7 @@ In the Connectome stack, [connectome-host](https://github.com/anima-research/con
   - `/undo [messages] [marks]` removes the last messages from the agent's context (1 by default, at most 50).
   - `/hide message [to] [marks]` removes a message, or the range from it through `to`, from the agent's context. Both take a message link or ID.
   - `marks` on `/undo` chooses which removed messages get a 💤 awareness mark: `none`, the default, `addressed`, those that addressed the agent, or `all`. The host places those marks, so `/undo` needs a host whose agent framework has the `marks` host command (anima-research/agent-framework#250), and is refused on an older host.
-  - `marks` on `/hide` is `none`, the default, or `all`, which adds 💤 to each hidden message. Those marks are discord-mcpl's own, on any host, and outside the host's ledger: `/marks` doesn't list them, and a retract reaches one only where a batch marked the same message.
+  - `marks` on `/hide` is `none`, the default, or `all`, which adds 💤 to each hidden message. Those marks are discord-mcpl's own, on any host, and outside the host's ledger: `/marks` doesn't list them, and a retract reaches one only on a message the host's ledger also names.
   - `/marks action:list [target:<id>] [page:<n>]` shows the host's awareness ledger of the marks it scheduled, `/marks action:cancel target:<id>` stops what it hasn't sent, and `/marks action:retract target:<id>` queues the removal of a batch's marks, or of every mark in the ledger with `target:all`. It needs the same host as `/undo`.
   - `/nudge` runs the agent on its current context, with no new event.
   - `/unstick [max]` rewinds the turns behind a refusal and runs the agent again until the model stops refusing, at most `max` times.

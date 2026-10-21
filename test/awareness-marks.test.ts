@@ -67,9 +67,9 @@ function host(opts: {
 
 /** A server over `conn`, recording the reactions it places itself, which only
  *  a /hide with marks chosen does. `refuse` names messages whose reaction
- *  Discord refuses; `hold` keeps every reaction waiting until its gate opens,
+ *  Discord refuses, each with its error when given as a map; `hold` keeps every reaction waiting until its gate opens,
  *  calling `onCall` as each one starts. */
-function serverWith(conn: unknown, refuse: string[] = [], hold?: { gate: Promise<void>; onCall: () => void }) {
+function serverWith(conn: unknown, refuse: string[] | Record<string, string> = [], hold?: { gate: Promise<void>; onCall: () => void }) {
   const reactions: Array<{ channelId: string; messageId: string; emoji: string }> = [];
   const discord = {
     addReaction: async (channelId: string, messageId: string, emoji: string) => {
@@ -77,7 +77,9 @@ function serverWith(conn: unknown, refuse: string[] = [], hold?: { gate: Promise
         hold.onCall();
         await hold.gate;
       }
-      if (refuse.includes(messageId)) throw new Error('Unknown Message');
+      if (Array.isArray(refuse) ? refuse.includes(messageId) : messageId in refuse) {
+        throw new Error(Array.isArray(refuse) ? 'Unknown Message' : refuse[messageId]);
+      }
       reactions.push({ channelId, messageId, emoji });
     },
   };
@@ -96,10 +98,13 @@ function serverWith(conn: unknown, refuse: string[] = [], hold?: { gate: Promise
 function interaction(
   commandName: string,
   options: Record<string, string | number | undefined>,
-  opts: { rejectEdits?: number; acceptEdits?: number } = {},
+  opts: { rejectEdits?: number; acceptEdits?: number; holdFirstEdit?: Promise<void> } = {},
 ) {
   let toReject = opts.rejectEdits ?? 0;
   let toAccept = opts.acceptEdits ?? Infinity;
+  let held = opts.holdFirstEdit;
+  let editStarted!: () => void;
+  const firstEdit = new Promise<void>((resolve) => { editStarted = resolve; });
   const out: { replies: string[]; files: Array<{ attachment: Buffer; name: string }[]>; deferred?: unknown; ephemeral: boolean[] } = {
     replies: [],
     files: [],
@@ -107,6 +112,8 @@ function interaction(
   };
   return {
     out,
+    /** Settles when the first edit starts. */
+    firstEdit,
     value: {
       commandName,
       user: { id: 'admin-1', username: 'Admin' },
@@ -121,6 +128,12 @@ function interaction(
       },
       deferReply: async (o?: { flags?: unknown }) => { out.deferred = o ?? {}; },
       editReply: async (o: string | { content: string; files: Array<{ attachment: Buffer; name: string }> }) => {
+        editStarted();
+        if (held) {
+          const gate = held;
+          held = undefined;
+          await gate;
+        }
         const content = typeof o === 'string' ? o : o.content;
         // Discord refuses a reply over its limit; a test can also refuse edits outright.
         if (toReject > 0 || toAccept <= 0 || content.length > REPLY_LIMIT) {
@@ -455,6 +468,15 @@ describe('replies stay within one message, and never misreport an applied surger
     }
   });
 
+  it('quotes at most 500 characters of a transit error, so the check after it fits', async () => {
+    const long = { sendRequest: async (_m: string, p: Sent) => { if (isProbe(p)) return VERB_ANSWER; throw new Error('x'.repeat(3000)); } };
+    const { server } = serverWith(long);
+    const i = interaction('hide', { message: '111111111111111111' });
+    await asAdmin(() => server.handleSlashCommand(i.value));
+    assert.equal(i.out.replies.at(-1), `⚠️ Hide outcome unknown (${'x'.repeat(499)}…): the host may or may not have applied it. ` +
+      "Check the agent's context before trying again.");
+  });
+
   it('still answers when the host request rejects with something that is not an Error', async () => {
     for (const thrown of [undefined, null, 'down']) {
       const conn = { sendRequest: async (_m: string, p: Sent) => { if (isProbe(p)) return VERB_ANSWER; throw thrown; } };
@@ -491,7 +513,7 @@ describe('replies stay within one message, and never misreport an applied surger
     const cases: Array<[string, Record<string, string>, string]> = [
       ['undo', {}, "⚠️ Undo outcome unknown: the host may or may not have applied it. Check the agent's context before trying again."],
       ['hide', { message: '111111111111111111' }, "⚠️ Hide outcome unknown: the host may or may not have applied it. Check the agent's context before trying again."],
-      ['marks', { action: 'retract', target: 'b-1' }, '⚠️ /marks action:retract outcome unknown: the host may already have queued the removals. Check `/marks action:list` before trying again: a retract it queued is listed first.'],
+      ['marks', { action: 'retract', target: 'b-1' }, '⚠️ /marks action:retract outcome unknown: the host may already have queued the removals. Check `/marks action:list` for a retract of `b-1` before trying again; the ledger lists newest first.'],
       ['marks', { action: 'cancel', target: 'r-1' }, '⚠️ /marks action:cancel outcome unknown: the host may already have cancelled it. Check `/marks action:list target:r-1` before trying again.'],
     ];
     for (const [name, options, outcome] of cases) {
@@ -511,16 +533,17 @@ describe('an answer only `ok: false` makes a failure', () => {
         ['undo', { marks: 'all' }, "Check the agent's context, and `/marks action:list` for a 💤 batch it may have scheduled, before trying again."],
         ['hide', { message: '111111111111111111' }, "Check the agent's context before trying again."],
         ['hide', { message: '111111111111111111', marks: 'all' }, "Check the agent's context before trying again.\nMarks: no 💤 was added, since this server adds them only once it has read the host's answer."],
-        ['marks', { action: 'retract', target: 'b-1' }, 'Check `/marks action:list` before trying again: a retract it queued is listed first.'],
+        ['marks', { action: 'retract', target: 'b-1' }, 'Check `/marks action:list` for a retract of `b-1` before trying again; the ledger lists newest first.'],
         ['marks', { action: 'cancel', target: 'b-1' }, 'Check `/marks action:list target:b-1` before trying again.'],
       ];
       for (const [name, options, check] of cases) {
         const shown = name === 'marks' ? `/marks action:${options.action}` : `/${name}`;
         const i = interaction(name, options);
         await asAdmin(() => server.handleSlashCommand(i.value));
+        // The check comes before the answer, so a cut takes only the answer.
         assert.equal(
           i.out.replies.at(-1),
-          `⚠️ The host answered ${shown} in a shape this server can't read, so it may have been applied; here it is as sent:\n\`\`\`json\n${JSON.stringify(odd)}\n\`\`\`\n${check}`,
+          `⚠️ The host answered ${shown} in a shape this server can't read, so it may have been applied. ${check}\nHere it is as sent:\n\`\`\`json\n${JSON.stringify(odd)}\n\`\`\``,
           `${JSON.stringify(odd)}: ${name}`,
         );
       }
@@ -582,7 +605,7 @@ describe('/hide and its 💤', () => {
   const hidden = [{ channelId: 'discord:g1:c1', messageId: 'm1' }, { channelId: 'c1', messageId: 'm2' }];
   const hiding = (answer: Sent, marksVerb: 'yes' | 'no' = 'yes') => host({ marksVerb, answer: (p) => (p.command === 'hide' ? answer : { ok: true }) });
   const own = "They're this server's own, outside the host's awareness ledger: `/marks` doesn't list them, " +
-    'and a retract reaches one only where a batch marked the same message.';
+    "and a retract reaches one only on a message the host's ledger also names.";
   const removed = (n: number) => `🙈 Removed **${n}** message${n === 1 ? '' : 's'} from the agent's context (redacted in place).`;
 
   it("adds 💤 itself to each hidden message when all is chosen, on any host, and says where /marks reaches them", async () => {
@@ -618,6 +641,37 @@ describe('/hide and its 💤', () => {
     assert.equal(i.out.replies.at(-1), `${removed(2)}\nMarks: Discord confirmed 💤 on 2 of 2 hidden messages. ${own}`);
   });
 
+  it('starts no 💤 until its first reply has settled, so that reply can never land after the count', async () => {
+    let open!: () => void;
+    const gate = new Promise<void>((resolve) => { open = resolve; });
+    const h = hiding({ ok: true, hidden: 2, hiddenRefs: hidden });
+    const i = interaction('hide', { message: '111111111111111111', marks: 'all' }, { holdFirstEdit: gate });
+    let early = 0;
+    const { server, reactions } = serverWith(h.conn, [], { gate: Promise.resolve(), onCall: () => { if (i.out.replies.length === 0) early++; } });
+    const done = asAdmin(() => server.handleSlashCommand(i.value));
+    await i.firstEdit;
+    // A turn of the event loop, for any marking that didn't wait for the first reply.
+    await new Promise((resolve) => setImmediate(resolve));
+    open();
+    await done;
+    assert.equal(early, 0);
+    assert.equal(reactions.length, 2);
+    assert.deepEqual(i.out.replies, [
+      `${removed(2)}\nMarks: adding 💤 to 2 hidden messages…`,
+      `${removed(2)}\nMarks: Discord confirmed 💤 on 2 of 2 hidden messages. ${own}`,
+    ]);
+  });
+
+  it('keeps the no-💤 line in the short account of an unreadable answer whose reply is refused', async () => {
+    const h = hiding({ hidden: 2, hiddenRefs: hidden } as Sent);
+    const { server, reactions } = serverWith(h.conn);
+    const i = interaction('hide', { message: '111111111111111111', marks: 'all' }, { rejectEdits: 1 });
+    await asAdmin(() => server.handleSlashCommand(i.value));
+    assert.deepEqual(reactions, []);
+    assert.deepEqual(i.out.replies, ["⚠️ Hide outcome unknown: the host may or may not have applied it. Check the agent's context before trying again. " +
+      "Marks: no 💤 was added, since this server adds them only once it has read the host's answer. (The full reply couldn't be shown: Unknown interaction.)"]);
+  });
+
   it('keeps what Discord confirmed on stderr when the edit that would show it is refused', async (t) => {
     const logged = t.mock.method(console, 'error', () => undefined);
     const h = hiding({ ok: true, hidden: 2, hiddenRefs: hidden });
@@ -649,7 +703,29 @@ describe('/hide and its 💤', () => {
     await asAdmin(() => server.handleSlashCommand(i.value));
     assert.deepEqual(reactions.map((r) => r.messageId), ['m1']);
     assert.equal(i.out.replies.at(-1), `${removed(2)}\nMarks: Discord confirmed 💤 on 1 of 2 hidden messages. ` +
-      `The rest weren't confirmed (first error: Unknown Message). ${own}`);
+      `The rest weren't confirmed, so they may or may not be on Discord (first error: Unknown Message). ${own}`);
+  });
+
+  it('names the first error to fail, quoting up to 400 characters of it', async () => {
+    const three = [...hidden, { channelId: 'c1', messageId: 'm3' }];
+    const long = 'L'.repeat(500);
+    const h = hiding({ ok: true, hidden: 3, hiddenRefs: three });
+    // m1's refusal settles first, and m3's after it.
+    const { server } = serverWith(h.conn, { m1: 'first refusal', m3: 'second refusal' });
+    const i = interaction('hide', { message: '111111111111111111', marks: 'all' });
+    await asAdmin(() => server.handleSlashCommand(i.value));
+    assert.match(i.out.replies.at(-1)!, /\(first error: first refusal\)/);
+    const l = hiding({ ok: true, hidden: 1, hiddenRefs: [hidden[1]!] });
+    const ls = serverWith(l.conn, { m2: long });
+    const li = interaction('hide', { message: '111111111111111111', marks: 'all' });
+    await asAdmin(() => ls.server.handleSlashCommand(li.value));
+    assert.ok(li.out.replies.at(-1)!.includes(`(first error: ${'L'.repeat(399)}…)`));
+    // The adapter's account of an unusable channel, about 350 characters with its remedy last, is quoted whole.
+    const short = hiding({ ok: true, hidden: 1, hiddenRefs: [hidden[1]!] });
+    const ss = serverWith(short.conn, { m2: 'L'.repeat(397) + 'END' });
+    const si = interaction('hide', { message: '111111111111111111', marks: 'all' });
+    await asAdmin(() => ss.server.handleSlashCommand(si.value));
+    assert.match(si.out.replies.at(-1)!, /LEND\)/);
   });
 
   it('says none was marked when the host named no hidden messages', async () => {
@@ -1062,10 +1138,21 @@ describe('/marks', () => {
     const r = interaction('marks', { action: 'retract', target: 'b-1' });
     await asAdmin(() => server.handleSlashCommand(r.value));
     // A retract the host queued is an entry of its own, listed first: the batch's entry doesn't show it.
-    assert.equal(r.out.replies.at(-1), '⚠️ /marks action:retract outcome unknown (connection lost): the host may already have queued the removals. Check `/marks action:list` before trying again: a retract it queued is listed first.');
+    assert.equal(r.out.replies.at(-1), '⚠️ /marks action:retract outcome unknown (connection lost): the host may already have queued the removals. Check `/marks action:list` for a retract of `b-1` before trying again; the ledger lists newest first.');
     const all = interaction('marks', { action: 'retract', target: 'all' });
     await asAdmin(() => server.handleSlashCommand(all.value));
-    assert.equal(all.out.replies.at(-1), '⚠️ /marks action:retract outcome unknown (connection lost): the host may already have queued the removals. Check `/marks action:list` before trying again: a retract it queued is listed first.');
+    assert.equal(all.out.replies.at(-1), '⚠️ /marks action:retract outcome unknown (connection lost): the host may already have queued the removals. Check `/marks action:list` for a retract of all before trying again; the ledger lists newest first.');
+    // A cancel of all names no entry, so its check is the whole ledger, never a retract.
+    const cancelAll = interaction('marks', { action: 'cancel', target: 'all' });
+    await asAdmin(() => server.handleSlashCommand(cancelAll.value));
+    assert.equal(cancelAll.out.replies.at(-1), '⚠️ /marks action:cancel outcome unknown (connection lost): the host may already have cancelled it. Check `/marks action:list` before trying again.');
+    // A long transit error is clipped, so the check after it always fits.
+    const long = { sendRequest: async (_m: string, p: Sent) => { if (!p.requesterId) return { ok: true, awareness: [] }; throw new Error('x'.repeat(3000)); } };
+    const l = serverWith(long);
+    const li = interaction('marks', { action: 'retract', target: 'b-1' });
+    await asAdmin(() => l.server.handleSlashCommand(li.value));
+    assert.equal(li.out.replies.at(-1), `⚠️ /marks action:retract outcome unknown (${'x'.repeat(499)}…): the host may already have queued the removals. ` +
+      'Check `/marks action:list` for a retract of `b-1` before trying again; the ledger lists newest first.');
     const c = interaction('marks', { action: 'cancel', target: 'b-1' });
     await asAdmin(() => server.handleSlashCommand(c.value));
     assert.equal(c.out.replies.at(-1), '⚠️ /marks action:cancel outcome unknown (connection lost): the host may already have cancelled it. Check `/marks action:list target:b-1` before trying again.');
@@ -1093,8 +1180,8 @@ describe('/marks', () => {
       ['retract', { requestId: 'r-2', removalsQueued: 3, addsSuperseded: 0, keysWithUnresolvedAdds: 1 },
         '✅ Retract `r-2`: 3 removals requested, not yet confirmed on Discord; 1 message has an add on the wire or never answered, which may land after its removal.'],
       ['retract', { requestId: 'r-3', removalsQueued: 5, addsSuperseded: 1, keysWithUnresolvedAdds: 2 },
-        '✅ Retract `r-3`: 5 removals requested, not yet confirmed on Discord; 2 messages have adds on the wire or never answered, which may land ' +
-          'after their removal.'],
+        '✅ Retract `r-3`: 5 removals requested, not yet confirmed on Discord; 1 unsent add superseded; 2 messages have adds on the wire or never ' +
+          'answered, which may land after their removal.'],
       ['cancel', { target: 'b-4', kind: 'batch', cancelled: 0, confirmed: 2, mayStillLand: 1 },
         '✅ Cancelled batch `b-4`: nothing it asked for was still waiting to be sent; cancel removes nothing from Discord: 1 reaction with a ' +
           'request on the wire or one never answered may land. If any of its marks are on Discord, `/marks action:retract target:b-4` queues their removal.'],
@@ -1105,7 +1192,7 @@ describe('/marks', () => {
       ['retract', { requestId: 'r-6', removalsQueued: 0, addsSuperseded: 0, keysWithUnresolvedAdds: 0 },
         '✅ Retract `r-6` queued no removal: its target names no message.'],
       // An accepted control whose receipt can't be read.
-      ['retract', { requestId: 'r-7' }, "✅ The host accepted /marks action:retract `b-1` (its receipt couldn't be read)."],
+      ['retract', { requestId: 'r-7' }, "✅ The host accepted /marks action:retract `b-1` (its receipt couldn't be read). `/marks action:list` shows what it did."],
     ];
     for (const [action, receipt, short] of receipts) {
       const h = host({ marksVerb: 'yes', answer: () => ({ ok: true, awareness: receipt }) });

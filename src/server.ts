@@ -1191,10 +1191,11 @@ export class DiscordMcplServer {
   /**
    * Does the connected host make 💤 awareness marks a choice? Asked for each
    * command that depends on the answer, with a `marks` request that names no
-   * action, so the host reads nothing to answer it. Every agent framework
-   * with host/command answers a verb it lacks with "Unknown host command"; a
-   * host with the verb answers anything else (agent-framework#250 refuses
-   * the missing action). A request that fails (a timeout, a host that
+   * action, so the host reads nothing to answer it. agent-framework answers
+   * a verb it lacks with "Unknown host command" (at every revision checked,
+   * from 2ea26ffea, where host/command arrived, to #250's 915ad4be); a host
+   * with the verb answers anything else (agent-framework#250 refuses the
+   * missing action). A request that fails (a timeout, a host that
    * refuses host commands outright) settles nothing, and the command stops
    * with nothing changed.
    */
@@ -1406,7 +1407,7 @@ export class DiscordMcplServer {
     if (answer.ok !== true) {
       await this.acknowledge(
         interaction,
-        boundedReply(unreadableSurgery('hide', result, false) + (marking ? `\n${HIDE_MARKS_NOT_ADDED}` : ''), result),
+        boundedReply(unreadableSurgery('hide', result, false, marking ? HIDE_MARKS_NOT_ADDED : undefined), result),
         surgeryOutcomeUnknown('Hide', false) + (marking ? ` ${HIDE_MARKS_NOT_ADDED}` : ''),
       );
       return;

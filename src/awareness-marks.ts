@@ -232,7 +232,7 @@ export function readHiddenRefs(v: unknown): HiddenRef[] | 'unreadable' {
 
 /** Where a /hide's own 💤 stand against /marks. */
 const HIDE_MARKS_OWN = "They're this server's own, outside the host's awareness ledger: `/marks` doesn't list them, " +
-  'and a retract reaches one only where a batch marked the same message.';
+  "and a retract reaches one only on a message the host's ledger also names.";
 
 /** A chosen /hide's marks line when there's nothing to mark, or while they're being added. */
 export function hideMarksAt(refs: HiddenRef[] | 'unreadable'): string {
@@ -241,9 +241,17 @@ export function hideMarksAt(refs: HiddenRef[] | 'unreadable'): string {
   return `Marks: adding 💤 to ${plural(refs.length, 'hidden message')}…`;
 }
 
+/** How much of an error a reply quotes: enough for the adapter's whole
+ *  account of an unusable channel and its remedy (about 350 characters). */
+const ERROR_MAX = 400;
+/** How much of a transit error an outcome-unknown reply quotes, so the
+ *  check before retrying that follows it always fits. */
+const TRANSIT_ERROR_MAX = 500;
+
 /** A chosen /hide's marks line once its reactions have settled: what Discord confirmed. */
 export function describeHideMarks(confirmed: number, total: number, firstError?: string): string {
-  const rest = firstError === undefined ? '' : ` The rest weren't confirmed (first error: ${clip(firstError, SHORT_TEXT_MAX)}).`;
+  const rest = firstError === undefined ? ''
+    : ` The rest weren't confirmed, so they may or may not be on Discord (first error: ${clip(firstError, ERROR_MAX)}).`;
   return `Marks: Discord confirmed 💤 on ${confirmed} of ${plural(total, 'hidden message')}.${rest} ${HIDE_MARKS_OWN}`;
 }
 
@@ -452,7 +460,7 @@ export function describeCancel(r: CancelReceipt): string {
   if (r.mayStillLand) limits.push(mayLand(r.mayStillLand));
   lines.push(`Cancel removes nothing from Discord${limits.length ? `: ${limits.join('; ')}.` : '.'}`);
   // Every batch's: its receipt can't see marks an import brought, or marks
-  // another batch placed on the same messages, which a retract takes off too.
+  // another batch placed on the same messages, whose removal a retract queues too.
   if (r.kind === 'batch') lines.push(retractPointer(r.target));
   return lines.join('\n');
 }
@@ -523,9 +531,11 @@ export function summarizeControl(action: string, target: string | undefined, ans
       : answer.keysWithUnresolvedAdds === 1
         ? '; 1 message has an add on the wire or never answered, which may land after its removal'
         : `; ${answer.keysWithUnresolvedAdds} messages have adds on the wire or never answered, which may land after their removal`;
-    return `✅ Retract \`${answer.requestId}\`: ${plural(answer.removalsQueued, 'removal')} requested, not yet confirmed on Discord${after}.`;
+    const superseded = answer.addsSuperseded ? `; ${plural(answer.addsSuperseded, 'unsent add')} superseded` : '';
+    return `✅ Retract \`${answer.requestId}\`: ${plural(answer.removalsQueued, 'removal')} requested, not yet confirmed on Discord${superseded}${after}.`;
   }
-  return `✅ The host accepted /marks action:${action}${target ? ` \`${target}\`` : ''} (its receipt couldn't be read).`;
+  return `✅ The host accepted /marks action:${action}${target ? ` \`${target}\`` : ''} (its receipt couldn't be read). ` +
+    '`/marks action:list` shows what it did.';
 }
 
 /**
@@ -534,16 +544,19 @@ export function summarizeControl(action: string, target: string | undefined, ans
  */
 export function controlOutcomeUnknown(action: string, target: string | undefined, error?: string): string {
   const effect = action === 'cancel' ? 'already have cancelled it' : 'already have queued the removals';
-  return `⚠️ /marks action:${action} outcome unknown${error ? ` (${error})` : ''}: the host may ${effect}. ${controlCheck(action, target)}`;
+  return `⚠️ /marks action:${action} outcome unknown${error ? ` (${clip(error, TRANSIT_ERROR_MAX)})` : ''}: the host may ${effect}. ` +
+    controlCheck(action, target);
 }
 
 /** Before retrying a control that may have been applied: a cancel shows on
- *  its target's entry, and a retract the host queued is an entry of its own,
- *  with an id the operator doesn't have yet, listed first. */
+ *  its target's entry; a retract the host queued is an entry of its own,
+ *  with an id the operator doesn't have yet, found in the list by its target. */
 const controlCheck = (action: string, target: string | undefined): string =>
-  action === 'cancel' && target && target !== 'all'
-    ? `Check \`/marks action:list target:${target}\` before trying again.`
-    : 'Check `/marks action:list` before trying again: a retract it queued is listed first.';
+  action === 'retract' && target
+    ? `Check \`/marks action:list\` for a retract of ${target === 'all' ? 'all' : `\`${target}\``} before trying again; the ledger lists newest first.`
+    : target && target !== 'all'
+      ? `Check \`/marks action:list target:${target}\` before trying again.`
+      : 'Check `/marks action:list` before trying again.';
 
 /**
  * After a probe whose request failed: what can make running the command
@@ -566,7 +579,7 @@ const surgeryCheck = (marksChosen: boolean): string =>
  * can't be shown.
  */
 export function surgeryOutcomeUnknown(command: 'Undo' | 'Hide', marksChosen: boolean, error?: string): string {
-  return `⚠️ ${command} outcome unknown${error ? ` (${error})` : ''}: the host may or may not have applied it. ` +
+  return `⚠️ ${command} outcome unknown${error ? ` (${clip(error, TRANSIT_ERROR_MAX)})` : ''}: the host may or may not have applied it. ` +
     surgeryCheck(marksChosen);
 }
 
@@ -574,15 +587,17 @@ export function surgeryOutcomeUnknown(command: 'Undo' | 'Hide', marksChosen: boo
  * An /undo or /hide answer without a boolean `ok`: not a refusal, so the
  * host may have applied it. Shown as sent, with the check before retrying.
  */
-export function unreadableSurgery(command: 'undo' | 'hide', answer: unknown, marksChosen: boolean): string {
-  return `⚠️ The host answered /${command} in a shape this server can't read, so it may have been applied; ` +
-    `here it is as sent:\n${asSent(answer)}\n${surgeryCheck(marksChosen)}`;
+export function unreadableSurgery(command: 'undo' | 'hide', answer: unknown, marksChosen: boolean, note?: string): string {
+  // The check and the note come before the answer, so a cut takes only the
+  // answer, which the reply then attaches whole.
+  return `⚠️ The host answered /${command} in a shape this server can't read, so it may have been applied. ` +
+    `${surgeryCheck(marksChosen)}${note ? `\n${note}` : ''}\nHere it is as sent:\n${asSent(answer)}`;
 }
 
 /** A /marks control's answer without a boolean `ok`, as unreadableSurgery. */
 export function unreadableControl(action: string, target: string | undefined, answer: unknown): string {
-  return `⚠️ The host answered /marks action:${action} in a shape this server can't read, so it may have been applied; ` +
-    `here it is as sent:\n${asSent(answer)}\n${controlCheck(action, target)}`;
+  return `⚠️ The host answered /marks action:${action} in a shape this server can't read, so it may have been applied. ` +
+    `${controlCheck(action, target)}\nHere it is as sent:\n${asSent(answer)}`;
 }
 
 /** The host's refusal (`ok: false`) of a command, with its code when it gave one. */
