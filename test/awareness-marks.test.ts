@@ -609,7 +609,7 @@ describe('/hide and its 💤', () => {
   const hidden = [{ channelId: 'discord:g1:c1', messageId: 'm1' }, { channelId: 'c1', messageId: 'm2' }];
   const hiding = (answer: Sent, marksVerb: 'yes' | 'no' = 'yes') => host({ marksVerb, answer: (p) => (p.command === 'hide' ? answer : { ok: true }) });
   const own = "They're this server's own, outside the host's awareness ledger: `/marks` doesn't list them, " +
-    "and a retract reaches one only on a message the host's ledger also names.";
+    "and a retract reaches one only on a message the host's ledger also names, when the host's marks are 💤 too.";
   const removed = (n: number) => `🙈 Removed **${n}** message${n === 1 ? '' : 's'} from the agent's context (redacted in place).`;
 
   it("adds 💤 itself to each hidden message when all is chosen, on any host, and says where /marks reaches them", async () => {
@@ -1093,15 +1093,15 @@ describe('/marks', () => {
     assert.match(list, /\n• batch `b897e6cb-25af-4485-8f94-0c8e39d4f23a` — active, cancelled, all, 3 messages \(cairn\): reactions queued 3; 1 may still land\n/);
     assert.match(
       await replyTo({ action: 'list', target: 'dd34b043' }),
-      /\nIts messages' reactions: queued 3\.\nImported from agent-framework 0\.22\.x, which recorded 1 mark on these messages as added\. Marks it placed may still be on Discord: `\/marks action:retract target:dd34b043` queues their removal\.\nStates: queued, /,
+      /\nIts messages' reactions: queued 3\.\nImported from agent-framework 0\.22\.x, which recorded 1 mark on these messages as added\. Marks it placed may still be on Discord: `\/marks action:retract target:dd34b043` queues their removal\.\nStates, counted by what each reaction's latest act wants, an add or a later retract's removal: queued, /,
     );
     assert.match(
       await replyTo({ action: 'list', target: 'b897e6cb-25af-4485-8f94-0c8e39d4f23a' }),
-      /\nIts messages' reactions: queued 3\.\n1 reaction with a request on the wire or one never answered — any may land\.\nStates: /,
+      /\nIts messages' reactions: queued 3\.\n1 reaction with a request on the wire or one never answered — any may land\.\nStates, counted by /,
     );
     assert.match(
       await replyTo({ action: 'list', target: '110ae4cf-fdb6-4526-b122-9dcd6a002e27' }),
-      /\n9 removals queued\. The reactions it still wants absent: queued 9\.\n2 reactions with a request on the wire or one never answered — any may land\.\nStates: /,
+      /\n9 removals queued\. The reactions it still wants absent: queued 9\.\n2 reactions with a request on the wire or one never answered — any may land\.\nStates, counted by /,
     );
   });
 
@@ -1150,6 +1150,27 @@ describe('/marks', () => {
     const cancelAll = interaction('marks', { action: 'cancel', target: 'all' });
     await asAdmin(() => server.handleSlashCommand(cancelAll.value));
     assert.equal(cancelAll.out.replies.at(-1), '⚠️ /marks action:cancel outcome unknown (connection lost): the host may already have cancelled it. Check `/marks action:list` before trying again.');
+    // A target as long as Discord allows is clipped, so the check after it fits too, in each text it reaches.
+    const longTarget = 't'.repeat(2500);
+    for (const action of ['retract', 'cancel']) {
+      const lt = interaction('marks', { action, target: longTarget });
+      await asAdmin(() => server.handleSlashCommand(lt.value));
+      const reply = lt.out.replies.at(-1)!;
+      assert.ok(reply.length <= REPLY_LIMIT, `${action}: ${reply.length}`);
+      assert.ok(reply.includes(`${'t'.repeat(99)}…`), action);
+      assert.ok(reply.endsWith(action === 'retract' ? 'before trying again; the ledger lists newest first.' : 'before trying again.'), action);
+    }
+    const oddConn = { sendRequest: async (_m: string, p: Sent) => (!p.requesterId ? { ok: true, awareness: [] } : { done: 'maybe' }) };
+    const odd = serverWith(oddConn);
+    const lu = interaction('marks', { action: 'retract', target: longTarget });
+    await asAdmin(() => odd.server.handleSlashCommand(lu.value));
+    assert.ok(lu.out.replies.at(-1)!.includes(`for a retract of \`${'t'.repeat(99)}…\` before trying again; the ledger lists newest first.`));
+    // And the short account of an accepted control whose receipt can't be read.
+    const acc = host({ marksVerb: 'yes', answer: () => ({ ok: true, awareness: { requestId: 'r-9' } }) });
+    const a = serverWith(acc.conn);
+    const la = interaction('marks', { action: 'retract', target: longTarget }, { rejectEdits: 1 });
+    await asAdmin(() => a.server.handleSlashCommand(la.value));
+    assert.ok(la.out.replies.at(-1)!.startsWith(`✅ The host accepted /marks action:retract \`${'t'.repeat(99)}…\` (its receipt couldn't be read).`));
     // A long transit error is clipped, so the check after it always fits.
     const long = { sendRequest: async (_m: string, p: Sent) => { if (!p.requesterId) return { ok: true, awareness: [] }; throw new Error('x'.repeat(3000)); } };
     const l = serverWith(long);
@@ -1189,6 +1210,10 @@ describe('/marks', () => {
       ['cancel', { target: 'b-4', kind: 'batch', cancelled: 0, confirmed: 2, mayStillLand: 1 },
         '✅ Cancelled batch `b-4`: nothing it asked for was still waiting to be sent; cancel removes nothing from Discord: 1 reaction with a ' +
           'request on the wire or one never answered may land. If any of its marks are on Discord, `/marks action:retract target:b-4` queues their removal.'],
+      // An all-zero batch cancel still points to retract: its marks may be on Discord from 0.22.x, which no receipt sees.
+      ['cancel', { target: 'b-0', kind: 'batch', cancelled: 0, confirmed: 0, mayStillLand: 0 },
+        '✅ Cancelled batch `b-0`: nothing it asked for was still waiting to be sent; cancel removes nothing from Discord. ' +
+          'If any of its marks are on Discord, `/marks action:retract target:b-0` queues their removal.'],
       // A retract's cancel: no pointer, since retract takes a batch id or all.
       ['cancel', { target: 'r-5', kind: 'retract', cancelled: 1, confirmed: 0, mayStillLand: 0 },
         '✅ Cancelled retract `r-5`: 1 reaction will never be requested; cancel removes nothing from Discord.'],
@@ -1257,7 +1282,8 @@ describe('rendering', () => {
   });
 
   it('ends an entry in full with what each reaction state means, and names what a retract of all covers', () => {
-    const states = 'States: queued, a request owed and not yet sent; sending, on the wire; present or absent, ' +
+    const states = "States, counted by what each reaction's latest act wants, an add or a later retract's removal: " +
+      'queued, a request owed and not yet sent; sending, on the wire; present or absent, ' +
       "Discord's last answer, with nothing owed; unknown, the last request went unanswered; failed, it ended unconfirmed; untouched, never asked.";
     for (const v of [batch(1), retractView(1)]) assert.ok(detailText(v).endsWith(`\n${states}`), v.kind);
     assert.match(detailText(retractView(1)), /^\*\*Retract `retract-9f8e[^`]*`\*\* of every message in the ledger, /);

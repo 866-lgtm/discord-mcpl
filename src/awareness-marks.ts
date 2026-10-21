@@ -107,6 +107,9 @@ export function describeMarkers(markers: unknown): string {
 
 /** A batch id or other host text inside a one-line account. */
 const SHORT_TEXT_MAX = 100;
+/** How much of an operator's target a reply echoes: ids are far shorter,
+ *  and a check before retrying that follows it then always fits. */
+const ID_MAX = 100;
 
 /**
  * The marks in one bounded line, for the short account of an applied /undo
@@ -232,7 +235,7 @@ export function readHiddenRefs(v: unknown): HiddenRef[] | 'unreadable' {
 
 /** Where a /hide's own 💤 stand against /marks. */
 const HIDE_MARKS_OWN = "They're this server's own, outside the host's awareness ledger: `/marks` doesn't list them, " +
-  "and a retract reaches one only on a message the host's ledger also names.";
+  "and a retract reaches one only on a message the host's ledger also names, when the host's marks are 💤 too.";
 
 /** A chosen /hide's marks line when there's nothing to mark, or while they're being added. */
 export function hideMarksAt(refs: HiddenRef[] | 'unreadable'): string {
@@ -302,7 +305,8 @@ export function summaryLine(v: AwarenessView): string {
 }
 
 /** What the reaction states mean, once in an entry shown in full. */
-const STATES = 'States: queued, a request owed and not yet sent; sending, on the wire; present or absent, ' +
+const STATES = "States, counted by what each reaction's latest act wants, an add or a later retract's removal: " +
+  'queued, a request owed and not yet sent; sending, on the wire; present or absent, ' +
   "Discord's last answer, with nothing owed; unknown, the last request went unanswered; failed, it ended unconfirmed; " +
   'untouched, never asked.';
 
@@ -384,7 +388,7 @@ export function renderListPage(views: AwarenessView[], pageNumber: number, budge
 /** One entry of the ledger by id, in full, or why not. */
 export function renderEntry(views: AwarenessView[], id: string): string {
   const found = views.filter((v) => v.id === id);
-  if (found.length === 0) return `No batch or retract \`${clip(id, 100)}\` in the ledger.`;
+  if (found.length === 0) return `No batch or retract \`${clip(id, ID_MAX)}\` in the ledger.`;
   return found.map(detailText).join('\n\n');
 }
 
@@ -536,7 +540,7 @@ export function summarizeControl(action: string, target: string | undefined, ans
     const superseded = answer.addsSuperseded ? `; it replaces ${plural(answer.addsSuperseded, 'add')} still owed` : '';
     return `✅ Retract \`${answer.requestId}\`: ${plural(answer.removalsQueued, 'removal')} requested, not yet confirmed on Discord${superseded}${after}.`;
   }
-  return `✅ The host accepted /marks action:${action}${target ? ` \`${target}\`` : ''} (its receipt couldn't be read). ` +
+  return `✅ The host accepted /marks action:${action}${target ? ` \`${clip(target, ID_MAX)}\`` : ''} (its receipt couldn't be read). ` +
     '`/marks action:list` shows what it did.';
 }
 
@@ -555,9 +559,10 @@ export function controlOutcomeUnknown(action: string, target: string | undefined
  *  with an id the operator doesn't have yet, found in the list by its target. */
 const controlCheck = (action: string, target: string | undefined): string =>
   action === 'retract' && target
-    ? `Check \`/marks action:list\` for a retract of ${target === 'all' ? 'all' : `\`${target}\``} before trying again; the ledger lists newest first.`
+    ? `Check \`/marks action:list\` for a retract of ${target === 'all' ? 'all' : `\`${clip(target, ID_MAX)}\``} before trying again; ` +
+      'the ledger lists newest first.'
     : target && target !== 'all'
-      ? `Check \`/marks action:list target:${target}\` before trying again.`
+      ? `Check \`/marks action:list target:${clip(target, ID_MAX)}\` before trying again.`
       : 'Check `/marks action:list` before trying again.';
 
 /**

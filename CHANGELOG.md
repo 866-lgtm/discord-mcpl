@@ -32,8 +32,8 @@ in the git log and PR descriptions.
     hid, on any host. The reply goes out as soon as the hide is applied and is
     edited once the 💤 have settled, with how many Discord confirmed. It says
     they're outside the host's ledger: `/marks` doesn't list them, and a
-    retract reaches one only on a message the host's ledger also names. The
-    host places no marks for a hide.
+    retract reaches one only on a message the host's ledger also names, when
+    the host's marks are 💤 too. The host places no marks for a hide.
   - A new admin command, `/marks action:list [target:<id>] [page:<n>]` and
     `/marks action:cancel|retract target:<id>`, shows the host's awareness
     ledger and acts on it, ephemerally:
