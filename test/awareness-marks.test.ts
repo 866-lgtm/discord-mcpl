@@ -364,6 +364,10 @@ describe('replies stay within one message, and never misreport an applied surger
         assert.ok(reply.length <= REPLY_LIMIT, `${name}: ${reply.length}`);
         assert.match(reply, refused, name);
         assert.match(reply, /cut to fit one message/, name);
+        // The host's refusal attaches its answer whole; a failed probe has no answer to attach.
+        const [file] = i.out.files.at(-1)!;
+        if (conn === refusing) assert.deepEqual(JSON.parse(file!.attachment.toString('utf8')), { ok: false, error: longError }, name);
+        else assert.equal(file!.name, 'reply.txt', name);
       }
     }
   });
@@ -1008,7 +1012,7 @@ describe('/marks', () => {
       { command: 'marks', action: 'retract', target: 'all' },
     );
     const rr = r.out.replies.at(-1)!;
-    assert.match(rr, /Retract `r-1`: 4 💤 removals requested — not yet confirmed on Discord; 1 unsent add superseded\./);
+    assert.match(rr, /Retract `r-1`: 4 💤 removals requested — not yet confirmed on Discord; it replaces 1 add still owed\./);
     assert.match(rr, /\n2 messages have an add on the wire or one never answered: such an add may land after its removal\.\n/);
   });
 
@@ -1072,7 +1076,7 @@ describe('/marks', () => {
     );
     assert.equal(
       await replyTo({ action: 'retract', target: AF250.view[3]!.id }),
-      `✅ Retract \`${r}\`: 2 💤 removals requested — not yet confirmed on Discord; 2 unsent adds superseded.\n` +
+      `✅ Retract \`${r}\`: 2 💤 removals requested — not yet confirmed on Discord; it replaces 2 adds still owed.\n` +
         '1 message has an add on the wire or one never answered: such an add may land after its removal.\n' +
         `\`/marks action:list target:${r}\` shows progress; \`/marks action:cancel target:${r}\` stops what hasn't been sent.`,
     );
@@ -1137,7 +1141,7 @@ describe('/marks', () => {
     const { server } = serverWith(conn);
     const r = interaction('marks', { action: 'retract', target: 'b-1' });
     await asAdmin(() => server.handleSlashCommand(r.value));
-    // A retract the host queued is an entry of its own, listed first: the batch's entry doesn't show it.
+    // A retract the host queued is an entry of its own, found in the list by its target: the batch's entry doesn't show it.
     assert.equal(r.out.replies.at(-1), '⚠️ /marks action:retract outcome unknown (connection lost): the host may already have queued the removals. Check `/marks action:list` for a retract of `b-1` before trying again; the ledger lists newest first.');
     const all = interaction('marks', { action: 'retract', target: 'all' });
     await asAdmin(() => server.handleSlashCommand(all.value));
@@ -1180,7 +1184,7 @@ describe('/marks', () => {
       ['retract', { requestId: 'r-2', removalsQueued: 3, addsSuperseded: 0, keysWithUnresolvedAdds: 1 },
         '✅ Retract `r-2`: 3 removals requested, not yet confirmed on Discord; 1 message has an add on the wire or never answered, which may land after its removal.'],
       ['retract', { requestId: 'r-3', removalsQueued: 5, addsSuperseded: 1, keysWithUnresolvedAdds: 2 },
-        '✅ Retract `r-3`: 5 removals requested, not yet confirmed on Discord; 1 unsent add superseded; 2 messages have adds on the wire or never ' +
+        '✅ Retract `r-3`: 5 removals requested, not yet confirmed on Discord; it replaces 1 add still owed; 2 messages have adds on the wire or never ' +
           'answered, which may land after their removal.'],
       ['cancel', { target: 'b-4', kind: 'batch', cancelled: 0, confirmed: 2, mayStillLand: 1 },
         '✅ Cancelled batch `b-4`: nothing it asked for was still waiting to be sent; cancel removes nothing from Discord: 1 reaction with a ' +

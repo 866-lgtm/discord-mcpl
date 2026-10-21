@@ -1125,7 +1125,7 @@ export class DiscordMcplServer {
     // `ok` may still have been applied, so it's shown as sent, never as a failure.
     const answer: Record<string, unknown> = isJsonObject(result) ? result : {};
     if (answer.ok === false) {
-      await this.acknowledge(interaction, boundedReply(hostRefusal('Undo', answer)));
+      await this.acknowledge(interaction, boundedReply(hostRefusal('Undo', answer), answer));
       return;
     }
     if (answer.ok !== true) {
@@ -1282,7 +1282,7 @@ export class DiscordMcplServer {
     // boolean `ok` is shown as sent: a control may have been applied.
     const response: Record<string, unknown> = isJsonObject(result) ? result : {};
     if (response.ok === false) {
-      await this.acknowledge(interaction, boundedReply(hostRefusal(`/marks action:${action}`, response)));
+      await this.acknowledge(interaction, boundedReply(hostRefusal(`/marks action:${action}`, response), response));
       return;
     }
     if (response.ok !== true) {
@@ -1401,7 +1401,7 @@ export class DiscordMcplServer {
     // `ok` may still have been applied, so it's shown as sent, never as a failure.
     const answer: Record<string, unknown> = isJsonObject(result) ? result : {};
     if (answer.ok === false) {
-      await this.acknowledge(interaction, boundedReply(hostRefusal('Hide', answer)));
+      await this.acknowledge(interaction, boundedReply(hostRefusal('Hide', answer), answer));
       return;
     }
     if (answer.ok !== true) {

@@ -475,7 +475,9 @@ const nothingToRetract = (requestId: string): string => `✅ Retract \`${request
 /** retract's reply: removals requested, and adds that may land after them. */
 export function describeRetract(r: RetractReceipt): string {
   if (r.removalsQueued === 0) return nothingToRetract(r.requestId);
-  const superseded = r.addsSuperseded ? `; ${plural(r.addsSuperseded, 'unsent add')} superseded` : '';
+  // An add still owed includes one on the wire, which settles before the
+  // removal is sent and may land (keysWithUnresolvedAdds).
+  const superseded = r.addsSuperseded ? `; it replaces ${plural(r.addsSuperseded, 'add')} still owed` : '';
   const lines = [
     `✅ Retract \`${r.requestId}\`: ${plural(r.removalsQueued, '💤 removal')} requested — not yet confirmed on Discord${superseded}.`,
   ];
@@ -531,7 +533,7 @@ export function summarizeControl(action: string, target: string | undefined, ans
       : answer.keysWithUnresolvedAdds === 1
         ? '; 1 message has an add on the wire or never answered, which may land after its removal'
         : `; ${answer.keysWithUnresolvedAdds} messages have adds on the wire or never answered, which may land after their removal`;
-    const superseded = answer.addsSuperseded ? `; ${plural(answer.addsSuperseded, 'unsent add')} superseded` : '';
+    const superseded = answer.addsSuperseded ? `; it replaces ${plural(answer.addsSuperseded, 'add')} still owed` : '';
     return `✅ Retract \`${answer.requestId}\`: ${plural(answer.removalsQueued, 'removal')} requested, not yet confirmed on Discord${superseded}${after}.`;
   }
   return `✅ The host accepted /marks action:${action}${target ? ` \`${target}\`` : ''} (its receipt couldn't be read). ` +
