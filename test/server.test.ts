@@ -1100,7 +1100,7 @@ describe('DiscordMcplServer', () => {
       commandName: 'undo',
       user: { id: 'admin-1', username: 'Admin' },
       channelId: 'c1',
-      options: { getInteger: () => 1 },
+      options: { getInteger: () => 1, getString: () => null },
       deferReply: async () => {},
       editReply: async (content: string) => { reply = content; },
       reply: async () => {},
