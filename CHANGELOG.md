@@ -23,7 +23,11 @@ in the git log and PR descriptions.
   mcpl-core's own -32000 timeout (unknown outcome) and "host is stopping"
   are not retried. An edit or delete isn't retried once a later edit or
   delete of the message has gone out (resending it after would put the older
-  version back), and a later one waits for a retry in progress.
+  version back), and a later one waits for a retry in progress until it is
+  sent (not for its answer). A retry goes only to the host that asked for it:
+  when that connection ends during the wait, the retry is dropped and logged
+  (`not retried: the host's connection has ended`), and an edit or delete
+  that waited is not sent to the next host either.
 - **A message the host refuses is no longer reported as sent, and one
   refused for a large inline image still reaches the agent as text.** A
   forwarded message's answer is now read: `channels/incoming`'s per-message

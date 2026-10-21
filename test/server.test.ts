@@ -2931,6 +2931,22 @@ describe('applyMentionCandidates', () => {
 
 // ── RFC-006 event coalescing ──
 
+describe("the retry window a coalescing host advertises", () => {
+  it('is read at initialize, and caps the wait before a keep-retry at half of it', async () => {
+    const { client, serverConn, discord } = await createTestPair();
+    const server = new DiscordMcplServer(discord as unknown as DiscordAdapter);
+    const serverPromise = server.serve(serverConn);
+    await mcplHandshake(client, { eventCoalescing: { pushEvents: true, channelsIncoming: true, retryWindowMs: 10 } });
+    const regMsg = await client.nextMessage();
+    if (regMsg.type === 'request') client.sendResponse(regMsg.request.id, {});
+    const s = server as unknown as { hostRetryWindowMs?: number; persistRetryDelay(): number };
+    assert.equal(s.hostRetryWindowMs, 10);
+    assert.equal(s.persistRetryDelay(), 5);
+    client.close();
+    await serverPromise;
+  });
+});
+
 describe('RFC-006 coalescing', () => {
   type Coalesce = { key: string; channelId?: string; retract?: boolean; initial?: boolean };
   type Push = PushEventParams & { coalesce?: Coalesce };
