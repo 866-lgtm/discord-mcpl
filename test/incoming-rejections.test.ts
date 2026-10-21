@@ -3,18 +3,21 @@
  * about the message's inline media — answered with one resend that keeps the
  * text.
  *
- * Before agent-framework #266 a host checked a coalesced message's whole
- * content against 1 MiB, inline base64 included, and refused a message with a
- * large screenshot per item (`coalesce_invalid` on channels/incoming, a
- * -32602 error on push/event). discord-mcpl never read the per-item result
- * and logged the message as sent: the message, text and all, was lost
- * without a trace on either side.
+ * agent-framework's coalescing hosts before 0.22.2, its 0.21 line included,
+ * check a coalesced message's whole content against 1 MiB, inline base64
+ * included, and refuse a message with a large screenshot per item
+ * (`coalesce_invalid` on channels/incoming, a -32602 error on push/event).
+ * discord-mcpl didn't read the per-item result and logged the
+ * channels/incoming refusal as sent, so the message, text and all, was lost
+ * with nothing on either side saying so.
  */
 
 import { afterEach, beforeEach, describe, it } from 'node:test';
 import * as assert from 'node:assert/strict';
+import { PassThrough } from 'node:stream';
+import { createInterface } from 'node:readline';
 
-import { textContent } from '@animalabs/mcpl-core';
+import { ConnectionClosedError, McplConnection, RpcError, textContent } from '@animalabs/mcpl-core';
 import type { ContentBlock } from '@animalabs/mcpl-core';
 import type { DiscordAdapter, MessageEventInfo } from '../src/discord-adapter.js';
 import { ChannelManager, toDescriptor } from '../src/channels.js';
@@ -30,18 +33,57 @@ import {
 
 type Responder = (method: string, params: any, n: number) => unknown | Promise<unknown>;
 type EditHandler = (c: string, m: string, t: string, isDM: boolean, info?: MessageEventInfo) => void;
+type DeleteHandler = (c: string, m: string, isDM: boolean, info?: MessageEventInfo) => void;
 
-/** ~1.2 MB of base64: over the 1 MiB budget a pre-#266 host applied. */
+/** ~1.2 MB of base64: over the 1 MiB budget of agent-framework's coalescing
+ *  hosts before 0.22.2. */
 const BIG_IMAGE = 'A'.repeat(1_200_000);
+/** ~40 KB of base64: small enough that a create remembers the image's blocks
+ *  for a replacing edit (64 KiB). */
+const SMALL_IMAGE = 'A'.repeat(40_000);
 
-function rpcError(code: number, message: string): Error & { code: number } {
-  return Object.assign(new Error(message), { code });
+/** The error mcpl-core rejects a request with when the host answers with one. */
+function rpcError(code: number, message: string): RpcError {
+  return new RpcError(code, message);
 }
 
-function wire(respond: Responder, opts: { open?: boolean } = {}) {
+type Answer = { result: unknown } | { error: { code: number; message: string } } | 'no answer';
+
+/**
+ * A real mcpl-core connection to a scripted host, for the errors only
+ * mcpl-core makes: each request is answered as `answer` says, or not at all,
+ * and an unanswered one times out in mcpl-core itself, after 50 ms.
+ */
+function scriptedHost(answer: (method: string, params: any, n: number) => Answer) {
+  const toServer = new PassThrough();
+  const fromServer = new PassThrough();
+  const conn = McplConnection.fromStreams(toServer, fromServer);
+  conn.requestTimeout = 50;
+  const sent: Array<{ method: string; params: any }> = [];
+  createInterface({ input: fromServer }).on('line', (line) => {
+    const msg = JSON.parse(line);
+    if (msg.id === undefined) return;
+    sent.push({ method: msg.method, params: msg.params });
+    const a = answer(msg.method, msg.params, sent.length);
+    if (a !== 'no answer') toServer.write(`${JSON.stringify({ jsonrpc: '2.0', id: msg.id, ...a })}\n`);
+  });
+  return { conn, sent };
+}
+
+/** Wait until `done()` holds, a tick at a time, failing after 2 s. */
+async function until(done: () => boolean): Promise<void> {
+  const deadline = Date.now() + 2000;
+  while (!done()) {
+    if (Date.now() > deadline) throw new Error('timed out waiting for the condition');
+    await new Promise((r) => setImmediate(r));
+  }
+}
+
+function wire(respond: Responder, opts: { open?: boolean; host?: ReturnType<typeof scriptedHost> } = {}) {
   const server = new DiscordMcplServer({} as DiscordAdapter);
   const s = server as unknown as Record<string, unknown>;
   let edit: EditHandler | undefined;
+  let del: DeleteHandler | undefined;
   const noop = () => {};
   s.discord = {
     botUserId: 'bot',
@@ -58,10 +100,10 @@ function wire(respond: Responder, opts: { open?: boolean } = {}) {
     hasGuild: () => true,
     channelAdmitted: () => true,
     onMessageEdit: (h: EditHandler) => { edit = h; },
-    onMessageDelete: noop,
+    onMessageDelete: (h: DeleteHandler) => { del = h; },
   };
-  const sent: Array<{ method: string; params: any }> = [];
-  s.conn = {
+  const sent: Array<{ method: string; params: any }> = opts.host?.sent ?? [];
+  s.conn = opts.host?.conn ?? {
     sendRequest: (method: string, params: unknown) => {
       sent.push({ method, params });
       try {
@@ -84,15 +126,16 @@ function wire(respond: Responder, opts: { open?: boolean } = {}) {
     manager.register(toDescriptor({ id: 'chan1', guildId: 'g1', guildName: 'Guild', type: 'text', name: 'general' }));
     manager.open('discord:g1:chan1');
   }
-  return { server, sent, edit: () => edit! };
+  return { server, sent, edit: () => edit!, del: () => del! };
 }
 
 /** A message with one image attachment; the fetch + downsample is stubbed. */
-async function deliver(server: DiscordMcplServer, image: string | null): Promise<void> {
+async function deliver(server: DiscordMcplServer, image: string | null, extra: ContentBlock[] = []): Promise<void> {
   const s = server as unknown as Record<string, unknown>;
-  s.buildAttachmentBlocks = async (): Promise<ContentBlock[]> => image === null ? [] : [
+  s.buildAttachmentBlocks = async (): Promise<ContentBlock[]> => image === null ? extra : [
     { type: 'image', data: image, mimeType: 'image/png' } as ContentBlock,
     textContent('[image attachment: shot.png — https://cdn.example/shot.png]'),
+    ...extra,
   ];
   await (server as any).handleDiscordMessage({
     id: 'm1', content: 'look at this', cleanContent: 'look at this', authorId: 'u1', authorName: 'someone',
@@ -124,7 +167,7 @@ describe('channels/incoming (open channel): the per-message result is read', () 
     await deliver(server, BIG_IMAGE);
     assert.equal(sent.length, 1);
     assert.equal(sent[0].method, 'channels/incoming');
-    assert.deepEqual(errors.filter((e) => e.includes('rejected')), []);
+    assert.deepEqual(errors.filter((e) => e.includes('rejected') || e.includes("didn't take")), []);
   });
 
   it('a coalesce_invalid refusal of a message with an inline image is logged, then resent once with a note instead of the image', async () => {
@@ -133,7 +176,7 @@ describe('channels/incoming (open channel): the per-message result is read', () 
       : { results: [{ messageId: 'm1', accepted: true }] }, { open: true });
     await deliver(server, BIG_IMAGE);
 
-    assert.ok(errors.includes('[discord-mcpl] host rejected message m1 in discord:g1:chan1: coalesce_invalid'), errors.join('\n'));
+    assert.ok(errors.includes("[discord-mcpl] host didn't take message m1 in discord:g1:chan1: coalesce_invalid"), errors.join('\n'));
     assert.equal(sent.length, 2, 'exactly one resend');
     const [first, second] = sent;
     assert.equal(second.method, 'channels/incoming');
@@ -141,7 +184,7 @@ describe('channels/incoming (open channel): the per-message result is read', () 
     assert.equal(contentOf(second).some((b: any) => b.type === 'image'), false);
     const texts = contentOf(second).map((b: any) => b.text ?? '').join('\n');
     assert.match(texts, /someone: look at this/);
-    assert.match(texts, /\[image omitted: the host refused this message with the image inline \(image\/png, ~\d+(\.\d)?(KB|MB); host said: coalesce_invalid\)/);
+    assert.match(texts, /\[image omitted: the host refused this message with the image inline \(image\/png, ~\d+(\.\d)?(KB|MB)\)\. The attachment line below names it and links to it\.\]/);
     assert.match(texts, /\[image attachment: shot\.png — https:\/\/cdn\.example\/shot\.png\]/);
     // A fresh occurrence id on the same subject, still the subject's first occurrence.
     assert.equal(eventIdOf(first), 'discord_msg_m1');
@@ -154,21 +197,41 @@ describe('channels/incoming (open channel): the per-message result is read', () 
     const { server, sent } = wire(() => ({ results: [{ messageId: 'm1', accepted: false, reason: 'coalesce_invalid' }] }), { open: true });
     await deliver(server, null);
     assert.equal(sent.length, 1);
-    assert.ok(errors.includes('[discord-mcpl] host rejected message m1 in discord:g1:chan1: coalesce_invalid'));
+    assert.ok(errors.includes("[discord-mcpl] host didn't take message m1 in discord:g1:chan1: coalesce_invalid"));
   });
 
   it('a refusal that is not about content (empty_content) is logged and not resent', async () => {
     const { server, sent } = wire(() => ({ results: [{ messageId: 'm1', accepted: false, reason: 'empty_content' }] }), { open: true });
     await deliver(server, BIG_IMAGE);
     assert.equal(sent.length, 1);
-    assert.ok(errors.includes('[discord-mcpl] host rejected message m1 in discord:g1:chan1: empty_content'));
+    assert.ok(errors.includes("[discord-mcpl] host didn't take message m1 in discord:g1:chan1: empty_content"));
   });
 
   it('a resend the host refuses too is logged, and nothing more is sent', async () => {
     const { server, sent } = wire(() => ({ results: [{ messageId: 'm1', accepted: false, reason: 'coalesce_invalid' }] }), { open: true });
     await deliver(server, BIG_IMAGE);
     assert.equal(sent.length, 2);
-    assert.ok(errors.some((e) => e.endsWith('host rejected it again: coalesce_invalid')), errors.join('\n'));
+    assert.ok(errors.some((e) => e.endsWith("host didn't take it again: coalesce_invalid")), errors.join('\n'));
+  });
+
+  it('a -32602 error for the whole request is the host refusing it: logged in its own words, then resent without the image', async () => {
+    const host = scriptedHost((_m, _p, n) => n === 1
+      ? { error: { code: -32602, message: 'invalid params' } }
+      : { result: { results: [{ messageId: 'm1', accepted: true }] } });
+    const { server, sent } = wire(() => undefined, { open: true, host });
+    await deliver(server, BIG_IMAGE);
+    assert.ok(errors.includes('[discord-mcpl] host rejected message m1 in discord:g1:chan1: invalid params'), errors.join('\n'));
+    assert.equal(sent.length, 2);
+    assert.equal(contentOf(sent[1]).some((b: any) => b.type === 'image'), false);
+  });
+
+  it('a channels/incoming request mcpl-core times out is a send failure, not a refusal, and is not resent', async () => {
+    const host = scriptedHost(() => 'no answer');
+    const { server, sent } = wire(() => undefined, { open: true, host });
+    await deliver(server, BIG_IMAGE);
+    assert.equal(sent.length, 1);
+    assert.ok(errors.some((e) => e.startsWith('[discord-mcpl] channels/incoming failed:')), errors.join('\n'));
+    assert.equal(errors.some((e) => e.includes('host rejected') || e.includes("didn't take")), false);
   });
 });
 
@@ -197,12 +260,34 @@ describe('push/event (closed channel): the result or error is read', () => {
     assert.ok(errors.includes('[discord-mcpl] host rejected message m1 in discord:g1:chan1: duplicate'));
   });
 
-  it('a transport failure (timeout) is logged as a send failure and not resent', async () => {
-    const { server, sent } = wire(() => { throw rpcError(-32000, 'Request timed out after 30000ms: push/event'); });
+  it('a push/event request mcpl-core times out is a send failure, not a refusal, and is not resent', async () => {
+    const host = scriptedHost(() => 'no answer');
+    const { server, sent } = wire(() => undefined, { host });
     await deliver(server, BIG_IMAGE);
     assert.equal(sent.length, 1);
     assert.ok(errors.some((e) => e.startsWith('[discord-mcpl] push/event failed:')), errors.join('\n'));
-    assert.equal(errors.some((e) => e.includes('host rejected')), false);
+    assert.equal(errors.some((e) => e.includes('host rejected') || e.includes("didn't take")), false);
+  });
+
+  it('a resend mcpl-core times out is logged as a failed resend, not as sent', async () => {
+    const host = scriptedHost((_m, _p, n) => n === 1
+      ? { error: { code: -32602, message: 'content exceeds host byte limit' } }
+      : 'no answer');
+    const { server, sent } = wire(() => undefined, { host });
+    await deliver(server, BIG_IMAGE);
+    assert.equal(sent.length, 2);
+    assert.ok(errors.includes('[discord-mcpl] host rejected message m1 in discord:g1:chan1: content exceeds host byte limit'), errors.join('\n'));
+    assert.ok(errors.some((e) => e.startsWith('[discord-mcpl] resent message m1 in discord:g1:chan1 with 1 inline attachment(s) replaced by a note: send failed:')), errors.join('\n'));
+    assert.equal(errors.some((e) => e.includes('sent (no verdict)')), false);
+  });
+
+  it("a feature-set refusal (-32001) is a refusal in the host's words, and is not resent", async () => {
+    const host = scriptedHost(() => ({ error: { code: -32001, message: 'Feature set not enabled: discord.messaging' } }));
+    const { server, sent } = wire(() => undefined, { host });
+    await deliver(server, BIG_IMAGE);
+    assert.equal(sent.length, 1);
+    assert.ok(errors.includes('[discord-mcpl] host rejected message m1 in discord:g1:chan1: Feature set not enabled: discord.messaging'), errors.join('\n'));
+    assert.equal(errors.some((e) => e.includes('failed')), false);
   });
 
   it('an accepted push logs nothing as refused', async () => {
@@ -213,13 +298,115 @@ describe('push/event (closed channel): the result or error is read', () => {
   });
 });
 
-describe('edits: a refused edit is logged', () => {
+describe('edits and deletes: a refusal is logged', () => {
   it('logs the refusal of an edit', async () => {
     const { sent, edit } = wire(() => ({ accepted: false, reason: 'coalesce_invalid' }));
     edit()('chan1', 'm9', 'fixed', false, { guildId: 'g1', authorId: 'u1', authorName: 'someone' });
-    await new Promise((r) => setImmediate(r));
+    await until(() => errors.length > 0);
     assert.equal(sent.length, 1);
     assert.ok(errors.includes('[discord-mcpl] host rejected edit of message m9 in discord:g1:chan1: coalesce_invalid'), errors.join('\n'));
+  });
+
+  it('logs an edit the host refuses with an error code, in the host\'s words', async () => {
+    const { sent, edit } = wire(() => { throw rpcError(-32023, 'channel not declared'); });
+    edit()('chan1', 'm9', 'fixed', false, { guildId: 'g1', authorId: 'u1', authorName: 'someone' });
+    await until(() => errors.length > 0);
+    assert.equal(sent.length, 1);
+    assert.ok(errors.includes('[discord-mcpl] host rejected edit of message m9 in discord:g1:chan1: channel not declared'), errors.join('\n'));
+  });
+
+  it('logs the refusal of a delete', async () => {
+    const { sent, del } = wire(() => ({ accepted: false, reason: 'duplicate' }));
+    del()('chan1', 'm9', false, { guildId: 'g1', authorId: 'u1', authorName: 'someone' });
+    await until(() => errors.length > 0);
+    assert.equal(sent.length, 1);
+    assert.ok(errors.includes('[discord-mcpl] host rejected delete of message m9 in discord:g1:chan1: duplicate'), errors.join('\n'));
+  });
+});
+
+describe('an edit that replaces a create carries what the agent was sent', () => {
+  // Refuses the create as a budgeted host does, on either lane, and accepts
+  // the resend and the edit.
+  const refuseCreate: Responder = (m, _p, n) => {
+    if (m === 'channels/incoming') {
+      return n === 1
+        ? { results: [{ messageId: 'm1', accepted: false, reason: 'coalesce_invalid' }] }
+        : { results: [{ messageId: 'm1', accepted: true }] };
+    }
+    if (n === 1) throw rpcError(-32602, 'content exceeds host byte limit');
+    return { accepted: true, inferenceId: 'i1' };
+  };
+  const editM1 = (edit: () => EditHandler) =>
+    edit()('chan1', 'm1', 'look at this one', false, { guildId: 'g1', authorId: 'u1', authorName: 'someone' });
+
+  for (const lane of ['channels/incoming', 'push/event'] as const) {
+    for (const [size, image] of [['under', SMALL_IMAGE], ['over', BIG_IMAGE]] as const) {
+      it(`after a ${lane} create refused and resent, keeps the omission note and the link, without the image, for an image ${size} the 64 KiB a create remembers`, async () => {
+        const { server, sent, edit } = wire(refuseCreate, { open: lane === 'channels/incoming' });
+        await deliver(server, image);
+        assert.deepEqual(sent.map((r) => r.method), [lane, lane]);
+        editM1(edit);
+        await until(() => sent.length === 3);
+        assert.equal(sent[2].method, 'push/event');
+        const edited = contentOf(sent[2]);
+        assert.equal(edited.some((b: any) => b.type === 'image'), false);
+        const texts = edited.map((b: any) => b.text ?? '').join('\n');
+        assert.match(texts, /look at this one \[edited\]/);
+        assert.match(texts, /\[image omitted: the host refused this message with the image inline/);
+        assert.match(texts, /\[image attachment: shot\.png — https:\/\/cdn\.example\/shot\.png\]/);
+      });
+    }
+  }
+
+  it('after a resend whose attachment blocks still pass 64 KiB, carries the placeholder, so the memory stays bounded', async () => {
+    const big = 'x'.repeat(70_000);
+    const { server, sent, edit } = wire(refuseCreate, { open: true });
+    await deliver(server, SMALL_IMAGE, [textContent(`[attachment: notes.txt]\n${big}`)]);
+    editM1(edit);
+    await until(() => sent.length === 3);
+    const edited = contentOf(sent[2]);
+    const texts = edited.map((b: any) => b.text ?? '').join('\n');
+    assert.equal(edited.some((b: any) => b.type === 'image'), false);
+    assert.match(texts, /\[attachments as in the original message\]/);
+    assert.equal(texts.includes(big), false, 'the large text attachment is not kept for the edit');
+  });
+
+  it('after an accepted create, carries an image the create remembers, and the placeholder for one over 64 KiB', async () => {
+    for (const [image, kept] of [[SMALL_IMAGE, true], [BIG_IMAGE, false]] as const) {
+      const { server, sent, edit } = wire((m) => m === 'channels/incoming'
+        ? { results: [{ messageId: 'm1', accepted: true }] }
+        : { accepted: true, inferenceId: 'i1' }, { open: true });
+      await deliver(server, image);
+      editM1(edit);
+      await until(() => sent.length === 2);
+      const edited = contentOf(sent[1]);
+      const texts = edited.map((b: any) => b.text ?? '').join('\n');
+      if (kept) {
+        assert.equal(edited.filter((b: any) => b.type === 'image' && b.data === image).length, 1, 'the image the create remembers');
+        assert.match(texts, /\[image attachment: shot\.png — https:\/\/cdn\.example\/shot\.png\]/);
+      } else {
+        assert.equal(edited.some((b: any) => b.type === 'image'), false);
+        assert.match(texts, /\[attachments as in the original message\]/);
+      }
+    }
+  });
+
+  it('an edit that arrives while the resend is unanswered waits for it', async () => {
+    let answerResend!: () => void;
+    const resendAnswered = new Promise<void>((r) => { answerResend = r; });
+    const { server, sent, edit } = wire(async (m, p, n) => {
+      if (n === 2) await resendAnswered;
+      return refuseCreate(m, p, n);
+    }, { open: true });
+    const delivered = deliver(server, SMALL_IMAGE);
+    await until(() => sent.length === 2);
+    edit()('chan1', 'm1', 'look at this one', false, { guildId: 'g1', authorId: 'u1', authorName: 'someone' });
+    await new Promise((r) => setImmediate(r));
+    assert.equal(sent.length, 2, 'the edit waits while the resend is unanswered');
+    answerResend();
+    await delivered;
+    await until(() => sent.length === 3);
+    assert.equal(sent[2].method, 'push/event');
   });
 });
 
@@ -233,20 +420,39 @@ describe('incoming-results helpers', () => {
     assert.deepEqual(pushOutcome(null), { kind: 'no-result' });
   });
 
-  it('only -32602 errors are refusals', () => {
+  it("reads an error the host refuses a request with as its refusal, in the host's own words", () => {
     assert.deepEqual(errorRejection(rpcError(-32602, 'bad')), { reason: 'bad', code: -32602 });
-    assert.equal(errorRejection(rpcError(-32000, 'timed out')), undefined);
-    assert.equal(errorRejection(new Error('closed')), undefined);
+    assert.deepEqual(errorRejection(rpcError(-32001, 'Feature set not enabled: x')), { reason: 'Feature set not enabled: x', code: -32001 });
+    assert.deepEqual(errorRejection(rpcError(-32601, 'Method not found')), { reason: 'Method not found', code: -32601 });
+    assert.deepEqual(errorRejection(rpcError(-32602, '')), { reason: 'unspecified', code: -32602 });
+    // Stands in for a later mcpl-core, whose RpcError keeps the host's message
+    // as it came; 0.2.1 can't make this one.
+    assert.deepEqual(errorRejection({ code: -32602, message: 'bad' }), { reason: 'bad', code: -32602 });
   });
 
-  it('classifies content refusals', () => {
+  it('an error that is no verdict on the message is no refusal: no answer, or the host failing', () => {
+    assert.equal(errorRejection(new ConnectionClosedError()), undefined);
+    assert.equal(errorRejection(new Error('closed')), undefined);
+    assert.equal(errorRejection(rpcError(-32000, 'host could not persist the acceptance; retry')), undefined);
+    assert.equal(errorRejection(rpcError(-32603, 'Internal error')), undefined);
+    // mcpl-core 0.2.1's own timeout comes from mcpl-core in the lanes' tests.
+    // This stands in for a later mcpl-core's ConnectionTimeoutError, an
+    // RpcError with -32000, which 0.2.1 can't make.
+    const later = Object.assign(new Error('push/event timed out: no reply came within 50 ms, so whether it ran is unknown.'),
+      { name: 'ConnectionTimeoutError', code: -32000 });
+    assert.equal(errorRejection(later), undefined);
+  });
+
+  it('counts a -32602 error and coalesce_invalid as content refusals, and nothing else', () => {
     assert.equal(isContentRejection({ reason: 'coalesce_invalid' }), true);
-    assert.equal(isContentRejection({ reason: 'content exceeds host byte limit' }), true);
+    assert.equal(isContentRejection({ reason: 'content exceeds host byte limit', code: -32602 }), true);
     assert.equal(isContentRejection({ reason: 'anything', code: -32602 }), true);
+    assert.equal(isContentRejection({ reason: 'rate limit exceeded' }), false);
     assert.equal(isContentRejection({ reason: 'empty_content' }), false);
     assert.equal(isContentRejection({ reason: 'duplicate' }), false);
     assert.equal(isContentRejection({ reason: 'unknown channel "x" — register it first (§14.5)' }), false);
-    assert.equal(isContentRejection({ reason: 'host could not persist the acceptance; retry' }), false);
+    assert.equal(isContentRejection({ reason: 'host could not persist the acceptance; retry', code: -32000 }), false);
+    assert.equal(isContentRejection({ reason: 'Feature set not enabled: x', code: -32001 }), false);
   });
 
   it('replaces only inline media, and summarizes what was inline', () => {
@@ -259,10 +465,13 @@ describe('incoming-results helpers', () => {
     assert.equal(summary.inline, 1);
     assert.deepEqual(summary.kinds, ['image/png']);
     assert.equal(summary.inlineBase64Bytes, 4);
-    const { content: out, replaced } = withoutInlineMedia(content, 'coalesce_invalid');
+    const { content: out, replaced } = withoutInlineMedia(content);
     assert.equal(replaced, 1);
     assert.equal((out[0] as any).text, 'hi');
-    assert.equal((out[1] as any).type, 'text');
+    // The agent is told what is missing and where to find it; the host's
+    // reason is the operator's, on stderr.
+    assert.equal((out[1] as any).text,
+      '[image omitted: the host refused this message with the image inline (image/png, ~3B). The attachment line below names it and links to it.]');
     assert.deepEqual(out[2], content[2]);
   });
 });
