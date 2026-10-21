@@ -5,6 +5,8 @@ in the git log and PR descriptions.
 
 ## Unreleased
 
+## 0.3.0 — 2026-10-18
+
 ### Upgrade notes
 
 - **Upgrade the host's agent framework first, or together with this release.**
@@ -64,6 +66,24 @@ in the git log and PR descriptions.
   carries `expiresAt` beside its `url`, and both tools' descriptions say
   what it means. A URL without a readable `ex` gets neither.
 
+- **A message that addresses the agent from a channel it hasn't opened says
+  what reaches it from there.** The push for a message posted in a guild
+  channel or thread that is neither open, subscribed nor muted, such as one
+  that mentions the bot or the role Discord created for it, or replies to
+  one of its messages, now begins with `<system>While this channel isn't
+  open, a message from it reaches you as it's posted when it mentions you or
+  the role Discord created for you, or replies to one of your messages.
+  Opening it brings its other messages as they arrive.</system>`, before the
+  message's own line. After a restart, a closed channel's catch-up block
+  gets the same note. A DM, a subscribed channel's message and an open
+  channel's `channels/incoming` carry no such note, and neither does an edit
+  that replaces the message, a reaction's push, which the agent turns on per
+  channel with `set_reaction_visibility`, a push from a channel muted while
+  the message was on its way, or one whose channel the delivery couldn't
+  register: deleted, archived, in a server the bot left, no longer admitted
+  by the channel filters, not held in the client's cache, or with facts that
+  may be older than Discord's.
+
 ### Changed
 
 - **These refusals, each given before the call sends or saves anything,
@@ -100,6 +120,26 @@ in the git log and PR descriptions.
     what to send instead. The count check names the count, and each file's
     check names the file by its place in the list or by its path as read on
     the machine running discord-mcpl.
+- **Built with TypeScript 7.** The `typescript` dev dependency is now
+  `^7.0.2`, the native compiler, in place of 5.9.3. Built from the same
+  tree, the JavaScript is byte-identical to 5.9.3's, in `dist/src` and
+  `dist/test` alike. Two declarations print their string-literal types with
+  single quotes, the same types: `TOOL_CLASS_VOCABULARY` in
+  `tool-classes.d.ts` and `PlaybackFailure` in `voice.d.ts`. TypeScript
+  5.9.3 and 5.0.4 read the new declarations without errors, with
+  `skipLibCheck` off. Source maps differ in their `mappings` only, which
+  reaches only tools that read them, such as a debugger or Node's
+  `--enable-source-maps`: a position can resolve to another column or to
+  none, and go-to-definition can land on another line. Without that flag,
+  Node's stack traces cite the JavaScript, which is unchanged.
+- **Building from a clone needs TypeScript 7's native binary.** `tsc` now
+  comes from one of 20 per-platform packages that npm installs as optional
+  dependencies, so an install that leaves out optional dependencies, or a
+  platform with no package, such as 32-bit x86 or Android, can't build.
+  TypeScript 7 ships no `tsserver`, so an editor set to use the workspace's
+  TypeScript finds no language server there. `tsconfig.json` now names the
+  Node types (`"types": ["node"]`), which TypeScript 7 no longer includes
+  on its own.
 
 - **The admin commands make 💤 awareness marks an explicit choice.**
   - `/undo` takes an optional `marks` choice: `none` (the default),
@@ -148,6 +188,14 @@ in the git log and PR descriptions.
   authorize them as a one-shot act.
 
 ### Fixed
+
+- **The send tools say where a message's text goes.** `send_message`'s and
+  `reply_message`'s `content` now say, in `send_dm`'s form, that it holds
+  the text to send, required unless files are attached, and that a call
+  that gives neither is rejected as empty. `send_dm`'s description says
+  to reply to a DM by passing the sender as `userId` and the reply as
+  `content`. An agent that left the text out of the call, writing it only
+  in its reasoning, could repeat a refused call.
 
 - **`set_reaction_visibility`, `mute_channel`, `unmute_channel` and
   `channel_missed` given a blank `channelId`, and a send given a value of
@@ -215,6 +263,74 @@ in the git log and PR descriptions.
   then, where before they were skipped; a message forwarded live in it
   before then moves its watermark past them, as for a channel whose identity
   can't be resolved. An answer that admits the messages stands, as before.
+- **`channels/open` opens exactly the channel it was asked for.** A stale or
+  unknown `channelId` used to fall through to the first registered channel of
+  the same type, so a host could open, subscribe to, and receive history from
+  a different channel than it named. Now `channelId` is the exact selector.
+  agent-framework's `ChannelsOpenParams` gives it as the exact registered id,
+  preferred over type and address matching (MCPL's SPEC gives `channels/open`
+  no `channelId`), and this server reads it strictly: a `channelId` alone
+  selects, and an `address` beside it isn't read; without a `channelId`, an
+  `address` naming a guildId and a channelId selects. Either names exactly one
+  channel or is refused: an id the registry doesn't hold is looked up in
+  Discord, and opened when it's a channel messages are posted in (text,
+  announcement, voice or stage), a thread, or a DM, that the filters admit,
+  so a DM or thread after a restart still opens. The open registers it only
+  when it succeeds, by the rule every other path registers by, so a refused
+  open registers and announces nothing itself. A guild channel is registered
+  from what the cache knows then, and the registered channels of its name are
+  re-derived, as a channel's creation does; a DM keeps the descriptor its
+  lookup built. (The lookup fetches a stale channel fresh, a looked-up
+  thread's stale channel included, and that fetch registers the channel when
+  it's a text, announcement, voice or stage channel the filters admit, as any
+  fresh fetch of a stale channel does.) A looked-up DM's recipient is the
+  party at its other end, and when the cache can't name it, as when
+  discord.js recorded only the bot, Discord is asked again, past the cache. An
+  archived thread opens too, since the host named it, and is forgotten as any
+  archived thread is: when it's reported archived again, or a sync of its
+  channel's threads doesn't list it. Any other id is refused, a lately
+  deleted channel, a thread of one, and a channel of a guild the bot has left
+  included, whatever an address beside it says, and so is a lookup that
+  finds a different channel. A channel outlives its deleted category. A
+  request with no selector (`channelId` absent or null, and `address` absent,
+  null or `{}`) opens the one registered channel of its type, DMs and threads
+  counted, and is refused when there are none or several; a refusal over
+  several lists the first ten and points to `channels/list` for the rest.
+  `type`, which MCPL requires, must be a non-empty string on every request and
+  must match the channel opened, so a registered `channelId` with a different
+  `type` is refused too. An empty-string `channelId`, which used to be read as
+  absent, is refused, and address ids must be strings. Refusals carry MCPL's
+  codes: unknown channel (`-32023`), invalid params (`-32602`), or open failed
+  (`-32024`, when the lookup can't get the channel's current facts, the
+  history fetch fails, or the channel filters refuse reading its history or
+  can't be checked). No history is fetched, and nothing is opened or
+  subscribed, before a request names its channel. Requests are handled one at
+  a time, so a `channels/close` or `mute_channel` sent during an open is
+  handled after it, and closes what it opened. A
+  channel unregistered while the open is in progress isn't opened, and neither
+  is one looked up that's deleted, or whose server the bot leaves, meanwhile,
+  or a DM looked up whose recipient the DM list stops admitting meanwhile. A
+  channel gone meanwhile, as far as this server has heard, is refused as
+  unknown (`-32023`) wherever the open notices it: when the channel filters
+  can't find it or refuse it, when its history fetch fails, and at commit. A
+  registered thread archived meanwhile is refused that way too, and opening
+  it again by its id opens it.
+  History items carry the label the open commits to. `sinceLastSeen` reads the
+  persisted watermark even on the first open after a restart, before anything
+  else has loaded it. An id the registry doesn't hold is looked up as every
+  fetch past the cache is: Discord's Unknown Channel there is a deletion, and
+  an id Discord refuses (Missing Access, a malformed id's Invalid Form Body,
+  or any other 403 or 404) is unknown. An id whose current facts can't be had
+  (Discord gives no answer, or refuses for a reason that isn't the id, such as
+  a 401 after the bot's token changed; every try is overtaken by a change; or
+  a thread's stale channel can't be fetched fresh) is refused as an open that
+  failed, and another open looks it up again.
+- **`channels/open` returns no backscroll from a channel the filters stop
+  admitting while its history is fetched (#94).** The filters file is
+  reloaded on a timer, so it can narrow during the fetch. The open checked the
+  filters only before fetching, and returned what it fetched. It now checks
+  them again after the fetch and refuses as an open that failed (`-32024`),
+  with nothing returned, opened or subscribed.
 - **Thread fields name the thread a message was posted in.** They were read
   from discord.js `message.thread`, which is the thread a message *started*,
   so a message that had spawned a thread was tagged `chat:thread`, rendered

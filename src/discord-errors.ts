@@ -26,7 +26,9 @@ export const UNKNOWN_CHANNEL = 10003;
 const UNKNOWN_GUILD = 10004;
 const UNKNOWN_MESSAGE = 10008;
 const UNKNOWN_USER = 10013;
-const MISSING_ACCESS = 50001;
+export const MISSING_ACCESS = 50001;
+/** A malformed field in a request, such as an id that isn't a snowflake. */
+export const INVALID_FORM_BODY = 50035;
 /** Discord's codes for a refusal the agent can't change itself. */
 const CANNOT_DM_USER = 50007;
 const MISSING_PERMISSIONS = 50013;

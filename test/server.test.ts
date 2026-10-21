@@ -374,6 +374,13 @@ async function mcpHandshake(client: McplConnection): Promise<McplInitializeResul
   return result;
 }
 
+/** discord-mcpl's note, ahead of the message line, on a push from a guild
+ *  channel whose gate admits a message only when it addresses the agent. */
+const CLOSED_NOTE =
+  "<system>While this channel isn't open, a message from it reaches you as it's posted when it mentions you or the " +
+  'role Discord created for you, or replies to one of your messages. Opening it brings its other messages as they ' +
+  'arrive.</system>\n';
+
 // ── Tests ──
 
 describe('DiscordMcplServer', () => {
@@ -1242,8 +1249,12 @@ describe('DiscordMcplServer', () => {
       // …plus an explicit, in-context reply affordance so the agent knows it can
       // reply by name/id rather than needing the bot's own user id (the complaint).
       assert.ok(text.includes('Direct message from @Alice'), 'DM should announce the sender');
-      assert.ok(text.includes('send_dm("Alice")'), 'DM should suggest replying by sender name');
-      assert.ok(text.includes('send_dm("u_alice")'), 'DM should offer the id fallback');
+      assert.ok(text.includes('send_dm("Alice", content='), 'DM should suggest replying by sender name');
+      assert.ok(text.includes('send_dm("u_alice", content='), 'DM should offer the id fallback');
+      // The affordance must show the full call form: an agent copying
+      // send_dm("Alice") alone produces an empty send that the server
+      // rejects (seen in the wild — GLM-5.2 agent retry loops).
+      assert.ok(text.includes('"content" parameter'), 'DM affordance should name the content parameter');
       // The chat:dm tags still ride along for the host gate.
       assert.ok(p.tags?.includes('chat:dm'), 'DM should carry the chat:dm tag');
       client.sendResponse(pushMsg.request.id, { accepted: true });
@@ -1471,8 +1482,12 @@ describe('DiscordMcplServer', () => {
     const second = await nextRequest('push/event');
     client.sendResponse(second.id, { accepted: true });
     const textOf = (r: { params?: unknown }) => ((r.params as PushEventParams).payload.content[0] as { text: string }).text;
+    // Both threads are closed. th2, which the cache holds, is registered by
+    // its delivery, so its push carries the note first. The first thread
+    // isn't in the cache here, so its delivery can't say what opening it
+    // brings, and its push carries none.
     assert.ok(textOf(first).startsWith('[thread "design-chat" in Test Server] Bob:'), textOf(first));
-    assert.ok(textOf(second).startsWith('[#general thread "th2" in Test Server] Bob:'), textOf(second));
+    assert.ok(textOf(second).startsWith(`${CLOSED_NOTE}[#general thread "th2" in Test Server] Bob:`), textOf(second));
     const firstOrigin = (first.params as PushEventParams).origin as Record<string, unknown>;
     const secondOrigin = (second.params as PushEventParams).origin as Record<string, unknown>;
     assert.equal('threadParentName' in firstOrigin, false, 'an unknown parent is left out');
@@ -1528,6 +1543,13 @@ describe('DiscordMcplServer', () => {
       ? { id: channelId, guildId: meta.guildId, guildName: meta.guildName, type: 'thread', name: meta.threadName ?? null, parentName: meta.threadParentName ?? null }
       : { id: channelId, guildId: meta.guildId, guildName: meta.guildName, type: 'text', name: meta.name };
   }
+
+  /** The sweep's block, after the closed channel's note, which a closed
+   *  channel's block of mentions carries (closedChannelNote). */
+  const blockOf = (p: PushEventParams): string => {
+    const text = (p.payload.content[0] as { text: string }).text;
+    return text.startsWith(CLOSED_NOTE) ? text.slice(CLOSED_NOTE.length) : text;
+  };
 
   async function sweepOne(channelId: string, meta: ChannelMeta | null, rest?: ChannelMeta | Error): Promise<PushEventParams> {
     const wmPath = join(tmpdir(), `discord-mcpl-wm-${process.pid}-sweep-${channelId}.json`);
@@ -1588,20 +1610,21 @@ describe('DiscordMcplServer', () => {
     assert.equal(origin.threadParentName, 'general');
     assert.deepEqual(p.tags, ['chat:thread']);
     const text = (p.payload.content[0] as { text: string }).text;
-    assert.ok(text.startsWith('<missed channel="#general" thread="design-chat" channelId="th1" guild="Test Guild"'), text);
+    // Closed, with a mention, it carries the note as a live mention does.
+    assert.ok(text.startsWith(`${CLOSED_NOTE}<missed channel="#general" thread="design-chat" channelId="th1" guild="Test Guild"`), text);
   });
 
   it("the reconnect sweep's header quotes a name that holds a quote", async () => {
     // A voice channel's name may hold quotes, and its text chat is swept like
     // any channel; so may a thread's.
     const voice = await sweepOne('vc1', { name: 'Movie "night"', guildId: 'g1', guildName: 'Test Guild', isDM: false });
-    const voiceText = (voice.payload.content[0] as { text: string }).text;
+    const voiceText = blockOf(voice);
     assert.ok(voiceText.startsWith('<missed channel="#Movie \\"night\\"" channelId="vc1" guild="Test Guild"'), voiceText);
     const thread = await sweepOne('th2', {
       name: 'the "plan"', guildId: 'g1', guildName: 'Test Guild', isDM: false,
       threadId: 'th2', threadName: 'the "plan"', threadParentName: 'general',
     });
-    const threadText = (thread.payload.content[0] as { text: string }).text;
+    const threadText = blockOf(thread);
     assert.ok(threadText.startsWith('<missed channel="#general" thread="the \\"plan\\"" channelId="th2" guild="Test Guild"'), threadText);
   });
 
@@ -2093,7 +2116,7 @@ describe('DiscordMcplServer', () => {
       name: 'plan\u202eend', guildId: 'g1', guildName: 'Test\u0085Guild', isDM: false,
       threadId: 'th-bidi', threadName: 'plan\u202eend', threadParentName: 'gen\u202eeral',
     });
-    const header = (p.payload.content[0] as { text: string }).text.split('\n')[0];
+    const header = blockOf(p).split('\n')[0];
     assert.equal(/[\u202e\u0085]/.test(header), false, JSON.stringify(header));
     assert.ok(header.startsWith('<missed channel="#gen\\u202eeral" thread="plan\\u202eend" channelId="th-bidi" guild="Test\\u0085Guild"'), JSON.stringify(header));
   });
@@ -2105,12 +2128,12 @@ describe('DiscordMcplServer', () => {
       name: 'late-thread', guildId: 'g1', guildName: 'Test Guild', isDM: false,
       threadId: 'th3', threadName: 'late-thread', threadParentName: 'general',
     });
-    const lookedText = (looked.payload.content[0] as { text: string }).text;
+    const lookedText = blockOf(looked);
     assert.ok(lookedText.startsWith('<missed channel="#general" thread="late-thread" channelId="th3"'), lookedText);
     assert.equal((looked.origin as Record<string, unknown>).threadParentName, 'general');
     const errors = t.mock.method(console, 'error', () => {});
     const failed = await sweepOne('th3', partly, new Error('Missing Access'));
-    const failedText = (failed.payload.content[0] as { text: string }).text;
+    const failedText = blockOf(failed);
     assert.ok(failedText.startsWith('<missed thread="th3" channelId="th3" guild="Test Guild"'), failedText);
     assert.deepEqual(failed.tags, ['chat:thread'], 'still a thread');
     // The failure reaches stderr, not only the debug log.
@@ -2123,11 +2146,11 @@ describe('DiscordMcplServer', () => {
     // sweep tries then finds no more, here as Discord would.)
     const sparse: ChannelMeta = { name: 'design-chat', guildId: 'g1', guildName: 'Test Guild', isDM: false, threadId: 'th4', threadName: 'design-chat', threadParentName: null };
     const noParent = await sweepOne('th4', sparse, sparse);
-    const noParentText = (noParent.payload.content[0] as { text: string }).text;
+    const noParentText = blockOf(noParent);
     assert.ok(noParentText.startsWith('<missed thread="design-chat" channelId="th4" guild="Test Guild"'), noParentText);
     assert.equal('threadParentName' in (noParent.origin as Record<string, unknown>), false, 'an unknown channel is left out of the origin');
     const noName = await sweepOne('th5', { name: null, guildId: 'g1', guildName: 'Test Guild', isDM: false, threadId: 'th5', threadParentName: 'general' });
-    const noNameText = (noName.payload.content[0] as { text: string }).text;
+    const noNameText = blockOf(noName);
     assert.ok(noNameText.startsWith('<missed channel="#general" thread="th5" channelId="th5" guild="Test Guild"'), noNameText);
     assert.equal('threadName' in (noName.origin as Record<string, unknown>), false, 'an unknown name is left out of the origin');
   });
@@ -2232,6 +2255,60 @@ describe('DiscordMcplServer', () => {
       assert.equal(pushed.request.method, 'push/event');
       client.sendResponse(pushed.request.id, { accepted: true });
     }
+
+    client.close();
+    await serverPromise;
+  });
+
+  it('handles a channels/close sent while an open waits for its history after that open, so the close stands', { timeout: 10_000 }, async (t: TestContext) => {
+    const { client, serverConn, discord } = await createTestPair();
+    const server = new DiscordMcplServer(discord as unknown as DiscordAdapter);
+    const serverPromise = server.serve(serverConn);
+
+    await mcplHandshake(client);
+    const regMsg = await client.nextMessage();
+    if (regMsg.type === 'request') client.sendResponse(regMsg.request.id, {});
+
+    // Hold the open's history fetch until the close has been sent and has had
+    // time to reach the server.
+    let entered!: () => void;
+    const fetchEntered = new Promise<void>((resolve) => { entered = resolve; });
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    // A failed assertion mustn't leave the fetch held and the connection open.
+    t.after(() => {
+      release();
+      if (!client.isClosed) client.close();
+    });
+    discord.fetchHistory = async () => {
+      entered();
+      await held;
+      return discord.historyToReturn;
+    };
+
+    const settled: string[] = [];
+    const open = client.sendRequest('channels/open', {
+      channelId: 'discord:g1:c1',
+      type: 'discord',
+      address: { guildId: 'g1', channelId: 'c1' },
+      history: { limit: 10 },
+    }, 5_000).then((result) => { settled.push('open'); return result as ChannelsOpenResult; });
+    await fetchEntered;
+    const close = client.sendRequest('channels/close', { channelId: 'discord:g1:c1' }, 5_000)
+      .then((result) => { settled.push('close'); return result as { closed: boolean }; });
+
+    // A server that handled requests concurrently would answer the close now.
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    assert.deepEqual(settled, [], 'nothing is answered while the open waits for its history');
+
+    release();
+    const opened = await open;
+    const closed = await close;
+    assert.deepEqual(settled, ['open', 'close'], 'the open is answered first, then the close');
+    assert.equal(opened.channel.id, 'discord:g1:c1');
+    assert.equal(closed.closed, true);
+    const channels = (server as unknown as { channelManager: { isOpen(id: string): boolean } }).channelManager;
+    assert.equal(channels.isOpen('discord:g1:c1'), false, 'the close stands');
 
     client.close();
     await serverPromise;
@@ -2699,6 +2776,109 @@ describe('DiscordMcplServer', () => {
 
     client.close();
     await serverPromise;
+  });
+});
+
+describe("a closed channel's push", () => {
+  const NOTE = CLOSED_NOTE;
+  type Push = PushEventParams & { coalesce?: unknown };
+
+  /** A server and its host, closed after the test whether it passes or fails. */
+  async function boot(t: TestContext, hostExtras: Record<string, unknown> = {}) {
+    const { client, serverConn, discord } = await createTestPair();
+    // The cache holds #general, as discord.js's holds the channel of every
+    // message it delivers, so a delivery registers it.
+    discord.facts.c1 = { id: 'c1', guildId: 'g1', guildName: 'Test Server', type: 'text', name: 'general' };
+    const server = new DiscordMcplServer(discord as unknown as DiscordAdapter);
+    const serverPromise = server.serve(serverConn);
+    await mcplHandshake(client, hostExtras);
+    const regMsg = await client.nextMessage();
+    if (regMsg.type === 'request') client.sendResponse(regMsg.request.id, {});
+    const nextRequest = async (): Promise<{ method: string; params: unknown; id: string | number }> => {
+      for (;;) {
+        const m = await nextWithin(client);
+        if (m.type === 'request') return { method: m.request.method, params: m.request.params, id: m.request.id };
+      }
+    };
+    let finished: Promise<void> | undefined;
+    const finish = (): Promise<void> => (finished ??= (async () => { client.close(); await serverPromise; })());
+    t.after(finish);
+    return { client, discord, server: server as unknown as { subscribedChannels: Set<string> }, nextRequest, finish };
+  }
+  const posted = (id: string, text: string, over: Record<string, unknown> = {}): DiscordMessageData => ({
+    id, content: text, cleanContent: text, authorId: 'u1', authorName: 'Bob', isBot: false,
+    channelId: 'c1', channelName: 'general', guildId: 'g1', guildName: 'Test Server',
+    mentions: ['bot_123'], attachments: [], timestamp: new Date(), ...over,
+  } as unknown as DiscordMessageData);
+  const textOf = (params: unknown) => ((params as Push).payload.content[0] as { text?: string }).text ?? '';
+
+  it('a mention, or a reply to the agent, from a channel neither open nor subscribed carries the note ahead of the message', async (t) => {
+    const h = await boot(t);
+    h.discord.simulateMessage(posted('m1', 'can you look?'));
+    const push = await h.nextRequest();
+    h.client.sendResponse(push.id, { accepted: true });
+    assert.equal(push.method, 'push/event');
+    assert.equal(textOf(push.params), `${NOTE}[#general in Test Server] Bob: can you look?`);
+    // A reply to the agent's message addresses it too.
+    h.discord.simulateMessage(posted('m2', 'thanks', { mentions: [], replyToId: 'mine', replyToUserId: 'bot_123', replyToUserName: 'bot' }));
+    const reply = await h.nextRequest();
+    h.client.sendResponse(reply.id, { accepted: true });
+    assert.equal(textOf(reply.params), `${NOTE}[replying to @bot]\nBob: thanks`);
+    await h.finish();
+  });
+
+  it('no note where other messages arrive: a subscribed channel, an open one, or a DM', async (t) => {
+    const h = await boot(t);
+    // A channel still subscribed from before subscribe_channel was retired delivers its other messages.
+    h.server.subscribedChannels.add('c1');
+    h.discord.simulateMessage(posted('m1', 'can you look?'));
+    const subscribed = await h.nextRequest();
+    h.client.sendResponse(subscribed.id, { accepted: true });
+    assert.equal(subscribed.method, 'push/event');
+    assert.equal(textOf(subscribed.params), '[#general in Test Server] Bob: can you look?');
+    h.server.subscribedChannels.delete('c1');
+    // Open: the mention, and then an ordinary message, arrive by channels/incoming, without the note.
+    await h.client.sendRequest(method.CHANNELS_OPEN, { type: 'discord', address: { guildId: 'g1', channelId: 'c1' } });
+    h.discord.simulateMessage(posted('m2', 'one more thing'));
+    const open = await h.nextRequest();
+    h.client.sendResponse(open.id, { results: [{ messageId: 'm2', accepted: true }] });
+    assert.equal(open.method, 'channels/incoming');
+    const openText = ((open.params as ChannelsIncomingParams).messages[0].content[0] as { text?: string }).text ?? '';
+    assert.ok(!openText.includes('<system>'), openText);
+    h.discord.simulateMessage(posted('m3', 'and an ordinary message', { mentions: [] }));
+    const ambient = await h.nextRequest();
+    h.client.sendResponse(ambient.id, { results: [{ messageId: 'm3', accepted: true }] });
+    assert.equal(ambient.method, 'channels/incoming', 'opening it brings its other messages as they arrive');
+    // A DM's messages arrive without addressing the agent, so even a reply to it there gets no note.
+    h.discord.simulateMessage(posted('m4', 'hello', {
+      channelId: 'dm1', channelName: undefined, guildId: null, guildName: undefined, mentions: [],
+      replyToId: 'mine', replyToUserId: 'bot_123', replyToUserName: 'bot',
+    }));
+    const dm = await h.nextRequest();
+    h.client.sendResponse(dm.id, { accepted: true });
+    assert.equal(dm.method, 'push/event');
+    assert.ok(!textOf(dm.params).includes("While this channel isn't open"), textOf(dm.params));
+    await h.finish();
+  });
+
+  it('an edit that replaces the create, which the gate admits once the channel is open, leaves the note out', async (t) => {
+    const h = await boot(t, { eventCoalescing: { pushEvents: true, channelsIncoming: true, channelScopedPush: true } });
+    h.discord.simulateMessage(posted('m1', 'first version'));
+    // The create stays unanswered, so it's still on its way when the edits come.
+    const create = await h.nextRequest();
+    assert.equal(textOf(create.params), `${NOTE}[#general in Test Server] Bob: first version`);
+    // While the channel is closed, the gate admits no edit.
+    h.discord.simulateEdit('c1', 'm1', 'second version', false, { guildId: 'g1', editedAt: '2026-10-02T00:00:01.000Z', authorName: 'Bob', cleanContent: 'second version' });
+    await h.client.sendRequest(method.CHANNELS_OPEN, { type: 'discord', address: { guildId: 'g1', channelId: 'c1' } });
+    h.discord.simulateEdit('c1', 'm1', 'third version', false, { guildId: 'g1', editedAt: '2026-10-02T00:00:02.000Z', authorName: 'Bob', cleanContent: 'third version' });
+    // The edit waits for the create, and replaces it once it settles.
+    h.client.sendResponse(create.id, { accepted: true });
+    const edit = await h.nextRequest();
+    h.client.sendResponse(edit.id, { accepted: true });
+    assert.equal(edit.method, 'push/event');
+    assert.deepEqual((edit.params as Push).coalesce, { key: 'message:m1', channelId: 'discord:g1:c1' }, 'it replaces the create');
+    assert.equal(textOf(edit.params), '[#general in Test Server] Bob: third version [edited]', 'the first edit never came');
+    await h.finish();
   });
 });
 

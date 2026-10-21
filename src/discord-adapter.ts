@@ -49,7 +49,7 @@ import {
   type ResolveResult,
 } from './channel-names.js';
 import { channelLabelFor, mcplChannelId } from './channels.js';
-import { UNKNOWN_CHANNEL } from './discord-errors.js';
+import { INVALID_FORM_BODY, MISSING_ACCESS, UNKNOWN_CHANNEL } from './discord-errors.js';
 
 /** The channels a name resolves among (nameView), with the guilds where
  *  no name resolves while a channel there is stale (uncertainGuildNames),
@@ -1750,6 +1750,80 @@ export class DiscordAdapter {
     // discord.js returns the `around` window unsorted; present oldest → newest.
     collected.sort((a, b) => a.id.localeCompare(b.id, 'en-US-u-kn-true'));
     return collected;
+  }
+
+  /**
+   * The channel an exact channels/open selector names, when this server
+   * serves it, for one the registry doesn't hold yet (a DM or thread after a
+   * restart, say). `guildSegment` is the MCPL id's middle part: a guild id,
+   * or `dm`.
+   *
+   * Served means a channel the registry's own paths would register: in that
+   * guild, a channel messages are posted in (isListedKind: text,
+   * announcement, voice, stage) or a thread, which the guild filter and the
+   * channel list admit (a thread through its channel); or a DM whose
+   * recipient the DM list admits. Anything else is null: a category or
+   * forum, which hold no messages, a kind this server doesn't know, another
+   * guild, a channel the filters refuse, an id Discord refuses, and a lookup
+   * that finds nothing. A guild channel comes back as the facts its
+   * descriptor is made from. A DM's recipient is its other party as the DM
+   * list reads it (dmOtherParty): when the cache can't name one, Discord is
+   * asked again, past the cache, by the freshness rule, and a DM whose other
+   * party that answer doesn't name either is null.
+   *
+   * The channel is read as the tools read one (channelById): from the cache
+   * when it holds the channel whole and current, else from Discord by the
+   * freshness rule, so Unknown Channel there is a deletion (channelGone). A
+   * thread's stale channel is looked up first, as a delivery's is, since its
+   * category may be what admits the thread. A channel that is still stale
+   * then, or a thread whose channel is, comes back as `uncertain`, and so
+   * does a lookup Discord gives no answer to: its facts decide no
+   * registration until a fresh fetch.
+   */
+  async lookUpServedChannel(guildSegment: string, channelId: string): Promise<
+    | { kind: 'guild'; facts: ChannelFacts }
+    | { kind: 'dm'; recipientId: string; recipientName: string }
+    | { kind: 'uncertain' }
+    | null
+  > {
+    let channel: Channel | null;
+    try {
+      channel = await this.channelById(channelId);
+    } catch (err) {
+      return lookUpFailure(channelId, err);
+    }
+    if (!channel) return null;
+    if (guildSegment === 'dm') {
+      if (channel.type !== ChannelType.DM) return null;
+      // discord.js holds a DM it has seen a message in as whole, whatever
+      // recipients it recorded, and when the bot's own message was the first
+      // it saw there, it recorded only the bot. Its recipientId getter then
+      // gives the bot's id, so the other party is read as the DM list reads
+      // it.
+      let recipientId = this.dmOtherParty(channel);
+      if (!recipientId) {
+        try {
+          recipientId = this.dmOtherParty(await this.refetchChannel(channelId));
+        } catch (err) {
+          return lookUpFailure(channelId, err);
+        }
+      }
+      if (!recipientId || (this.dmUsers && !this.dmUsers.has(recipientId))) return null;
+      // The username, as an inbound DM's descriptor is labelled.
+      const recipient = this.client.users.resolve(recipientId) ?? (await this.client.users.fetch(recipientId).catch(() => null));
+      // The DM list may have changed while the name was fetched.
+      if (this.dmUsers && !this.dmUsers.has(recipientId)) return null;
+      return { kind: 'dm', recipientId, recipientName: recipient?.username ?? recipientId };
+    }
+    if (!('guildId' in channel) || channel.guildId !== guildSegment) return null;
+    const staleParent = this.staleParentOf(channel);
+    if (staleParent) await this.lookUpChannel(channel.guildId, staleParent);
+    if (this.isStale(channelId) || (staleParent !== null && this.isStale(staleParent))) return { kind: 'uncertain' };
+    const facts = this.channelFacts(channel);
+    if (!facts) return null;
+    if (!isListedKind(facts.type) && facts.type !== 'thread') return null;
+    if (!this.channelAdmitted(facts.guildId, facts.id, facts.parentId ?? null)) return null;
+    return { kind: 'guild', facts };
   }
 
   /** Resolve display metadata for a channel by ID — used by the reconnect
@@ -3522,6 +3596,13 @@ export class DiscordAdapter {
     return !!this.dmUsers && (!userId || !this.dmUsers.has(userId));
   }
 
+  /** Whether the DM list admits this user as a DM's other party, as it
+   *  stands now: a channels/open that looked a DM up checks again at its
+   *  commit, since the filters file can be reloaded during the open. */
+  dmUserAdmitted(userId: string): boolean {
+    return !this.dmUserRefused(userId);
+  }
+
   /** Ingress decision for a message fetched from history (the catch-up
    *  sweep), resolving a thread's parent from the channel cache. */
   historyIngressReason(channelId: string, guildId: string | null, authorId: string): string | null {
@@ -3727,6 +3808,22 @@ export function mapAllAttachments(m: {
     }
   }
   return out;
+}
+
+/** What an exact open's lookup makes of a fetch that failed. Discord refusing
+ *  the id means this server doesn't serve it: Unknown Channel, Missing
+ *  Access, a malformed id's Invalid Form Body, or any other 403 or 404.
+ *  Anything else leaves its facts unknown, and another open fetches it
+ *  again: no answer (a 5xx, a timeout, a dropped connection, or a rejection
+ *  that isn't Discord's), and a refusal that isn't about the id, such as a
+ *  401 after the bot's token changed. */
+function lookUpFailure(channelId: string, err: unknown): null | { kind: 'uncertain' } {
+  const status = (err as { status?: unknown } | null)?.status;
+  const code = (err as { code?: unknown } | null)?.code;
+  const refused = code === UNKNOWN_CHANNEL || code === MISSING_ACCESS || code === INVALID_FORM_BODY
+    || status === 403 || status === 404;
+  dbg('lookUpServedChannel:failed', { channelId, refused, error: err instanceof Error ? err.message : String(err) });
+  return refused ? null : { kind: 'uncertain' };
 }
 
 /** The kinds of guild channel registered by listing them (at boot, when one

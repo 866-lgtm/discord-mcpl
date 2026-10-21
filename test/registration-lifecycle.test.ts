@@ -56,6 +56,12 @@ const threadData = {
   thread_metadata: { archived: false, auto_archive_duration: 60, archive_timestamp: new Date().toISOString(), locked: false },
 };
 const attachment = { url: 'https://example.invalid/a.txt', name: 'a.txt', contentType: 'text/plain', size: 1 };
+/** discord-mcpl's note on a push from a channel whose gate admits a message
+ *  only when it addresses the agent. */
+const NOTE =
+  "<system>While this channel isn't open, a message from it reaches you as it's posted when it mentions you or the " +
+  'role Discord created for you, or replies to one of your messages. Opening it brings its other messages as they ' +
+  'arrive.</system>\n';
 /** A time to set Discord's clocks by, with others a second either side. */
 const T = Date.UTC(2026, 9, 12, 8, 0, 0);
 /** The thread as Discord sends it, archived or not, its archive status last
@@ -1707,7 +1713,7 @@ it("create_text_channel whose fetch afterwards is overtaken on every try reports
 it("a thread registered before its channel was known keeps its registration while it's stale, whatever its cache shows", async (t) => {
   // Known only from a message, and registered by its id, with no channel.
   const f = fixture(t, { sparse: true });
-  assert.equal(f.server.registerGuildDelivery(G, TH), threadMcplId);
+  assert.equal(f.server.registerGuildDelivery(G, TH).id, threadMcplId);
   const meta = () => f.server.channelManager.get(threadMcplId)?.metadata;
   assert.equal(meta()?.parentId, undefined);
   // Every reply of its fetch lands after a report on it: the cache takes in
@@ -2150,7 +2156,7 @@ it("a covered sync drops a thread patched outside its parent's thread cache", (t
   const f = fixture(t, { sparse: true });
   dispatch(f.client, 'THREAD_UPDATE', threadUpdate, { d: threadAt(false, T) });
   assert.equal(f.client.channels.cache.get(P).threads.cache.has(TH), false);
-  assert.equal(f.server.registerGuildDelivery(G, TH), threadMcplId);
+  assert.equal(f.server.registerGuildDelivery(G, TH).id, threadMcplId);
 
   dispatch(f.client, 'THREAD_LIST_SYNC', threadListSync, {
     d: { guild_id: G, channel_ids: [P], threads: [], members: [] },
@@ -2240,7 +2246,7 @@ it("a sync covering channels leaves a thread whose channel isn't known, and a sy
   // Known only from a message: no channel, and in no channel's threads cache.
   const f = fixture(t, { sparse: true });
   assert.equal(f.client.channels.cache.get(TH).parentId, null);
-  assert.equal(f.server.registerGuildDelivery(G, TH), threadMcplId);
+  assert.equal(f.server.registerGuildDelivery(G, TH).id, threadMcplId);
 
   dispatch(f.client, 'THREAD_LIST_SYNC', threadListSync, {
     d: { guild_id: G, channel_ids: [P], threads: [], members: [] },
@@ -2258,7 +2264,7 @@ it("a sync covering channels leaves a thread whose channel isn't known, and a sy
 
 it("a sync forgets a thread it drops from the cache whose registration doesn't know its channel", async (t) => {
   const f = fixture(t, { sparse: true });
-  assert.equal(f.server.registerGuildDelivery(G, TH), threadMcplId);
+  assert.equal(f.server.registerGuildDelivery(G, TH).id, threadMcplId);
   assert.equal(f.server.channelManager.get(threadMcplId)?.metadata.parentId, undefined);
   // A tool's fetch teaches the cache the thread's channel, and puts it in P's
   // threads cache, without deriving the registration again.
@@ -2659,4 +2665,242 @@ it('create_text_channel whose channel is gone before its facts are fetched says 
     message: `Channel ${X} was created, but Discord says it no longer exists: it was deleted since, so there's no ` +
       'channel to use. create_text_channel can make it again.',
   });
+});
+
+it("an archived thread channels/open names exactly is forgotten as any archived thread: reported archived again, or omitted by a sync of its channel", async (t) => {
+  for (const how of ['update', 'sync'] as const) {
+    const f = fixture(t);
+    // Archived before anything registers it, so only the exact open does.
+    dispatch(f.client, 'THREAD_UPDATE', threadUpdate, { d: threadAt(true, T) });
+    assert.equal(f.server.channelManager.get(threadMcplId), undefined, `${how}: not registered before the open`);
+    const res = await f.server.handleChannelOpen({ channelId: threadMcplId, type: 'discord' });
+    assert.equal(res.channel.id, threadMcplId, how);
+    assert.equal(f.server.channelManager.isOpen(threadMcplId), true, `${how}: opened`);
+    if (how === 'update') {
+      // Still archived, and locked now.
+      const archived = threadAt(true, T);
+      dispatch(f.client, 'THREAD_UPDATE', threadUpdate, { d: { ...archived, thread_metadata: { ...archived.thread_metadata, locked: true } } });
+    } else {
+      dispatch(f.client, 'THREAD_LIST_SYNC', threadListSync, { d: { guild_id: G, channel_ids: [P], threads: [], members: [] } });
+    }
+    assert.equal(f.server.channelManager.get(threadMcplId), undefined, `${how}: forgotten`);
+    assert.ok(f.removed(threadMcplId), `${how}: its removal is announced`);
+  }
+});
+
+it('a mention in a thread that is neither open nor subscribed carries the note on what reaches the agent', async (t) => {
+  const f = fixture(t);
+  await f.server.handleDiscordMessage(f.posted());
+  const text = f.pushes()[0].params.payload.content[0].text as string;
+  assert.equal(text, `${NOTE}[#before thread "topic" in Guild] Bob: hi`);
+});
+
+it("a message addressed only by the role Discord created for the bot carries the note, and one mentioning another role the bot has isn't delivered", async (t) => {
+  const BOT_ROLE = '100000000000000007';
+  const TEAM = '100000000000000008';
+  const f = fixture(t, {
+    roles: [
+      { id: BOT_ROLE, name: 'bot', permissions: '0', position: 1, managed: true, tags: { bot_id: BOT } },
+      { id: TEAM, name: 'team', permissions: '0', position: 2 },
+    ],
+  });
+  f.client.guilds.cache.get(G).members._add({ user: bot, roles: [BOT_ROLE, TEAM] });
+  const create = (id: string, role: string) => f.client.actions.MessageCreate.handle({
+    id, guild_id: G, channel_id: TH, type: MessageType.Default, content: `<@&${role}> hi`, timestamp: new Date().toISOString(),
+    author: { id: U, username: 'Bob', discriminator: '0', avatar: null }, mentions: [], mention_roles: [role], attachments: [], embeds: [], flags: 0,
+  });
+  create(snowflakeAt(T), BOT_ROLE);
+  await until(() => f.pushes().length > 0);
+  assert.equal(f.pushes()[0].params.payload.content[0].text, `${NOTE}[#before thread "topic" in Guild] Bob: @bot hi`);
+  create(snowflakeAt(T + 1000), TEAM);
+  create(snowflakeAt(T + 2000), BOT_ROLE);
+  await until(() => f.pushes().length > 1);
+  assert.equal(f.pushes()[1].params.origin.messageId, snowflakeAt(T + 2000), "the other role's message, between them, isn't delivered");
+  assert.equal(f.pushes().length, 2);
+});
+
+it('no note on a mention whose closed thread was deleted while its attachments were fetched, which leaves nothing to open', async (t) => {
+  const f = fixture(t);
+  const { held, release } = holder(t);
+  f.server.buildAttachmentBlocks = async () => { await held; return []; };
+  const delivery = f.server.handleDiscordMessage(f.posted({ attachments: [attachment] }));
+  f.deleteThread();
+  release();
+  await delivery;
+  const push = f.pushes()[0];
+  assert.equal(push.params.origin.mcplChannelId, undefined, 'the push names no channel');
+  assert.equal(push.params.payload.content[0].text, '[#before thread "topic" in Guild] Bob: hi');
+});
+
+it('a mention admitted before its closed thread was muted, while its attachments were fetched, goes out naming its thread without the note', async (t) => {
+  const f = fixture(t);
+  const { held, release } = holder(t);
+  f.server.buildAttachmentBlocks = async () => { await held; return []; };
+  const delivery = f.server.handleDiscordMessage(f.posted({ attachments: [attachment] }));
+  await f.server.executeToolCall('mute_channel', { channelId: TH });
+  release();
+  await delivery;
+  const push = f.pushes()[0];
+  assert.equal(push.params.origin.mcplChannelId, threadMcplId, 'admitted before the mute, it goes out naming its thread');
+  assert.equal(push.params.payload.content[0].text, '[#before thread "topic" in Guild] Bob: hi');
+});
+
+it('a mention admitted while its thread was open, and closed while its attachments were fetched, carries the note', async (t) => {
+  const f = fixture(t);
+  f.server.registerGuildDelivery(G, TH);
+  assert.ok(f.server.channelManager.open(threadMcplId));
+  const { held, release } = holder(t);
+  f.server.buildAttachmentBlocks = async () => { await held; return []; };
+  const delivery = f.server.handleDiscordMessage(f.posted({ attachments: [attachment] }));
+  f.server.handleChannelClose({ channelId: threadMcplId });
+  release();
+  await delivery;
+  const push = f.pushes()[0];
+  assert.ok(push, 'closed by the time it goes out, it goes out as a push');
+  assert.equal(push.params.payload.content[0].text, `${NOTE}[#before thread "topic" in Guild] Bob: hi`);
+});
+
+it('an ordinary message admitted while its thread was open, and closed while its attachments were fetched, carries the note', async (t) => {
+  const f = fixture(t);
+  f.server.registerGuildDelivery(G, TH);
+  assert.ok(f.server.channelManager.open(threadMcplId));
+  const { held, release } = holder(t);
+  f.server.buildAttachmentBlocks = async () => { await held; return []; };
+  const delivery = f.server.handleDiscordMessage(f.posted({ mentions: [], attachments: [attachment] }));
+  f.server.handleChannelClose({ channelId: threadMcplId });
+  release();
+  await delivery;
+  const push = f.pushes()[0];
+  assert.ok(push, 'admitted while the thread was open, it still goes out');
+  assert.ok(push.params.tags.includes('chat:ambient'), 'it did not address the agent');
+  assert.equal(push.params.payload.content[0].text, `${NOTE}[#before thread "topic" in Guild] Bob: hi`);
+});
+
+it('an ordinary message admitted while its thread was subscribed, and unsubscribed while its attachments were fetched, carries the note', async (t) => {
+  const f = fixture(t);
+  // As one still subscribed from before subscribe_channel was retired is.
+  f.server.subscribedChannels.add(TH);
+  const { held, release } = holder(t);
+  f.server.buildAttachmentBlocks = async () => { await held; return []; };
+  const delivery = f.server.handleDiscordMessage(f.posted({ mentions: [], attachments: [attachment] }));
+  f.server.subscribedChannels.delete(TH);
+  release();
+  await delivery;
+  const push = f.pushes()[0];
+  assert.ok(push, 'admitted while the thread was subscribed, it still goes out');
+  assert.ok(push.params.tags.includes('chat:ambient'), 'it did not address the agent');
+  assert.equal(push.params.payload.content[0].text, `${NOTE}[#before thread "topic" in Guild] Bob: hi`);
+});
+
+it('no note on a mention whose closed thread was subscribed while its attachments were fetched, since its other messages enter now', async (t) => {
+  const f = fixture(t);
+  const { held, release } = holder(t);
+  f.server.buildAttachmentBlocks = async () => { await held; return []; };
+  const delivery = f.server.handleDiscordMessage(f.posted({ attachments: [attachment] }));
+  // As one still subscribed from before subscribe_channel was retired is.
+  f.server.subscribedChannels.add(TH);
+  release();
+  await delivery;
+  const push = f.pushes()[0];
+  assert.equal(push.params.origin.mcplChannelId, threadMcplId);
+  assert.equal(push.params.payload.content[0].text, '[#before thread "topic" in Guild] Bob: hi');
+});
+
+it('no note on a mention whose registered thread was archived while its attachments were fetched', async (t) => {
+  const f = fixture(t);
+  f.server.registerGuildDelivery(G, TH);
+  const { held, release } = holder(t);
+  f.server.buildAttachmentBlocks = async () => { await held; return []; };
+  const delivery = f.server.handleDiscordMessage(f.posted({ timestamp: new Date(T), attachments: [attachment] }));
+  dispatch(f.client, 'THREAD_UPDATE', threadUpdate, { d: threadAt(true, T + 1000) });
+  release();
+  await delivery;
+  const push = f.pushes()[0];
+  assert.equal(push.params.origin.mcplChannelId, undefined, 'archived after it was posted, the thread is forgotten');
+  assert.equal(push.params.payload.content[0].text, '[#before thread "topic" in Guild] Bob: hi');
+});
+
+it("no note on a mention from a registered thread whose facts may be older than Discord's, though the push names it", async (t) => {
+  const f = fixture(t);
+  f.server.registerGuildDelivery(G, TH);
+  // Its guild came back without it, or its lookup failed: it may have been
+  // archived or deleted meanwhile, and it keeps its registration.
+  (f.adapter as any).stale.set(TH, { guildId: G });
+  await f.server.handleDiscordMessage(f.posted());
+  const push = f.pushes()[0];
+  assert.equal(push.params.origin.mcplChannelId, threadMcplId, 'registered before, it is named');
+  assert.equal(push.params.payload.content[0].text, '[#before thread "topic" in Guild] Bob: hi');
+});
+
+it("the catch-up's block of a closed thread's mentions carries the note ahead of the block", { timeout: 5000 }, async (t) => {
+  const f = fixture(t);
+  watermarkFile(t);
+  f.server.forwardedWatermark.set(TH, '100');
+  f.adapter.fetchHistory = async () => [
+    { id: '200', content: 'ordinary', cleanContent: 'ordinary', authorId: U, authorName: 'Bob', timestamp: new Date(T), mentionsBot: false, attachments: [] },
+    { id: '201', content: 'hi', cleanContent: 'hi', authorId: U, authorName: 'Bob', timestamp: new Date(T + 1000), mentionsBot: true, attachments: [] },
+  ] as any;
+  await f.server.runReconnectSweep();
+  const text = f.pushes()[0]?.params.payload.content[0].text as string;
+  assert.ok(text.startsWith(`${NOTE}<missed `), text);
+  assert.match(text, /reason="mention"/);
+});
+
+it("no note on the catch-up's block of a subscribed thread or a DM, whose other messages enter", { timeout: 5000 }, async (t) => {
+  t.mock.method(console, 'error', () => {});
+  const f = fixture(t);
+  watermarkFile(t);
+  const DM = '100000000000000009';
+  f.server.subscribedChannels.add(TH);
+  f.server.dmChannelIds.add(DM);
+  for (const id of [TH, DM]) f.server.forwardedWatermark.set(id, '100');
+  t.mock.method(f.client.rest, 'get', async () => { throw new Error('Service Unavailable'); });
+  f.adapter.fetchHistory = async (channelId: string) => [
+    { id: `${channelId}1`, content: 'hi', cleanContent: 'hi', authorId: U, authorName: 'Bob', timestamp: new Date(T), mentionsBot: true, attachments: [] },
+  ] as any;
+  await f.server.runReconnectSweep();
+  const pushes = f.pushes();
+  assert.deepEqual(pushes.map((x) => x.params.origin.channelId).sort(), [TH, DM].sort(), 'both blocks are delivered');
+  for (const push of pushes) assert.ok((push.params.payload.content[0].text as string).startsWith('<missed '), push.params.origin.channelId);
+});
+
+it("the catch-up's block of a thread subscribed when the catch-up began, and unsubscribed while its missed messages were fetched, carries the note", { timeout: 5000 }, async (t) => {
+  const f = fixture(t);
+  watermarkFile(t);
+  f.server.subscribedChannels.add(TH);
+  f.server.forwardedWatermark.set(TH, '100');
+  const { held, release } = holder(t);
+  let fetching = false;
+  f.adapter.fetchHistory = async () => {
+    fetching = true;
+    await held;
+    return [{ id: '200', content: 'ordinary', cleanContent: 'ordinary', authorId: U, authorName: 'Bob', timestamp: new Date(T), mentionsBot: false, attachments: [] }] as any;
+  };
+  const sweep = f.server.runReconnectSweep();
+  await until(() => fetching);
+  // Subscribed when the catch-up set out, so the block is the backscroll.
+  f.server.subscribedChannels.delete(TH);
+  release();
+  await sweep;
+  const text = f.pushes()[0]?.params.payload.content[0].text as string;
+  assert.ok(text.startsWith(`${NOTE}<missed `), text);
+  assert.match(text, /reason="backscroll"/);
+});
+
+it("no note on the catch-up's block of a registered thread whose facts may be older than Discord's, though the push names it", { timeout: 5000 }, async (t) => {
+  t.mock.method(console, 'error', () => {});
+  const f = fixture(t);
+  watermarkFile(t);
+  f.server.registerGuildDelivery(G, TH);
+  f.server.forwardedWatermark.set(TH, '100');
+  (f.adapter as any).stale.set(TH, { guildId: G });
+  f.adapter.fetchHistory = async () => [
+    { id: '200', content: 'hi', cleanContent: 'hi', authorId: U, authorName: 'Bob', timestamp: new Date(T), mentionsBot: true, attachments: [] },
+  ] as any;
+  // The catch-up looks a stale thread up first; this lookup fails, so it stays stale.
+  t.mock.method(f.client.rest, 'get', async () => { throw new Error('Service Unavailable'); });
+  await f.server.runReconnectSweep();
+  const push = f.pushes()[0];
+  assert.equal(push.params.origin.mcplChannelId, threadMcplId, 'registered before, it is named');
+  assert.ok((push.params.payload.content[0].text as string).startsWith('<missed '), push.params.payload.content[0].text);
 });
