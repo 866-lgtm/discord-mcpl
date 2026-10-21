@@ -216,6 +216,40 @@ export const hostCount = (v: unknown): number | undefined => (Number.isInteger(v
 
 const isObj = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
 
+/** A message a hide's answer names as hidden. */
+export interface HiddenRef { channelId: string; messageId: string }
+
+/**
+ * A hide's `hiddenRefs`, read whole: absent means none named, and a value
+ * that isn't a list, or a list with any entry that isn't a message
+ * reference, is unreadable, so nothing is marked from it.
+ */
+export function readHiddenRefs(v: unknown): HiddenRef[] | 'unreadable' {
+  if (v === undefined || v === null) return [];
+  if (!Array.isArray(v)) return 'unreadable';
+  return v.every((r: unknown) => isObj(r) && isStr(r.channelId) && isStr(r.messageId)) ? (v as HiddenRef[]) : 'unreadable';
+}
+
+/** Where a /hide's own 💤 stand against /marks. */
+const HIDE_MARKS_OWN = "They're this server's own, outside the host's awareness ledger: `/marks` doesn't list them, " +
+  'and a retract reaches one only where a batch marked the same message.';
+
+/** A chosen /hide's marks line when there's nothing to mark, or while they're being added. */
+export function hideMarksAt(refs: HiddenRef[] | 'unreadable'): string {
+  if (refs === 'unreadable') return "Marks: the host's list of hidden messages couldn't be read, so none was marked with 💤.";
+  if (refs.length === 0) return 'Marks: the host named no hidden messages, so none was marked with 💤.';
+  return `Marks: adding 💤 to ${plural(refs.length, 'hidden message')}…`;
+}
+
+/** A chosen /hide's marks line once its reactions have settled: what Discord confirmed. */
+export function describeHideMarks(confirmed: number, total: number, firstError?: string): string {
+  const rest = firstError === undefined ? '' : ` The rest weren't confirmed (first error: ${clip(firstError, SHORT_TEXT_MAX)}).`;
+  return `Marks: Discord confirmed 💤 on ${confirmed} of ${plural(total, 'hidden message')}.${rest} ${HIDE_MARKS_OWN}`;
+}
+
+/** A chosen /hide whose answer didn't arrive or couldn't be read. */
+export const HIDE_MARKS_NOT_ADDED = "Marks: no 💤 was added, since this server adds them only once it has read the host's answer.";
+
 /**
  * Cut text to `max` UTF-16 units (its `length`), marking the cut. The cut
  * falls between code points, so it never leaves half of a surrogate pair,
@@ -268,7 +302,7 @@ const STATES = 'States: queued, a request owed and not yet sent; sending, on the
 export function detailText(v: AwarenessView): string {
   const lines: string[] = [];
   if (v.kind === 'retract') {
-    lines.push(`**Retract \`${v.id}\`** of ${v.target === 'all' ? 'every marked message' : `batch \`${v.target}\``}, ${when(v.at)}${v.by ? ` by ${v.by}` : ''}.`);
+    lines.push(`**Retract \`${v.id}\`** of ${v.target === 'all' ? 'every message in the ledger' : `batch \`${v.target}\``}, ${when(v.at)}${v.by ? ` by ${v.by}` : ''}.`);
     if (v.cancelled) lines.push(`Cancelled ${when(v.cancelled.at)}${v.cancelled.by ? ` by ${v.cancelled.by}` : ''}.`);
     lines.push(`${plural(v.keys, 'removal')} queued. The reactions it still wants absent: ${counts(v.reactions)}.`);
     if (v.mayStillLand) lines.push(`${plural(v.mayStillLand, 'reaction')} with a request on the wire or one never answered — any may land.`);
@@ -285,7 +319,7 @@ export function detailText(v: AwarenessView): string {
     if (v.mayStillLand) lines.push(`${plural(v.mayStillLand, 'reaction')} with a request on the wire or one never answered — any may land.`);
     if (isNum(v.legacyAdded)) {
       lines.push(`Imported from agent-framework 0.22.x, which recorded ${plural(v.legacyAdded, 'mark')} on these messages as added. ` +
-        `Marks it placed may still be on Discord: \`/marks action:retract target:${v.id}\` takes them down.`);
+        `Marks it placed may still be on Discord: \`/marks action:retract target:${v.id}\` queues their removal.`);
     }
   }
   lines.push(STATES);
@@ -419,12 +453,20 @@ export function describeCancel(r: CancelReceipt): string {
   lines.push(`Cancel removes nothing from Discord${limits.length ? `: ${limits.join('; ')}.` : '.'}`);
   // Every batch's: its receipt can't see marks an import brought, or marks
   // another batch placed on the same messages, which a retract takes off too.
-  if (r.kind === 'batch') lines.push(`If any of its marks are on Discord, \`/marks action:retract target:${r.target}\` takes them down.`);
+  if (r.kind === 'batch') lines.push(retractPointer(r.target));
   return lines.join('\n');
 }
 
+/** A batch cancel's pointer for the marks its receipt can't see. */
+const retractPointer = (batchId: string): string =>
+  `If any of its marks are on Discord, \`/marks action:retract target:${batchId}\` queues their removal.`;
+
+/** A retract whose target names no message: nothing to remove. */
+const nothingToRetract = (requestId: string): string => `✅ Retract \`${requestId}\` queued no removal: its target names no message.`;
+
 /** retract's reply: removals requested, and adds that may land after them. */
 export function describeRetract(r: RetractReceipt): string {
+  if (r.removalsQueued === 0) return nothingToRetract(r.requestId);
   const superseded = r.addsSuperseded ? `; ${plural(r.addsSuperseded, 'unsent add')} superseded` : '';
   const lines = [
     `✅ Retract \`${r.requestId}\`: ${plural(r.removalsQueued, '💤 removal')} requested — not yet confirmed on Discord${superseded}.`,
@@ -469,9 +511,11 @@ export function summarizeControl(action: string, target: string | undefined, ans
     // The short account keeps what cancel couldn't stop: requests that may
     // still land, or may already have landed.
     return `✅ Cancelled ${answer.kind} \`${answer.target}\`: ${stopped(answer.cancelled, 'will never be requested')}; ` +
-      `cancel removes nothing from Discord${answer.mayStillLand ? `: ${mayLand(answer.mayStillLand)}` : ''}.`;
+      `cancel removes nothing from Discord${answer.mayStillLand ? `: ${mayLand(answer.mayStillLand)}` : ''}.` +
+      (answer.kind === 'batch' ? ` ${retractPointer(answer.target)}` : '');
   }
   if (action === 'retract' && isRetractReceipt(answer)) {
+    if (answer.removalsQueued === 0) return nothingToRetract(answer.requestId);
     // Like cancel's, it keeps what may still change Discord after it: an
     // earlier add that may land after its removal.
     const after = !answer.keysWithUnresolvedAdds
@@ -490,11 +534,16 @@ export function summarizeControl(action: string, target: string | undefined, ans
  */
 export function controlOutcomeUnknown(action: string, target: string | undefined, error?: string): string {
   const effect = action === 'cancel' ? 'already have cancelled it' : 'already have queued the removals';
-  return `⚠️ /marks action:${action} outcome unknown${error ? ` (${error})` : ''}: the host may ${effect}. ${controlCheck(target)}`;
+  return `⚠️ /marks action:${action} outcome unknown${error ? ` (${error})` : ''}: the host may ${effect}. ${controlCheck(action, target)}`;
 }
 
-const controlCheck = (target: string | undefined): string =>
-  `Check ${target && target !== 'all' ? `\`/marks action:list target:${target}\`` : '`/marks action:list`'} before trying again.`;
+/** Before retrying a control that may have been applied: a cancel shows on
+ *  its target's entry, and a retract the host queued is an entry of its own,
+ *  with an id the operator doesn't have yet, listed first. */
+const controlCheck = (action: string, target: string | undefined): string =>
+  action === 'cancel' && target && target !== 'all'
+    ? `Check \`/marks action:list target:${target}\` before trying again.`
+    : 'Check `/marks action:list` before trying again: a retract it queued is listed first.';
 
 /**
  * After a probe whose request failed: what can make running the command
@@ -533,7 +582,7 @@ export function unreadableSurgery(command: 'undo' | 'hide', answer: unknown, mar
 /** A /marks control's answer without a boolean `ok`, as unreadableSurgery. */
 export function unreadableControl(action: string, target: string | undefined, answer: unknown): string {
   return `⚠️ The host answered /marks action:${action} in a shape this server can't read, so it may have been applied; ` +
-    `here it is as sent:\n${asSent(answer)}\n${controlCheck(target)}`;
+    `here it is as sent:\n${asSent(answer)}\n${controlCheck(action, target)}`;
 }
 
 /** The host's refusal (`ok: false`) of a command, with its code when it gave one. */

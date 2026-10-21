@@ -63,13 +63,17 @@ import {
   describeMarkers,
   describeRetract,
   hostCount,
+  describeHideMarks,
+  HIDE_MARKS_NOT_ADDED,
   HIDE_MARKS_OPTION,
+  hideMarksAt,
   hostRefusal,
   isCancelReceipt,
   isRetractReceipt,
   isView,
   MARKS_OPTION,
   PROBE_AGAIN,
+  readHiddenRefs,
   readMarksChoice,
   renderEntry,
   renderListPage,
@@ -80,6 +84,7 @@ import {
   unreadableControl,
   unreadableSurgery,
   type BoundedReply,
+  type HiddenRef,
 } from './awareness-marks.js';
 import { toolDefinitions } from './tools.js';
 import { withToolClasses } from './tool-classes.js';
@@ -587,7 +592,6 @@ export function parseHostCoalescing(
 
 export class DiscordMcplServer {
   private conn: McplConnection | null = null;
-
   // Note: the location-header transition tracker and the sticky-reply
   // channel are the same thing — both want to know "where did
   // communication last happen, in either direction." Tracked in
@@ -1386,8 +1390,8 @@ export class DiscordMcplServer {
       dbg('slash:hide-failed', { error: errorText(err) });
       await this.acknowledge(
         interaction,
-        boundedReply(surgeryOutcomeUnknown('Hide', false, errorText(err))),
-        surgeryOutcomeUnknown('Hide', false),
+        boundedReply(surgeryOutcomeUnknown('Hide', false, errorText(err)) + (marking ? `\n${HIDE_MARKS_NOT_ADDED}` : '')),
+        surgeryOutcomeUnknown('Hide', false) + (marking ? ` ${HIDE_MARKS_NOT_ADDED}` : ''),
       );
       return;
     }
@@ -1402,58 +1406,58 @@ export class DiscordMcplServer {
     if (answer.ok !== true) {
       await this.acknowledge(
         interaction,
-        boundedReply(unreadableSurgery('hide', result, false), result),
-        surgeryOutcomeUnknown('Hide', false),
+        boundedReply(unreadableSurgery('hide', result, false) + (marking ? `\n${HIDE_MARKS_NOT_ADDED}` : ''), result),
+        surgeryOutcomeUnknown('Hide', false) + (marking ? ` ${HIDE_MARKS_NOT_ADDED}` : ''),
       );
       return;
     }
 
-    // The hide is applied, so a reply always goes out: each field is read
-    // only once its type is checked, and a reply that can't be shown never
-    // reads as the hide's failure.
-    const marks = marking ? await this.markHidden(answer.hiddenRefs) : undefined;
+    // The hide is applied, so a reply always goes out, and at once: the 💤
+    // follow, and the reply is edited with what Discord confirmed. Each field
+    // is read only once its type is checked, and a reply that can't be shown
+    // never reads as the hide's failure.
     const n = hostCount(answer.hidden);
-    const lines = [
+    const reply = (marks: string | undefined): string => [
       n === undefined
         ? "🙈 Hide applied (redacted in place); the number of messages removed from the agent's context was not given."
         : `🙈 Removed **${n}** message${n === 1 ? '' : 's'} from the agent's context (redacted in place).`,
       ...(marks ? [marks] : []),
       ...lastVisibleLines(answer.lastVisible),
-    ];
-    await this.acknowledge(
-      interaction,
-      boundedReply(lines.join('\n'), result),
+    ].join('\n');
+    const short = (marks: string | undefined): string =>
       `🙈 Hide applied: ${n === undefined ? 'the number of messages removed was not given' : `removed ${n} message${n === 1 ? '' : 's'} from the agent's context`}.` +
-        (marks ? ` ${marks}` : ''),
-    );
+        (marks ? ` ${marks}` : '');
+    const refs = marking ? readHiddenRefs(answer.hiddenRefs) : undefined;
+    const first = refs === undefined ? undefined : hideMarksAt(refs);
+    await this.acknowledge(interaction, boundedReply(reply(first), result), short(first));
+    if (!Array.isArray(refs) || refs.length === 0) return;
+    const marks = await this.markHidden(refs);
+    await this.acknowledge(interaction, boundedReply(reply(marks), result), short(marks));
   }
 
   /**
    * A chosen /hide's 💤, added by this server to each message the host says
    * it hid, as every /hide did before the choice. Best-effort and in
    * parallel: discord.js's REST queue sends one channel's reaction requests
-   * one at a time, within Discord's limits. The marks are outside the
-   * host's awareness ledger, which is why the reply says `/marks` can't take
-   * them back.
+   * one at a time, within Discord's limits. Only what Discord confirmed is
+   * counted, since a request that failed may still have landed. The marks
+   * are outside the host's awareness ledger, which the line says.
    */
-  private async markHidden(hiddenRefs: unknown): Promise<string> {
-    if (!Array.isArray(hiddenRefs)) {
-      return 'Marks: the host named no hidden messages, so none was marked with 💤.';
-    }
-    let added = 0;
-    await Promise.all(hiddenRefs.map(async (ref: unknown) => {
-      if (!isJsonObject(ref) || typeof ref.channelId !== 'string' || typeof ref.messageId !== 'string') return;
+  private async markHidden(refs: HiddenRef[]): Promise<string> {
+    let confirmed = 0;
+    let firstError: string | undefined;
+    await Promise.all(refs.map(async (ref) => {
       // channelId may be raw or the "discord:guild:channel" composite.
       const parsed = parseMcplChannelId(ref.channelId);
       try {
         await this.discord.addReaction(parsed ? parsed.channelId : ref.channelId, ref.messageId, '💤');
-        added++;
+        confirmed++;
       } catch (err) {
+        firstError ??= errorText(err);
         dbg('slash:hide-react-failed', { messageId: ref.messageId, error: errorText(err) });
       }
     }));
-    return `Marks: 💤 added to ${added} of ${hiddenRefs.length} hidden message${hiddenRefs.length === 1 ? '' : 's'}. ` +
-      "They're this server's own, outside the host's awareness ledger, so `/marks` doesn't list, cancel or retract them.";
+    return describeHideMarks(confirmed, refs.length, firstError);
   }
 
   /**

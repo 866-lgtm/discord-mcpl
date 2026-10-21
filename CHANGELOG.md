@@ -109,9 +109,11 @@ in the git log and PR descriptions.
     reply says what it scheduled: requested, not yet confirmed on Discord.
   - `/hide` takes `marks: none` (the default) or `all`. Its 💤 is this server's
     own, as before: with `all`, it's added to each message the host says it
-    hid, on any host, and the reply counts them and says that `/marks` doesn't
-    list, cancel or retract them, since they're outside the host's ledger. The
-    host places no marks for a hide.
+    hid, on any host. The reply goes out as soon as the hide is applied and is
+    edited once the 💤 have settled, with how many Discord confirmed. It says
+    they're outside the host's ledger: `/marks` doesn't list them, and a
+    retract reaches one only where a batch marked the same message. The host
+    places no marks for a hide.
   - A new admin command, `/marks action:list [target:<id>] [page:<n>]` and
     `/marks action:cancel|retract target:<id>`, shows the host's awareness
     ledger and acts on it, ephemerally:
@@ -130,9 +132,9 @@ in the git log and PR descriptions.
     - A reply too long for one message is cut visibly, with what it shows
       attached in full: the host's answer, or for `action:list target:` the
       entry. An answer in a shape this server can't read is shown as sent.
-      Only the host's `ok: false` reads as a failure: any other answer to
-      `/undo`, `/hide` or a `/marks` control is shown with a warning that it
-      may have been applied.
+      Only the host's `ok: false` reads as a failure: an answer to `/undo`,
+      `/hide` or a `/marks` control without a boolean `ok` is shown as sent,
+      with a warning that it may have been applied.
 
   To learn which kind of host it has, `/undo` and `/marks` ask with a `marks`
   request that names no action, which the host answers without reading its

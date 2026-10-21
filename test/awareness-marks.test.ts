@@ -21,6 +21,7 @@ import {
   boundedReply,
   clip,
   describeMarkers,
+  describeRetract,
   detailText,
   isView,
   paginate,
@@ -39,7 +40,7 @@ const isProbe = (p: Sent): boolean => p.command === 'marks' && p.action === unde
  *  with host/command answers a verb it lacks. */
 const VERB_ANSWER = { ok: false, error: 'marks needs action list, cancel or retract' };
 const NO_VERB_ANSWER = { ok: false, error: 'Unknown host command: marks' };
-/** What a refusal after a failed probe ends with, at /undo, /hide and /marks. */
+/** What a refusal after a failed probe ends with, at /undo and /marks. */
 const PROBE_AGAIN = 'Running it again can work after a timeout, or once the host is back if it was restarting. ' +
   'If the host refuses host commands, whoever runs it has to allow them for this server (`allowHostCommands`).';
 
@@ -66,11 +67,16 @@ function host(opts: {
 
 /** A server over `conn`, recording the reactions it places itself, which only
  *  a /hide with marks chosen does. `refuse` names messages whose reaction
- *  Discord refuses. */
-function serverWith(conn: unknown, refuse: string[] = []) {
+ *  Discord refuses; `hold` keeps every reaction waiting until its gate opens,
+ *  calling `onCall` as each one starts. */
+function serverWith(conn: unknown, refuse: string[] = [], hold?: { gate: Promise<void>; onCall: () => void }) {
   const reactions: Array<{ channelId: string; messageId: string; emoji: string }> = [];
   const discord = {
     addReaction: async (channelId: string, messageId: string, emoji: string) => {
+      if (hold) {
+        hold.onCall();
+        await hold.gate;
+      }
       if (refuse.includes(messageId)) throw new Error('Unknown Message');
       reactions.push({ channelId, messageId, emoji });
     },
@@ -84,10 +90,16 @@ function serverWith(conn: unknown, refuse: string[] = []) {
 }
 
 /** A slash interaction from an admin, recording what it was answered.
- *  `rejectEdits` refuses that many edits first, as Discord does once an
- *  interaction has expired. */
-function interaction(commandName: string, options: Record<string, string | number | undefined>, opts: { rejectEdits?: number } = {}) {
+ *  `rejectEdits` refuses that many edits first, standing for any refusal of
+ *  a full reply; `acceptEdits` accepts that many and refuses every one after,
+ *  as Discord does once an interaction has expired. */
+function interaction(
+  commandName: string,
+  options: Record<string, string | number | undefined>,
+  opts: { rejectEdits?: number; acceptEdits?: number } = {},
+) {
   let toReject = opts.rejectEdits ?? 0;
+  let toAccept = opts.acceptEdits ?? Infinity;
   const out: { replies: string[]; files: Array<{ attachment: Buffer; name: string }[]>; deferred?: unknown; ephemeral: boolean[] } = {
     replies: [],
     files: [],
@@ -111,10 +123,11 @@ function interaction(commandName: string, options: Record<string, string | numbe
       editReply: async (o: string | { content: string; files: Array<{ attachment: Buffer; name: string }> }) => {
         const content = typeof o === 'string' ? o : o.content;
         // Discord refuses a reply over its limit; a test can also refuse edits outright.
-        if (toReject > 0 || content.length > REPLY_LIMIT) {
+        if (toReject > 0 || toAccept <= 0 || content.length > REPLY_LIMIT) {
           if (toReject > 0) toReject--;
           throw new Error(content.length > REPLY_LIMIT ? 'Invalid Form Body: content too long' : 'Unknown interaction');
         }
+        toAccept--;
         if (typeof o === 'string') out.replies.push(o);
         else { out.replies.push(o.content); out.files.push(o.files); }
       },
@@ -369,9 +382,8 @@ describe('replies stay within one message, and never misreport an applied surger
     assert.equal(hd.out.replies.at(-1), "🙈 Hide applied: removed 1 message from the agent's context. (The full reply couldn't be shown: Unknown interaction.)");
     const marked = interaction('hide', { message: '111111111111111111', marks: 'all' }, { rejectEdits: 1 });
     await asAdmin(() => server.handleSlashCommand(marked.value));
-    assert.equal(marked.out.replies.at(-1), "🙈 Hide applied: removed 1 message from the agent's context. Marks: 💤 added to 0 of 0 hidden messages. " +
-      "They're this server's own, outside the host's awareness ledger, so `/marks` doesn't list, cancel or retract them. " +
-      "(The full reply couldn't be shown: Unknown interaction.)");
+    assert.equal(marked.out.replies.at(-1), "🙈 Hide applied: removed 1 message from the agent's context. " +
+      "Marks: the host named no hidden messages, so none was marked with 💤. (The full reply couldn't be shown: Unknown interaction.)");
   });
 
   it("names an applied undo's marks in its short account: the batch it scheduled", async () => {
@@ -415,26 +427,31 @@ describe('replies stay within one message, and never misreport an applied surger
       },
     });
     const ledger = ', and `/marks action:list` for a 💤 batch it may have scheduled,';
-    const cases: Array<['yes' | 'no', string, Record<string, string>, boolean]> = [
-      ['yes', 'undo', {}, false],
-      ['yes', 'undo', { marks: 'none' }, false],
-      ['yes', 'undo', { marks: 'addressed' }, true],
+    const notAdded = "Marks: no 💤 was added, since this server adds them only once it has read the host's answer.";
+    // [marksVerb, command, options, the ledger pointer, the line that no 💤 was added]
+    const cases: Array<['yes' | 'no', string, Record<string, string>, boolean, boolean]> = [
+      ['yes', 'undo', {}, false, false],
+      ['yes', 'undo', { marks: 'none' }, false, false],
+      ['yes', 'undo', { marks: 'addressed' }, true, false],
       // A hide's marks are this server's own, added only after the host's answer, so no batch.
-      ['yes', 'hide', { message: '111111111111111111', marks: 'all' }, false],
-      ['yes', 'hide', { message: '111111111111111111' }, false],
-      ['no', 'hide', { message: '111111111111111111' }, false],
+      ['yes', 'hide', { message: '111111111111111111', marks: 'all' }, false, true],
+      ['no', 'hide', { message: '111111111111111111', marks: 'all' }, false, true],
+      ['yes', 'hide', { message: '111111111111111111' }, false, false],
+      ['no', 'hide', { message: '111111111111111111', marks: 'none' }, false, false],
     ];
-    for (const [marksVerb, name, options, pointer] of cases) {
+    for (const [marksVerb, name, options, pointer, marked] of cases) {
       const command = name === 'undo' ? 'Undo' : 'Hide';
       const check = `Check the agent's context${pointer ? ledger : ''} before trying again.`;
       const { server } = serverWith(failing(marksVerb));
       const i = interaction(name, options);
       await asAdmin(() => server.handleSlashCommand(i.value));
       const what = `${marksVerb} ${name} ${JSON.stringify(options)}`;
-      assert.equal(i.out.replies.at(-1), `⚠️ ${command} outcome unknown (request timed out): the host may or may not have applied it. ${check}`, what);
+      assert.equal(i.out.replies.at(-1), `⚠️ ${command} outcome unknown (request timed out): the host may or may not have applied it. ${check}` +
+        (marked ? `\n${notAdded}` : ''), what);
       const refused = interaction(name, options, { rejectEdits: 1 });
       await asAdmin(() => server.handleSlashCommand(refused.value));
-      assert.equal(refused.out.replies.at(-1), `⚠️ ${command} outcome unknown: the host may or may not have applied it. ${check} (The full reply couldn't be shown: Unknown interaction.)`, what);
+      assert.equal(refused.out.replies.at(-1), `⚠️ ${command} outcome unknown: the host may or may not have applied it. ${check}` +
+        `${marked ? ` ${notAdded}` : ''} (The full reply couldn't be shown: Unknown interaction.)`, what);
     }
   });
 
@@ -474,7 +491,7 @@ describe('replies stay within one message, and never misreport an applied surger
     const cases: Array<[string, Record<string, string>, string]> = [
       ['undo', {}, "⚠️ Undo outcome unknown: the host may or may not have applied it. Check the agent's context before trying again."],
       ['hide', { message: '111111111111111111' }, "⚠️ Hide outcome unknown: the host may or may not have applied it. Check the agent's context before trying again."],
-      ['marks', { action: 'retract', target: 'b-1' }, '⚠️ /marks action:retract outcome unknown: the host may already have queued the removals. Check `/marks action:list target:b-1` before trying again.'],
+      ['marks', { action: 'retract', target: 'b-1' }, '⚠️ /marks action:retract outcome unknown: the host may already have queued the removals. Check `/marks action:list` before trying again: a retract it queued is listed first.'],
       ['marks', { action: 'cancel', target: 'r-1' }, '⚠️ /marks action:cancel outcome unknown: the host may already have cancelled it. Check `/marks action:list target:r-1` before trying again.'],
     ];
     for (const [name, options, outcome] of cases) {
@@ -493,10 +510,12 @@ describe('an answer only `ok: false` makes a failure', () => {
       const cases: Array<[string, Record<string, string>, string]> = [
         ['undo', { marks: 'all' }, "Check the agent's context, and `/marks action:list` for a 💤 batch it may have scheduled, before trying again."],
         ['hide', { message: '111111111111111111' }, "Check the agent's context before trying again."],
-        ['marks', { action: 'retract', target: 'b-1' }, 'Check `/marks action:list target:b-1` before trying again.'],
+        ['hide', { message: '111111111111111111', marks: 'all' }, "Check the agent's context before trying again.\nMarks: no 💤 was added, since this server adds them only once it has read the host's answer."],
+        ['marks', { action: 'retract', target: 'b-1' }, 'Check `/marks action:list` before trying again: a retract it queued is listed first.'],
+        ['marks', { action: 'cancel', target: 'b-1' }, 'Check `/marks action:list target:b-1` before trying again.'],
       ];
       for (const [name, options, check] of cases) {
-        const shown = name === 'marks' ? '/marks action:retract' : `/${name}`;
+        const shown = name === 'marks' ? `/marks action:${options.action}` : `/${name}`;
         const i = interaction(name, options);
         await asAdmin(() => server.handleSlashCommand(i.value));
         assert.equal(
@@ -562,9 +581,11 @@ describe('an answer only `ok: false` makes a failure', () => {
 describe('/hide and its 💤', () => {
   const hidden = [{ channelId: 'discord:g1:c1', messageId: 'm1' }, { channelId: 'c1', messageId: 'm2' }];
   const hiding = (answer: Sent, marksVerb: 'yes' | 'no' = 'yes') => host({ marksVerb, answer: (p) => (p.command === 'hide' ? answer : { ok: true }) });
-  const ledger = "They're this server's own, outside the host's awareness ledger, so `/marks` doesn't list, cancel or retract them.";
+  const own = "They're this server's own, outside the host's awareness ledger: `/marks` doesn't list them, " +
+    'and a retract reaches one only where a batch marked the same message.';
+  const removed = (n: number) => `🙈 Removed **${n}** message${n === 1 ? '' : 's'} from the agent's context (redacted in place).`;
 
-  it("adds 💤 itself to each hidden message when all is chosen, on any host, and says /marks can't take them back", async () => {
+  it("adds 💤 itself to each hidden message when all is chosen, on any host, and says where /marks reaches them", async () => {
     for (const marksVerb of ['yes', 'no'] as const) {
       const h = hiding({ ok: true, hidden: 2, hiddenRefs: hidden }, marksVerb);
       const { server, reactions } = serverWith(h.conn);
@@ -573,8 +594,41 @@ describe('/hide and its 💤', () => {
       assert.equal('marks' in h.commands()[0]!, false, marksVerb);
       // The composite channel id is read as its channel.
       assert.deepEqual(reactions, [{ channelId: 'c1', messageId: 'm1', emoji: '💤' }, { channelId: 'c1', messageId: 'm2', emoji: '💤' }], marksVerb);
-      assert.equal(i.out.replies.at(-1), `🙈 Removed **2** messages from the agent's context (redacted in place).\nMarks: 💤 added to 2 of 2 hidden messages. ${ledger}`, marksVerb);
+      assert.deepEqual(i.out.replies, [
+        `${removed(2)}\nMarks: adding 💤 to 2 hidden messages…`,
+        `${removed(2)}\nMarks: Discord confirmed 💤 on 2 of 2 hidden messages. ${own}`,
+      ], marksVerb);
     }
+  });
+
+  it('replies as soon as the hide is applied, before any 💤 settles, then edits in what Discord confirmed', async () => {
+    let open!: () => void;
+    const gate = new Promise<void>((resolve) => { open = resolve; });
+    let started!: () => void;
+    const first = new Promise<void>((resolve) => { started = resolve; });
+    const h = hiding({ ok: true, hidden: 2, hiddenRefs: hidden });
+    const { server, reactions } = serverWith(h.conn, [], { gate, onCall: () => started() });
+    const i = interaction('hide', { message: '111111111111111111', marks: 'all' });
+    const done = asAdmin(() => server.handleSlashCommand(i.value));
+    await first;
+    assert.deepEqual(i.out.replies, [`${removed(2)}\nMarks: adding 💤 to 2 hidden messages…`]);
+    assert.deepEqual(reactions, []);
+    open();
+    await done;
+    assert.equal(i.out.replies.at(-1), `${removed(2)}\nMarks: Discord confirmed 💤 on 2 of 2 hidden messages. ${own}`);
+  });
+
+  it('keeps what Discord confirmed on stderr when the edit that would show it is refused', async (t) => {
+    const logged = t.mock.method(console, 'error', () => undefined);
+    const h = hiding({ ok: true, hidden: 2, hiddenRefs: hidden });
+    const { server } = serverWith(h.conn);
+    const i = interaction('hide', { message: '111111111111111111', marks: 'all' }, { acceptEdits: 1 });
+    await asAdmin(() => server.handleSlashCommand(i.value));
+    assert.deepEqual(i.out.replies, [`${removed(2)}\nMarks: adding 💤 to 2 hidden messages…`]);
+    assert.deepEqual(logged.mock.calls.map((c) => c.arguments.join(' ')), [
+      "[discord-mcpl] /hide: Discord refused its reply twice (Unknown interaction), so the operator wasn't told: " +
+        `🙈 Hide applied: removed 2 messages from the agent's context. Marks: Discord confirmed 💤 on 2 of 2 hidden messages. ${own}`,
+    ]);
   });
 
   it('places no 💤 and says nothing of marks when none is chosen or the option is left out', async () => {
@@ -584,38 +638,64 @@ describe('/hide and its 💤', () => {
       const i = interaction('hide', { message: '111111111111111111', marks });
       await asAdmin(() => server.handleSlashCommand(i.value));
       assert.deepEqual(reactions, [], String(marks));
-      assert.equal(i.out.replies.at(-1), "🙈 Removed **2** messages from the agent's context (redacted in place).", String(marks));
+      assert.deepEqual(i.out.replies, [removed(2)], String(marks));
     }
   });
 
-  it('counts only the 💤 Discord took, skipping an entry that names no message', async () => {
-    const h = hiding({ ok: true, hidden: 3, hiddenRefs: [...hidden, { channelId: 7 }] });
+  it("counts only what Discord confirmed, naming the first error, since a failed request may still have landed", async () => {
+    const h = hiding({ ok: true, hidden: 2, hiddenRefs: hidden });
     const { server, reactions } = serverWith(h.conn, ['m2']);
     const i = interaction('hide', { message: '111111111111111111', marks: 'all' });
     await asAdmin(() => server.handleSlashCommand(i.value));
     assert.deepEqual(reactions.map((r) => r.messageId), ['m1']);
-    assert.equal(i.out.replies.at(-1), `🙈 Removed **3** messages from the agent's context (redacted in place).\nMarks: 💤 added to 1 of 3 hidden messages. ${ledger}`);
+    assert.equal(i.out.replies.at(-1), `${removed(2)}\nMarks: Discord confirmed 💤 on 1 of 2 hidden messages. ` +
+      `The rest weren't confirmed (first error: Unknown Message). ${own}`);
   });
 
   it('says none was marked when the host named no hidden messages', async () => {
-    for (const hiddenRefs of [undefined, 'm1', { channelId: 'c1', messageId: 'm1' }]) {
+    for (const hiddenRefs of [undefined, null, []]) {
       const h = hiding({ ok: true, hidden: 1, hiddenRefs });
       const { server, reactions } = serverWith(h.conn);
       const i = interaction('hide', { message: '111111111111111111', marks: 'all' });
       await asAdmin(() => server.handleSlashCommand(i.value));
       assert.deepEqual(reactions, [], JSON.stringify(hiddenRefs));
-      assert.equal(i.out.replies.at(-1), "🙈 Removed **1** message from the agent's context (redacted in place).\nMarks: the host named no hidden messages, so none was marked with 💤.", JSON.stringify(hiddenRefs));
+      assert.deepEqual(i.out.replies, [`${removed(1)}\nMarks: the host named no hidden messages, so none was marked with 💤.`], JSON.stringify(hiddenRefs));
     }
   });
 
-  it("marks nothing when the host refuses the hide, or answers in a shape it can't read", async () => {
-    for (const answer of [{ ok: false, error: 'no such message' }, { hidden: 2, hiddenRefs: hidden }]) {
-      const h = hiding(answer as Sent);
+  it("marks nothing from a list of hidden messages it can't read whole: one that isn't a list, or any entry that isn't a message", async () => {
+    const lists: unknown[] = [
+      'm1',
+      { channelId: 'c1', messageId: 'm1' },
+      [...hidden, { channelId: 'c1' }],
+      [...hidden, { channelId: 7, messageId: 'm3' }],
+      [...hidden, { channelId: 'c1', messageId: 3 }],
+      [...hidden, null],
+      [...hidden, 'm3'],
+    ];
+    for (const hiddenRefs of lists) {
+      const h = hiding({ ok: true, hidden: 3, hiddenRefs });
       const { server, reactions } = serverWith(h.conn);
       const i = interaction('hide', { message: '111111111111111111', marks: 'all' });
       await asAdmin(() => server.handleSlashCommand(i.value));
-      assert.deepEqual(reactions, [], JSON.stringify(answer));
+      assert.deepEqual(reactions, [], JSON.stringify(hiddenRefs));
+      assert.deepEqual(i.out.replies, [`${removed(3)}\nMarks: the host's list of hidden messages couldn't be read, so none was marked with 💤.`],
+        JSON.stringify(hiddenRefs));
     }
+  });
+
+  it("marks nothing when the host refuses the hide, even one naming messages, or answers in a shape it can't read", async () => {
+    const refused = hiding({ ok: false, error: 'no such message', hiddenRefs: hidden } as Sent);
+    const a = serverWith(refused.conn);
+    const ia = interaction('hide', { message: '111111111111111111', marks: 'all' });
+    await asAdmin(() => a.server.handleSlashCommand(ia.value));
+    assert.deepEqual(a.reactions, []);
+    assert.deepEqual(ia.out.replies, ['⚠️ Hide failed: no such message']);
+    const odd = hiding({ hidden: 2, hiddenRefs: hidden } as Sent);
+    const b = serverWith(odd.conn);
+    const ib = interaction('hide', { message: '111111111111111111', marks: 'all' });
+    await asAdmin(() => b.server.handleSlashCommand(ib.value));
+    assert.deepEqual(b.reactions, []);
   });
 });
 
@@ -791,7 +871,7 @@ describe('/marks', () => {
     const reply = i.out.replies.at(-1)!;
     assert.match(reply, /Cancelled batch `batch-1`: 2 reactions will now never be requested\./);
     assert.match(reply, /\nCancel removes nothing from Discord: 2 reactions with a request on the wire or one never answered may land\.\n/);
-    assert.match(reply, /\nIf any of its marks are on Discord, `\/marks action:retract target:batch-1` takes them down\.$/);
+    assert.match(reply, /\nIf any of its marks are on Discord, `\/marks action:retract target:batch-1` queues their removal\.$/);
   });
 
   it("points every batch cancel to retract, an imported batch's all-zero receipt included, and never a retract's cancel", async () => {
@@ -810,7 +890,7 @@ describe('/marks', () => {
     assert.equal(
       await replyTo(imported),
       '✅ Cancelled batch `dd34b043`: nothing it asked for was still waiting to be sent.\nCancel removes nothing from Discord.\n' +
-        'If any of its marks are on Discord, `/marks action:retract target:dd34b043` takes them down.',
+        'If any of its marks are on Discord, `/marks action:retract target:dd34b043` queues their removal.',
     );
     assert.equal(
       await replyTo(retractCancel),
@@ -831,7 +911,7 @@ describe('/marks', () => {
       i.out.replies.at(-1),
       '✅ Cancelled batch `batch-2`: nothing it asked for was still waiting to be sent.\n' +
         'Cancel removes nothing from Discord: 3 already confirmed on Discord stay as they are.\n' +
-        'If any of its marks are on Discord, `/marks action:retract target:batch-2` takes them down.',
+        'If any of its marks are on Discord, `/marks action:retract target:batch-2` queues their removal.',
     );
   });
 
@@ -906,7 +986,7 @@ describe('/marks', () => {
       await replyTo({ action: 'cancel', target: a }),
       `✅ Cancelled batch \`${a}\`: 1 reaction will now never be requested.\n` +
         'Cancel removes nothing from Discord: 1 already confirmed on Discord stays as it is; 1 reaction with a request on the wire or one ' +
-        `never answered may land.\nIf any of its marks are on Discord, \`/marks action:retract target:${a}\` takes them down.`,
+        `never answered may land.\nIf any of its marks are on Discord, \`/marks action:retract target:${a}\` queues their removal.`,
     );
     const r = AF250.retract.requestId;
     assert.equal(
@@ -933,7 +1013,11 @@ describe('/marks', () => {
     assert.match(list, /\n• batch `b897e6cb-25af-4485-8f94-0c8e39d4f23a` — active, cancelled, all, 3 messages \(cairn\): reactions queued 3; 1 may still land\n/);
     assert.match(
       await replyTo({ action: 'list', target: 'dd34b043' }),
-      /\nIts messages' reactions: queued 3\.\nImported from agent-framework 0\.22\.x, which recorded 1 mark on these messages as added\. Marks it placed may still be on Discord: `\/marks action:retract target:dd34b043` takes them down\.\nStates: queued, /,
+      /\nIts messages' reactions: queued 3\.\nImported from agent-framework 0\.22\.x, which recorded 1 mark on these messages as added\. Marks it placed may still be on Discord: `\/marks action:retract target:dd34b043` queues their removal\.\nStates: queued, /,
+    );
+    assert.match(
+      await replyTo({ action: 'list', target: 'b897e6cb-25af-4485-8f94-0c8e39d4f23a' }),
+      /\nIts messages' reactions: queued 3\.\n1 reaction with a request on the wire or one never answered — any may land\.\nStates: /,
     );
     assert.match(
       await replyTo({ action: 'list', target: '110ae4cf-fdb6-4526-b122-9dcd6a002e27' }),
@@ -977,10 +1061,14 @@ describe('/marks', () => {
     const { server } = serverWith(conn);
     const r = interaction('marks', { action: 'retract', target: 'b-1' });
     await asAdmin(() => server.handleSlashCommand(r.value));
-    assert.match(r.out.replies.at(-1)!, /^⚠️ \/marks action:retract outcome unknown \(connection lost\): the host may already have queued the removals\. Check `\/marks action:list target:b-1` before trying again\.$/);
+    // A retract the host queued is an entry of its own, listed first: the batch's entry doesn't show it.
+    assert.equal(r.out.replies.at(-1), '⚠️ /marks action:retract outcome unknown (connection lost): the host may already have queued the removals. Check `/marks action:list` before trying again: a retract it queued is listed first.');
     const all = interaction('marks', { action: 'retract', target: 'all' });
     await asAdmin(() => server.handleSlashCommand(all.value));
-    assert.match(all.out.replies.at(-1)!, /Check `\/marks action:list` before trying again/);
+    assert.equal(all.out.replies.at(-1), '⚠️ /marks action:retract outcome unknown (connection lost): the host may already have queued the removals. Check `/marks action:list` before trying again: a retract it queued is listed first.');
+    const c = interaction('marks', { action: 'cancel', target: 'b-1' });
+    await asAdmin(() => server.handleSlashCommand(c.value));
+    assert.equal(c.out.replies.at(-1), '⚠️ /marks action:cancel outcome unknown (connection lost): the host may already have cancelled it. Check `/marks action:list target:b-1` before trying again.');
     const list = interaction('marks', { action: 'list' });
     await asAdmin(() => server.handleSlashCommand(list.value));
     assert.match(list.out.replies.at(-1)!, /^⚠️ \/marks action:list failed: connection lost$/);
@@ -996,7 +1084,8 @@ describe('/marks', () => {
     assert.match(r.out.replies.at(-1)!, /^✅ Retract `r-1`: 4 removals requested, not yet confirmed on Discord\. \(The full reply couldn't be shown/);
     const c = interaction('marks', { action: 'cancel', target: 'b-2' }, { rejectEdits: 1 });
     await asAdmin(() => server.handleSlashCommand(c.value));
-    assert.match(c.out.replies.at(-1)!, /^✅ Cancelled batch `b-2`: 3 reactions will never be requested; cancel removes nothing from Discord\. \(The full reply/);
+    assert.equal(c.out.replies.at(-1), '✅ Cancelled batch `b-2`: 3 reactions will never be requested; cancel removes nothing from Discord. ' +
+      "If any of its marks are on Discord, `/marks action:retract target:b-2` queues their removal. (The full reply couldn't be shown: Unknown interaction.)");
   });
 
   it("keeps a retract's caveats in its short account, and says when a cancel found nothing still waiting", async () => {
@@ -1008,7 +1097,15 @@ describe('/marks', () => {
           'after their removal.'],
       ['cancel', { target: 'b-4', kind: 'batch', cancelled: 0, confirmed: 2, mayStillLand: 1 },
         '✅ Cancelled batch `b-4`: nothing it asked for was still waiting to be sent; cancel removes nothing from Discord: 1 reaction with a ' +
-          'request on the wire or one never answered may land.'],
+          'request on the wire or one never answered may land. If any of its marks are on Discord, `/marks action:retract target:b-4` queues their removal.'],
+      // A retract's cancel: no pointer, since retract takes a batch id or all.
+      ['cancel', { target: 'r-5', kind: 'retract', cancelled: 1, confirmed: 0, mayStillLand: 0 },
+        '✅ Cancelled retract `r-5`: 1 reaction will never be requested; cancel removes nothing from Discord.'],
+      // A retract whose target names no message queued nothing.
+      ['retract', { requestId: 'r-6', removalsQueued: 0, addsSuperseded: 0, keysWithUnresolvedAdds: 0 },
+        '✅ Retract `r-6` queued no removal: its target names no message.'],
+      // An accepted control whose receipt can't be read.
+      ['retract', { requestId: 'r-7' }, "✅ The host accepted /marks action:retract `b-1` (its receipt couldn't be read)."],
     ];
     for (const [action, receipt, short] of receipts) {
       const h = host({ marksVerb: 'yes', answer: () => ({ ok: true, awareness: receipt }) });
@@ -1028,7 +1125,8 @@ describe('/marks', () => {
     assert.equal(
       c.out.replies.at(-1),
       '✅ Cancelled batch `b-3`: 2 reactions will never be requested; cancel removes nothing from Discord: 3 reactions with a request on ' +
-        "the wire or one never answered may land. (The full reply couldn't be shown: Unknown interaction.)",
+        'the wire or one never answered may land. If any of its marks are on Discord, `/marks action:retract target:b-3` queues their removal. ' +
+        "(The full reply couldn't be shown: Unknown interaction.)",
     );
   });
 
@@ -1049,7 +1147,7 @@ describe('/marks', () => {
 
 describe('rendering', () => {
   it('describes every receipt status without claiming delivery', () => {
-    assert.match(describeMarkers(undefined), /reported nothing/);
+    assert.equal(describeMarkers(undefined), 'Marks: this host reported nothing about 💤 marks; `/marks action:list` shows whether it scheduled any.');
     assert.equal(describeMarkers({ scope: 'none', unmarked: 2, notRemoved: 0, status: 'none', queued: 0 }), 'Marks: none.');
     assert.match(describeMarkers({ scope: 'addressed', unmarked: 0, notRemoved: 0, status: 'none', queued: 0 }), /nothing removed fell within "addressed"/);
     assert.equal(
@@ -1067,10 +1165,22 @@ describe('rendering', () => {
     assert.doesNotMatch(detailText(batch(1)), /Left unmarked/);
   });
 
+  it('ends an entry in full with what each reaction state means, and names what a retract of all covers', () => {
+    const states = 'States: queued, a request owed and not yet sent; sending, on the wire; present or absent, ' +
+      "Discord's last answer, with nothing owed; unknown, the last request went unanswered; failed, it ended unconfirmed; untouched, never asked.";
+    for (const v of [batch(1), retractView(1)]) assert.ok(detailText(v).endsWith(`\n${states}`), v.kind);
+    assert.match(detailText(retractView(1)), /^\*\*Retract `retract-9f8e[^`]*`\*\* of every message in the ledger, /);
+  });
+
+  it('says a retract whose target names no message queued nothing, rather than a removal not yet confirmed', () => {
+    assert.equal(describeRetract({ requestId: 'r-0', removalsQueued: 0, addsSuperseded: 0, keysWithUnresolvedAdds: 0 }),
+      '✅ Retract `r-0` queued no removal: its target names no message.');
+  });
+
   it('says how many marks 0.22.x recorded as added for an imported batch, none included, and nothing for a ledger batch', () => {
     const imported = (legacyAdded: number) => detailText(batch(1, { scope: 'legacy', legacyAdded }));
     const id = batch(1).id;
-    const takeDown = ` Marks it placed may still be on Discord: \`/marks action:retract target:${id}\` takes them down.`;
+    const takeDown = ` Marks it placed may still be on Discord: \`/marks action:retract target:${id}\` queues their removal.`;
     assert.ok(imported(2).includes(`\nImported from agent-framework 0.22.x, which recorded 2 marks on these messages as added.${takeDown}\n`));
     assert.ok(imported(1).includes(`\nImported from agent-framework 0.22.x, which recorded 1 mark on these messages as added.${takeDown}\n`));
     assert.ok(imported(0).includes(`\nImported from agent-framework 0.22.x, which recorded 0 marks on these messages as added.${takeDown}\n`));
@@ -1157,7 +1267,7 @@ describe('rendering', () => {
 
 describe('registration', () => {
   it("offers /undo's three marks choices and /hide's two, and registers /marks", async () => {
-    let registered: Array<{ name: string; options?: Array<{ name: string; choices?: Array<{ value: string }> }> }> = [];
+    let registered: Array<{ name: string; options?: Array<{ name: string; required?: boolean; choices?: Array<{ value: string }> }> }> = [];
     const discord = {
       onSlashCommand: () => undefined,
       registerGuildCommands: async (commands: typeof registered) => { registered = commands; },
@@ -1167,6 +1277,7 @@ describe('registration', () => {
     for (const [name, choices] of [['undo', ['none', 'addressed', 'all']], ['hide', ['none', 'all']]] as const) {
       const marks = registered.find((c) => c.name === name)?.options?.find((o) => o.name === 'marks');
       assert.deepEqual(marks?.choices?.map((c) => c.value), choices, name);
+      assert.equal(marks?.required, false, `${name}: marks is optional`);
     }
     const marksCommand = registered.find((c) => c.name === 'marks');
     assert.deepEqual(marksCommand?.options?.find((o) => o.name === 'action')?.choices?.map((c) => c.value), ['list', 'cancel', 'retract']);
