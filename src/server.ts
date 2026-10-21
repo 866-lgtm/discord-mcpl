@@ -88,11 +88,14 @@ import { isId, isJsonObject, readJsonFile, usableIds, writeJsonFile, type Usable
 import sharp from 'sharp';
 import { dbg } from './debug-log.js';
 import {
+  advertisedRetryWindowMs,
   errorRejection,
   incomingOutcome,
   isContentRejection,
+  isUnpersistedAnswer,
   pushOutcome,
   summarizeAttachments,
+  unpersistedError,
   withoutInlineMedia,
   type ForwardOutcome,
 } from './incoming-results.js';
@@ -814,6 +817,26 @@ export class DiscordMcplServer {
    */
   private readonly recentCreates = new Map<string, CreateMemory>();
   private editSeq = 0;
+  /**
+   * The wait before resending an occurrence the host took but couldn't keep
+   * ("host could not persist the acceptance; retry"), once, with the same
+   * eventId. Well inside the host's retry window; capped at half of it when
+   * the host advertises a shorter one. A field so tests can shorten it.
+   */
+  private persistRetryDelayMs = 1000;
+  /** The host's advertised `eventCoalescing.retryWindowMs`, if any. */
+  private hostRetryWindowMs: number | undefined;
+  /**
+   * Per message, a count of the edits and deletes sent for it, so a retry of
+   * one the host couldn't keep is skipped once a later one has gone out: the
+   * later occurrence replaces or withdraws the subject, and resending the
+   * earlier one after it would put the older version back. Bounded like
+   * recentCreates; a forgotten message is never retried.
+   */
+  private readonly mutationSeqs = new Map<string, number>();
+  /** A retry of an edit or delete being waited out, per message: later edits
+   *  and deletes of that message wait for it (afterCreate), so none overtakes it. */
+  private readonly mutationRetries = new Map<string, Promise<void>>();
   private enabledFeatureSets = new Set<string>();
   /** Every channel registered in this process, whether or not a host is
    *  connected: each connection is given all of it (syncChannelsWithHost). */
@@ -1486,6 +1509,7 @@ export class DiscordMcplServer {
     const clientMcpl = params?.capabilities?.experimental?.mcpl;
     this.mcplEnabled = clientMcpl !== undefined;
     this.hostCoalescing = parseHostCoalescing((clientMcpl as { eventCoalescing?: unknown } | undefined)?.eventCoalescing);
+    this.hostRetryWindowMs = advertisedRetryWindowMs((clientMcpl as { eventCoalescing?: unknown } | undefined)?.eventCoalescing);
     dbg('handleInitialize', {
       mcplEnabled: this.mcplEnabled,
       clientName: params?.clientInfo?.name,
@@ -4206,7 +4230,12 @@ export class DiscordMcplServer {
    *  settled message is sent exactly as promptly as before. */
   private afterCreate(messageId: string, then: () => void): Promise<void> | void {
     const mem = this.recentCreates.get(messageId);
-    if (mem && !mem.done) return mem.settled.then(then);
+    const createPending = mem && !mem.done ? mem.settled : undefined;
+    // An edit or delete of this message the host couldn't keep, being retried.
+    const retryPending = this.mutationRetries.get(messageId);
+    if (createPending && retryPending) return Promise.all([createPending, retryPending]).then(then);
+    if (createPending) return createPending.then(then);
+    if (retryPending) return retryPending.then(then);
     then();
   }
 
@@ -4257,8 +4286,9 @@ export class DiscordMcplServer {
         ? { coalesce: { key: `message:${messageId}`, ...(scope ? { channelId: scope } : {}) } }
         : {}),
     };
+    const conn = this.conn;
     this.noteMutationOutcome('edit', messageId, registeredId ?? channelId,
-      this.conn.sendRequest(method.PUSH_EVENT, params as unknown as Record<string, unknown>));
+      () => conn.sendRequest(method.PUSH_EVENT, params as unknown as Record<string, unknown>));
   }
 
   private async forwardMessageDelete(channelId: string, messageId: string, isDM: boolean, info?: MessageEventInfo): Promise<void> {
@@ -4289,8 +4319,9 @@ export class DiscordMcplServer {
         ? { coalesce: { key: `message:${messageId}`, retract: true, ...(scope ? { channelId: scope } : {}) } }
         : {}),
     };
+    const conn = this.conn;
     this.noteMutationOutcome('delete', messageId, registeredId ?? channelId,
-      this.conn.sendRequest(method.PUSH_EVENT, params as unknown as Record<string, unknown>));
+      () => conn.sendRequest(method.PUSH_EVENT, params as unknown as Record<string, unknown>));
   }
 
   // ── DM refusal notices ──
@@ -5204,10 +5235,13 @@ export class DiscordMcplServer {
             } as CoalescedIncomingMessage],
           };
           try {
-            return incomingOutcome(await conn.sendRequest(method.CHANNELS_INCOMING, params), msg.id);
+            const outcome = incomingOutcome(await conn.sendRequest(method.CHANNELS_INCOMING, params), msg.id);
+            // The item's reason, without a code, is how this lane says it.
+            return outcome.kind === 'rejected' && isUnpersistedAnswer(outcome.reason)
+              ? { kind: 'unpersisted', reason: outcome.reason }
+              : outcome;
           } catch (err) {
-            const rejection = errorRejection(err);
-            return rejection ? { kind: 'rejected', ...rejection } : { kind: 'failed', error: errorText(err) };
+            return sendErrorOutcome(err);
           }
         },
       });
@@ -5291,10 +5325,12 @@ export class DiscordMcplServer {
             payload: { content },
           };
           try {
-            return pushOutcome(await conn.sendRequest(method.PUSH_EVENT, params as unknown as Record<string, unknown>));
+            const outcome = pushOutcome(await conn.sendRequest(method.PUSH_EVENT, params as unknown as Record<string, unknown>));
+            return outcome.kind === 'rejected' && isUnpersistedAnswer(outcome.reason)
+              ? { kind: 'unpersisted', reason: outcome.reason }
+              : outcome;
           } catch (err) {
-            const rejection = errorRejection(err);
-            return rejection ? { kind: 'rejected', ...rejection } : { kind: 'failed', error: errorText(err) };
+            return sendErrorOutcome(err);
           }
         },
       });
@@ -5324,6 +5360,12 @@ export class DiscordMcplServer {
    * - No answer (mcpl-core's timeout, or a closed connection), or the host's
    *   own failure (-32000, -32603; errorRejection): logged as before,
    *   `handleDiscordMessage:send-failed`, and not resent.
+   * - Taken but not kept ("host could not persist the acceptance; retry",
+   *   UNPERSISTED_ACCEPTANCE_ANSWERS): sent once more, after
+   *   persistRetryDelayMs, as the same occurrence (same eventId and
+   *   coalesce member), as the host's coalescer asks; see keepOrRetry. Each
+   *   send here (the create, and a resend without media) gets at most one
+   *   such retry.
    */
   private async deliverCreate(args: {
     lane: 'channels/incoming' | 'push/event';
@@ -5336,7 +5378,7 @@ export class DiscordMcplServer {
     send: (content: ContentBlock[], resend: boolean) => Promise<SendOutcome>;
   }): Promise<void> {
     const { lane, messageId, channelMcplId, content, attachmentBlocks, mem, send } = args;
-    const first = await send(content, false);
+    const first = await this.keepOrRetry(lane, `message ${messageId} in ${channelMcplId}`, () => send(content, false));
     if (first.kind === 'failed') {
       console.error(`[discord-mcpl] ${lane} failed:`, first.error);
       dbg('handleDiscordMessage:send-failed', { method: lane, error: first.error });
@@ -5368,7 +5410,7 @@ export class DiscordMcplServer {
     // the agent was sent, which the memory of a create over that size held
     // only as a placeholder.
     if (mem.render) mem.render.attachments = rememberedAttachments(withoutInlineMedia(attachmentBlocks).content);
-    const second = await send(stripped.content, true);
+    const second = await this.keepOrRetry(lane, `message ${messageId} in ${channelMcplId} (resent without inline media)`, () => send(stripped.content, true));
     const what = `message ${messageId} in ${channelMcplId} with ${stripped.replaced} inline attachment(s) replaced by a note`;
     if (second.kind === 'failed') {
       console.error(`[discord-mcpl] resent ${what}: send failed: ${second.error}`);
@@ -5382,31 +5424,130 @@ export class DiscordMcplServer {
     }
   }
 
-  /** Read the host's verdict on an edit or delete (fire-and-forget sends):
-   *  a refusal is logged; transport failures stay quiet, as before. */
-  private noteMutationOutcome(kind: 'edit' | 'delete', messageId: string, channel: string, sent: Promise<unknown>): void {
-    sent.then(
-      (response) => {
-        const outcome = pushOutcome(response);
-        if (outcome.kind !== 'rejected') return;
+  /** The wait before a keep-retry: persistRetryDelayMs, capped at half the
+   *  host's advertised retry window. */
+  private persistRetryDelay(): number {
+    const w = this.hostRetryWindowMs;
+    return w !== undefined ? Math.min(this.persistRetryDelayMs, Math.floor(w / 2)) : this.persistRetryDelayMs;
+  }
+
+  /**
+   * Send, and when the host answers that it took the occurrence but couldn't
+   * keep it (UNPERSISTED_ACCEPTANCE_ANSWERS), send it ONCE more after
+   * persistRetryDelay, as the same occurrence: `attempt` re-sends the same
+   * params, so the same eventId and coalesce member. agent-framework's
+   * coalescer asks for exactly that ("The producer retries within the
+   * window"): it can match the retry to a receipt it kept, or admit it if it
+   * kept none. Never more than one retry; a second "couldn't keep it" is
+   * returned as a failed send. A transport timeout is never retried here:
+   * its outcome is unknown (unpersistedError only matches the host's words).
+   */
+  private async keepOrRetry(
+    lane: string,
+    what: string,
+    attempt: () => Promise<SendOutcome>,
+  ): Promise<Exclude<SendOutcome, { kind: 'unpersisted' }>> {
+    return this.retryUnkept(lane, what, await attempt(), attempt);
+  }
+
+  /** keepOrRetry's second half, for a caller that already holds the first
+   *  answer: `first` is returned as it is unless it is `unpersisted`. */
+  private async retryUnkept(
+    lane: string,
+    what: string,
+    first: SendOutcome,
+    attempt: () => Promise<SendOutcome>,
+  ): Promise<Exclude<SendOutcome, { kind: 'unpersisted' }>> {
+    if (first.kind !== 'unpersisted') return first;
+    const delay = this.persistRetryDelay();
+    console.error(`[discord-mcpl] host couldn't keep ${what} (${first.reason}); retrying once with the same event id in ${delay}ms`);
+    dbg('handleDiscordMessage:keep-retry', { method: lane, what, reason: first.reason, delayMs: delay });
+    await sleep(delay);
+    const second = await attempt();
+    const said = second.kind === 'unpersisted' ? `still not kept: ${second.reason}`
+      : second.kind === 'rejected' ? `host rejected it: ${second.reason}`
+        : second.kind === 'failed' ? `send failed: ${second.error}`
+          : second.kind === 'accepted' ? 'accepted' : 'sent (no verdict)';
+    console.error(`[discord-mcpl] retried ${what} with the same event id: ${said}`);
+    dbg('handleDiscordMessage:keep-retried', { method: lane, what, result: second.kind, ...('reason' in second ? { reason: second.reason } : {}) });
+    if (second.kind === 'unpersisted') return { kind: 'failed', error: `${second.reason} (after one retry)` };
+    return second;
+  }
+
+  /**
+   * Send an edit or delete (fire-and-forget: nothing waits on it) and read the
+   * host's verdict: a refusal is logged; transport failures stay quiet, as
+   * before. When the host took it but couldn't keep it, it is sent once more
+   * as the same occurrence (keepOrRetry's rule), unless a later edit or delete
+   * of the message has gone out since, which supersedes it: resending the
+   * earlier one after it would put the older version back. While the retry
+   * is waited out, later edits and deletes of the message wait for it
+   * (afterCreate), so none overtakes it.
+   */
+  private noteMutationOutcome(kind: 'edit' | 'delete', messageId: string, channel: string, send: () => Promise<unknown>): void {
+    const seq = (this.mutationSeqs.get(messageId) ?? 0) + 1;
+    this.mutationSeqs.delete(messageId);
+    this.mutationSeqs.set(messageId, seq);
+    while (this.mutationSeqs.size > RECENT_CREATES_MAX) this.mutationSeqs.delete(this.mutationSeqs.keys().next().value!);
+
+    const attempt = async (): Promise<SendOutcome> => {
+      try {
+        const outcome = pushOutcome(await send());
+        return outcome.kind === 'rejected' && isUnpersistedAnswer(outcome.reason)
+          ? { kind: 'unpersisted', reason: outcome.reason }
+          : outcome;
+      } catch (err) {
+        return sendErrorOutcome(err);
+      }
+    };
+    const report = (outcome: SendOutcome): void => {
+      if (outcome.kind === 'rejected') {
         console.error(`[discord-mcpl] host rejected ${kind} of message ${messageId} in ${channel}: ${outcome.reason}`);
-        dbg('handleMessageMutation:rejected', { kind, messageId, channel, reason: outcome.reason });
-      },
-      (err) => {
-        const rejection = errorRejection(err);
-        if (rejection) {
-          console.error(`[discord-mcpl] host rejected ${kind} of message ${messageId} in ${channel}: ${rejection.reason}`);
-          dbg('handleMessageMutation:rejected', { kind, messageId, channel, reason: rejection.reason, code: rejection.code });
-        } else {
-          dbg('handleMessageMutation:send-failed', { kind, messageId, channel, error: errorText(err) });
-        }
-      },
-    );
+        dbg('handleMessageMutation:rejected', { kind, messageId, channel, reason: outcome.reason, ...(outcome.code !== undefined ? { code: outcome.code } : {}) });
+      } else if (outcome.kind === 'failed') {
+        dbg('handleMessageMutation:send-failed', { kind, messageId, channel, error: outcome.error });
+      }
+    };
+
+    void (async () => {
+      const first = await attempt();
+      if (first.kind !== 'unpersisted') { report(first); return; }
+      const what = `${kind} of message ${messageId} in ${channel}`;
+      if (this.mutationSeqs.get(messageId) !== seq) {
+        console.error(`[discord-mcpl] host couldn't keep ${what} (${first.reason}); not retried: a later edit or delete of the message has been sent since`);
+        dbg('handleMessageMutation:keep-retry-superseded', { kind, messageId, channel, reason: first.reason });
+        return;
+      }
+      let resolveRetry!: () => void;
+      const retryDone = new Promise<void>((r) => { resolveRetry = r; });
+      this.mutationRetries.set(messageId, retryDone);
+      try {
+        report(await this.retryUnkept('push/event', what, first, attempt));
+      } finally {
+        if (this.mutationRetries.get(messageId) === retryDone) this.mutationRetries.delete(messageId);
+        resolveRetry();
+      }
+    })();
   }
 }
 
-/** A forwarded create's outcome, as `deliverCreate` reads it. */
-type SendOutcome = ForwardOutcome | { kind: 'failed'; error: string };
+/** A forwarded create's outcome, as `deliverCreate` reads it. `unpersisted`:
+ *  the host took it but couldn't keep it, and asks for the same occurrence
+ *  again (keepOrRetry). */
+type SendOutcome = ForwardOutcome | { kind: 'failed'; error: string } | { kind: 'unpersisted'; reason: string };
+
+/** A request's error, read as the host's verdict: its "couldn't keep it;
+ *  retry", its refusal (errorRejection), or a failed send. */
+function sendErrorOutcome(err: unknown): SendOutcome {
+  const unkept = unpersistedError(err);
+  if (unkept) return { kind: 'unpersisted', reason: unkept };
+  const rejection = errorRejection(err);
+  return rejection ? { kind: 'rejected', ...rejection } : { kind: 'failed', error: errorText(err) };
+}
+
+function sleep(ms: number): Promise<void> {
+  return ms > 0 ? new Promise((r) => setTimeout(r, ms)) : Promise.resolve();
+}
 
 /** Serve a stdio host until its connection ends, then exit. A stdio server
  *  can't be reached again once its host has gone, so it exits, as MCP's

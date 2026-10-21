@@ -7,6 +7,23 @@ in the git log and PR descriptions.
 
 ### Fixed
 
+- **An occurrence the host took but couldn't keep is sent once more, as
+  the host asks.** agent-framework's event coalescer answers -32000 "host
+  could not persist the acceptance; retry" (or "host could not make the
+  acceptance durable; retry") when it couldn't keep an occurrence's
+  receipt, and expects the producer to send the same occurrence again within
+  its retry window (`retryWindowMs`, one hour, advertised at initialize). A
+  create, a resend without media, an edit or a delete that gets that answer,
+  as a `channels/incoming` item reason or a `push/event` error, is now sent
+  once more after 1 s (at most half the advertised window), with the same
+  `eventId` and `coalesce` member; the retry and its outcome are logged
+  (`[discord-mcpl] host couldn't keep … ; retrying once with the same event
+  id in <n>ms`, then `[discord-mcpl] retried … with the same event id:
+  <outcome>`). Never more than one retry. Only those exact words count:
+  mcpl-core's own -32000 timeout (unknown outcome) and "host is stopping"
+  are not retried. An edit or delete isn't retried once a later edit or
+  delete of the message has gone out (resending it after would put the older
+  version back), and a later one waits for a retry in progress.
 - **A message the host refuses is no longer reported as sent, and one
   refused for a large inline image still reaches the agent as text.** A
   forwarded message's answer is now read: `channels/incoming`'s per-message
