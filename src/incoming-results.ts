@@ -107,6 +107,56 @@ export function isContentRejection(rejection: HostRejection): boolean {
   return rejection.code === -32602 || rejection.reason === 'coalesce_invalid';
 }
 
+/**
+ * What agent-framework's event coalescer answers, with -32000, when it took a
+ * coalesced occurrence but could not keep the acceptance (push-coalescer.ts,
+ * the same in 0.22.0 and main):
+ * - "host could not persist the acceptance; retry": writing the receipt
+ *   failed. "Not acknowledged: the work would be lost while its receipt
+ *   suppressed a retry. The producer retries within the window."
+ * - "host could not make the acceptance durable; retry": committing it
+ *   failed; "the producer retries once more".
+ *
+ * The window is the coalescer's `retryWindowMs`, 3,600,000 ms (one hour),
+ * which it advertises as `eventCoalescing.retryWindowMs` at initialize. A
+ * retry is the SAME occurrence: same `eventId`, same `coalesce` member, so
+ * the host can match it to a receipt it did keep. On push/event the words
+ * come as a JSON-RPC error; on channels/incoming as a message's `reason`,
+ * without a code.
+ *
+ * Only these exact words. A -32000 is also mcpl-core's own timeout
+ * ("Request timed out after <n>ms: <method>" in 0.2.1) and the host's
+ * "host is stopping": a timed-out request's outcome is unknown, and a
+ * stopping host won't keep it either, so neither is retried.
+ */
+export const UNPERSISTED_ACCEPTANCE_ANSWERS: readonly string[] = [
+  'host could not persist the acceptance; retry',
+  'host could not make the acceptance durable; retry',
+];
+
+/** Whether `words` are one of the host's "took it, couldn't keep it; retry" answers. */
+export function isUnpersistedAnswer(words: string | undefined): boolean {
+  return typeof words === 'string' && UNPERSISTED_ACCEPTANCE_ANSWERS.includes(words.trim());
+}
+
+/** The host's "couldn't keep it; retry" words in a request's error, or
+ *  undefined: the error must carry -32000 and exactly those words (mcpl-core
+ *  0.2.1's `RPC error -32000: ` prefix dropped). */
+export function unpersistedError(err: unknown): string | undefined {
+  const e = err as { code?: unknown; message?: unknown } | null | undefined;
+  if (!e || e.code !== -32000 || typeof e.message !== 'string') return undefined;
+  const prefix = 'RPC error -32000: ';
+  const words = e.message.startsWith(prefix) ? e.message.slice(prefix.length) : e.message;
+  return isUnpersistedAnswer(words) ? words.trim() : undefined;
+}
+
+/** The host's advertised retry window (`eventCoalescing.retryWindowMs`), when
+ *  it gives a positive number. */
+export function advertisedRetryWindowMs(advertised: unknown): number | undefined {
+  const w = (advertised as { retryWindowMs?: unknown } | null | undefined)?.retryWindowMs;
+  return typeof w === 'number' && Number.isFinite(w) && w > 0 ? w : undefined;
+}
+
 /** Inline media blocks: an image or audio block that carries its bytes. */
 function isInlineMedia(b: ContentBlock): boolean {
   const block = b as { type?: unknown; data?: unknown };
