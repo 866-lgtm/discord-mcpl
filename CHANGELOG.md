@@ -5,6 +5,8 @@ in the git log and PR descriptions.
 
 ## Unreleased
 
+## 0.4.0 — 2026-10-22
+
 ### Upgrade notes
 
 - **Upgrade the host's agent framework first, or together with this release.**
