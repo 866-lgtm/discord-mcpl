@@ -5,6 +5,68 @@ in the git log and PR descriptions.
 
 ## Unreleased
 
+### Upgrade notes
+
+- **Upgrade the host's agent framework first, or together with this release.**
+  `/undo` now needs the `marks` host command, which the agent framework gains
+  with anima-research/agent-framework#250. On a host without it, `/undo` is
+  refused for every option, so a deployment that takes this release before its
+  host does loses `/undo` from Discord until the host upgrades. Each `/undo`
+  asks the host, so it works again once the upgraded host is connected. To
+  tell whether a host has the command, run `/marks action:list`: on a host
+  without it, the reply says the host has no awareness-mark controls.
+- **`/undo` and `/hide` mark nothing unless `marks` is chosen.** `/hide` used
+  to react 💤 on every hidden message by default; choose `marks: all` for that.
+  The admin commands' entry under Changed has the details.
+
+### Changed
+
+- **The admin commands make 💤 awareness marks an explicit choice.**
+  - `/undo` takes an optional `marks` choice: `none` (the default),
+    `addressed` or `all`. On a host whose agent framework has the `marks` host
+    command (anima-research/agent-framework#250), the host places the marks,
+    keeps them in its awareness ledger, and returns a `markers` receipt. The
+    reply says what it scheduled: requested, not yet confirmed on Discord.
+  - `/hide` takes `marks: none` (the default) or `all`. Its 💤 is this server's
+    own, as before: with `all`, it's added to each message the host says it
+    hid, on any host. The reply goes out as soon as the hide is applied and is
+    edited once the 💤 have settled, with how many Discord confirmed. It says
+    they're outside the host's ledger: `/marks` doesn't list them, and a
+    retract reaches one only on a message the host's ledger also names, when
+    the host's marks are 💤 too. The host places no marks for a hide.
+  - A new admin command, `/marks action:list [target:<id>] [page:<n>]` and
+    `/marks action:cancel|retract target:<id>`, shows the host's awareness
+    ledger and acts on it, ephemerally:
+    - `action:list` pages the ledger newest first, each page within one
+      Discord reply. Each entry counts its messages' reactions by state
+      (queued, sending, present, absent, unknown, failed, untouched) and says
+      how many may still land. `action:list target:<id>` shows one batch or
+      retract in full, with what each state means. A batch imported from
+      agent-framework 0.22.x's ledger says how many marks 0.22.x recorded as
+      added, and the entry in full says that marks it placed may still be on
+      Discord, and how to take them down.
+    - cancel and retract each answer with what that action's receipt says.
+      Cancel keeps its limits: confirmed marks stay, and a reaction with a
+      request on the wire or one never answered may still land. A batch's
+      cancel also says how to take its marks down.
+    - A reply too long for one message is cut visibly, with what it shows
+      attached in full: the host's answer, or for `action:list target:` the
+      entry. An answer in a shape this server can't read is shown as sent.
+      Only the host's `ok: false` reads as a failure: an answer to `/undo`,
+      `/hide` or a `/marks` control without a boolean `ok` is shown as sent,
+      with a warning that it may have been applied.
+
+  To learn which kind of host it has, `/undo` and `/marks` ask with a `marks`
+  request that names no action, which the host answers without reading its
+  ledger. `/hide` never asks. A probe whose request fails (a timeout, a host
+  that refuses host commands) stops the command with nothing changed, and says
+  that running it again can work after a timeout or once the host is back, and
+  that a host refusing host commands has to allow them for this server. On a
+  host without the verb, `/undo` is **refused** whatever the option. Such a
+  host's undo places marks that follow branches: they are re-applied on every
+  switch, with no frozen audience and no cancel, so no choice here can
+  authorize them as a one-shot act.
+
 ### Fixed
 
 - **An occurrence the host took but couldn't keep is sent once more, as
