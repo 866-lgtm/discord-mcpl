@@ -67,6 +67,37 @@ in the git log and PR descriptions.
   switch, with no frozen audience and no cancel, so no choice here can
   authorize them as a one-shot act.
 
+### Fixed
+
+- **A message the host refuses is no longer reported as sent, and one
+  refused for a large inline image still reaches the agent as text.** A
+  forwarded message's answer is now read: `channels/incoming`'s per-message
+  `results[]`, `push/event`'s `{accepted, reason}`, and a JSON-RPC error the
+  host refuses it with. A refusal logs `[discord-mcpl] host rejected
+  message <id> in <channel>: <reason>` on stderr and
+  `handleDiscordMessage:rejected` in the debug log, with what the message
+  carried inline; `handleDiscordMessage:sent` now means the host accepted it
+  (or answered without a per-message verdict) and carries `result`. A
+  request that gets no answer (a timeout or a closed connection), or an
+  error the host fails with (-32000, -32603), is logged as a failed send, as
+  before. `channels/incoming` answers each message without a code, so there
+  the host's own failure can't be told from a refusal, and the line reads
+  `host didn't take message <id> in <channel>: <reason>`, in the host's
+  words. A message refused for its content (`coalesce_invalid`, or a -32602
+  error) while it carried inline images or audio is sent once more with
+  each inline block replaced by a text note, under a fresh occurrence id
+  (`<eventId>_media_omitted`) on the same coalescing subject; its outcome is
+  logged, and it is never resent again. An edit that replaces it carries the
+  same notes and links, while they fit the 64 KiB the server keeps for an
+  edit. agent-framework's coalescing hosts before 0.22.2, its 0.21 line
+  included, refuse a coalesced message whose content, inline base64
+  included, passes 1 MiB (agent-framework#267 removed that budget in
+  0.22.2), so a message with a large screenshot was lost, text and all,
+  while this server logged it as sent on `channels/incoming` and as a
+  failed send on `push/event`. A refused edit or delete is logged too
+  (`[discord-mcpl] host rejected edit of message <id> in <channel>:
+  <reason>`).
+
 ## 0.3.0 — 2026-10-18
 
 ### Upgrade notes

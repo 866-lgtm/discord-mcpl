@@ -117,6 +117,15 @@ import { existsSync, readFileSync } from 'node:fs';
 import { isId, isJsonObject, readJsonFile, usableIds, writeJsonFile, type Usable } from './persisted-json.js';
 import sharp from 'sharp';
 import { dbg } from './debug-log.js';
+import {
+  errorRejection,
+  incomingOutcome,
+  isContentRejection,
+  pushOutcome,
+  summarizeAttachments,
+  withoutInlineMedia,
+  type ForwardOutcome,
+} from './incoming-results.js';
 
 // TypeScript copies the manifest into dist. The module-relative path works
 // in both source and built layouts, independently of the working directory.
@@ -600,8 +609,17 @@ const RECENT_CREATES_MAX = 512;
 /** How many deleted channel ids the server remembers (deletedChannels). A
  *  delivery is on its way for seconds, not for a thousand deletions. */
 const DELETED_CHANNELS_KEPT = 1000;
-/** Attachment blocks above this size are not kept for edits (inline images). */
+/** Attachment blocks above this size, all of them together, are not kept for
+ *  edits (inline images, inline text files). */
 const RECENT_CREATE_ATTACHMENT_BYTES = 64 * 1024;
+
+/** What a create remembers of its attachment blocks for an edit that replaces
+ *  it: the blocks while they fit RECENT_CREATE_ATTACHMENT_BYTES, and above it
+ *  a note that stands for them. */
+function rememberedAttachments(blocks: ContentBlock[]): ContentBlock[] {
+  if (Buffer.byteLength(JSON.stringify(blocks)) <= RECENT_CREATE_ATTACHMENT_BYTES) return blocks;
+  return [textContent('[attachments as in the original message]')];
+}
 
 /** RFC-006 `coalesce` member (mcpl-core 0.2.x predates it). */
 interface CoalesceMember {
@@ -4551,7 +4569,8 @@ export class DiscordMcplServer {
         ? { coalesce: { key: `message:${messageId}`, ...(scope ? { channelId: scope } : {}) } }
         : {}),
     };
-    this.conn.sendRequest(method.PUSH_EVENT, params as unknown as Record<string, unknown>).catch(() => {});
+    this.noteMutationOutcome('edit', messageId, registeredId ?? channelId,
+      this.conn.sendRequest(method.PUSH_EVENT, params as unknown as Record<string, unknown>));
   }
 
   private async forwardMessageDelete(channelId: string, messageId: string, isDM: boolean, info?: MessageEventInfo): Promise<void> {
@@ -4582,7 +4601,8 @@ export class DiscordMcplServer {
         ? { coalesce: { key: `message:${messageId}`, retract: true, ...(scope ? { channelId: scope } : {}) } }
         : {}),
     };
-    this.conn.sendRequest(method.PUSH_EVENT, params as unknown as Record<string, unknown>).catch(() => {});
+    this.noteMutationOutcome('delete', messageId, registeredId ?? channelId,
+      this.conn.sendRequest(method.PUSH_EVENT, params as unknown as Record<string, unknown>));
   }
 
   // ── DM refusal notices ──
@@ -5429,21 +5449,17 @@ export class DiscordMcplServer {
       return [...t];
     })();
 
-    {
-      const attachmentBytes = Buffer.byteLength(JSON.stringify(attachmentBlocks));
-      // Without the closed channel's note (below): the gate admits an edit,
-      // when it arrives, only while its channel is open or subscribed
-      // (forwardMessageEdit), so an edit that replaces this create normally
-      // comes once the note no longer holds. Admission is checked when an
-      // edit arrives, not when it's sent, so one admitted while the channel
-      // was open can follow a close during this create's attachment fetch,
-      // and replace a create pushed with the note.
-      mem.render = {
-        prefix: prefixBlock, replyMarker, location, authorName: msg.authorName,
-        attachments: attachmentBytes <= RECENT_CREATE_ATTACHMENT_BYTES ? attachmentBlocks
-          : attachmentBlocks.length ? [textContent('[attachments as in the original message]')] : [],
-      };
-    }
+    // Without the closed channel's note (below): the gate admits an edit,
+    // when it arrives, only while its channel is open or subscribed
+    // (forwardMessageEdit), so an edit that replaces this create normally
+    // comes once the note no longer holds. Admission is checked when an
+    // edit arrives, not when it's sent, so one admitted while the channel
+    // was open can follow a close during this create's attachment fetch,
+    // and replace a create pushed with the note.
+    mem.render = {
+      prefix: prefixBlock, replyMarker, location, authorName: msg.authorName,
+      attachments: rememberedAttachments(attachmentBlocks),
+    };
 
     // If this channel is open, use channels/incoming
     if (channelIsOpen) {
@@ -5480,15 +5496,33 @@ export class DiscordMcplServer {
           },
           tags: eventTags,
       };
-      const incomingParams: ChannelsIncomingParams = { messages: [message] };
-
-      try {
-        await conn.sendRequest(method.CHANNELS_INCOMING, incomingParams);
-        dbg('handleDiscordMessage:sent', { method: 'channels/incoming', channelMcplId });
-      } catch (err) {
-        console.error('[discord-mcpl] channels/incoming failed:', (err as Error).message);
-        dbg('handleDiscordMessage:send-failed', { method: 'channels/incoming', error: (err as Error).message });
-      }
+      await this.deliverCreate({
+        lane: 'channels/incoming',
+        messageId: msg.id,
+        channelMcplId,
+        content: message.content,
+        attachmentBlocks,
+        mem,
+        send: async (content, resend) => {
+          const params: ChannelsIncomingParams = {
+            messages: [{
+              ...message,
+              content,
+              // A refused item was never admitted (the host validates before
+              // its coalescer accepts, so no receipt or subject exists for
+              // it); a fresh occurrence id still keeps the resend clear of
+              // any receipt or dedup keyed on the first one.
+              ...(resend && message.eventId ? { eventId: `${message.eventId}_media_omitted` } : {}),
+            } as CoalescedIncomingMessage],
+          };
+          try {
+            return incomingOutcome(await conn.sendRequest(method.CHANNELS_INCOMING, params), msg.id);
+          } catch (err) {
+            const rejection = errorRejection(err);
+            return rejection ? { kind: 'rejected', ...rejection } : { kind: 'failed', error: errorText(err) };
+          }
+        },
+      });
     } else {
       // Otherwise, use push/event.
       //
@@ -5554,16 +5588,137 @@ export class DiscordMcplServer {
         },
       };
 
-      try {
-        await conn.sendRequest(method.PUSH_EVENT, pushParams as unknown as Record<string, unknown>);
-        dbg('handleDiscordMessage:sent', { method: 'push/event', channelMcplId });
-      } catch (err) {
-        console.error('[discord-mcpl] push/event failed:', (err as Error).message);
-        dbg('handleDiscordMessage:send-failed', { method: 'push/event', error: (err as Error).message });
-      }
+      await this.deliverCreate({
+        lane: 'push/event',
+        messageId: msg.id,
+        channelMcplId,
+        content: pushParams.payload.content,
+        attachmentBlocks,
+        mem,
+        send: async (content, resend) => {
+          const params: CoalescedPushEventParams = {
+            ...pushParams,
+            // See the channels/incoming resend above: a fresh occurrence id.
+            ...(resend ? { eventId: `${pushParams.eventId}_media_omitted` } : {}),
+            payload: { content },
+          };
+          try {
+            return pushOutcome(await conn.sendRequest(method.PUSH_EVENT, params as unknown as Record<string, unknown>));
+          } catch (err) {
+            const rejection = errorRejection(err);
+            return rejection ? { kind: 'rejected', ...rejection } : { kind: 'failed', error: errorText(err) };
+          }
+        },
+      });
     }
   }
+
+  /**
+   * Send one message create to the host and read its verdict: sending is not
+   * delivering. A host can refuse a message per item (channels/incoming
+   * `results[]`, push/event `{accepted:false}`) or with a JSON-RPC error, and
+   * the refused message never reaches the agent, its text included.
+   *
+   * - Accepted, or answered without a per-message verdict (an older host):
+   *   `handleDiscordMessage:sent`, as before, now with `result`.
+   * - Refused, by a result or by an error the host answered with
+   *   (errorRejection): one `[discord-mcpl] host rejected message …` stderr
+   *   line and `handleDiscordMessage:rejected` with the reason, an error's
+   *   code, and what the message carried inline. channels/incoming answers
+   *   each message without a code, so there the host's own failure reads the
+   *   same as a refusal, and the line says `host didn't take message …`.
+   * - Refused for its content (isContentRejection) while carrying inline
+   *   images/audio: resent ONCE with each inline block replaced by a text
+   *   note, so the text, and the fact that media was attached, still reach
+   *   the agent. agent-framework's coalescing hosts before 0.22.2, its 0.21
+   *   line included, refuse a coalesced message whose content, inline base64
+   *   included, passes 1 MiB. Never more than one resend.
+   * - No answer (mcpl-core's timeout, or a closed connection), or the host's
+   *   own failure (-32000, -32603; errorRejection): logged as before,
+   *   `handleDiscordMessage:send-failed`, and not resent.
+   */
+  private async deliverCreate(args: {
+    lane: 'channels/incoming' | 'push/event';
+    messageId: string;
+    channelMcplId: string;
+    content: ContentBlock[];
+    /** The create's attachment blocks, as `content` carries them. */
+    attachmentBlocks: ContentBlock[];
+    mem: CreateMemory;
+    send: (content: ContentBlock[], resend: boolean) => Promise<SendOutcome>;
+  }): Promise<void> {
+    const { lane, messageId, channelMcplId, content, attachmentBlocks, mem, send } = args;
+    const first = await send(content, false);
+    if (first.kind === 'failed') {
+      console.error(`[discord-mcpl] ${lane} failed:`, first.error);
+      dbg('handleDiscordMessage:send-failed', { method: lane, error: first.error });
+      return;
+    }
+    if (first.kind !== 'rejected') {
+      dbg('handleDiscordMessage:sent', { method: lane, channelMcplId, result: first.kind });
+      return;
+    }
+    // channels/incoming answers each message without a code, so there the
+    // host's own failure ("host could not persist the acceptance; retry",
+    // "host is stopping") reads the same as a refusal, and that lane's line
+    // says only that the host didn't take the message.
+    const verb = (code: number | undefined) => (lane === 'channels/incoming' && code === undefined ? "didn't take" : 'rejected');
+    const attachments = summarizeAttachments(content);
+    console.error(`[discord-mcpl] host ${verb(first.code)} message ${messageId} in ${channelMcplId}: ${first.reason}`);
+    dbg('handleDiscordMessage:rejected', {
+      method: lane, messageId, channelMcplId, reason: first.reason,
+      ...(first.code !== undefined ? { code: first.code } : {}),
+      attachments,
+    });
+    if (!isContentRejection(first) || attachments.inline === 0) return;
+
+    const stripped = withoutInlineMedia(content);
+    // An edit that replaces this create re-renders the attachments the create
+    // remembers. From here they are the ones resent, notes and links, so the
+    // edit doesn't carry back the media the host refused. While the resent
+    // blocks fit RECENT_CREATE_ATTACHMENT_BYTES it keeps the note and the link
+    // the agent was sent, which the memory of a create over that size held
+    // only as a placeholder.
+    if (mem.render) mem.render.attachments = rememberedAttachments(withoutInlineMedia(attachmentBlocks).content);
+    const second = await send(stripped.content, true);
+    const what = `message ${messageId} in ${channelMcplId} with ${stripped.replaced} inline attachment(s) replaced by a note`;
+    if (second.kind === 'failed') {
+      console.error(`[discord-mcpl] resent ${what}: send failed: ${second.error}`);
+      dbg('handleDiscordMessage:resend-failed', { method: lane, messageId, channelMcplId, error: second.error });
+    } else if (second.kind === 'rejected') {
+      console.error(`[discord-mcpl] resent ${what}: host ${verb(second.code)} it again: ${second.reason}`);
+      dbg('handleDiscordMessage:resend-rejected', { method: lane, messageId, channelMcplId, reason: second.reason });
+    } else {
+      console.error(`[discord-mcpl] resent ${what}: ${second.kind === 'accepted' ? 'accepted' : 'sent (no verdict)'}`);
+      dbg('handleDiscordMessage:resent', { method: lane, messageId, channelMcplId, replaced: stripped.replaced, result: second.kind });
+    }
+  }
+
+  /** Read the host's verdict on an edit or delete (fire-and-forget sends):
+   *  a refusal is logged; transport failures stay quiet, as before. */
+  private noteMutationOutcome(kind: 'edit' | 'delete', messageId: string, channel: string, sent: Promise<unknown>): void {
+    sent.then(
+      (response) => {
+        const outcome = pushOutcome(response);
+        if (outcome.kind !== 'rejected') return;
+        console.error(`[discord-mcpl] host rejected ${kind} of message ${messageId} in ${channel}: ${outcome.reason}`);
+        dbg('handleMessageMutation:rejected', { kind, messageId, channel, reason: outcome.reason });
+      },
+      (err) => {
+        const rejection = errorRejection(err);
+        if (rejection) {
+          console.error(`[discord-mcpl] host rejected ${kind} of message ${messageId} in ${channel}: ${rejection.reason}`);
+          dbg('handleMessageMutation:rejected', { kind, messageId, channel, reason: rejection.reason, code: rejection.code });
+        } else {
+          dbg('handleMessageMutation:send-failed', { kind, messageId, channel, error: errorText(err) });
+        }
+      },
+    );
+  }
 }
+
+/** A forwarded create's outcome, as `deliverCreate` reads it. */
+type SendOutcome = ForwardOutcome | { kind: 'failed'; error: string };
 
 /** Serve a stdio host until its connection ends, then exit. A stdio server
  *  can't be reached again once its host has gone, so it exits, as MCP's
