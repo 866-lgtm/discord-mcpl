@@ -68,6 +68,39 @@ in the git log and PR descriptions.
   channels are registered with it**, as the first one does. The policy gate
   was answered once per process, so a second connection was sent
   `channels/register` straight after `initialize`, before its policy.
+- **A message the host didn't take is owed, and delivered later.** The
+  watermark moves past a message when it's forwarded, so one the host
+  didn't take, after every resend, was lost for good: neither the catch-up
+  sweep nor a later backscroll would see it again. Such a message is now
+  owed: one that got no verdict (marked as one that may have arrived after
+  all), or one refused for a reason the spec gives no meaning, and an edit
+  not taken (its message is owed, marked as edited). A refusal the spec does
+  give a meaning (malformed, not permitted, unknown channel) isn't owed: it's
+  the host's decision or this server's bug. What is owed is delivered as
+  Discord has it then, in one `<missed … reason="undelivered">` block per
+  channel, like the catch-up's, when a host connection becomes ready
+  (alongside the catch-up, not ahead of it; one that becomes ready while a
+  delivery still runs on the connection before it delivers once that ends),
+  and when the host takes a message in that channel again, on a connection
+  whose start-up has settled (not within five minutes of a failed try on the
+  same connection). One read of up to 100 messages from Discord answers
+  for every owed message inside it. They go through the same ingestion gate
+  as live messages: one that doesn't address the agent goes only while its
+  channel is open or subscribed. A message Discord no longer has, one the
+  filters or the gate refuse now, and those of a muted, deleted or unknown
+  channel are given up (Discord not knowing the channel is read as the
+  catch-up reads it: the channel is gone). A block not delivered (not taken, a failed read, a channel whose
+  identity can't be resolved, or a filter refusal resting on facts that
+  aren't current, which the catch-up holds back too) counts a try (not one
+  cut short by its connection ending), and three tries give it up; a refusal with a code the
+  spec gives a meaning, or an unknown channel, gives it up at once. A later
+  edit or delete of the message that the host takes clears what was owed for
+  it; a message owed again while a delivery of it is on its way stays owed. At most 50
+  messages are owed per channel. They are kept with the watermarks (`DISCORD_WATERMARK_FILE`,
+  under `owed`, written only while something is owed), so a restart
+  delivers them. Logged: `[discord-mcpl] Message <id> in channel <id> is
+  owed: …`, `[discord-mcpl] Delivered <n> owed message(s) in channel <id>.`,
+  `[discord-mcpl] Couldn't deliver <n> owed message(s) in channel <id>: …`.
 - **The resend without inline media is named for what it is**: a
   compatibility measure for agent-framework's hosts before 0.22.2, which
   answered -32602 / `coalesce_invalid` to content over a 1 MiB budget. In
