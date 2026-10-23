@@ -16,6 +16,9 @@ import { afterEach, beforeEach, describe, it } from 'node:test';
 import * as assert from 'node:assert/strict';
 import { PassThrough } from 'node:stream';
 import { createInterface } from 'node:readline';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 
 import { ConnectionClosedError, McplConnection, RpcError, textContent } from '@animalabs/mcpl-core';
 import type { ContentBlock } from '@animalabs/mcpl-core';
@@ -638,7 +641,7 @@ describe('sending the same occurrence again, by what the spec defines', () => {
       const silent = wire(() => undefined, { host, coalescing: false });
       await deliver(silent.server, SMALL_IMAGE);
       assert.equal(host.sent.length, 1);
-      assert.equal(errors.some((e) => e.includes('again')), false, errors.join('\n'));
+      assert.equal(errors.some((e) => e.includes('same occurrence again') || e.includes('(same event id')), false, errors.join('\n'));
     });
 
     it('…but an unknown channel is announced and the occurrence sent once more, on any host: it was not admitted', async () => {
@@ -851,5 +854,189 @@ describe('sending the same occurrence again, by what the spec defines', () => {
     assert.equal(advertisedRetryWindowMs({ pushEvents: true, retryWindowMs: 3_600_000 }), 3_600_000);
     assert.equal(advertisedRetryWindowMs(true), undefined);
     assert.equal(advertisedRetryWindowMs({ retryWindowMs: -1 }), undefined);
+  });
+});
+
+/**
+ * A message the host didn't take, after every resend, is owed: the watermark
+ * has moved past it, so nothing else would bring it. It's delivered, as
+ * Discord has it then, in a `<missed reason="undelivered">` block when a
+ * connection becomes ready, or when the host takes a message in its channel
+ * again. A refusal the spec gives a meaning isn't owed.
+ */
+describe('owed messages', () => {
+  let dir: string;
+  let file: string;
+  let savedEnv: string | undefined;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'owed-'));
+    file = join(dir, 'watermarks.json');
+    savedEnv = process.env.DISCORD_WATERMARK_FILE;
+    process.env.DISCORD_WATERMARK_FILE = file;
+  });
+  afterEach(() => {
+    if (savedEnv === undefined) delete process.env.DISCORD_WATERMARK_FILE;
+    else process.env.DISCORD_WATERMARK_FILE = savedEnv;
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  const saved = (): any => JSON.parse(readFileSync(file, 'utf8'));
+  const history = (id: string, text: string, over: Record<string, unknown> = {}) => ({
+    id, authorId: 'u1', authorName: 'someone', isBot: false, content: text, cleanContent: text,
+    attachments: [], mentionsBot: false, timestamp: new Date('2026-10-22T10:00:00Z'), reactions: [], ...over,
+  });
+  /** Discord as the stubs read it: these messages exist in chan1. */
+  const onDiscord = (server: DiscordMcplServer, messages: Array<ReturnType<typeof history>>) => {
+    const d = (server as any).discord;
+    d.fetchAround = async (_channel: string, id: string) => messages.filter((m) => m.id === id);
+    d.getCachedChannelMeta = () => ({ name: 'general', guildId: 'g1', guildName: 'Guild', isDM: false });
+    d.getChannelMeta = async () => null;
+    d.lookUpStaleParent = async () => {};
+    d.historyIngressReason = () => null;
+  };
+  const owedPushes = (sent: Array<{ method: string; params: any }>) =>
+    sent.filter((r) => r.method === 'push/event' && String(r.params.eventId).startsWith('discord_owed_'));
+  const blockOf = (req: { params: any }): string => req.params.payload.content.map((b: any) => b.text ?? '').join('\n');
+
+  it('a create with no verdict after every resend is owed, as one that may have arrived, and saved with the watermarks', async () => {
+    const host = scriptedHost(() => ({ error: { code: -32603, message: 'Internal error' } }));
+    const { server } = wire(() => undefined, { host });
+    (server as any).retryDelaysMs = [2];
+    await deliver(server, SMALL_IMAGE);
+    assert.deepEqual(saved().owed, { chan1: [{ id: 'm1', uncertain: true }] });
+    assert.ok(errors.includes('[discord-mcpl] Message m1 in channel chan1 is owed: it is delivered when the host takes messages there again.'), errors.join('\n'));
+  });
+
+  it('a create refused for a reason the spec gives no meaning, after its resend, is owed', async () => {
+    const { server } = wire(() => ({ results: [{ messageId: 'm1', accepted: false, reason: 'host is stopping' }] }), { open: true });
+    await deliver(server, SMALL_IMAGE);
+    assert.deepEqual(saved().owed, { chan1: [{ id: 'm1' }] });
+  });
+
+  for (const [what, respond] of [
+    ['a feature-set refusal (-32001)', () => { throw rpcError(-32001, 'Feature set not enabled'); }],
+    ['coalesce_invalid without inline media', () => ({ accepted: false, reason: 'coalesce_invalid' })],
+    ['an accepted create', () => ({ accepted: true })],
+  ] as const) {
+    it(`${what} isn't owed`, async () => {
+      const { server } = wire(respond as Responder);
+      await deliver(server, null);
+      let owed: unknown;
+      try { owed = saved().owed; } catch { owed = undefined; }
+      assert.equal(owed, undefined);
+      assert.equal((server as any).owed.size, 0);
+    });
+  }
+
+  it('an edit not taken owes its message, marked as an edit', async () => {
+    const { server, edit } = wire(() => { throw rpcError(-32603, 'Internal error'); });
+    (server as any).retryDelaysMs = [2];
+    edit()('chan1', 'm9', 'fixed', false, { guildId: 'g1', authorId: 'u1', authorName: 'someone' });
+    await until(() => (server as any).owed.size > 0);
+    assert.deepEqual((server as any).owed.get('chan1'), [{ id: 'm9', uncertain: true, edit: true }]);
+  });
+
+  it('owed messages are delivered as Discord has them, in one undelivered block, then forgotten', async () => {
+    const { server, sent } = wire(() => ({ accepted: true }));
+    onDiscord(server, [history('m1', 'first'), history('m2', 'second, edited since', { mentionsBot: true })]);
+    (server as any).owe('chan1', 'm1', { uncertain: false });
+    (server as any).owe('chan1', 'm2', { uncertain: true, edit: true });
+    await (server as any).deliverOwed((server as any).conn);
+    const pushes = owedPushes(sent);
+    assert.equal(pushes.length, 1);
+    assert.equal(pushes[0].params.eventId, 'discord_owed_chan1_m1_m2_2');
+    assert.equal(pushes[0].params.origin.mcplChannelId, 'discord:g1:chan1');
+    assert.equal(pushes[0].params.origin.isMention, true);
+    const block = blockOf(pushes[0]);
+    assert.match(block, /^<missed channel="#general" channelId="chan1" guild="Guild" count="2" reason="undelivered">/m);
+    assert.match(block, /\[The host didn't take these messages when they were sent; this is how Discord has them now\.\]/);
+    assert.match(block, /id=m1\] someone: first$/m);
+    assert.match(block, /id=m2\] someone \(mention\) \(edited\) \(may have arrived already\): second, edited since$/m);
+    assert.equal((server as any).owed.size, 0);
+    assert.equal(saved().owed, undefined, 'the file holds nothing owed once delivered');
+    assert.ok(errors.includes('[discord-mcpl] Delivered 2 owed message(s) in channel chan1.'), errors.join('\n'));
+  });
+
+  it("a message Discord no longer has is forgotten, and nothing is pushed for it", async () => {
+    const { server, sent } = wire(() => ({ accepted: true }));
+    onDiscord(server, []);
+    (server as any).owe('chan1', 'm1', { uncertain: false });
+    await (server as any).deliverOwed((server as any).conn);
+    assert.equal(owedPushes(sent).length, 0);
+    assert.equal((server as any).owed.size, 0);
+  });
+
+  it(`a block the host doesn't take is tried again, ${3} times in all, then given up`, async () => {
+    const { server, sent } = wire(() => ({ accepted: false, reason: 'busy' }));
+    onDiscord(server, [history('m1', 'first')]);
+    (server as any).owe('chan1', 'm1', { uncertain: false });
+    for (let i = 1; i <= 3; i++) {
+      await (server as any).deliverOwed((server as any).conn);
+      assert.equal(owedPushes(sent).length, i);
+    }
+    assert.equal((server as any).owed.size, 0);
+    assert.ok(errors.some((e) => e.startsWith("[discord-mcpl] Couldn't deliver 1 owed message(s) in channel chan1: host didn't take it: busy; tried again later.")), errors.join('\n'));
+    assert.ok(errors.some((e) => e.endsWith('; given up.')), errors.join('\n'));
+  });
+
+  it('a block refused with a code the spec defines is given up at once', async () => {
+    const { server, sent } = wire(() => { throw rpcError(-32017, 'Channel not permitted'); });
+    onDiscord(server, [history('m1', 'first')]);
+    (server as any).owe('chan1', 'm1', { uncertain: false });
+    await (server as any).deliverOwed((server as any).conn);
+    assert.equal(owedPushes(sent).length, 1);
+    assert.equal((server as any).owed.size, 0);
+  });
+
+  it('when the host takes a message in the channel again, what it owes there follows', async () => {
+    const { server, sent } = wire(() => ({ accepted: true }));
+    onDiscord(server, [history('m0', 'earlier')]);
+    (server as any).owe('chan1', 'm0', { uncertain: false });
+    await deliver(server, null);
+    await until(() => owedPushes(sent).length === 1);
+    assert.match(blockOf(owedPushes(sent)[0]), /id=m0\] someone: earlier/);
+    assert.equal((server as any).owed.size, 0);
+  });
+
+  it('what is owed survives a restart: a new server loads it and delivers it when its connection is ready', async () => {
+    writeFileSync(file, JSON.stringify({ watermarks: { chan1: 'm5' }, dmChannels: [], missed: {}, owed: { chan1: [{ id: 'm1', uncertain: true }] } }));
+    const { server, sent } = wire(() => ({ accepted: true }));
+    onDiscord(server, [history('m1', 'first')]);
+    await (server as any).deliverOwed((server as any).conn);
+    assert.equal(owedPushes(sent).length, 1);
+    assert.match(blockOf(owedPushes(sent)[0]), /\(may have arrived already\): first/);
+    assert.equal(saved().watermarks.chan1, 'm5', 'the watermark is left as it was');
+  });
+
+  it("a message the filters would refuse today isn't delivered, and is forgotten", async () => {
+    const { server, sent } = wire(() => ({ accepted: true }));
+    onDiscord(server, [history('m1', 'first'), history('m2', 'second', { authorId: 'u2' })]);
+    (server as any).discord.historyIngressReason = (_c: string, _g: string | null, author: string) => author === 'u2' ? 'user-not-allowed' : null;
+    (server as any).owe('chan1', 'm1', { uncertain: false });
+    (server as any).owe('chan1', 'm2', { uncertain: false });
+    await (server as any).deliverOwed((server as any).conn);
+    const block = blockOf(owedPushes(sent)[0]);
+    assert.match(block, /count="1"/);
+    assert.match(block, /id=m1\]/);
+    assert.equal(block.includes('id=m2'), false);
+    assert.equal((server as any).owed.size, 0);
+  });
+
+  it('a muted channel gives up what it owes', async () => {
+    const { server, sent } = wire(() => ({ accepted: true }));
+    onDiscord(server, [history('m1', 'first')]);
+    (server as any).owe('chan1', 'm1', { uncertain: false });
+    (server as any).isChannelMuted = (id: string) => id === 'chan1';
+    await (server as any).deliverOwed((server as any).conn);
+    assert.equal(owedPushes(sent).length, 0);
+    assert.equal((server as any).owed.size, 0);
+  });
+
+  it(`at most ${50} messages are owed per channel; the oldest go first`, () => {
+    const { server } = wire(() => ({ accepted: true }));
+    for (let i = 0; i < 52; i++) (server as any).owe('chan1', `m${i}`, { uncertain: false });
+    const ids = (server as any).owed.get('chan1').map((o: { id: string }) => o.id);
+    assert.equal(ids.length, 50);
+    assert.equal(ids[0], 'm2');
   });
 });
