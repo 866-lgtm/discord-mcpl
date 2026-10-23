@@ -616,6 +616,17 @@ export function buildForwardedContent(
  *  so neither forwards nor system messages can regress to empty on
  *  backscroll or the reconnect catch-up sweep — history replays missed
  *  messages through fetchHistory, not the live path. */
+/** What a message says about whom it addresses: the users it mentions,
+ *  whether it mentions the bot's own managed role, the author of the message
+ *  it replies to, and whether a bot wrote it. The server reads a create's and
+ *  an edit's the same way (`addressFlags`). */
+export interface AddressFacts {
+  mentions: string[];
+  mentionsBotRole: boolean;
+  replyToUserId: string | null;
+  isBot: boolean;
+}
+
 /** Author/location context forwarded with an edit or delete event, the
  *  thread included when the message's channel is one (ThreadPlace). */
 export interface MessageEventInfo extends ThreadPlace {
@@ -636,6 +647,10 @@ export interface MessageEventInfo extends ThreadPlace {
   editedAt?: string;
   /** The edited body with mentions resolved, as a create renders it. */
   cleanContent?: string;
+  /** For an edit: the edited message's own address facts, when discord.js
+   *  holds the whole message. Absent for a partial one, whose addressing
+   *  isn't known. */
+  address?: AddressFacts;
 }
 
 /** Why an incoming `messageUpdate` is (not) forwarded as an edit. */
@@ -2882,12 +2897,16 @@ export class DiscordAdapter {
     // replacing edit need the edit time and the mention-resolved body.
     const editedAt = newMsg.editedTimestamp ? new Date(newMsg.editedTimestamp).toISOString() : undefined;
     const cleanContent = newMsg.cleanContent ?? undefined;
+    // Whom the message addresses as edited, from the update's own payload: an
+    // edit can add a mention or take one away. A partial message carries no
+    // mentions to read, so its addressing stays unknown rather than ambient.
+    const address = newMsg.partial ? undefined : this.addressFacts(newMsg);
     await this.forwardMessageEvent(newMsg, (info) => {
       if (!info.guildId && this.dmUserRefused(info.authorId)) {
         dbg('messageUpdate:drop', { msgId: messageId, channelId, reason: info.authorId ? 'dm-not-allowed' : 'dm-party-unknown' });
         return;
       }
-      this.editHandler?.(channelId, messageId, content, !info.guildId, { ...info, editedAt, cleanContent });
+      this.editHandler?.(channelId, messageId, content, !info.guildId, { ...info, editedAt, cleanContent, ...(address ? { address } : {}) });
     });
   }
 
@@ -3635,7 +3654,6 @@ export class DiscordAdapter {
       cleanContent: content,
       authorId: message.author.id,
       authorName: message.author.username,
-      isBot: message.author.bot,
       channelId: message.channelId,
       channelName,
       guildId: message.guildId ?? null,
@@ -3645,18 +3663,26 @@ export class DiscordAdapter {
       // posted, so it never stands in for this.)
       ...this.threadPlace(message.channel, message.channelId),
       replyToId: refType === 0 ? (message.reference?.messageId ?? undefined) : undefined,
+      replyToUserName: message.mentions.repliedUser?.username ?? null,
+      ...this.addressFacts(message),
+      attachments: mapAllAttachments(message),
+      timestamp: message.createdAt,
+    };
+  }
+
+  /** A message's address facts, as a create and each edit of it report them. */
+  private addressFacts(message: Message): AddressFacts {
+    return {
       // mentions.repliedUser is the User the reply targets — distinct
       // from mentions.users (which only includes them if the sender
       // explicitly enabled the reply-ping). We capture it so reply-to-bot
       // can be treated as direct address regardless of the ping toggle.
       replyToUserId: message.mentions.repliedUser?.id ?? null,
-      replyToUserName: message.mentions.repliedUser?.username ?? null,
       mentions: message.mentions.users.map((u) => u.id),
       mentionsBotRole: message.mentions.roles.some(
         (r) => (r as { tags?: { botId?: string } }).tags?.botId === this.client.user?.id,
       ),
-      attachments: mapAllAttachments(message),
-      timestamp: message.createdAt,
+      isBot: message.author.bot,
     };
   }
 }

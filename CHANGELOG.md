@@ -7,6 +7,19 @@ in the git log and PR descriptions.
 
 ### Changed
 
+- **A message edit carries the edited message's address tags, as its
+  create does.** An edit's push was tagged only `chat:edited` (and
+  `chat:thread` in a thread), so a host couldn't tell an edit to a message
+  addressed to the bot from an edit to chatter. It now also carries
+  `chat:mention`, `chat:reply`, `chat:dm` and `chat:private`, `chat:addressed`
+  or `chat:ambient`, and `chat:from-bot` or `chat:from-human`, read from the
+  message as edited by the same rule as a create: an edit that adds a
+  mention is addressed, and one that takes the mention away is ambient. An
+  edit whose message discord.js holds only in part, so its mentions can't be
+  read, carries no address tags, as before. A host whose wake rules match
+  these tags now meets edits there too, where they used to fall past those
+  rules.
+
 - **What is sent again after a host's answer rests on the MCPL spec alone,
   not on one host's words.** discord-mcpl serves more than one kind of
   host, and 0.4.0 recognized only agent-framework's two "could not persist /

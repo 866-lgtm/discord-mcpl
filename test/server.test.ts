@@ -36,6 +36,7 @@ import { parseChannelRef } from '../src/channel-names.js';
 import { applyMentionCandidates } from '../src/discord-adapter.js';
 import { TOOL_CLASSES } from '../src/tool-classes.js';
 import type {
+  AddressFacts,
   ChannelChange,
   ChannelFacts,
   ChannelMeta,
@@ -1528,6 +1529,48 @@ describe('DiscordMcplServer', () => {
       assert.deepEqual(p.tags, [tag], tag);
       const origin = p.origin as Record<string, unknown>;
       assert.equal('threadName' in origin || 'threadParentName' in origin, false, tag);
+    }
+  });
+
+  it("tags an edit with the edited message's own addressing, as its create would be, and an edit whose addressing isn't known as before", async (t) => {
+    const { client, discord, nextRequest } = await threadServer(t);
+    await client.sendRequest(method.CHANNELS_OPEN, { type: 'discord', address: { guildId: 'g1', channelId: 'c1' } });
+    // The adapter's address facts for each edit, as handleMessageUpdate reads them from the edited message.
+    const facts = (over: Partial<AddressFacts> = {}): AddressFacts => ({ mentions: [], mentionsBotRole: false, replyToUserId: null, isBot: false, ...over });
+    const rows: Array<[string, AddressFacts | undefined, string[]]> = [
+      ['an edit that mentions the bot', facts({ mentions: ['u9', 'bot_123'] }), ['chat:edited', 'chat:mention', 'chat:addressed', 'chat:from-human']],
+      ["an edit that mentions the bot's role", facts({ mentionsBotRole: true }), ['chat:edited', 'chat:mention', 'chat:addressed', 'chat:from-human']],
+      ['an edit of a reply to the bot', facts({ replyToUserId: 'bot_123' }), ['chat:edited', 'chat:reply', 'chat:addressed', 'chat:from-human']],
+      ['an edit that addresses nobody', facts({ mentions: ['u9'], replyToUserId: 'u9' }), ['chat:edited', 'chat:ambient', 'chat:from-human']],
+      ["another bot's edit", facts({ isBot: true }), ['chat:edited', 'chat:ambient', 'chat:from-bot']],
+      ["an edit whose addressing isn't known (a partial message)", undefined, ['chat:edited']],
+    ];
+    let n = 0;
+    for (const [name, address, tags] of rows) {
+      n += 1;
+      discord.simulateEdit('c1', `m${n}`, 'second version', false, { guildId: 'g1', authorName: 'Bob', editedAt: `2026-10-02T00:00:0${n}.000Z`, ...(address ? { address } : {}) });
+      const edit = await nextRequest('push/event');
+      client.sendResponse(edit.id, { accepted: true });
+      assert.deepEqual((edit.params as PushEventParams).tags, tags, name);
+    }
+    // A thread's edit keeps its thread tag after the address tags, as a create's does.
+    await client.sendRequest(method.CHANNELS_OPEN, { type: 'discord', address: { guildId: 'g1', channelId: 'th1' } });
+    discord.simulateEdit('th1', 'm9', 'second version', false, { guildId: 'g1', authorName: 'Bob', threadId: 'th1', threadName: 'design-chat', threadParentName: 'general', editedAt: '2026-10-02T00:00:09.000Z', address: facts({ mentions: ['bot_123'] }) });
+    const threadEdit = await nextRequest('push/event');
+    client.sendResponse(threadEdit.id, { accepted: true });
+    assert.deepEqual((threadEdit.params as PushEventParams).tags, ['chat:edited', 'chat:mention', 'chat:addressed', 'chat:from-human', 'chat:thread']);
+  });
+
+  it("tags a DM's edit as addressed and private, as a DM's create is", async (t) => {
+    const { client, discord } = await threadServer(t);
+    discord.simulateEdit('dm7', 'd1', 'fixed', true, { guildId: null, authorId: 'u7', authorName: 'Ra', editedAt: '2026-10-02T00:00:02.000Z', address: { mentions: [], mentionsBotRole: false, replyToUserId: null, isBot: false } });
+    // A DM's edit registers its channel first (channels/changed), then pushes.
+    for (;;) {
+      const m = await nextWithin(client);
+      if (m.type !== 'request' || m.request.method !== 'push/event') continue;
+      client.sendResponse(m.request.id, { accepted: true });
+      assert.deepEqual((m.request.params as PushEventParams).tags, ['chat:edited', 'chat:dm', 'chat:private', 'chat:addressed', 'chat:from-human']);
+      break;
     }
   });
 

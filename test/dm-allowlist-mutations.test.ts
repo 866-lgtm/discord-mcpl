@@ -65,9 +65,11 @@ const dm = (user: string, id: string, cached: boolean) => ({
   channel: cached
     ? { id: `dm-${user}`, type: ChannelType.DM, recipientIds: [user], isDMBased: () => true }
     : { id: `dm-${user}`, type: ChannelType.DM, isDMBased: () => true },
-  author: cached ? { id: user, username: `${user}_name` } : null,
+  author: cached ? { id: user, username: `${user}_name`, bot: false } : null,
   content: cached ? 'words' : null,
   editedTimestamp: 1790000000000,
+  // A whole message, as discord.js gives one, says whom it mentions.
+  ...(cached ? { mentions: { users: [], roles: [], repliedUser: null } } : {}),
 });
 
 describe('the DM allowlist on edits and deletes', () => {
@@ -227,9 +229,10 @@ describe('the DM allowlist and guild channels', () => {
     const inGuild = (id: string) => ({
       id, channelId: 'g-chan', guildId: 'guild-1', partial: false,
       channel: { id: 'g-chan', type: ChannelType.GuildText, guildId: 'guild-1', parentId: null, isDMBased: () => false },
-      author: { id: 'stranger', username: 'stranger_name' },
+      author: { id: 'stranger', username: 'stranger_name', bot: false },
       content: 'changed words',
       editedTimestamp: 1790000000000,
+      mentions: { users: [], roles: [], repliedUser: null },
     });
     emit('messageUpdate', { partial: true }, inGuild('g-edit'));
     emit('messageDelete', inGuild('g-delete'));
