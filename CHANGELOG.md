@@ -5,6 +5,57 @@ in the git log and PR descriptions.
 
 ## Unreleased
 
+### Changed
+
+- **What is sent again after a host's answer rests on the MCPL spec alone,
+  not on one host's words.** discord-mcpl serves more than one kind of
+  host, and 0.4.0 recognized only agent-framework's two "could not persist /
+  make durable the acceptance; retry" sentences. A forwarded message, edit or
+  delete is now read by what the spec defines:
+  - **Accepted**, or answered without a verdict: done.
+  - **A refusal the spec gives a meaning** (-32602 / `coalesce_invalid`,
+    -32001, -32002, -32003, -32017, JSON-RPC's -32600, -32601, -32700):
+    final, logged, never sent again as it is.
+  - **-32023, an unknown channel**: the channel is announced to the host
+    again (`channels/changed`) and the same occurrence sent once more, on
+    any host: it wasn't admitted, so it can't be a duplicate.
+  - **A refusal the spec gives no meaning** (`accepted: false` with a
+    free-text reason, or none): sent once more as the same occurrence.
+  - **No verdict** (no answer, a closed connection, -32603, or another
+    -32000 to -32099 error the spec doesn't define, mcpl-core's own timeout
+    included): sent again as the same occurrence after 1 s, 5 s, 30 s, 2 min
+    and 10 min while answers stay that way.
+
+  The last two only for an occurrence that carries `coalesce`, to a host that
+  advertises event coalescing for its lane: RFC-006 §3.1 obliges that host to
+  recognize a repeated `eventId` for its retry window (`retryWindowMs`, an
+  hour by default) and return the first result without repeating its
+  effects. Resends stop at half that window after the first send. A host
+  that advertises no coalescing gets each occurrence once, as before. Every
+  resend is logged (`[discord-mcpl] <what>: <answer>; sending the same
+  occurrence again (same event id) in <n>ms`, then `[discord-mcpl] sent
+  <what> again (same event id): <answer>`), and so is each one skipped
+  (`…; not sent again: <why>`).
+- **A resend waits for the host to come back.** After a reconnect it goes to
+  the host connected since, once that host's start-up has settled
+  (initialized, its policy answered, the channels registered), as RFC-006
+  §3.1 allows ("survives reconnects and host restarts"); never to a host
+  that advertises no coalescing. 0.4.0 dropped it instead. An edit or delete
+  that waited for its message's create goes to the host connected since
+  only once its start-up has settled, too.
+- **A later edit or delete no longer waits for an earlier one being sent
+  again.** It goes at once, and the earlier one isn't sent again: the later
+  occurrence replaces or withdraws the message.
+- **A host that connects after another waits for its own policy before the
+  channels are registered with it**, as the first one does. The policy gate
+  was answered once per process, so a second connection was sent
+  `channels/register` straight after `initialize`, before its policy.
+- **The resend without inline media is named for what it is**: a
+  compatibility measure for agent-framework's hosts before 0.22.2, which
+  answered -32602 / `coalesce_invalid` to content over a 1 MiB budget. In
+  the spec those answers mean a malformed request; on another host the
+  resend costs one request.
+
 ## 0.4.0 — 2026-10-22
 
 ### Upgrade notes

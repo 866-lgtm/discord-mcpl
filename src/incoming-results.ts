@@ -7,12 +7,11 @@
  * (`code`, `message`). A refused message never reaches the agent, so the
  * refusal has to be read and reported here: sending is not delivering.
  *
- * The case this exists for: agent-framework's coalescing hosts before 0.22.2,
- * its 0.21 line included, check a coalesced message's whole content against
- * a 1 MiB budget, inline base64 images included (agent-framework #266; #267
- * removed the budget in 0.22.2). They refuse a message carrying a large
- * screenshot as `coalesce_invalid` (channels/incoming) or with a -32602 error
- * (push/event), and the host logs nothing about it. The message, its text
+ * discord-mcpl serves more than one kind of host, so what it does with an
+ * answer rests only on what the MCPL spec defines (answerClass): the
+ * refusal codes of SPEC Appendix A and RFC-006 §13, `accepted`, and the
+ * retry contract of RFC-006 §3.1. A host's `reason` is free text, kept for
+ * the operator's log and never matched.
  * included, never reaches the agent.
  */
 
@@ -60,30 +59,32 @@ export function pushOutcome(response: unknown): ForwardOutcome {
   return { kind: 'no-result' };
 }
 
+/** The refusal codes the MCPL spec defines in JSON-RPC's server-error range
+ *  (SPEC Appendix A). Any other code in that range is implementation-defined. */
+const SPEC_SERVER_RANGE_CODES = new Set([-32001, -32002, -32003, -32005, -32017, -32023, -32024]);
+
 /**
  * The host's refusal in the error a request was rejected with, or undefined
  * when the error isn't a verdict on this message:
- * - no code: a closed connection;
- * - -32000: mcpl-core's own timeout (0.2.1's RpcError, and the
- *   ConnectionTimeoutError of later versions), or the host's own failure,
- *   such as agent-framework's "host could not persist the acceptance; retry",
- *   which it can answer after it has already delivered the message;
- * - -32603: the host's internal error.
+ * - no code: a closed connection, or any error that isn't JSON-RPC's;
+ * - -32603: JSON-RPC's internal error;
+ * - -32000 to -32099 outside the codes SPEC Appendix A defines: an
+ *   implementation-defined server error, which mcpl-core's own timeout is too
+ *   (-32000, "Request timed out after <n>ms: <method>" in 0.2.1).
  *
- * Any other code is the host refusing this request: agent-framework answers
- * codes such as -32602 for content or params it won't admit, -32001 and
- * -32003 for a feature set, and -32017 and -32023 for a channel. This is the
- * line agent-framework draws itself (coalesceRejectionReason in its
- * push-coalescer.ts, since 0.22.2): -32000 and -32603 are the host's own
- * failure, and every other answer is the sender's.
+ * Every other code is the host refusing this request: -32602 (malformed),
+ * the spec's feature-set, capability and channel codes, JSON-RPC's -32600,
+ * -32601 and -32700, and any code outside the server-error range.
  *
- * channels/incoming answers each message as a result without a code, so the
- * host's own failure there comes back as a reason that reads like a refusal.
+ * channels/incoming answers each message as a result without a code, so a
+ * host's own failure there comes back as a refusal it gives no reason code
+ * for (answerClass reads that as `refused`).
  */
 export function errorRejection(err: unknown): HostRejection | undefined {
   const e = err as { code?: unknown; message?: unknown } | null | undefined;
   if (!e || typeof e.code !== 'number') return undefined;
-  if (e.code === -32000 || e.code === -32603) return undefined;
+  if (e.code === -32603) return undefined;
+  if (e.code <= -32000 && e.code >= -32099 && !SPEC_SERVER_RANGE_CODES.has(e.code)) return undefined;
   const message = typeof e.message === 'string' ? e.message : '';
   // mcpl-core 0.2.1 puts "RPC error <code>: " in front of the host's message,
   // and later versions don't. The reason is the host's own words.
@@ -93,61 +94,61 @@ export function errorRejection(err: unknown): HostRejection | undefined {
 }
 
 /**
- * Whether a refusal is about the message's CONTENT, so that the same message
- * without its inline media might be admitted: a -32602 error, or the item
- * reason `coalesce_invalid`. Those are the two answers agent-framework gives a
- * coalesced message over its 1 MiB content budget (push/event and
- * channels/incoming, on the hosts before 0.22.2 that have one). The host
- * gives them for malformed content or a malformed coalesce member too, which
- * this server doesn't send. Every other refusal, such as `empty_content`,
- * `duplicate`, `unknown channel …` or a feature-set error, isn't one the
- * media caused, so it isn't resent without it.
+ * Whether a refusal might be about the message's inline media, so that the
+ * same message without it, as a new occurrence, might be admitted: a -32602
+ * error, or the item reason `coalesce_invalid`.
+ *
+ * A compatibility measure for one host, not something the spec says: in the
+ * spec both mean a MALFORMED request (RFC-006 §13), and "coalescing capacity
+ * alone is never a reason to refuse". agent-framework's coalescing hosts
+ * before 0.22.2, its 0.21 line included, gave those two answers to a
+ * coalesced message over a 1 MiB content budget, inline base64 included
+ * (agent-framework #266, removed by #267 in 0.22.2). On any other host the
+ * resend it leads to costs one request, for a refusal that is this server's
+ * bug either way. Every other refusal isn't one the media caused, so it isn't
+ * resent without it.
  */
 export function isContentRejection(rejection: HostRejection): boolean {
   return rejection.code === -32602 || rejection.reason === 'coalesce_invalid';
 }
 
 /**
- * What agent-framework's event coalescer answers, with -32000, when it took a
- * coalesced occurrence but could not keep the acceptance (push-coalescer.ts,
- * the same in 0.22.0 and main):
- * - "host could not persist the acceptance; retry": writing the receipt
- *   failed. "Not acknowledged: the work would be lost while its receipt
- *   suppressed a retry. The producer retries within the window."
- * - "host could not make the acceptance durable; retry": committing it
- *   failed; "the producer retries once more".
+ * What an answer to a forwarded occurrence leaves the sender to do, read
+ * only from what the MCPL spec defines, never from one host's wording:
  *
- * The window is the coalescer's `retryWindowMs`, 3,600,000 ms (one hour),
- * which it advertises as `eventCoalescing.retryWindowMs` at initialize. A
- * retry is the SAME occurrence: same `eventId`, same `coalesce` member, so
- * the host can match it to a receipt it did keep. On push/event the words
- * come as a JSON-RPC error; on channels/incoming as a message's `reason`,
- * without a code.
- *
- * Only these exact words. A -32000 is also mcpl-core's own timeout
- * ("Request timed out after <n>ms: <method>" in 0.2.1) and the host's
- * "host is stopping": a timed-out request's outcome is unknown, and a
- * stopping host won't keep it either, so neither is retried.
+ * - `done`: accepted, or answered without a per-message verdict.
+ * - `final`: a refusal the spec gives a meaning that resending can't change:
+ *   -32602 / `coalesce_invalid` (malformed, RFC-006 §13), -32001 / -32002 /
+ *   -32003 / -32017 (feature set, capability, channel permission), and
+ *   JSON-RPC's -32600, -32601 and -32700.
+ * - `unknown-channel`: -32023, the host has no such channel registered: the
+ *   sender can register it and send the same occurrence again.
+ * - `refused`: a refusal the spec gives no meaning: `accepted: false` with a
+ *   free-text reason or none, or an error code outside the server-error
+ *   range. The host didn't admit it, so the same occurrence sent again can't
+ *   be a duplicate, and as its cause is unknown, it may pass.
+ * - `uncertain`: no verdict: no answer (a timeout, a closed connection),
+ *   -32603, or an implementation-defined server error. It may have been
+ *   admitted, so only the same occurrence may be sent again, which RFC-006
+ *   §3.1's retry window makes safe on a coalescing host.
  */
-export const UNPERSISTED_ACCEPTANCE_ANSWERS: readonly string[] = [
-  'host could not persist the acceptance; retry',
-  'host could not make the acceptance durable; retry',
-];
+export type AnswerClass = 'done' | 'final' | 'unknown-channel' | 'refused' | 'uncertain';
 
-/** Whether `words` are one of the host's "took it, couldn't keep it; retry" answers. */
-export function isUnpersistedAnswer(words: string | undefined): boolean {
-  return typeof words === 'string' && UNPERSISTED_ACCEPTANCE_ANSWERS.includes(words.trim());
-}
+/** The refusal codes after which the same occurrence is never sent again. */
+const FINAL_CODES = new Set([-32602, -32001, -32002, -32003, -32017, -32600, -32601, -32700]);
 
-/** The host's "couldn't keep it; retry" words in a request's error, or
- *  undefined: the error must carry -32000 and exactly those words (mcpl-core
- *  0.2.1's `RPC error -32000: ` prefix dropped). */
-export function unpersistedError(err: unknown): string | undefined {
-  const e = err as { code?: unknown; message?: unknown } | null | undefined;
-  if (!e || e.code !== -32000 || typeof e.message !== 'string') return undefined;
-  const prefix = 'RPC error -32000: ';
-  const words = e.message.startsWith(prefix) ? e.message.slice(prefix.length) : e.message;
-  return isUnpersistedAnswer(words) ? words.trim() : undefined;
+export function answerClass(outcome: ForwardOutcome | { kind: 'failed' }): AnswerClass {
+  switch (outcome.kind) {
+    case 'accepted':
+    case 'no-result':
+      return 'done';
+    case 'failed':
+      return 'uncertain';
+    case 'rejected':
+      if (outcome.code === undefined) return outcome.reason === 'coalesce_invalid' ? 'final' : 'refused';
+      if (outcome.code === -32023) return 'unknown-channel';
+      return FINAL_CODES.has(outcome.code) ? 'final' : 'refused';
+  }
 }
 
 /** The host's advertised retry window (`eventCoalescing.retryWindowMs`), when

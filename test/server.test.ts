@@ -2932,18 +2932,66 @@ describe('applyMentionCandidates', () => {
 // ── RFC-006 event coalescing ──
 
 describe("the retry window a coalescing host advertises", () => {
-  it('is read at initialize, and caps the wait before a keep-retry at half of it', async () => {
+  it('is read at initialize, and is the window resends are counted against', async () => {
     const { client, serverConn, discord } = await createTestPair();
     const server = new DiscordMcplServer(discord as unknown as DiscordAdapter);
     const serverPromise = server.serve(serverConn);
     await mcplHandshake(client, { eventCoalescing: { pushEvents: true, channelsIncoming: true, retryWindowMs: 10 } });
     const regMsg = await client.nextMessage();
     if (regMsg.type === 'request') client.sendResponse(regMsg.request.id, {});
-    const s = server as unknown as { hostRetryWindowMs?: number; persistRetryDelay(): number };
+    const s = server as unknown as { hostRetryWindowMs?: number; retryWindowFor(lane: string): number | undefined };
     assert.equal(s.hostRetryWindowMs, 10);
-    assert.equal(s.persistRetryDelay(), 5);
+    assert.equal(s.retryWindowFor('push/event'), 10);
+    assert.equal(s.retryWindowFor('channels/incoming'), 10);
     client.close();
     await serverPromise;
+  });
+});
+
+describe('a host that connects after another', () => {
+  it("waits for its own policy before the channels are registered with it, as the first one does", async () => {
+    const first = await createTestPair();
+    const server = new DiscordMcplServer(first.discord as unknown as DiscordAdapter);
+    const firstServed = server.serve(first.serverConn);
+    await mcplHandshake(first.client);
+    const reg = await first.client.nextMessage();
+    if (reg.type === 'request') first.client.sendResponse(reg.request.id, {});
+    first.client.close();
+    await firstServed;
+
+    const second = await createTestPair();
+    const secondServed = server.serve(second.serverConn);
+    const seen: string[] = [];
+    void (async () => {
+      try {
+        for (;;) {
+          const m = await second.client.nextMessage();
+          if (m.type === 'request') {
+            seen.push(m.request.method);
+            second.client.sendResponse(m.request.id, {});
+          } else {
+            seen.push(m.notification.method);
+          }
+        }
+      } catch { /* the client closed */ }
+    })();
+    await second.client.sendRequest('initialize', {
+      protocolVersion: '2024-11-05',
+      capabilities: { experimental: { mcpl: { version: '0.4', pushEvents: true, channels: true, rollback: true } } },
+      clientInfo: { name: 'test-client', version: '0.1.0' },
+    });
+    second.client.sendNotification('notifications/initialized');
+    try {
+      await new Promise((r) => setTimeout(r, 150));
+      assert.equal(seen.includes('channels/register'), false, `before its policy: ${seen.join(', ')}`);
+      await second.client.sendRequest('featureSets/update', { enabled: ['discord.messaging', 'discord.channels'] });
+      const deadline = Date.now() + 2000;
+      while (!seen.includes('channels/register') && Date.now() < deadline) await new Promise((r) => setTimeout(r, 10));
+      assert.ok(seen.includes('channels/register'), `after its policy: ${seen.join(', ')}`);
+    } finally {
+      second.client.close();
+      await secondServed;
+    }
   });
 });
 

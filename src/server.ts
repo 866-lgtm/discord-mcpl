@@ -119,13 +119,12 @@ import sharp from 'sharp';
 import { dbg } from './debug-log.js';
 import {
   advertisedRetryWindowMs,
+  answerClass,
   errorRejection,
   incomingOutcome,
   isContentRejection,
-  isUnpersistedAnswer,
   pushOutcome,
   summarizeAttachments,
-  unpersistedError,
   withoutInlineMedia,
   type ForwardOutcome,
 } from './incoming-results.js';
@@ -609,6 +608,9 @@ interface CreateMemory {
   edits: number;
 }
 const RECENT_CREATES_MAX = 512;
+/** RFC-006 §3.1's retry window for a host that advertises event coalescing
+ *  without one: an hour. */
+const DEFAULT_RETRY_WINDOW_MS = 3_600_000;
 /** How many deleted channel ids the server remembers (deletedChannels). A
  *  delivery is on its way for seconds, not for a thousand deletions. */
 const DELETED_CHANNELS_KEPT = 1000;
@@ -672,11 +674,15 @@ export class DiscordMcplServer {
    *  saved, or the file couldn't be read, copied aside or rewritten. */
   private reactionChannelsUnsaved = false;
 
-  /** Resolved when the host's first featureSets/update (either form) has
-   *  been processed — the signal that §5.3 policy is settled and pushes
-   *  will land inside the granted window. Gates the reconnect sweep. */
+  /** Resolved when the current connection's first featureSets/update
+   *  (either form) has been processed — the signal that §5.3 policy is
+   *  settled and pushes will land inside the granted window. Gates channel
+   *  registration and the reconnect sweep. One per connection (serve()), so
+   *  a host that connects later waits for its own policy too. */
   private policyAnswered: Promise<void>;
   private resolvePolicyAnswered!: () => void;
+  /** Whether a connection has used the policy gate the constructor made. */
+  private policyGateUsed = false;
 
   /** The Discord filters plane's desired/effective/status state, shared by
    *  the whitelists and reaction suppression (issue #21) — which reactions
@@ -867,32 +873,37 @@ export class DiscordMcplServer {
   private readonly recentCreates = new Map<string, CreateMemory>();
   private editSeq = 0;
   /**
-   * The wait before resending an occurrence the host took but couldn't keep
-   * ("host could not persist the acceptance; retry"), once, with the same
-   * eventId. Well inside the host's retry window; capped at half of it when
-   * the host advertises a shorter one. A field so tests can shorten it.
+   * The waits before each resend of an occurrence whose answer leaves it
+   * worth sending again (answerClass: `uncertain`, or `refused` once), as
+   * the same occurrence. Each is cut to what is left of the retry deadline,
+   * half the host's retry window after the first send. A field so tests can
+   * shorten it.
    */
-  private persistRetryDelayMs = 1000;
+  private retryDelaysMs: readonly number[] = [1_000, 5_000, 30_000, 120_000, 600_000];
   /** The host's advertised `eventCoalescing.retryWindowMs`, if any. */
   private hostRetryWindowMs: number | undefined;
+  /**
+   * The connection whose start-up has settled: it initialized, its policy was
+   * answered (or the grace for hosts that send none ran out), and the
+   * channels were registered with it. A resend, or an edit or delete that
+   * waited, goes to a connection other than the one it was first meant for
+   * only once that one is ready (readyConnection).
+   */
+  private readyConn: McplConnection | null = null;
+  /** Woken when a connection becomes ready. */
+  private readonly readyWaiters = new Set<() => void>();
   /** Numbers every edit and delete sent, process-wide, so no two share one. */
   private mutationSeq = 0;
   /**
    * Per message with an edit or delete still unsettled: the number of the
-   * latest one sent for it, and how many are unsettled. A retry of one the
-   * host couldn't keep is skipped once a later one has gone out: the later
-   * occurrence replaces or withdraws the subject, and resending the earlier
-   * one after it would put the older version back. An entry lives exactly as
-   * long as one of its message's mutations is unsettled, so the one being
-   * judged always finds it; that bounds the map by the requests in flight
-   * (each settles within mcpl-core's request timeout, or when its connection
-   * closes).
+   * latest one sent for it, and how many are unsettled. A resend of one is
+   * skipped once a later one has gone out: the later occurrence replaces or
+   * withdraws the subject, and resending the earlier one after it would put
+   * the older version back. An entry lives exactly as long as one of its
+   * message's mutations is unsettled, so the one being judged always finds
+   * it; that bounds the map by the mutations in flight or being retried.
    */
   private readonly mutationsInFlight = new Map<string, { latest: number; unsettled: number }>();
-  /** A retry of an edit or delete being waited out, per message, until it is
-   *  sent: later edits and deletes of that message wait for it (afterCreate),
-   *  so none overtakes it. */
-  private readonly mutationRetries = new Map<string, Promise<void>>();
   private enabledFeatureSets = new Set<string>();
   /** Every channel registered in this process, whether or not a host is
    *  connected: each connection is given all of it (syncChannelsWithHost). */
@@ -1640,6 +1651,13 @@ export class DiscordMcplServer {
    */
   async serve(conn: McplConnection): Promise<void> {
     this.conn = conn;
+    this.readyConn = null;
+    // This connection's own policy gate (the first connection's is the one
+    // the constructor made).
+    if (this.policyGateUsed) {
+      this.policyAnswered = new Promise((resolve) => { this.resolvePolicyAnswered = resolve; });
+    }
+    this.policyGateUsed = true;
 
     // The connection emits 'error' for a line that isn't JSON, and for an
     // error on either stream. With no listener, EventEmitter throws it from
@@ -1731,6 +1749,7 @@ export class DiscordMcplServer {
             console.error('[discord-mcpl] Channel registration failed:', errorText(err));
           }
         }
+        this.markReady(conn);
         // Deliver anything that arrived while the bot was offline (mentions +
         // DMs everywhere, full missed backscroll for subscribed channels).
         // Best-effort and one-shot; failures must not block serving.
@@ -1793,6 +1812,7 @@ export class DiscordMcplServer {
       // leave its socket open. Closing an already closed connection is a
       // no-op.
       this.conn = null;
+      this.readyConn = null;
       conn.close();
     }
   }
@@ -4544,15 +4564,14 @@ export class DiscordMcplServer {
     return this.coalesceChannelScope(guildId, channelId);
   }
 
-  /** Never overtake an in-flight create of the same message, nor a retry of
-   *  an edit or delete of it that the host couldn't keep (until the retry is
-   *  sent); each wait is followed by a fresh look. Synchronous (no await,
-   *  same tick) when there is neither, so an edit or delete of a settled
-   *  message is sent exactly as promptly as before. */
+  /** Never overtake an in-flight create of the same message (its resends
+   *  included). Synchronous (no await, same tick) when there is none, so an
+   *  edit or delete of a settled message is sent exactly as promptly as
+   *  before. An edit or delete doesn't wait for an earlier one being resent:
+   *  it supersedes it (sendWithRetries' `superseded`). */
   private afterCreate(messageId: string, then: () => void): Promise<void> | void {
     const mem = this.recentCreates.get(messageId);
-    const pending = mem && !mem.done ? mem.settled : this.mutationRetries.get(messageId);
-    if (pending) return pending.then(() => this.afterCreate(messageId, then));
+    if (mem && !mem.done) return mem.settled.then(then);
     then();
   }
 
@@ -4566,16 +4585,24 @@ export class DiscordMcplServer {
       dbg('handleMessageEdit:drop', { channelId, messageId, reason: this.isChannelMuted(channelId) ? 'muted' : 'not-open-or-subscribed' });
       return;
     }
-    // Sent on the connection that admitted it, or not at all: one that comes
-    // while it waits (afterCreate) may not have initialized yet, and is owed
-    // nothing the last one admitted.
-    const conn = this.conn;
-    await this.afterCreate(messageId, () => this.sendMessageEdit(conn, channelId, messageId, newContent, isDM, info));
+    const admitted = this.conn;
+    await this.afterCreate(messageId, () => this.sendMessageEdit(admitted, channelId, messageId, newContent, isDM, info));
   }
 
-  private sendMessageEdit(conn: McplConnection, channelId: string, messageId: string, newContent: string, isDM: boolean, info?: MessageEventInfo): void {
-    if (this.conn !== conn) {
-      dbg('handleMessageEdit:drop', { channelId, messageId, reason: 'connection-changed' });
+  /** The connection an edit or delete admitted on `admitted` goes out on
+   *  once it has waited (afterCreate): that one while it is current, else the
+   *  current one once its start-up has settled (readyNow), else none. One
+   *  that connected meanwhile may not have initialized, or may not take
+   *  Discord messages at all, until then. */
+  private mutationConn(admitted: McplConnection): McplConnection | null {
+    if (this.conn === admitted && !admitted.isClosed) return admitted;
+    return this.readyNow();
+  }
+
+  private sendMessageEdit(admitted: McplConnection, channelId: string, messageId: string, newContent: string, isDM: boolean, info?: MessageEventInfo): void {
+    const conn = this.mutationConn(admitted);
+    if (!conn) {
+      dbg('handleMessageEdit:drop', { channelId, messageId, reason: 'no-ready-connection' });
       return;
     }
     const registeredId = this.registerEventChannel(channelId, isDM, info);
@@ -4610,8 +4637,7 @@ export class DiscordMcplServer {
         ? { coalesce: { key: `message:${messageId}`, ...(scope ? { channelId: scope } : {}) } }
         : {}),
     };
-    this.noteMutationOutcome('edit', messageId, registeredId ?? channelId, conn,
-      () => conn.sendRequest(method.PUSH_EVENT, params as unknown as Record<string, unknown>));
+    this.noteMutationOutcome('edit', messageId, registeredId ?? channelId, registeredId, conn, params);
   }
 
   private async forwardMessageDelete(channelId: string, messageId: string, isDM: boolean, info?: MessageEventInfo): Promise<void> {
@@ -4621,13 +4647,14 @@ export class DiscordMcplServer {
       dbg('handleMessageDelete:drop', { channelId, messageId, reason: this.isChannelMuted(channelId) ? 'muted' : 'not-open-or-subscribed' });
       return;
     }
-    const conn = this.conn; // as for an edit
-    await this.afterCreate(messageId, () => this.sendMessageDelete(conn, channelId, messageId, isDM, info));
+    const admitted = this.conn; // as for an edit
+    await this.afterCreate(messageId, () => this.sendMessageDelete(admitted, channelId, messageId, isDM, info));
   }
 
-  private sendMessageDelete(conn: McplConnection, channelId: string, messageId: string, isDM: boolean, info?: MessageEventInfo): void {
-    if (this.conn !== conn) {
-      dbg('handleMessageDelete:drop', { channelId, messageId, reason: 'connection-changed' });
+  private sendMessageDelete(admitted: McplConnection, channelId: string, messageId: string, isDM: boolean, info?: MessageEventInfo): void {
+    const conn = this.mutationConn(admitted);
+    if (!conn) {
+      dbg('handleMessageDelete:drop', { channelId, messageId, reason: 'no-ready-connection' });
       return;
     }
     const registeredId = this.registerEventChannel(channelId, isDM, info);
@@ -4646,8 +4673,7 @@ export class DiscordMcplServer {
         ? { coalesce: { key: `message:${messageId}`, retract: true, ...(scope ? { channelId: scope } : {}) } }
         : {}),
     };
-    this.noteMutationOutcome('delete', messageId, registeredId ?? channelId, conn,
-      () => conn.sendRequest(method.PUSH_EVENT, params as unknown as Record<string, unknown>));
+    this.noteMutationOutcome('delete', messageId, registeredId ?? channelId, registeredId, conn, params);
   }
 
   // ── DM refusal notices ──
@@ -5544,12 +5570,15 @@ export class DiscordMcplServer {
       await this.deliverCreate({
         lane: 'channels/incoming',
         conn,
+        coalesced: (message as { coalesce?: unknown }).coalesce !== undefined,
+        // Registered, as an open channel is.
+        channel: channelMcplId,
         messageId: msg.id,
         channelMcplId,
         content: message.content,
         attachmentBlocks,
         mem,
-        send: async (content, resend) => {
+        send: async (conn, content, resend) => {
           const params: ChannelsIncomingParams = {
             messages: [{
               ...message,
@@ -5562,8 +5591,7 @@ export class DiscordMcplServer {
             } as CoalescedIncomingMessage],
           };
           try {
-            // The item's reason, without a code, is how this lane says it.
-            return keptOutcome(incomingOutcome(await conn.sendRequest(method.CHANNELS_INCOMING, params), msg.id));
+            return incomingOutcome(await conn.sendRequest(method.CHANNELS_INCOMING, params), msg.id);
           } catch (err) {
             return sendErrorOutcome(err);
           }
@@ -5637,12 +5665,14 @@ export class DiscordMcplServer {
       await this.deliverCreate({
         lane: 'push/event',
         conn,
+        coalesced: pushParams.coalesce !== undefined,
+        channel: registeredId,
         messageId: msg.id,
         channelMcplId,
         content: pushParams.payload.content,
         attachmentBlocks,
         mem,
-        send: async (content, resend) => {
+        send: async (conn, content, resend) => {
           const params: CoalescedPushEventParams = {
             ...pushParams,
             // See the channels/incoming resend above: a fresh occurrence id.
@@ -5650,7 +5680,7 @@ export class DiscordMcplServer {
             payload: { content },
           };
           try {
-            return keptOutcome(pushOutcome(await conn.sendRequest(method.PUSH_EVENT, params as unknown as Record<string, unknown>)));
+            return pushOutcome(await conn.sendRequest(method.PUSH_EVENT, params as unknown as Record<string, unknown>));
           } catch (err) {
             return sendErrorOutcome(err);
           }
@@ -5665,44 +5695,50 @@ export class DiscordMcplServer {
    * `results[]`, push/event `{accepted:false}`) or with a JSON-RPC error, and
    * the refused message never reaches the agent, its text included.
    *
+   * - Every send here, the create and a resend without media, goes through
+   *   sendWithRetries: an answer that leaves it worth sending again, by what
+   *   the MCPL spec defines (answerClass), sends the same occurrence again.
    * - Accepted, or answered without a per-message verdict (an older host):
-   *   `handleDiscordMessage:sent`, as before, now with `result`.
+   *   `handleDiscordMessage:sent`, with `result`.
    * - Refused, by a result or by an error the host answered with
    *   (errorRejection): one `[discord-mcpl] host rejected message …` stderr
    *   line and `handleDiscordMessage:rejected` with the reason, an error's
    *   code, and what the message carried inline. channels/incoming answers
    *   each message without a code, so there the host's own failure reads the
    *   same as a refusal, and the line says `host didn't take message …`.
-   * - Refused for its content (isContentRejection) while carrying inline
-   *   images/audio: resent ONCE with each inline block replaced by a text
-   *   note, so the text, and the fact that media was attached, still reach
-   *   the agent. agent-framework's coalescing hosts before 0.22.2, its 0.21
-   *   line included, refuse a coalesced message whose content, inline base64
-   *   included, passes 1 MiB. Never more than one resend.
-   * - No answer (mcpl-core's timeout, or a closed connection), or the host's
-   *   own failure (-32000, -32603; errorRejection): logged as before,
-   *   `handleDiscordMessage:send-failed`, and not resent.
-   * - Taken but not kept ("host could not persist the acceptance; retry",
-   *   UNPERSISTED_ACCEPTANCE_ANSWERS): sent once more, after
-   *   persistRetryDelayMs, as the same occurrence (same eventId and
-   *   coalesce member), as the host's coalescer asks; see keepOrRetry. Each
-   *   send here (the create, and a resend without media) gets at most one
-   *   such retry, and only on `conn`, the connection it was first sent on.
+   * - Refused as malformed (isContentRejection) while carrying inline
+   *   images/audio: resent ONCE, as a new occurrence, with each inline block
+   *   replaced by a text note, so the text, and the fact that media was
+   *   attached, still reach the agent. A compatibility measure for
+   *   agent-framework's hosts before 0.22.2, which gave that answer to
+   *   content over 1 MiB; see isContentRejection.
+   * - No verdict after the resends sendWithRetries allows (no answer, a
+   *   closed connection, the host's own failure): `[discord-mcpl] <lane>
+   *   failed:` and `handleDiscordMessage:send-failed`.
    */
   private async deliverCreate(args: {
     lane: 'channels/incoming' | 'push/event';
-    /** The connection `send` sends on. */
+    /** The connection the create is first sent on. */
     conn: McplConnection;
+    /** Whether the occurrence carries `coalesce` (sendWithRetries). */
+    coalesced: boolean;
+    /** The registered MCPL channel the occurrence names, if any. */
+    channel: string | undefined;
     messageId: string;
     channelMcplId: string;
     content: ContentBlock[];
     /** The create's attachment blocks, as `content` carries them. */
     attachmentBlocks: ContentBlock[];
     mem: CreateMemory;
-    send: (content: ContentBlock[], resend: boolean) => Promise<SendOutcome>;
+    send: (conn: McplConnection, content: ContentBlock[], resend: boolean) => Promise<SendOutcome>;
   }): Promise<void> {
-    const { lane, conn, messageId, channelMcplId, content, attachmentBlocks, mem, send } = args;
-    const first = await this.keepOrRetry(lane, conn, `message ${messageId} in ${channelMcplId}`, () => send(content, false));
+    const { lane, coalesced, channel, messageId, channelMcplId, content, attachmentBlocks, mem, send } = args;
+    const { outcome: first, conn } = await this.sendWithRetries({
+      lane, coalesced, channel, conn: args.conn,
+      what: `message ${messageId} in ${channelMcplId}`,
+      dbgPrefix: 'handleDiscordMessage',
+      attempt: (c) => send(c, content, false),
+    });
     if (first.kind === 'failed') {
       console.error(`[discord-mcpl] ${lane} failed:`, first.error);
       dbg('handleDiscordMessage:send-failed', { method: lane, error: first.error });
@@ -5715,8 +5751,7 @@ export class DiscordMcplServer {
     // channels/incoming answers each message without a code, so there the
     // host's own failure ("host is stopping", say) reads the same as a
     // refusal, and that lane's line says only that the host didn't take the
-    // message. (Its "couldn't keep it; retry" never comes here: keepOrRetry
-    // retries it, and a second one is a failed send.)
+    // message.
     const verb = (code: number | undefined) => (lane === 'channels/incoming' && code === undefined ? "didn't take" : 'rejected');
     const attachments = summarizeAttachments(content);
     console.error(`[discord-mcpl] host ${verb(first.code)} message ${messageId} in ${channelMcplId}: ${first.reason}`);
@@ -5735,149 +5770,251 @@ export class DiscordMcplServer {
     // the agent was sent, which the memory of a create over that size held
     // only as a placeholder.
     if (mem.render) mem.render.attachments = rememberedAttachments(withoutInlineMedia(attachmentBlocks).content);
-    const second = await this.keepOrRetry(lane, conn, `message ${messageId} in ${channelMcplId} (resent without inline media)`, () => send(stripped.content, true));
+    const { outcome: second } = await this.sendWithRetries({
+      lane, coalesced, channel, conn,
+      what: `message ${messageId} in ${channelMcplId} (resent without inline media)`,
+      dbgPrefix: 'handleDiscordMessage',
+      attempt: (c) => send(c, stripped.content, true),
+    });
     const what = `message ${messageId} in ${channelMcplId} with ${stripped.replaced} inline attachment(s) replaced by a note`;
     if (second.kind === 'failed') {
       console.error(`[discord-mcpl] resent ${what}: send failed: ${second.error}`);
       dbg('handleDiscordMessage:resend-failed', { method: lane, messageId, channelMcplId, error: second.error });
     } else if (second.kind === 'rejected') {
       console.error(`[discord-mcpl] resent ${what}: host ${verb(second.code)} it again: ${second.reason}`);
-      dbg('handleDiscordMessage:resend-rejected', { method: lane, messageId, channelMcplId, reason: second.reason });
+      dbg('handleDiscordMessage:resend-rejected', {
+        method: lane, messageId, channelMcplId, reason: second.reason,
+        ...(second.code !== undefined ? { code: second.code } : {}),
+      });
     } else {
       console.error(`[discord-mcpl] resent ${what}: ${second.kind === 'accepted' ? 'accepted' : 'sent (no verdict)'}`);
       dbg('handleDiscordMessage:resent', { method: lane, messageId, channelMcplId, replaced: stripped.replaced, result: second.kind });
     }
   }
 
-  /** The wait before a keep-retry: persistRetryDelayMs, capped at half the
-   *  host's advertised retry window. */
-  private persistRetryDelay(): number {
-    const w = this.hostRetryWindowMs;
-    return w !== undefined ? Math.min(this.persistRetryDelayMs, Math.floor(w / 2)) : this.persistRetryDelayMs;
+  /** The retry window (RFC-006 §3.1) of the current host for `lane`: what it
+   *  advertises, or the spec's default hour, when it advertises event
+   *  coalescing for that lane; undefined when it doesn't. */
+  private retryWindowFor(lane: 'channels/incoming' | 'push/event'): number | undefined {
+    const c = this.hostCoalescing;
+    const coalesces = lane === 'channels/incoming' ? c?.channelsIncoming : c?.pushEvents;
+    return coalesces ? (this.hostRetryWindowMs ?? DEFAULT_RETRY_WINDOW_MS) : undefined;
+  }
+
+  /** `conn`'s start-up has settled (serve()): wake whatever waits for a
+   *  ready connection. Nothing when another connection has replaced it. */
+  private markReady(conn: McplConnection): void {
+    if (this.conn !== conn || conn.isClosed) return;
+    this.readyConn = conn;
+    const waiters = [...this.readyWaiters];
+    this.readyWaiters.clear();
+    for (const wake of waiters) wake();
+  }
+
+  /** The current connection, when its start-up has settled and it takes
+   *  Discord messages (MCPL, `discord.messaging` enabled); else null. */
+  private readyNow(): McplConnection | null {
+    const conn = this.conn;
+    if (!conn || conn !== this.readyConn || conn.isClosed) return null;
+    if (!this.mcplEnabled || !isEnabled('discord.messaging', this.enabledFeatureSets)) return null;
+    return conn;
+  }
+
+  /** readyNow, waiting until `deadline` (epoch ms) for a connection to
+   *  become ready; when there is none by then, or the ready one doesn't take
+   *  Discord messages, why not. */
+  private async readyConnection(deadline: number): Promise<McplConnection | string> {
+    for (;;) {
+      const conn = this.readyNow();
+      if (conn) return conn;
+      const current = this.conn;
+      if (current && current === this.readyConn && !current.isClosed) {
+        return "the host connected now doesn't take Discord messages";
+      }
+      const left = deadline - Date.now();
+      if (left <= 0) return "no host connection was ready before the host's retry window closed";
+      await new Promise<void>((resolve) => {
+        const wake = (): void => { clearTimeout(timer); this.readyWaiters.delete(wake); resolve(); };
+        // Not unref'd: the wait is bounded by the deadline, and a stdio
+        // server exits on its own when its host goes (serveStdio).
+        const timer = setTimeout(wake, left);
+        this.readyWaiters.add(wake);
+      });
+    }
+  }
+
+  /** Announce a registered channel to the host again (channels/changed
+   *  `added`), when it is registered here. */
+  private reannounceChannel(conn: McplConnection, id: string): boolean {
+    const descriptor = this.channelManager.get(id);
+    if (!descriptor || conn.isClosed) return false;
+    conn.sendNotification(method.CHANNELS_CHANGED, { added: [descriptor] });
+    return true;
   }
 
   /**
-   * Send, and when the host answers that it took the occurrence but couldn't
-   * keep it (UNPERSISTED_ACCEPTANCE_ANSWERS), send it ONCE more after
-   * persistRetryDelay, as the same occurrence: `attempt` re-sends the same
-   * params, so the same eventId and coalesce member. agent-framework's
-   * coalescer asks for exactly that ("The producer retries within the
-   * window"): it can match the retry to a receipt it kept, or admit it if it
-   * kept none. Never more than one retry; a second "couldn't keep it" is
-   * returned as a failed send. A transport timeout is never retried here:
-   * its outcome is unknown (unpersistedError only matches the host's words).
+   * Send an occurrence and, while its answer leaves it worth sending again,
+   * send the SAME occurrence again (`attempt` sends the same params: the same
+   * eventId and coalesce member). What decides is only what the MCPL spec
+   * defines (answerClass), never a particular host's words, since this
+   * server serves more than one kind of host:
    *
-   * The retry goes to the host that asked for it, on `conn`, the connection
-   * `attempt` sends on, or nowhere: when that connection is no longer the
-   * current one, before the wait or after it, the retry is dropped and
-   * logged, and the answer is a failed send. A host connected since may not
-   * have initialized yet, and holds no receipt to match it against.
+   * - `unknown-channel` (-32023): the channel is announced to the host again
+   *   (channels/changed) and the occurrence sent once more, at once. The host
+   *   didn't admit it, so that can't make a duplicate, on any host.
+   * - `refused` (a refusal the spec gives no meaning): sent once more, after
+   *   the first wait.
+   * - `uncertain` (no answer, -32603, an implementation-defined server
+   *   error): sent again after each wait in retryDelaysMs while answers stay
+   *   uncertain.
+   *
+   * `refused` and `uncertain` occurrences are sent again only when they carry
+   * `coalesce` to a host that advertises event coalescing for their lane.
+   * RFC-006 §3.1 then obliges the host to recognize a repeated eventId for
+   * its retry window and return the first result without repeating its
+   * effects, so an occurrence admitted after all is never admitted twice.
+   * Other hosts promise less (the base spec's deduplication is a SHOULD,
+   * §9.4), and get each occurrence once. Resends stop at half the window
+   * after the first send (the spec's limit is the window itself; half leaves
+   * room for a slow last answer), over the shortest window advertised
+   * meanwhile, as §3.1 asks.
+   *
+   * A resend goes to the current connection once it is ready
+   * (readyConnection), which after a reconnect is the host connected since:
+   * the retry guarantee survives reconnects and host restarts (§3.1). Never
+   * to a host that doesn't advertise coalescing for the lane. `superseded`,
+   * when given, is asked before each resend, and a superseded occurrence
+   * isn't sent again.
+   *
+   * Returns the last answer and the connection it came on.
    */
-  private async keepOrRetry(
-    lane: string,
-    conn: McplConnection,
-    what: string,
-    attempt: () => Promise<SendOutcome>,
-  ): Promise<Exclude<SendOutcome, { kind: 'unpersisted' }>> {
-    return this.retryUnkept(lane, conn, what, await attempt(), attempt);
-  }
-
-  /** keepOrRetry's second half, for a caller that already holds the first
-   *  answer: `first` is returned as it is unless it is `unpersisted`. */
-  private async retryUnkept(
-    lane: string,
-    conn: McplConnection,
-    what: string,
-    first: SendOutcome,
-    attempt: () => Promise<SendOutcome>,
-  ): Promise<Exclude<SendOutcome, { kind: 'unpersisted' }>> {
-    if (first.kind !== 'unpersisted') return first;
-    const connectionGone = (): Exclude<SendOutcome, { kind: 'unpersisted' }> | undefined => {
-      if (this.conn === conn && !conn.isClosed) return undefined;
-      console.error(`[discord-mcpl] host couldn't keep ${what} (${first.reason}); not retried: the host's connection has ended`);
-      dbg('handleDiscordMessage:keep-retry-dropped', { method: lane, what, reason: first.reason });
-      return { kind: 'failed', error: `${first.reason} (not retried: the host's connection has ended)` };
+  private async sendWithRetries(args: {
+    lane: 'channels/incoming' | 'push/event';
+    what: string;
+    dbgPrefix: 'handleDiscordMessage' | 'handleMessageMutation';
+    conn: McplConnection;
+    coalesced: boolean;
+    channel: string | undefined;
+    attempt: (conn: McplConnection) => Promise<SendOutcome>;
+    superseded?: () => boolean;
+  }): Promise<{ outcome: SendOutcome | { kind: 'superseded' }; conn: McplConnection }> {
+    const { lane, what, dbgPrefix, coalesced, channel, attempt, superseded } = args;
+    let conn = args.conn;
+    const firstSentAt = Date.now();
+    let windowMs = this.retryWindowFor(lane);
+    let outcome = await attempt(conn);
+    let resends = 0;
+    let refusals = 0;
+    let announced = false;
+    const notResent = (why: string): void => {
+      console.error(`[discord-mcpl] ${what}: ${describeOutcome(outcome)}; not sent again: ${why}`);
+      dbg(`${dbgPrefix}:not-resent`, { method: lane, what, result: outcome.kind, why });
     };
-    const goneBefore = connectionGone();
-    if (goneBefore) return goneBefore;
-    const delay = this.persistRetryDelay();
-    console.error(`[discord-mcpl] host couldn't keep ${what} (${first.reason}); retrying once with the same event id in ${delay}ms`);
-    dbg('handleDiscordMessage:keep-retry', { method: lane, what, reason: first.reason, delayMs: delay });
-    await sleep(delay);
-    const goneAfter = connectionGone();
-    if (goneAfter) return goneAfter;
-    const second = await attempt();
-    const said = second.kind === 'unpersisted' ? `still not kept: ${second.reason}`
-      : second.kind === 'rejected' ? `host rejected it: ${second.reason}`
-        : second.kind === 'failed' ? `send failed: ${second.error}`
-          : second.kind === 'accepted' ? 'accepted' : 'sent (no verdict)';
-    console.error(`[discord-mcpl] retried ${what} with the same event id: ${said}`);
-    dbg('handleDiscordMessage:keep-retried', { method: lane, what, result: second.kind, ...('reason' in second ? { reason: second.reason } : {}) });
-    if (second.kind === 'unpersisted') return { kind: 'failed', error: `${second.reason} (after one retry)` };
-    return second;
+    for (;;) {
+      const answer = answerClass(outcome);
+      if (answer === 'done' || answer === 'final') return { outcome, conn };
+      if (superseded?.()) {
+        notResent('a later edit or delete of the message has been sent since');
+        return { outcome: { kind: 'superseded' }, conn };
+      }
+      if (answer === 'unknown-channel') {
+        if (announced || channel === undefined || !this.reannounceChannel(conn, channel)) return { outcome, conn };
+        announced = true;
+        console.error(`[discord-mcpl] ${what}: ${describeOutcome(outcome)}; announced channel ${channel} to the host again, and sending the same occurrence again`);
+        dbg(`${dbgPrefix}:resend`, { method: lane, what, answer, channel });
+        outcome = await attempt(conn);
+        console.error(`[discord-mcpl] sent ${what} again (same event id): ${describeOutcome(outcome)}`);
+        continue;
+      }
+      if (!coalesced || windowMs === undefined) return { outcome, conn };
+      if (answer === 'refused' && ++refusals > 1) return { outcome, conn };
+      if (resends >= this.retryDelaysMs.length) {
+        notResent(`sent ${resends + 1} times`);
+        return { outcome, conn };
+      }
+      const deadline = firstSentAt + windowMs / 2;
+      const wait = Math.min(this.retryDelaysMs[resends], deadline - Date.now());
+      if (wait < 0) {
+        notResent("the host's retry window is closing");
+        return { outcome, conn };
+      }
+      console.error(`[discord-mcpl] ${what}: ${describeOutcome(outcome)}; sending the same occurrence again (same event id) in ${wait}ms`);
+      dbg(`${dbgPrefix}:resend-wait`, { method: lane, what, answer, waitMs: wait, resend: resends + 1 });
+      await sleep(wait);
+      if (superseded?.()) {
+        notResent('a later edit or delete of the message has been sent since');
+        return { outcome: { kind: 'superseded' }, conn };
+      }
+      const next = await this.readyConnection(deadline);
+      if (typeof next === 'string') {
+        notResent(next);
+        return { outcome, conn };
+      }
+      const nextWindow = this.retryWindowFor(lane);
+      if (nextWindow === undefined) {
+        notResent("the host now connected doesn't coalesce events, so the same occurrence sent again could be a duplicate");
+        return { outcome, conn };
+      }
+      windowMs = Math.min(windowMs, nextWindow);
+      if (superseded?.()) {
+        notResent('a later edit or delete of the message has been sent since');
+        return { outcome: { kind: 'superseded' }, conn };
+      }
+      const moved = next !== conn;
+      conn = next;
+      resends++;
+      outcome = await attempt(conn);
+      console.error(`[discord-mcpl] sent ${what} again (same event id${moved ? ', to the host connected since' : ''}): ${describeOutcome(outcome)}`);
+      dbg(`${dbgPrefix}:resent-same`, { method: lane, what, result: outcome.kind, resend: resends, newConnection: moved });
+    }
   }
 
   /**
    * Send an edit or delete (fire-and-forget: nothing waits on it) and read the
-   * host's verdict: a refusal is logged; transport failures stay quiet, as
-   * before. When the host took it but couldn't keep it, it is sent once more
-   * as the same occurrence (keepOrRetry's rule, on `conn` only), unless a
-   * later edit or delete of the message has gone out since, which supersedes
-   * it: resending the earlier one after it would put the older version back.
-   * Until the retry is sent, later edits and deletes of the message wait for
-   * it (afterCreate), so none overtakes it; they don't wait for its answer,
-   * as they never waited for an earlier one's.
+   * host's verdict: a refusal is logged; a failed send stays in the debug
+   * log, as before. While its answer leaves it worth sending again, it is
+   * (sendWithRetries), unless a later edit or delete of the message has gone
+   * out since, which supersedes it: the later occurrence replaces or
+   * withdraws the subject, and sending the earlier one again after it would
+   * put the older version back.
    */
-  private noteMutationOutcome(kind: 'edit' | 'delete', messageId: string, channel: string, conn: McplConnection, send: () => Promise<unknown>): void {
+  private noteMutationOutcome(
+    kind: 'edit' | 'delete',
+    messageId: string,
+    channel: string,
+    registeredId: string | undefined,
+    conn: McplConnection,
+    params: CoalescedPushEventParams,
+  ): void {
     const seq = ++this.mutationSeq;
     const inFlight = this.mutationsInFlight.get(messageId) ?? { latest: 0, unsettled: 0 };
     inFlight.latest = seq;
     inFlight.unsettled++;
     this.mutationsInFlight.set(messageId, inFlight);
 
-    const attempt = async (): Promise<SendOutcome> => {
-      try {
-        // send() runs before the first await: the request is written when
-        // attempt() returns.
-        return keptOutcome(pushOutcome(await send()));
-      } catch (err) {
-        return sendErrorOutcome(err);
-      }
-    };
-    const report = (outcome: SendOutcome): void => {
-      if (outcome.kind === 'rejected') {
-        console.error(`[discord-mcpl] host rejected ${kind} of message ${messageId} in ${channel}: ${outcome.reason}`);
-        dbg('handleMessageMutation:rejected', { kind, messageId, channel, reason: outcome.reason, ...(outcome.code !== undefined ? { code: outcome.code } : {}) });
-      } else if (outcome.kind === 'failed') {
-        dbg('handleMessageMutation:send-failed', { kind, messageId, channel, error: outcome.error });
-      }
-    };
-
     void (async () => {
       try {
-        const first = await attempt();
-        if (first.kind !== 'unpersisted') { report(first); return; }
-        const what = `${kind} of message ${messageId} in ${channel}`;
-        if (inFlight.latest !== seq) {
-          console.error(`[discord-mcpl] host couldn't keep ${what} (${first.reason}); not retried: a later edit or delete of the message has been sent since`);
-          dbg('handleMessageMutation:keep-retry-superseded', { kind, messageId, channel, reason: first.reason });
-          return;
-        }
-        let resolveRetry!: () => void;
-        const retryDone = new Promise<void>((r) => { resolveRetry = r; });
-        const release = (): void => {
-          if (this.mutationRetries.get(messageId) === retryDone) this.mutationRetries.delete(messageId);
-          resolveRetry();
-        };
-        this.mutationRetries.set(messageId, retryDone);
-        try {
-          report(await this.retryUnkept('push/event', conn, what, first, () => {
-            const answered = attempt();
-            release(); // sent: whatever waited for it may follow it now
-            return answered;
-          }));
-        } finally {
-          release(); // not sent (the connection ended), or already released
+        const { outcome } = await this.sendWithRetries({
+          lane: 'push/event',
+          what: `${kind} of message ${messageId} in ${channel}`,
+          dbgPrefix: 'handleMessageMutation',
+          conn,
+          coalesced: params.coalesce !== undefined,
+          channel: registeredId,
+          superseded: () => inFlight.latest !== seq,
+          attempt: async (c) => {
+            try {
+              return pushOutcome(await c.sendRequest(method.PUSH_EVENT, params as unknown as Record<string, unknown>));
+            } catch (err) {
+              return sendErrorOutcome(err);
+            }
+          },
+        });
+        if (outcome.kind === 'rejected') {
+          console.error(`[discord-mcpl] host rejected ${kind} of message ${messageId} in ${channel}: ${outcome.reason}`);
+          dbg('handleMessageMutation:rejected', { kind, messageId, channel, reason: outcome.reason, ...(outcome.code !== undefined ? { code: outcome.code } : {}) });
+        } else if (outcome.kind === 'failed') {
+          dbg('handleMessageMutation:send-failed', { kind, messageId, channel, error: outcome.error });
         }
       } finally {
         if (--inFlight.unsettled === 0 && this.mutationsInFlight.get(messageId) === inFlight) {
@@ -5888,26 +6025,24 @@ export class DiscordMcplServer {
   }
 }
 
-/** A forwarded create's outcome, as `deliverCreate` reads it. `unpersisted`:
- *  the host took it but couldn't keep it, and asks for the same occurrence
- *  again (keepOrRetry). */
-type SendOutcome = ForwardOutcome | { kind: 'failed'; error: string } | { kind: 'unpersisted'; reason: string };
+/** A forwarded occurrence's outcome: the host's answer, or no answer
+ *  (`failed`: a timeout, a closed connection, the host's own failure). */
+type SendOutcome = ForwardOutcome | { kind: 'failed'; error: string };
 
-/** A host's answer as a send's outcome: a refusal in the host's "couldn't
- *  keep it; retry" words (UNPERSISTED_ACCEPTANCE_ANSWERS) is `unpersisted`.
- *  On channels/incoming they come as an item's reason, without a code; on
- *  push/event, as a refusal's reason when not as an error. */
-function keptOutcome(outcome: ForwardOutcome): SendOutcome {
-  return outcome.kind === 'rejected' && isUnpersistedAnswer(outcome.reason)
-    ? { kind: 'unpersisted', reason: outcome.reason }
-    : outcome;
+/** An outcome as the log lines put it. */
+function describeOutcome(outcome: SendOutcome | { kind: 'superseded' }): string {
+  switch (outcome.kind) {
+    case 'accepted': return 'accepted';
+    case 'no-result': return 'sent (no verdict)';
+    case 'rejected': return `host ${outcome.code === undefined ? "didn't take it" : 'rejected it'}: ${outcome.reason}`;
+    case 'failed': return `send failed: ${outcome.error}`;
+    case 'superseded': return 'superseded';
+  }
 }
 
-/** A request's error, read as the host's verdict: its "couldn't keep it;
- *  retry", its refusal (errorRejection), or a failed send. */
+/** A request's error, read as the host's verdict: its refusal
+ *  (errorRejection), or a failed send. */
 function sendErrorOutcome(err: unknown): SendOutcome {
-  const unkept = unpersistedError(err);
-  if (unkept) return { kind: 'unpersisted', reason: unkept };
   const rejection = errorRejection(err);
   return rejection ? { kind: 'rejected', ...rejection } : { kind: 'failed', error: errorText(err) };
 }
