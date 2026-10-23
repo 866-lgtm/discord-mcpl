@@ -35,6 +35,7 @@ import { DiscordMcplServer, serveStdio } from '../src/server.js';
 import { parseChannelRef } from '../src/channel-names.js';
 import { applyMentionCandidates } from '../src/discord-adapter.js';
 import { TOOL_CLASSES } from '../src/tool-classes.js';
+import { featureSets } from '../src/feature-sets.js';
 import type {
   AddressFacts,
   ChannelChange,
@@ -385,6 +386,17 @@ const CLOSED_NOTE =
 // ── Tests ──
 
 describe('DiscordMcplServer', () => {
+  it("declares in discord.messaging's tag ontology each chat:* tag its pushes carry, an edit's and a deletion's included", () => {
+    // The handshake sends this array as it is (featureSets in initialize).
+    const messaging = featureSets.find((fs) => fs.name === 'discord.messaging') as unknown as { tagOntology?: { coreTags?: string[] } };
+    assert.deepEqual(messaging.tagOntology?.coreTags, [
+      'chat:addressed', 'chat:mention', 'chat:reply', 'chat:dm', 'chat:ambient',
+      'chat:private', 'chat:from-human', 'chat:from-bot', 'chat:thread',
+      'chat:edited', 'chat:deleted', 'chat:reaction', 'chat:reaction-remove',
+      'chat:has-image', 'chat:has-audio', 'chat:has-file',
+    ]);
+  });
+
   it('MCPL handshake exposes feature sets and channels', async () => {
     const { client, serverConn, discord } = await createTestPair();
     const server = new DiscordMcplServer(discord as unknown as DiscordAdapter);

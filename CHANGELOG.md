@@ -24,7 +24,16 @@ in the git log and PR descriptions.
   connectome-host's documented example, edits used to fall past those
   rules. Now an edit of an addressed message, a typo fix included, meets an
   immediate rule on `chat:addressed` and wakes the agent at once, and an
-  edit to chatter meets a rule on `chat:ambient`.
+  edit to chatter meets a rule on `chat:ambient`. That includes each edit
+  of a bot's reply to the agent, which is a `chat:reply`, so a bot that
+  streams its reply by editing it can wake the agent while it's still
+  writing. A host that would rather edits didn't wake at once can put a
+  rule on `chat:edited` (with `chat:from-bot` for such a stream) above its
+  address rules.
+
+- **`discord.messaging` declares `chat:edited` and `chat:deleted`** in its
+  tag ontology, the tags its edits and deletions already carried, so a
+  host's or agent's list of the server's tags names them.
 
 - **What is sent again after a host's answer rests on the MCPL spec alone,
   not on one host's words.** discord-mcpl serves more than one kind of

@@ -498,6 +498,26 @@ describe("an edit's address facts, from discord.js's own MESSAGE_UPDATE", () => 
     assert.deepEqual(await f.update({ content: 'for nobody again', mentions: [] }, ID), none, 'an edit that takes it away');
   });
 
+  it("keeps a cached reply addressed to the bot when its update doesn't resend the target", async (t) => {
+    // discord.js rebuilds a cached message's mentions from the update, keeping
+    // the reply target it already holds when referenced_message is absent or
+    // null (Message#_patch), so the edit still reads as a reply to the bot.
+    const f = fixture();
+    t.after(() => f.client.destroy());
+    const ID = '940000000000000001';
+    const channel = f.client.channels.cache.get(CH) as any;
+    channel.messages._add({
+      id: ID, channel_id: CH, guild_id: GUILD, content: 'first', type: 19, author: { id: HUMAN, username: 'someone', discriminator: '0' },
+      timestamp: new Date(EDITED_AT - 60_000).toISOString(), edited_timestamp: null, mentions: [], mention_roles: [], attachments: [], embeds: [],
+      message_reference: { message_id: '919999999999999997', channel_id: CH, guild_id: GUILD },
+      referenced_message: { id: '919999999999999997', channel_id: CH, guild_id: GUILD, content: 'earlier', type: 0, author: { id: BOT, username: 'bot', bot: true, discriminator: '0' }, timestamp: new Date(EDITED_AT - 120_000).toISOString(), edited_timestamp: null, mentions: [], mention_roles: [], attachments: [], embeds: [] },
+    });
+    const none = { mentions: [], mentionsBotRole: false, replyToUserId: null, isBot: false };
+    const reply = { type: 19, message_reference: { message_id: '919999999999999997', channel_id: CH, guild_id: GUILD } };
+    assert.deepEqual(await f.update({ ...reply, content: 'second' }, ID), { ...none, replyToUserId: BOT }, 'referenced_message absent');
+    assert.deepEqual(await f.update({ ...reply, content: 'third', referenced_message: null }, ID), { ...none, replyToUserId: BOT }, 'referenced_message null');
+  });
+
   it("gives no address facts for a reply whose target Discord didn't send, not fetched or deleted", async (t) => {
     const f = fixture();
     t.after(() => f.client.destroy());
@@ -513,6 +533,8 @@ describe("an edit's address facts, from discord.js's own MESSAGE_UPDATE", () => 
     handler(f.client, { d: { id: '920000000000000001', channel_id: CH, guild_id: GUILD, content: 'sparse', edited_timestamp: new Date(EDITED_AT).toISOString() } });
     await new Promise<void>((resolve) => setImmediate(resolve));
     assert.equal(f.sent.length, 1, 'the edit is forwarded');
-    assert.equal(f.sent[0] !== undefined && 'address' in f.sent[0], false);
+    const info = f.sent[0];
+    assert.ok(info, 'the edit handler got the edit\'s info');
+    assert.equal('address' in info, false);
   });
 });
