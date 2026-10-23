@@ -1472,6 +1472,104 @@ describe('owed messages', () => {
     await until(() => (server as any).owed.size === 0);
   });
 
+  it('a connection that becomes ready while a delivery runs on the one before it delivers once that ends', async () => {
+    let answer!: (v: unknown) => void;
+    const answered = new Promise((r) => { answer = r; });
+    const { server, sent } = wire(() => answered);
+    onDiscord(server, [history('m1', 'first')]);
+    (server as any).owe('chan1', 'm1', { uncertain: false });
+    const first = (server as any).deliverOwed((server as any).conn);
+    await until(() => owedPushes(sent).length === 1);
+    const conn2 = reconnect(server, sent, () => ({ accepted: true }));
+    await (server as any).deliverOwedIn(conn2, 'chan1', 'ready'); // skipped for now
+    assert.equal(owedPushes(sent).length, 1);
+    answer({ accepted: false, reason: 'busy' });
+    await first;
+    await until(() => owedPushes(sent).length === 2);
+    await until(() => (server as any).owed.size === 0);
+  });
+
+  it("the event id covers the whole block: the same messages under another channel name are another occurrence", async () => {
+    const ids: string[] = [];
+    for (const name of ['general', 'general-renamed']) {
+      const { server, sent } = wire(() => ({ accepted: true }));
+      onDiscord(server, [history('m1', 'first')]);
+      (server as any).discord.getCachedChannelMeta = () => ({ name, guildId: 'g1', guildName: 'Guild', isDM: false });
+      (server as any).owe('chan1', 'm1', { uncertain: false });
+      await (server as any).deliverOwed((server as any).conn);
+      ids.push(owedPushes(sent)[0].params.eventId);
+    }
+    assert.notEqual(ids[0], ids[1]);
+  });
+
+  it('a message forgotten and owed anew while a delivery is on its way stays owed after it', async () => {
+    let answer!: (v: unknown) => void;
+    const answered = new Promise((r) => { answer = r; });
+    const { server, sent } = wire(() => answered);
+    onDiscord(server, [history('m1', 'first')]);
+    (server as any).owe('chan1', 'm1', { uncertain: false });
+    const delivering = (server as any).deliverOwed((server as any).conn);
+    await until(() => owedPushes(sent).length === 1);
+    (server as any).forgetOwed('chan1', ['m1']); // a later edit taken…
+    (server as any).owe('chan1', 'm1', { uncertain: true, edit: true }); // …then another not taken
+    answer({ accepted: true });
+    await delivering;
+    assert.deepEqual((server as any).owed.get('chan1'), [{ id: 'm1', uncertain: true, edit: true }]);
+  });
+
+  it('a permission refusal of a block sent before the start-up settled counts a try; it is not given up', async () => {
+    const { server } = wire(() => { throw rpcError(-32002, 'no policy yet'); });
+    onDiscord(server, [history('m1', 'first')]);
+    (server as any).owe('chan1', 'm1', { uncertain: false });
+    (server as any).readyConn = null;
+    await (server as any).deliverOwed((server as any).conn);
+    assert.deepEqual((server as any).owed.get('chan1'), [{ id: 'm1', tries: 1 }]);
+  });
+
+  it("loading merges as owing does: a copy owed for an edit doesn't clear 'may have arrived'", () => {
+    writeFileSync(file, JSON.stringify({ watermarks: {}, dmChannels: [], missed: {}, owed: { chan1: [{ id: 'd', uncertain: true }, { id: 'd', edit: true }] } }));
+    const { server } = wire(() => ({ accepted: true }));
+    (server as any).ensureWatermarkLoaded();
+    assert.deepEqual((server as any).owed.get('chan1'), [{ id: 'd', uncertain: true }]);
+  });
+
+  it('loading sets aside malformed owed entries and keeps the rest', () => {
+    writeFileSync(file, JSON.stringify({ watermarks: {}, dmChannels: [], missed: {}, owed: {
+      chan1: [{ id: 'ok' }, { id: 5 }, { id: 'x', uncertain: 'yes' }, { id: 'y', tries: -1 }, { id: 'z', edit: false }, 'm2'],
+      '': [{ id: 'a' }],
+      chan2: 'not a list',
+    } }));
+    const { server } = wire(() => ({ accepted: true }));
+    (server as any).ensureWatermarkLoaded();
+    assert.deepEqual([...(server as any).owed.keys()], ['chan1']);
+    assert.deepEqual((server as any).owed.get('chan1'), [{ id: 'ok' }]);
+  });
+
+  it('a create taken on its resend without inline media starts delivery of what its channel owes', async () => {
+    const { server, sent } = wire((m, _p, n) => {
+      if (m === 'channels/incoming') return n === 1
+        ? { results: [{ messageId: 'm1', accepted: false, reason: 'coalesce_invalid' }] }
+        : { results: [{ messageId: 'm1', accepted: true }] };
+      return { accepted: true };
+    }, { open: true });
+    onDiscord(server, [history('m0', 'earlier')]);
+    (server as any).owe('chan1', 'm0', { uncertain: false });
+    await deliver(server, BIG_IMAGE);
+    await until(() => owedPushes(sent).length === 1);
+  });
+
+  it("Discord not knowing the channel is read as the sweep reads it: the channel's watermark goes too", async () => {
+    const { server } = wire(() => ({ accepted: true }));
+    onDiscord(server, []);
+    (server as any).discord.fetchAround = async () => { throw Object.assign(new Error('Unknown Channel'), { code: 10003 }); };
+    (server as any).ensureWatermarkLoaded();
+    (server as any).forwardedWatermark.set('chan1', 'm5');
+    (server as any).owe('chan1', 'm1', { uncertain: false });
+    await (server as any).deliverOwed((server as any).conn);
+    assert.equal((server as any).owed.size, 0);
+    assert.equal((server as any).forwardedWatermark.has('chan1'), false);
+  });
+
   it(`at most ${50} messages are owed per channel; the oldest go first`, () => {
     const { server } = wire(() => ({ accepted: true }));
     for (let i = 0; i < 52; i++) (server as any).owe('chan1', `m${i}`, { uncertain: false });

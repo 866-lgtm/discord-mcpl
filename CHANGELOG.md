@@ -76,14 +76,17 @@ in the git log and PR descriptions.
   the host's decision or this server's bug. What is owed is delivered as
   Discord has it then, in one `<missed … reason="undelivered">` block per
   channel, like the catch-up's, when a host connection becomes ready
-  (alongside the catch-up, not ahead of it), and when the host takes a
-  message in that channel again (not within five minutes of a failed try on
-  the same connection). One read of up to 100 messages from Discord answers
+  (alongside the catch-up, not ahead of it; one that becomes ready while a
+  delivery still runs on the connection before it delivers once that ends),
+  and when the host takes a message in that channel again, on a connection
+  whose start-up has settled (not within five minutes of a failed try on the
+  same connection). One read of up to 100 messages from Discord answers
   for every owed message inside it. They go through the same ingestion gate
   as live messages: one that doesn't address the agent goes only while its
   channel is open or subscribed. A message Discord no longer has, one the
   filters or the gate refuse now, and those of a muted, deleted or unknown
-  channel are given up. A block not delivered (not taken, a failed read, a channel whose
+  channel are given up (Discord not knowing the channel is read as the
+  catch-up reads it: the channel is gone). A block not delivered (not taken, a failed read, a channel whose
   identity can't be resolved, or a filter refusal resting on facts that
   aren't current, which the catch-up holds back too) counts a try, at most
   one per connection, and three tries give it up; a refusal with a code the

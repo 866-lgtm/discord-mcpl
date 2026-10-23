@@ -2995,6 +2995,37 @@ describe('a host that connects after another', () => {
   });
 });
 
+describe('what is owed, when a connection becomes ready', () => {
+  it('is delivered by serve() once the start-up has settled', async () => {
+    const { client, serverConn, discord } = await createTestPair();
+    discord.facts.c1 = { id: 'c1', guildId: 'g1', guildName: 'Test Server', type: 'text', name: 'general' };
+    discord.historyToReturn = [{
+      id: 'm1', authorId: 'u1', authorName: 'Bob', isBot: false, content: 'hello', cleanContent: 'hello',
+      attachments: [], mentionsBot: true, timestamp: new Date(), reactions: [],
+    }];
+    const server = new DiscordMcplServer(discord as unknown as DiscordAdapter);
+    (server as unknown as { owe(c: string, m: string, how: { uncertain: boolean }): void }).owe('c1', 'm1', { uncertain: false });
+    const serverPromise = server.serve(serverConn);
+    try {
+      await mcplHandshake(client);
+      let owedPush: { eventId?: string; payload?: { content: Array<{ text?: string }> } } | undefined;
+      const deadline = Date.now() + 3000;
+      while (!owedPush && Date.now() < deadline) {
+        const m = await nextWithin(client);
+        if (m.type !== 'request') continue;
+        const params = m.request.params as { eventId?: string; payload?: { content: Array<{ text?: string }> } };
+        if (m.request.method === 'push/event' && params.eventId?.startsWith('discord_owed_c1_')) owedPush = params;
+        client.sendResponse(m.request.id, m.request.method === 'push/event' ? { accepted: true } : {});
+      }
+      assert.ok(owedPush, 'an owed block was pushed');
+      assert.match(owedPush!.payload!.content[0].text ?? '', /reason="undelivered"[\s\S]*id=m1\] Bob \(mention\): hello/);
+    } finally {
+      client.close();
+      await serverPromise;
+    }
+  });
+});
+
 describe("a replaced connection's start-up", () => {
   it('stops: it registers no channels with the host that replaced it', async () => {
     const first = await createTestPair();

@@ -3240,7 +3240,7 @@ export class DiscordMcplServer {
       for (const item of list) {
         const known = byId.get(item.id);
         if (!known) { byId.set(item.id, { ...item }); continue; }
-        if (!item.uncertain) delete known.uncertain;
+        if (!item.uncertain && !item.edit) delete known.uncertain;
         if (!item.edit) delete known.edit;
         const tries = Math.max(known.tries ?? 0, item.tries ?? 0);
         if (tries > 0) known.tries = tries;
@@ -3488,6 +3488,14 @@ export class DiscordMcplServer {
     dbg('owed:added', { channelId, messageId, ...how, owed: list.length });
   }
 
+  /** Forget these owed entries of a channel, as objects: an entry owed
+   *  anew since (a new object) stays. */
+  private forgetOwedEntries(channelId: string, entries: readonly OwedMessage[]): void {
+    const list = this.owed.get(channelId);
+    if (!list) return;
+    this.forgetOwed(channelId, list.filter((o) => entries.includes(o)).map((o) => o.id));
+  }
+
   /** Forget owed messages of a channel. */
   private forgetOwed(channelId: string, ids: readonly string[]): void {
     const list = this.owed.get(channelId);
@@ -3509,6 +3517,9 @@ export class DiscordMcplServer {
 
   /** Channels whose owed messages are being delivered (deliverOwedIn). */
   private readonly owedDelivering = new Set<string>();
+  /** A connection that became ready while its channel's delivery was still
+   *  running (on the connection before it): it delivers once that ends. */
+  private readonly owedRerun = new Map<string, McplConnection>();
   /** Per channel, the connection its last delivery try counted on, and when
    *  that try failed: a try counts once per connection, and a live trigger
    *  waits OWED_RETRY_COOLDOWN_MS after a failure before trying again. */
@@ -3540,7 +3551,13 @@ export class DiscordMcplServer {
    * connection, and after OWED_DELIVERY_TRIES they are given up.
    */
   private async deliverOwedIn(conn: McplConnection, channelId: string, trigger: 'ready' | 'live'): Promise<void> {
-    if (this.owedDelivering.has(channelId)) return;
+    if (this.owedDelivering.has(channelId)) {
+      if (trigger === 'ready') this.owedRerun.set(channelId, conn);
+      return;
+    }
+    // Owed messages go to a connection whose start-up has settled; one that
+    // hasn't gets them when it has (serve()).
+    if (trigger === 'live' && conn !== this.readyConn) return;
     const tried = this.owedTried.get(channelId);
     if (trigger === 'live' && tried?.conn === conn && Date.now() - tried.failedAt < OWED_RETRY_COOLDOWN_MS) return;
     this.owedDelivering.add(channelId);
@@ -3593,6 +3610,15 @@ export class DiscordMcplServer {
         } catch (err) {
           if ((err as { code?: unknown } | null)?.code === UNKNOWN_CHANNEL) {
             giveUp(list, "Discord doesn't know the channel");
+            // As the sweep reads that answer: the channel's deletion, or,
+            // with no guild known, the end of its watermark and tally.
+            const deletedFrom = this.guildOfChannel(channelId);
+            if (deletedFrom) {
+              this.channelDeleted(deletedFrom, channelId);
+            } else {
+              const tallied = this.missedTally.delete(channelId);
+              if (this.forwardedWatermark.delete(channelId) || tallied) this.saveWatermark();
+            }
           } else {
             notThisTime(list, `couldn't read them from Discord (${errorText(err)})`);
           }
@@ -3671,14 +3697,13 @@ export class DiscordMcplServer {
         ...lines,
         '</missed>',
       ].join('\n');
-      // The occurrence is this block: the same messages, marks and text give
-      // the same id (a block sent again is the same occurrence), and anything
-      // else a new one.
-      const digest = createHash('sha256')
-        .update(JSON.stringify(found.map(({ m, owed }) => [m.id, owed.edit === true, owed.uncertain === true, m.cleanContent])))
-        .digest('hex')
-        .slice(0, 16);
+      // The occurrence is this block: the same text, header and note
+      // included, gives the same id (a block sent again is the same
+      // occurrence), and any change a new one.
+      const payloadText = `${closedNote}${block}`;
+      const digest = createHash('sha256').update(payloadText).digest('hex').slice(0, 16);
       const revs = new Map(found.map(({ owed }) => [owed, this.owedRevs.get(owed) ?? 0]));
+      const sentBeforeReady = conn !== this.readyConn;
       let outcome: SendOutcome;
       try {
         outcome = pushOutcome(await conn.sendRequest(method.PUSH_EVENT, {
@@ -3697,7 +3722,7 @@ export class DiscordMcplServer {
             isDM,
           } as Record<string, unknown>,
           ...(threadTags(thread).length > 0 ? { tags: threadTags(thread) } : {}),
-          payload: { content: [textContent(`${closedNote}${block}`)] },
+          payload: { content: [textContent(payloadText)] },
         } satisfies PushEventParams));
       } catch (err) {
         outcome = sendErrorOutcome(err);
@@ -3706,17 +3731,29 @@ export class DiscordMcplServer {
         this.owedTried.delete(channelId);
         // Owed again while this was on its way (a later edit not taken, say):
         // that owing stays, for the next delivery.
-        this.forgetOwed(channelId, found.filter(({ owed }) => (this.owedRevs.get(owed) ?? 0) === revs.get(owed)).map(({ owed }) => owed.id));
+        this.forgetOwedEntries(channelId, found.filter(({ owed }) => (this.owedRevs.get(owed) ?? 0) === revs.get(owed)).map(({ owed }) => owed));
         console.error(`[discord-mcpl] Delivered ${found.length} owed message(s) in channel ${channelId}.`);
         dbg('owed:delivered', { channelId, ids: found.map(({ owed }) => owed.id), result: outcome.kind });
         return;
       }
       // A refusal the spec gives a meaning, unknown channel included (the
       // channel was registered just now), won't change with another try.
+      // A permission refusal of a block sent before the connection's
+      // start-up had settled is "not yet", as for a live message.
       const answer = answerClass(outcome);
-      notThisTime(found.map(({ owed }) => owed), describeOutcome(outcome, 'push/event'), answer === 'final' || answer === 'unknown-channel');
+      const notYet = sentBeforeReady && isAuthorityRefusal(outcome);
+      notThisTime(found.map(({ owed }) => owed), describeOutcome(outcome, 'push/event'), !notYet && (answer === 'final' || answer === 'unknown-channel'));
     } finally {
       this.owedDelivering.delete(channelId);
+      const again = this.owedRerun.get(channelId);
+      if (again) {
+        this.owedRerun.delete(channelId);
+        if (this.conn === again) {
+          void this.deliverOwedIn(again, channelId, 'ready').catch((err) => {
+            console.error('[discord-mcpl] Delivering owed messages failed:', errorText(err));
+          });
+        }
+      }
     }
   }
 
@@ -6153,12 +6190,7 @@ export class DiscordMcplServer {
     }
     if (first.kind !== 'rejected') {
       dbg('handleDiscordMessage:sent', { method: lane, channelMcplId, result: first.kind });
-      // The host takes messages here again: what it didn't take before follows.
-      if (this.owed.has(discordChannelId)) {
-        void this.deliverOwedIn(conn, discordChannelId, 'live').catch((err) => {
-          console.error('[discord-mcpl] Delivering owed messages failed:', errorText(err));
-        });
-      }
+      this.owedFollow(conn, discordChannelId);
       return;
     }
     // channels/incoming answers each message without a code, so there the
@@ -6204,8 +6236,18 @@ export class DiscordMcplServer {
       });
     } else {
       console.error(`[discord-mcpl] resent ${what}: ${second.kind === 'accepted' ? 'accepted' : 'sent (no verdict)'}`);
+      this.owedFollow(conn, discordChannelId);
       dbg('handleDiscordMessage:resent', { method: lane, messageId, channelMcplId, replaced: stripped.replaced, result: second.kind });
     }
+  }
+
+  /** The host took a message in this channel: what it didn't take before
+   *  there follows (deliverOwedIn's live trigger). */
+  private owedFollow(conn: McplConnection, discordChannelId: string): void {
+    if (!this.owed.has(discordChannelId)) return;
+    void this.deliverOwedIn(conn, discordChannelId, 'live').catch((err) => {
+      console.error('[discord-mcpl] Delivering owed messages failed:', errorText(err));
+    });
   }
 
   /** The retry window (RFC-006 §3.1) of the current host for `lane`: what it
