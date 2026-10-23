@@ -12,7 +12,6 @@
  * refusal codes of SPEC Appendix A and RFC-006 §13, `accepted`, and the
  * retry contract of RFC-006 §3.1. A host's `reason` is free text, kept for
  * the operator's log and never matched.
- * included, never reaches the agent.
  */
 
 import type { ContentBlock } from '@animalabs/mcpl-core';
@@ -118,9 +117,10 @@ export function isContentRejection(rejection: HostRejection): boolean {
  *
  * - `done`: accepted, or answered without a per-message verdict.
  * - `final`: a refusal the spec gives a meaning that resending can't change:
- *   -32602 / `coalesce_invalid` (malformed, RFC-006 §13), -32001 / -32002 /
- *   -32003 / -32017 (feature set, capability, channel permission), and
- *   JSON-RPC's -32600, -32601 and -32700.
+ *   -32602 / `coalesce_invalid` (malformed, RFC-006 §13), every other code
+ *   SPEC Appendix A defines but -32023, and JSON-RPC's -32600, -32601 and
+ *   -32700. (A permission refusal before the connection's policy is settled
+ *   is "not yet": isAuthorityRefusal, sendWithRetries.)
  * - `unknown-channel`: -32023, the host has no such channel registered: the
  *   sender can register it and send the same occurrence again.
  * - `refused`: a refusal the spec gives no meaning: `accepted: false` with a
@@ -135,7 +135,14 @@ export function isContentRejection(rejection: HostRejection): boolean {
 export type AnswerClass = 'done' | 'final' | 'unknown-channel' | 'refused' | 'uncertain';
 
 /** The refusal codes after which the same occurrence is never sent again. */
-const FINAL_CODES = new Set([-32602, -32001, -32002, -32003, -32017, -32600, -32601, -32700]);
+const FINAL_CODES = new Set([-32602, -32001, -32002, -32003, -32005, -32017, -32024, -32600, -32601, -32700]);
+
+/** The spec's permission refusals: feature set not enabled (-32001),
+ *  capability denied (-32002), channel not permitted (-32017). A host denies
+ *  with them until its §5.3 policy is settled, too. */
+export function isAuthorityRefusal(outcome: ForwardOutcome | { kind: 'failed' }): boolean {
+  return outcome.kind === 'rejected' && (outcome.code === -32001 || outcome.code === -32002 || outcome.code === -32017);
+}
 
 export function answerClass(outcome: ForwardOutcome | { kind: 'failed' }): AnswerClass {
   switch (outcome.kind) {

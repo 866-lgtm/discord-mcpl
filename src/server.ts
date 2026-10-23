@@ -121,6 +121,7 @@ import {
   advertisedRetryWindowMs,
   answerClass,
   errorRejection,
+  isAuthorityRefusal,
   incomingOutcome,
   isContentRejection,
   pushOutcome,
@@ -683,6 +684,9 @@ export class DiscordMcplServer {
   private resolvePolicyAnswered!: () => void;
   /** Whether a connection has used the policy gate the constructor made. */
   private policyGateUsed = false;
+  /** How long start-up waits for a host's policy before going on without
+   *  it (hosts before MCPL 0.5 send none). A field so tests can shorten it. */
+  private policyGraceMs = 20_000;
 
   /** The Discord filters plane's desired/effective/status state, shared by
    *  the whitelists and reaction suppression (issue #21) — which reactions
@@ -879,7 +883,12 @@ export class DiscordMcplServer {
    * deadline, half the host's retry window after the first send, isn't sent.
    * A field so tests can shorten it.
    */
-  private retryDelaysMs: readonly number[] = [1_000, 5_000, 30_000, 120_000, 600_000];
+  private retryDelaysMs: readonly number[] = [1_000, 5_000, 30_000];
+  /** The longest a resend waits for a host connection to become ready. Past
+   *  it the occurrence isn't sent again: a create held longer would reach
+   *  the agent long after the messages that came after it. A field so tests
+   *  can shorten it. */
+  private reconnectWaitMs = 60_000;
   /** The host's advertised `eventCoalescing.retryWindowMs`, if any. */
   private hostRetryWindowMs: number | undefined;
   /**
@@ -1738,10 +1747,14 @@ export class DiscordMcplServer {
           // unref: a pending grace timer must never hold the process open
           // (it made the test runner appear to hang for 20s per server).
           new Promise((r) => {
-            const t = setTimeout(r, 20_000);
+            const t = setTimeout(r, this.policyGraceMs);
             (t as { unref?: () => void }).unref?.();
           }),
         ]);
+        // A connection that has been replaced meanwhile has nothing left to
+        // start: the one that replaced it has its own gate and start-up, and
+        // this one must not register channels with it before its policy.
+        if (this.conn !== conn) return;
         if (this.mcplEnabled) {
           try {
             await this.syncChannelsWithHost();
@@ -5230,10 +5243,18 @@ export class DiscordMcplServer {
     const settled = new Promise<void>((r) => { resolve = r; });
     const mem: CreateMemory = { settled, resolve: () => { mem.done = true; resolve(); }, done: false, edits: 0 };
     this.recentCreates.set(messageId, mem);
+    // The oldest settled ones go. A create still being sent stays, however
+    // many come after it: an edit or delete must wait for it (afterCreate).
     while (this.recentCreates.size > RECENT_CREATES_MAX) {
-      const oldest = this.recentCreates.keys().next().value;
-      if (oldest === undefined) break;
-      this.recentCreates.delete(oldest);
+      let evicted = false;
+      for (const [id, m] of this.recentCreates) {
+        if (m.done) {
+          this.recentCreates.delete(id);
+          evicted = true;
+          break;
+        }
+      }
+      if (!evicted) break;
     }
     return mem;
   }
@@ -5832,7 +5853,7 @@ export class DiscordMcplServer {
         return "the host connected now doesn't take Discord messages";
       }
       const left = deadline - Date.now();
-      if (left <= 0) return "no host connection was ready before the host's retry window closed";
+      if (left <= 0) return 'no host connection was ready in time';
       await new Promise<void>((resolve) => {
         const wake = (): void => { clearTimeout(timer); this.readyWaiters.delete(wake); resolve(); };
         // Not unref'd: the wait is bounded by the deadline, and a stdio
@@ -5879,12 +5900,22 @@ export class DiscordMcplServer {
    * room for a slow last answer), over the shortest window advertised
    * meanwhile, as §3.1 asks.
    *
+   * A permission refusal (isAuthorityRefusal) answered before the
+   * connection's start-up had settled is "not yet": a host denies with them
+   * until its §5.3 policy is in place. The occurrence wasn't admitted, so it
+   * is sent once more, on any host, once a connection is ready.
+   *
    * A resend goes to the current connection once it is ready
-   * (readyConnection), which after a reconnect is the host connected since:
-   * the retry guarantee survives reconnects and host restarts (§3.1). Never
-   * to a host that doesn't advertise coalescing for the lane. `superseded`,
-   * when given, is asked before each resend, and a superseded occurrence
-   * isn't sent again.
+   * (readyConnection), waiting at most reconnectWaitMs for one: after a
+   * reconnect, the host connected since (§3.1's guarantee survives
+   * reconnects and host restarts; only the TCP transport reconnects, as a
+   * stdio server exits with its host). Never to a host that doesn't
+   * advertise coalescing for the lane. `superseded`, when given, is asked
+   * before each resend, and a superseded occurrence isn't sent again.
+   *
+   * A resend reaches the host after messages that came after it, each with
+   * its own timestamp; the waits are kept short for that reason (1 s, 5 s,
+   * 30 s, and at most reconnectWaitMs for a host to come back).
    *
    * Returns the last answer and the connection it came on.
    */
@@ -5902,28 +5933,49 @@ export class DiscordMcplServer {
     let conn = args.conn;
     const firstSentAt = Date.now();
     let windowMs = this.retryWindowFor(lane);
+    let sentBeforeReady = conn !== this.readyConn;
     let outcome = await attempt(conn);
     let resends = 0;
     let refusals = 0;
     let announced = false;
+    let notYetResent = false;
+    const said = (o: SendOutcome): string => describeOutcome(o, lane);
     const notResent = (why: string): void => {
-      console.error(`[discord-mcpl] ${what}: ${describeOutcome(outcome)}; not sent again: ${why}`);
+      console.error(`[discord-mcpl] ${what}: ${said(outcome)}; not sent again: ${why}`);
       dbg(`${dbgPrefix}:not-resent`, { method: lane, what, result: outcome.kind, why });
     };
     for (;;) {
       const answer = answerClass(outcome);
-      if (answer === 'done' || answer === 'final') return { outcome, conn };
+      if (answer === 'done') return { outcome, conn };
       if (superseded?.()) {
+        if (answer === 'final') return { outcome, conn };
         notResent('a later edit or delete of the message has been sent since');
         return { outcome: { kind: 'superseded' }, conn };
+      }
+      if (answer === 'final') {
+        if (!sentBeforeReady || notYetResent || !isAuthorityRefusal(outcome)) return { outcome, conn };
+        notYetResent = true;
+        const ready = await this.readyConnection(Date.now() + this.reconnectWaitMs);
+        if (typeof ready === 'string') {
+          notResent(ready);
+          return { outcome, conn };
+        }
+        console.error(`[discord-mcpl] ${what}: ${said(outcome)}, before the host's start-up had settled; sending the same occurrence again now that it has`);
+        dbg(`${dbgPrefix}:resend`, { method: lane, what, answer: 'not-yet' });
+        conn = ready;
+        sentBeforeReady = false;
+        outcome = await attempt(conn);
+        console.error(`[discord-mcpl] sent ${what} again (same event id): ${said(outcome)}`);
+        continue;
       }
       if (answer === 'unknown-channel') {
         if (announced || channel === undefined || !this.reannounceChannel(conn, channel)) return { outcome, conn };
         announced = true;
-        console.error(`[discord-mcpl] ${what}: ${describeOutcome(outcome)}; announced channel ${channel} to the host again, and sending the same occurrence again`);
+        console.error(`[discord-mcpl] ${what}: ${said(outcome)}; announced channel ${channel} to the host again, and sending the same occurrence again`);
         dbg(`${dbgPrefix}:resend`, { method: lane, what, answer, channel });
+        sentBeforeReady = conn !== this.readyConn;
         outcome = await attempt(conn);
-        console.error(`[discord-mcpl] sent ${what} again (same event id): ${describeOutcome(outcome)}`);
+        console.error(`[discord-mcpl] sent ${what} again (same event id): ${said(outcome)}`);
         continue;
       }
       if (!coalesced || windowMs === undefined) return { outcome, conn };
@@ -5940,14 +5992,14 @@ export class DiscordMcplServer {
         notResent("the host's retry window is closing");
         return { outcome, conn };
       }
-      console.error(`[discord-mcpl] ${what}: ${describeOutcome(outcome)}; sending the same occurrence again (same event id) in ${wait}ms`);
+      console.error(`[discord-mcpl] ${what}: ${said(outcome)}; sending the same occurrence again (same event id) in ${wait}ms`);
       dbg(`${dbgPrefix}:resend-wait`, { method: lane, what, answer, waitMs: wait, resend: resends + 1 });
       await sleep(wait);
       if (superseded?.()) {
         notResent('a later edit or delete of the message has been sent since');
         return { outcome: { kind: 'superseded' }, conn };
       }
-      const next = await this.readyConnection(deadline);
+      const next = await this.readyConnection(Math.min(deadline, Date.now() + this.reconnectWaitMs));
       if (typeof next === 'string') {
         notResent(next);
         return { outcome, conn };
@@ -5965,8 +6017,9 @@ export class DiscordMcplServer {
       const moved = next !== conn;
       conn = next;
       resends++;
+      sentBeforeReady = false;
       outcome = await attempt(conn);
-      console.error(`[discord-mcpl] sent ${what} again (same event id${moved ? ', to the host connected since' : ''}): ${describeOutcome(outcome)}`);
+      console.error(`[discord-mcpl] sent ${what} again (same event id${moved ? ', to the host connected since' : ''}): ${said(outcome)}`);
       dbg(`${dbgPrefix}:resent-same`, { method: lane, what, result: outcome.kind, resend: resends, newConnection: moved });
     }
   }
@@ -6031,12 +6084,14 @@ export class DiscordMcplServer {
  *  (`failed`: a timeout, a closed connection, the host's own failure). */
 type SendOutcome = ForwardOutcome | { kind: 'failed'; error: string };
 
-/** An outcome as the log lines put it. */
-function describeOutcome(outcome: SendOutcome | { kind: 'superseded' }): string {
+/** An outcome as the log lines put it. A refusal without a code reads as
+ *  "didn't take" on channels/incoming, where a host's own failure comes back
+ *  the same way, and as "rejected" otherwise, as deliverCreate's lines say. */
+function describeOutcome(outcome: SendOutcome | { kind: 'superseded' }, lane: 'channels/incoming' | 'push/event'): string {
   switch (outcome.kind) {
     case 'accepted': return 'accepted';
     case 'no-result': return 'sent (no verdict)';
-    case 'rejected': return `host ${outcome.code === undefined ? "didn't take it" : 'rejected it'}: ${outcome.reason}`;
+    case 'rejected': return `host ${lane === 'channels/incoming' && outcome.code === undefined ? "didn't take it" : 'rejected it'}: ${outcome.reason}`;
     case 'failed': return `send failed: ${outcome.error}`;
     case 'superseded': return 'superseded';
   }

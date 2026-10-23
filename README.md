@@ -78,7 +78,7 @@ DISCORD_TOKEN=... npx @animalabs/discord-mcpl --tcp 9040
 From a source checkout, run `node dist/src/index.js` with the same flags. `npm start -- --stdio` runs the TypeScript source through tsx without a build.
 
 - With `--stdio`, a host starts discord-mcpl and talks to it over stdin and stdout. discord-mcpl exits when the host closes the connection.
-- With `--tcp <port>`, discord-mcpl listens on 127.0.0.1 only and serves one host at a time, refusing any other that connects meanwhile. It stays logged in to Discord between hosts but doesn't queue messages for the next host. A message that arrives while no host is connected is dropped, and only a later read of history, such as the catch-up after the first host connects, can bring it back.
+- With `--tcp <port>`, discord-mcpl listens on 127.0.0.1 only and serves one host at a time, refusing any other that connects meanwhile. It stays logged in to Discord between hosts but doesn't queue messages for the next host. A message that arrives while no host is connected is dropped, and only a later read of history, such as the catch-up after the first host connects, can bring it back. A message already sent to a host that gave no verdict on it can be sent again to the next host, as the same occurrence, when that host connects within a minute and advertises event coalescing (see the CHANGELOG).
 
 discord-mcpl writes its logs to stderr.
 
