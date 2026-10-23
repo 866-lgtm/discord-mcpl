@@ -24,13 +24,12 @@ import { ChannelManager, toDescriptor } from '../src/channels.js';
 import { DiscordMcplServer } from '../src/server.js';
 import {
   advertisedRetryWindowMs,
+  answerClass,
   errorRejection,
   incomingOutcome,
   isContentRejection,
-  isUnpersistedAnswer,
   pushOutcome,
   summarizeAttachments,
-  unpersistedError,
   withoutInlineMedia,
 } from '../src/incoming-results.js';
 
@@ -82,7 +81,7 @@ async function until(done: () => boolean): Promise<void> {
   }
 }
 
-function wire(respond: Responder, opts: { open?: boolean; host?: ReturnType<typeof scriptedHost> } = {}) {
+function wire(respond: Responder, opts: { open?: boolean; host?: ReturnType<typeof scriptedHost>; coalescing?: boolean } = {}) {
   const server = new DiscordMcplServer({} as DiscordAdapter);
   const s = server as unknown as Record<string, unknown>;
   let edit: EditHandler | undefined;
@@ -117,9 +116,16 @@ function wire(respond: Responder, opts: { open?: boolean; host?: ReturnType<type
     },
     sendNotification: noop,
   };
+  // The connection's start-up has settled, as serve() marks it.
+  s.readyConn = s.conn;
+  // Resends a few milliseconds apart, so the tests don't wait out the real ones.
+  s.retryDelaysMs = [5, 5, 5, 5, 5];
   s.mcplEnabled = true;
   // A coalescing host, as the fleet's are: every create carries `coalesce`.
-  s.hostCoalescing = { pushEvents: true, channelsIncoming: true, channelScopedPush: false };
+  // `coalescing: false` stands for a host that advertises none.
+  s.hostCoalescing = opts.coalescing === false
+    ? undefined
+    : { pushEvents: true, channelsIncoming: true, channelScopedPush: false };
   (s.enabledFeatureSets as Set<string>).add('discord.messaging');
   (s.ensureSubscriptionsLoaded as () => void).call(server);
   (s.subscribedChannels as Set<string>).add('chan1');
@@ -203,10 +209,12 @@ describe('channels/incoming (open channel): the per-message result is read', () 
     assert.ok(errors.includes("[discord-mcpl] host didn't take message m1 in discord:g1:chan1: coalesce_invalid"));
   });
 
-  it('a refusal that is not about content (empty_content) is logged and not resent', async () => {
+  it('a refusal the spec gives no meaning (empty_content) is sent once more as the same occurrence, then logged, and never without its media', async () => {
     const { server, sent } = wire(() => ({ results: [{ messageId: 'm1', accepted: false, reason: 'empty_content' }] }), { open: true });
     await deliver(server, BIG_IMAGE);
-    assert.equal(sent.length, 1);
+    assert.equal(sent.length, 2);
+    assert.equal(eventIdOf(sent[1]), 'discord_msg_m1');
+    assert.deepEqual(contentOf(sent[1]), contentOf(sent[0]));
     assert.ok(errors.includes("[discord-mcpl] host didn't take message m1 in discord:g1:chan1: empty_content"));
   });
 
@@ -228,11 +236,12 @@ describe('channels/incoming (open channel): the per-message result is read', () 
     assert.equal(contentOf(sent[1]).some((b: any) => b.type === 'image'), false);
   });
 
-  it('a channels/incoming request mcpl-core times out is a send failure, not a refusal, and is not resent', async () => {
+  it('a channels/incoming request mcpl-core times out is a send failure, not a refusal: sent again as the same occurrence, then logged as failed', async () => {
     const host = scriptedHost(() => 'no answer');
     const { server, sent } = wire(() => undefined, { open: true, host });
     await deliver(server, BIG_IMAGE);
-    assert.equal(sent.length, 1);
+    assert.equal(sent.length, 6, 'the first send and five resends');
+    assert.equal(new Set(sent.map(eventIdOf)).size, 1);
     assert.ok(errors.some((e) => e.startsWith('[discord-mcpl] channels/incoming failed:')), errors.join('\n'));
     assert.equal(errors.some((e) => e.includes('host rejected') || e.includes("didn't take")), false);
   });
@@ -256,18 +265,20 @@ describe('push/event (closed channel): the result or error is read', () => {
     assert.deepEqual(sent[1].params.origin, sent[0].params.origin);
   });
 
-  it('an {accepted:false} result for a non-content reason is logged and not resent', async () => {
+  it('an {accepted:false} result for a non-content reason is sent once more as the same occurrence, then logged', async () => {
     const { server, sent } = wire(() => ({ accepted: false, reason: 'duplicate' }));
     await deliver(server, BIG_IMAGE);
-    assert.equal(sent.length, 1);
-    assert.ok(errors.includes('[discord-mcpl] host rejected message m1 in discord:g1:chan1: duplicate'));
+    assert.equal(sent.length, 2);
+    assert.equal(eventIdOf(sent[1]), eventIdOf(sent[0]));
+    assert.ok(errors.includes('[discord-mcpl] host rejected message m1 in discord:g1:chan1: duplicate'), errors.join('\n'));
   });
 
-  it('a push/event request mcpl-core times out is a send failure, not a refusal, and is not resent', async () => {
+  it('a push/event request mcpl-core times out is a send failure, not a refusal: sent again as the same occurrence, then logged as failed', async () => {
     const host = scriptedHost(() => 'no answer');
     const { server, sent } = wire(() => undefined, { host });
     await deliver(server, BIG_IMAGE);
-    assert.equal(sent.length, 1);
+    assert.equal(sent.length, 6, 'the first send and five resends');
+    assert.equal(new Set(sent.map(eventIdOf)).size, 1);
     assert.ok(errors.some((e) => e.startsWith('[discord-mcpl] push/event failed:')), errors.join('\n'));
     assert.equal(errors.some((e) => e.includes('host rejected') || e.includes("didn't take")), false);
   });
@@ -278,7 +289,8 @@ describe('push/event (closed channel): the result or error is read', () => {
       : 'no answer');
     const { server, sent } = wire(() => undefined, { host });
     await deliver(server, BIG_IMAGE);
-    assert.equal(sent.length, 2);
+    assert.equal(sent.length, 7, 'the create, then the resend without media and its own five');
+    assert.ok(sent.slice(1).every((r) => eventIdOf(r) === 'discord_msg_m1_media_omitted'));
     assert.ok(errors.includes('[discord-mcpl] host rejected message m1 in discord:g1:chan1: content exceeds host byte limit'), errors.join('\n'));
     assert.ok(errors.some((e) => e.startsWith('[discord-mcpl] resent message m1 in discord:g1:chan1 with 1 inline attachment(s) replaced by a note: send failed:')), errors.join('\n'));
     assert.equal(errors.some((e) => e.includes('sent (no verdict)')), false);
@@ -311,18 +323,28 @@ describe('edits and deletes: a refusal is logged', () => {
   });
 
   it('logs an edit the host refuses with an error code, in the host\'s words', async () => {
+    const { sent, edit } = wire(() => { throw rpcError(-32001, 'Feature set not enabled: discord.messaging'); });
+    edit()('chan1', 'm9', 'fixed', false, { guildId: 'g1', authorId: 'u1', authorName: 'someone' });
+    await until(() => errors.some((e) => e.startsWith('[discord-mcpl] host rejected')));
+    assert.equal(sent.length, 1);
+    assert.ok(errors.includes('[discord-mcpl] host rejected edit of message m9 in discord:g1:chan1: Feature set not enabled: discord.messaging'), errors.join('\n'));
+  });
+
+  it('logs an edit refused for an unknown channel, after announcing the channel and sending the edit once more', async () => {
     const { sent, edit } = wire(() => { throw rpcError(-32023, 'channel not declared'); });
     edit()('chan1', 'm9', 'fixed', false, { guildId: 'g1', authorId: 'u1', authorName: 'someone' });
-    await until(() => errors.length > 0);
-    assert.equal(sent.length, 1);
+    await until(() => errors.some((e) => e.startsWith('[discord-mcpl] host rejected')));
+    assert.equal(sent.length, 2);
+    assert.equal(sent[1].params.eventId, sent[0].params.eventId);
     assert.ok(errors.includes('[discord-mcpl] host rejected edit of message m9 in discord:g1:chan1: channel not declared'), errors.join('\n'));
   });
 
-  it('logs the refusal of a delete', async () => {
+  it('logs the refusal of a delete, after sending it once more (a refusal the spec gives no meaning)', async () => {
     const { sent, del } = wire(() => ({ accepted: false, reason: 'duplicate' }));
     del()('chan1', 'm9', false, { guildId: 'g1', authorId: 'u1', authorName: 'someone' });
-    await until(() => errors.length > 0);
-    assert.equal(sent.length, 1);
+    await until(() => errors.some((e) => e.startsWith('[discord-mcpl] host rejected')));
+    assert.equal(sent.length, 2);
+    assert.equal(sent[1].params.eventId, sent[0].params.eventId);
     assert.ok(errors.includes('[discord-mcpl] host rejected delete of message m9 in discord:g1:chan1: duplicate'), errors.join('\n'));
   });
 });
@@ -427,6 +449,11 @@ describe('incoming-results helpers', () => {
     assert.deepEqual(errorRejection(rpcError(-32602, 'bad')), { reason: 'bad', code: -32602 });
     assert.deepEqual(errorRejection(rpcError(-32001, 'Feature set not enabled: x')), { reason: 'Feature set not enabled: x', code: -32001 });
     assert.deepEqual(errorRejection(rpcError(-32601, 'Method not found')), { reason: 'Method not found', code: -32601 });
+    // The spec's own codes in the server-error range are refusals too.
+    assert.deepEqual(errorRejection(rpcError(-32023, 'Unknown channel')), { reason: 'Unknown channel', code: -32023 });
+    assert.deepEqual(errorRejection(rpcError(-32017, 'no')), { reason: 'no', code: -32017 });
+    // A code outside JSON-RPC's reserved ranges is a refusal the spec gives no meaning.
+    assert.deepEqual(errorRejection(rpcError(4001, 'nope')), { reason: 'nope', code: 4001 });
     assert.deepEqual(errorRejection(rpcError(-32602, '')), { reason: 'unspecified', code: -32602 });
     // Stands in for a later mcpl-core, whose RpcError keeps the host's message
     // as it came; 0.2.1 can't make this one.
@@ -438,6 +465,11 @@ describe('incoming-results helpers', () => {
     assert.equal(errorRejection(new Error('closed')), undefined);
     assert.equal(errorRejection(rpcError(-32000, 'host could not persist the acceptance; retry')), undefined);
     assert.equal(errorRejection(rpcError(-32603, 'Internal error')), undefined);
+    // Any implementation-defined server error: the spec defines no -32050.
+    assert.equal(errorRejection(rpcError(-32050, 'busy')), undefined);
+    // Nor a code JSON-RPC reserves and gives no meaning.
+    assert.equal(errorRejection(rpcError(-32650, 'reserved')), undefined);
+    assert.equal(errorRejection(rpcError(-32100, 'reserved')), undefined);
     // mcpl-core 0.2.1's own timeout comes from mcpl-core in the lanes' tests.
     // This stands in for a later mcpl-core's ConnectionTimeoutError, an
     // RpcError with -32000, which 0.2.1 can't make.
@@ -480,290 +512,567 @@ describe('incoming-results helpers', () => {
 });
 
 /**
- * agent-framework's coalescer answers -32000 "host could not persist the
- * acceptance; retry" (or "… make the acceptance durable; retry") when it took
- * an occurrence but couldn't keep its receipt, and asks the producer to send
- * the SAME occurrence again within its retry window. One retry, same eventId
- * and coalesce member; never for mcpl-core's own -32000 timeout.
+ * Sending the same occurrence again, by what the MCPL spec defines and never
+ * by one host's words: answerClass reads an answer as done, final, an
+ * unknown channel, a refusal the spec gives no meaning, or no verdict. A
+ * coalescing host's retry window (RFC-006 §3.1) is what makes the same
+ * eventId safe to send again, so only a host that advertises one gets resends
+ * of a refusal or of an uncertain answer.
  */
-describe("an acceptance the host couldn't keep is sent once more as the same occurrence", () => {
-  const PERSIST = 'host could not persist the acceptance; retry';
-  const DURABLE = 'host could not make the acceptance durable; retry';
-  const fast = (server: DiscordMcplServer, ms = 5) => { (server as any).persistRetryDelayMs = ms; };
+describe('sending the same occurrence again, by what the spec defines', () => {
+  const info = { guildId: 'g1', authorId: 'u1', authorName: 'someone' };
+  const delays = (server: DiscordMcplServer, ms: number, n = 5) => { (server as any).retryDelaysMs = Array(n).fill(ms); };
 
-  it('channels/incoming: a persist failure is retried once with the same eventId and content, and the acceptance logged', async () => {
-    const { server, sent } = wire((_m, _p, n) => n === 1
-      ? { results: [{ messageId: 'm1', accepted: false, reason: PERSIST }] }
-      : { results: [{ messageId: 'm1', accepted: true }] }, { open: true });
-    fast(server);
-    await deliver(server, SMALL_IMAGE);
-    assert.equal(sent.length, 2, 'exactly one retry');
-    assert.equal(eventIdOf(sent[1]), eventIdOf(sent[0]));
-    assert.equal(eventIdOf(sent[1]), 'discord_msg_m1');
-    assert.deepEqual(coalesceOf(sent[1]), coalesceOf(sent[0]));
-    // The same occurrence: the image is still inline (not the media-omitted resend).
-    assert.deepEqual(contentOf(sent[1]), contentOf(sent[0]));
-    assert.ok(errors.includes(`[discord-mcpl] host couldn't keep message m1 in discord:g1:chan1 (${PERSIST}); retrying once with the same event id in 5ms`), errors.join('\n'));
-    assert.ok(errors.includes('[discord-mcpl] retried message m1 in discord:g1:chan1 with the same event id: accepted'), errors.join('\n'));
-    assert.equal(errors.some((e) => e.includes("didn't take") || e.includes('host rejected')), false);
-  });
-
-  it('push/event: the host\'s -32000 "durable; retry" error (through mcpl-core) is retried once with the same eventId', async () => {
-    const host = scriptedHost((_m, _p, n) => n === 1
-      ? { error: { code: -32000, message: DURABLE } }
-      : { result: { accepted: true } });
-    const { server, sent } = wire(() => undefined, { host });
-    fast(server);
-    await deliver(server, SMALL_IMAGE);
-    assert.equal(sent.length, 2);
-    assert.equal(sent[1].method, 'push/event');
-    assert.equal(eventIdOf(sent[1]), eventIdOf(sent[0]));
-    assert.deepEqual(coalesceOf(sent[1]), coalesceOf(sent[0]));
-    assert.deepEqual(contentOf(sent[1]), contentOf(sent[0]));
-    assert.ok(errors.includes('[discord-mcpl] retried message m1 in discord:g1:chan1 with the same event id: accepted'), errors.join('\n'));
-    assert.equal(errors.some((e) => e.includes('push/event failed')), false);
-  });
-
-  it('a retry the host still can\'t keep is logged and nothing more is sent', async () => {
-    const host = scriptedHost(() => ({ error: { code: -32000, message: PERSIST } }));
-    const { server, sent } = wire(() => undefined, { host });
-    fast(server);
-    await deliver(server, SMALL_IMAGE);
-    assert.equal(sent.length, 2, 'one retry, no loop');
-    assert.ok(errors.includes(`[discord-mcpl] retried message m1 in discord:g1:chan1 with the same event id: still not kept: ${PERSIST}`), errors.join('\n'));
-    assert.ok(errors.some((e) => e.startsWith('[discord-mcpl] push/event failed:') && e.includes('(after one retry)')), errors.join('\n'));
-  });
-
-  it("a retry the host refuses is handled as that refusal (here: for its content, so the media-omitted resend follows)", async () => {
-    const { server, sent } = wire((_m, _p, n) => n === 1
-      ? { results: [{ messageId: 'm1', accepted: false, reason: PERSIST }] }
-      : n === 2
-        ? { results: [{ messageId: 'm1', accepted: false, reason: 'coalesce_invalid' }] }
+  describe('creates', () => {
+    it('a refusal the spec gives no meaning (a free-text item reason) is sent once more, the same occurrence, and its acceptance logged', async () => {
+      const reason = 'host could not persist the acceptance; retry';
+      const { server, sent } = wire((_m, _p, n) => n === 1
+        ? { results: [{ messageId: 'm1', accepted: false, reason }] }
         : { results: [{ messageId: 'm1', accepted: true }] }, { open: true });
-    fast(server);
-    await deliver(server, BIG_IMAGE);
-    assert.equal(sent.length, 3);
-    assert.equal(eventIdOf(sent[1]), 'discord_msg_m1');
-    assert.equal(eventIdOf(sent[2]), 'discord_msg_m1_media_omitted');
-    assert.ok(errors.includes('[discord-mcpl] retried message m1 in discord:g1:chan1 with the same event id: host rejected it: coalesce_invalid'), errors.join('\n'));
-  });
+      await deliver(server, SMALL_IMAGE);
+      assert.equal(sent.length, 2, 'one resend');
+      assert.equal(eventIdOf(sent[1]), 'discord_msg_m1');
+      assert.deepEqual(coalesceOf(sent[1]), coalesceOf(sent[0]));
+      // The same occurrence: the image is still inline.
+      assert.deepEqual(contentOf(sent[1]), contentOf(sent[0]));
+      assert.ok(errors.includes(`[discord-mcpl] message m1 in discord:g1:chan1: host didn't take it: ${reason}; sending the same occurrence again (same event id) in 5ms`), errors.join('\n'));
+      assert.ok(errors.includes('[discord-mcpl] sent message m1 in discord:g1:chan1 again (same event id): accepted'), errors.join('\n'));
+      assert.equal(errors.some((e) => e.startsWith('[discord-mcpl] host')), false, 'nothing reported as refused');
+    });
 
-  it("mcpl-core's own -32000 timeout is not retried: its outcome is unknown", async () => {
-    const host = scriptedHost(() => 'no answer');
-    const { server, sent } = wire(() => undefined, { host });
-    fast(server);
-    await deliver(server, SMALL_IMAGE);
-    assert.equal(sent.length, 1);
-    assert.equal(errors.some((e) => e.includes('retrying once') || e.includes('retried')), false);
-    assert.ok(errors.some((e) => e.startsWith('[discord-mcpl] push/event failed:')), errors.join('\n'));
-  });
+    it('a refusal the spec gives no meaning, refused again, is logged and not sent a third time', async () => {
+      const { server, sent } = wire(() => ({ results: [{ messageId: 'm1', accepted: false }] }), { open: true });
+      await deliver(server, SMALL_IMAGE);
+      assert.equal(sent.length, 2);
+      assert.ok(errors.includes("[discord-mcpl] host didn't take message m1 in discord:g1:chan1: unspecified"), errors.join('\n'));
+    });
 
-  it('"host is stopping" (-32000) is not retried', async () => {
-    const host = scriptedHost(() => ({ error: { code: -32000, message: 'host is stopping' } }));
-    const { server, sent } = wire(() => undefined, { host });
-    fast(server);
-    await deliver(server, SMALL_IMAGE);
-    assert.equal(sent.length, 1);
-    assert.equal(errors.some((e) => e.includes('retrying once')), false);
-  });
+    it('no answer, or an implementation-defined server error, is sent again as the same occurrence until one comes', async () => {
+      const host = scriptedHost((_m, _p, n) => n === 1 ? 'no answer'
+        : n === 2 ? { error: { code: -32000, message: 'host is stopping' } }
+          : n === 3 ? { error: { code: -32603, message: 'Internal error' } }
+            : { result: { accepted: true } });
+      const { server, sent } = wire(() => undefined, { host });
+      await deliver(server, SMALL_IMAGE);
+      assert.equal(sent.length, 4);
+      assert.equal(new Set(sent.map(eventIdOf)).size, 1);
+      assert.ok(sent.every((r) => JSON.stringify(contentOf(r)) === JSON.stringify(contentOf(sent[0]))));
+      assert.ok(errors.includes('[discord-mcpl] sent message m1 in discord:g1:chan1 again (same event id): accepted'), errors.join('\n'));
+      assert.equal(errors.some((e) => e.startsWith('[discord-mcpl] push/event failed')), false);
+    });
 
-  it('an edit the host couldn\'t keep is retried once with the same eventId', async () => {
-    const { server, sent, edit } = wire((_m, _p, n) => n === 1 ? { accepted: false, reason: PERSIST } : { accepted: true });
-    fast(server);
-    edit()('chan1', 'm9', 'fixed', false, { guildId: 'g1', authorId: 'u1', authorName: 'someone' });
-    await until(() => errors.some((e) => e.startsWith('[discord-mcpl] retried edit')));
-    assert.equal(sent.length, 2);
-    assert.equal(sent[1].params.eventId, sent[0].params.eventId);
-    assert.ok(errors.includes('[discord-mcpl] retried edit of message m9 in discord:g1:chan1 with the same event id: accepted'), errors.join('\n'));
-  });
+    it('an implementation-defined server error after every resend: logged as sent that many times, then as a failed send', async () => {
+      const host = scriptedHost(() => ({ error: { code: -32000, message: 'host could not make the acceptance durable; retry' } }));
+      const { server, sent } = wire(() => undefined, { host });
+      delays(server, 2, 3);
+      await deliver(server, SMALL_IMAGE);
+      assert.equal(sent.length, 4, 'the first send and three resends');
+      assert.ok(errors.some((e) => e.startsWith('[discord-mcpl] message m1 in discord:g1:chan1: send failed:') && e.endsWith('not sent again: sent 4 times')), errors.join('\n'));
+      assert.ok(errors.some((e) => e.startsWith('[discord-mcpl] push/event failed:')), errors.join('\n'));
+    });
 
-  it('an edit is not retried once a later edit of the message has been sent: the later one supersedes it', async () => {
-    let answerFirst!: (v: unknown) => void;
-    const firstAnswer = new Promise((r) => { answerFirst = r; });
-    const { server, sent, edit } = wire((_m, _p, n) => n === 1 ? firstAnswer : { accepted: true });
-    fast(server);
-    const info = { guildId: 'g1', authorId: 'u1', authorName: 'someone' };
-    edit()('chan1', 'm9', 'first', false, info);
-    await until(() => sent.length === 1);
-    edit()('chan1', 'm9', 'second', false, info);
-    await until(() => sent.length === 2);
-    answerFirst({ accepted: false, reason: PERSIST });
-    await until(() => errors.some((e) => e.includes('not retried')));
-    await new Promise((r) => setTimeout(r, 20));
-    assert.equal(sent.length, 2, 'the superseded edit is not resent');
-    assert.ok(errors.includes(`[discord-mcpl] host couldn't keep edit of message m9 in discord:g1:chan1 (${PERSIST}); not retried: a later edit or delete of the message has been sent since`), errors.join('\n'));
-  });
+    it('no answer at all, every time: the same, through mcpl-core timing each request out', async () => {
+      const host = scriptedHost(() => 'no answer');
+      const { server, sent } = wire(() => undefined, { host });
+      delays(server, 2, 2);
+      await deliver(server, SMALL_IMAGE);
+      assert.equal(sent.length, 3, 'the first send and two resends');
+      assert.ok(errors.some((e) => e.startsWith('[discord-mcpl] message m1 in discord:g1:chan1: send failed:') && e.endsWith('not sent again: sent 3 times')), errors.join('\n'));
+      assert.ok(errors.some((e) => e.startsWith('[discord-mcpl] push/event failed:')), errors.join('\n'));
+    });
 
-  it('an edit that arrives while a retry is waited out goes after the retry, never before it', async () => {
-    const { server, sent, edit } = wire((_m, _p, n) => n === 1 ? { accepted: false, reason: PERSIST } : { accepted: true });
-    fast(server, 40);
-    const info = { guildId: 'g1', authorId: 'u1', authorName: 'someone' };
-    edit()('chan1', 'm9', 'first', false, info);
-    await until(() => errors.some((e) => e.includes('retrying once')));
-    edit()('chan1', 'm9', 'second', false, info);
-    await until(() => sent.length === 3);
-    assert.equal(sent[1].params.eventId, sent[0].params.eventId, 'the retry is the first edit, again');
-    assert.notEqual(sent[2].params.eventId, sent[0].params.eventId, 'the second edit comes after it');
-    assert.match(JSON.stringify(sent[2].params.payload), /second/);
-  });
+    it('a resend the host refuses as malformed is handled as that refusal: the media-omitted resend follows', async () => {
+      const { server, sent } = wire((_m, _p, n) => n === 1
+        ? { results: [{ messageId: 'm1', accepted: false, reason: 'storage busy' }] }
+        : n === 2
+          ? { results: [{ messageId: 'm1', accepted: false, reason: 'coalesce_invalid' }] }
+          : { results: [{ messageId: 'm1', accepted: true }] }, { open: true });
+      await deliver(server, BIG_IMAGE);
+      assert.equal(sent.length, 3);
+      assert.equal(eventIdOf(sent[1]), 'discord_msg_m1');
+      assert.equal(eventIdOf(sent[2]), 'discord_msg_m1_media_omitted');
+      assert.ok(errors.includes("[discord-mcpl] sent message m1 in discord:g1:chan1 again (same event id): host didn't take it: coalesce_invalid"), errors.join('\n'));
+    });
 
-  for (const words of [PERSIST, DURABLE]) {
-    it(`a delete the host couldn't keep ("${words}") is retried once with the same eventId`, async () => {
+    it('the media-omitted resend is sent again as itself, never with the media', async () => {
+      const { server, sent } = wire((_m, _p, n) => n === 1
+        ? { results: [{ messageId: 'm1', accepted: false, reason: 'coalesce_invalid' }] }
+        : n === 2
+          ? { results: [{ messageId: 'm1', accepted: false, reason: 'storage busy' }] }
+          : { results: [{ messageId: 'm1', accepted: true }] }, { open: true });
+      await deliver(server, BIG_IMAGE);
+      assert.equal(sent.length, 3, 'the create, the resend, the same resend again');
+      assert.equal(eventIdOf(sent[2]), 'discord_msg_m1_media_omitted');
+      assert.deepEqual(coalesceOf(sent[2]), { key: 'message:m1', initial: true });
+      assert.deepEqual(contentOf(sent[2]), contentOf(sent[1]));
+      assert.equal(contentOf(sent[2]).some((b: any) => b.type === 'image'), false);
+      assert.ok(errors.includes('[discord-mcpl] sent message m1 in discord:g1:chan1 (resent without inline media) again (same event id): accepted'), errors.join('\n'));
+      assert.ok(errors.some((e) => e.startsWith('[discord-mcpl] resent message m1 in discord:g1:chan1 with 1 inline attachment(s) replaced by a note: accepted')), errors.join('\n'));
+    });
+
+    for (const [code, message] of [[-32001, 'Feature set not enabled: discord.messaging'], [-32017, 'Channel not permitted'], [-32024, 'Channel open failed'], [-32601, 'Method not found']] as const) {
+      it(`a refusal the spec defines (${code}) is final: logged, never sent again`, async () => {
+        const host = scriptedHost(() => ({ error: { code, message } }));
+        const { server, sent } = wire(() => undefined, { host });
+        await deliver(server, SMALL_IMAGE);
+        assert.equal(sent.length, 1);
+        assert.ok(errors.includes(`[discord-mcpl] host rejected message m1 in discord:g1:chan1: ${message}`), errors.join('\n'));
+      });
+    }
+
+    it('an unknown channel (-32023): the channel is announced to the host again, and the same occurrence sent once more', async () => {
       const host = scriptedHost((_m, _p, n) => n === 1
-        ? { error: { code: -32000, message: words } }
+        ? { error: { code: -32023, message: 'Unknown channel' } }
         : { result: { accepted: true } });
-      const { server, sent, del } = wire(() => undefined, { host });
-      fast(server);
-      del()('chan1', 'm9', false, { guildId: 'g1', authorId: 'u1', authorName: 'someone' });
-      await until(() => errors.some((e) => e.startsWith('[discord-mcpl] retried delete')));
+      const { server, sent } = wire(() => undefined, { host });
+      const notified: any[] = [];
+      (host.conn as any).sendNotification = (method: string, params: unknown) => { notified.push({ method, params }); };
+      await deliver(server, SMALL_IMAGE);
+      assert.equal(sent.length, 2);
+      assert.equal(eventIdOf(sent[1]), eventIdOf(sent[0]));
+      const announced = notified.filter((n) => n.method === 'channels/changed').flatMap((n) => n.params.added ?? []);
+      assert.ok(announced.some((d: any) => d.id === 'discord:g1:chan1'), JSON.stringify(notified));
+      assert.ok(errors.includes('[discord-mcpl] sent message m1 in discord:g1:chan1 again (same event id): accepted'), errors.join('\n'));
+    });
+
+    it('an unknown channel refused again is final', async () => {
+      const host = scriptedHost(() => ({ error: { code: -32023, message: 'Unknown channel' } }));
+      const { server, sent } = wire(() => undefined, { host });
+      await deliver(server, SMALL_IMAGE);
+      assert.equal(sent.length, 2);
+      assert.ok(errors.includes('[discord-mcpl] host rejected message m1 in discord:g1:chan1: Unknown channel'), errors.join('\n'));
+    });
+
+    it('a host that advertises no event coalescing gets each occurrence once: no resend of a refusal or of no answer', async () => {
+      const refusing = wire(() => ({ accepted: false }), { coalescing: false });
+      await deliver(refusing.server, SMALL_IMAGE);
+      assert.equal(refusing.sent.length, 1);
+      const host = scriptedHost(() => 'no answer');
+      const silent = wire(() => undefined, { host, coalescing: false });
+      await deliver(silent.server, SMALL_IMAGE);
+      assert.equal(host.sent.length, 1);
+      assert.equal(errors.some((e) => e.includes('again')), false, errors.join('\n'));
+    });
+
+    it('…but an unknown channel is announced and the occurrence sent once more, on any host: it was not admitted', async () => {
+      const host = scriptedHost((_m, _p, n) => n === 1
+        ? { error: { code: -32023, message: 'Unknown channel' } }
+        : { result: { accepted: true } });
+      const { server, sent } = wire(() => undefined, { host, coalescing: false });
+      await deliver(server, SMALL_IMAGE);
+      assert.equal(sent.length, 2);
+      assert.equal(eventIdOf(sent[1]), eventIdOf(sent[0]));
+    });
+
+    it("no resend whose wait would end after half the host's retry window, counted from the first send", async () => {
+      const host = scriptedHost(() => ({ error: { code: -32000, message: 'busy' } }));
+      const { server, sent } = wire(() => undefined, { host });
+      (server as any).hostRetryWindowMs = 400;
+      (server as any).retryDelaysMs = [50, 300, 5, 5, 5];
+      const started = Date.now();
+      await deliver(server, SMALL_IMAGE);
+      // The deadline is 200 ms after the first send: the 50 ms wait fits, the
+      // 300 ms one doesn't, and nothing is sent in a burst before it.
+      assert.equal(sent.length, 2);
+      assert.ok(Date.now() - started < 1000);
+      assert.ok(errors.some((e) => e.endsWith("not sent again: the host's retry window is closing")), errors.join('\n'));
+    });
+
+    it("a permission refusal before the connection's start-up settled is \"not yet\": sent once more when it has", async () => {
+      const host = scriptedHost((_m, _p, n) => n === 1
+        ? { error: { code: -32002, message: 'Capability denied: no policy yet' } }
+        : { result: { accepted: true } });
+      const { server, sent } = wire(() => undefined, { host });
+      (server as any).readyConn = null;
+      const delivered = deliver(server, SMALL_IMAGE);
+      await until(() => sent.length === 1);
+      await new Promise((r) => setTimeout(r, 20));
+      assert.equal(sent.length, 1, 'not before the start-up settles');
+      (server as any).markReady(host.conn);
+      await delivered;
+      assert.equal(sent.length, 2);
+      assert.equal(eventIdOf(sent[1]), eventIdOf(sent[0]));
+      assert.ok(errors.includes("[discord-mcpl] message m1 in discord:g1:chan1: host rejected it: Capability denied: no policy yet, before the host's start-up had settled; sending the same occurrence again now that it has"), errors.join('\n'));
+      assert.ok(errors.includes('[discord-mcpl] sent message m1 in discord:g1:chan1 again (same event id): accepted'), errors.join('\n'));
+    });
+
+    it('…and final once it has', async () => {
+      const host = scriptedHost(() => ({ error: { code: -32002, message: 'Capability denied' } }));
+      const { server, sent } = wire(() => undefined, { host });
+      await deliver(server, SMALL_IMAGE);
+      assert.equal(sent.length, 1);
+    });
+
+    it("no resend to a ready host that doesn't take Discord messages", async () => {
+      const { server, sent } = wire(() => ({ results: [{ messageId: 'm1', accepted: false }] }), { open: true });
+      delays(server, 20);
+      const delivered = deliver(server, SMALL_IMAGE);
+      await until(() => errors.some((e) => e.includes('sending the same occurrence again')));
+      ((server as any).enabledFeatureSets as Set<string>).delete('discord.messaging');
+      await delivered;
+      assert.equal(sent.length, 1);
+      assert.ok(errors.some((e) => e.endsWith("not sent again: the host connected now doesn't take Discord messages")), errors.join('\n'));
+    });
+
+    it('a resend waits at most reconnectWaitMs for a host, however long the retry window', async () => {
+      const { server, sent } = wire(() => ({ results: [{ messageId: 'm1', accepted: false }] }), { open: true });
+      (server as any).reconnectWaitMs = 50;
+      delays(server, 5);
+      const started = Date.now();
+      const delivered = deliver(server, SMALL_IMAGE);
+      await until(() => errors.some((e) => e.includes('sending the same occurrence again')));
+      (server as any).conn = null;
+      await delivered;
+      assert.ok(Date.now() - started < 1000);
+      assert.equal(sent.length, 1);
+      assert.ok(errors.some((e) => e.endsWith('not sent again: no host connection was ready in time')), errors.join('\n'));
+    });
+
+    it('a create still being sent is never pushed out of the memory its edits wait on', () => {
+      const { server } = wire(() => ({ accepted: true }));
+      const pending = (server as any).rememberCreate('pending');
+      for (let i = 0; i < 600; i++) (server as any).rememberCreate(`m${i}`).resolve();
+      const memory = (server as any).recentCreates as Map<string, unknown>;
+      assert.equal(memory.get('pending'), pending);
+      assert.equal(memory.size, 512);
+      pending.resolve();
+      (server as any).rememberCreate('one-more').resolve();
+      assert.equal(memory.has('pending'), false, 'once settled, it goes as the oldest');
+    });
+
+    it('after a reconnect, the resends are counted against the shortest retry window advertised meanwhile', async () => {
+      const { server, sent } = wire(() => { throw rpcError(-32603, 'Internal error'); });
+      (server as any).retryDelaysMs = [20, 300, 5];
+      const delivered = deliver(server, SMALL_IMAGE);
+      await until(() => errors.some((e) => e.includes('sending the same occurrence again')));
+      const next: unknown[] = [];
+      const conn2 = { sendRequest: () => { next.push(1); return Promise.reject(rpcError(-32603, 'Internal error')); }, sendNotification: () => {} };
+      (server as any).conn = conn2;
+      (server as any).hostRetryWindowMs = 200; // this host's: a 100 ms deadline from the first send
+      (server as any).markReady(conn2);
+      await delivered;
+      assert.equal(sent.length, 1);
+      assert.equal(next.length, 1, 'one resend to the host connected since, then none: the 300 ms wait passes its deadline');
+      assert.ok(errors.some((e) => e.endsWith("not sent again: the host's retry window is closing")), errors.join('\n'));
+    });
+
+    it('a channels/incoming resend never goes to another host: channels are opened per host', async () => {
+      const { server, sent } = wire(() => ({ results: [{ messageId: 'm1', accepted: false }] }), { open: true });
+      delays(server, 20);
+      const delivered = deliver(server, SMALL_IMAGE);
+      await until(() => errors.some((e) => e.includes('sending the same occurrence again')));
+      const next: unknown[] = [];
+      const conn2 = { sendRequest: () => { next.push(1); return Promise.resolve({}); }, sendNotification: () => {} };
+      (server as any).conn = conn2;
+      (server as any).markReady(conn2); // the channel still counts as open: open state is the process's
+      await delivered;
+      assert.equal(sent.length, 1);
+      assert.deepEqual(next, []);
+      assert.ok(errors.some((e) => e.endsWith('not sent again: it went through a channel a previous host opened, and channels/incoming goes only to the host that opened it')), errors.join('\n'));
+    });
+
+    it("a channel-scoped push isn't sent again to a host connected since that doesn't take them", async () => {
+      const { server, sent, edit } = wire(() => ({ accepted: false, reason: 'busy' }));
+      (server as any).hostCoalescing = { pushEvents: true, channelsIncoming: true, channelScopedPush: true };
+      delays(server, 20);
+      edit()('chan1', 'm9', 'fixed', false, info);
+      await until(() => errors.some((e) => e.includes('sending the same occurrence again')));
+      assert.equal(sent[0].params.coalesce.channelId, 'discord:g1:chan1', 'scoped to its channel');
+      const next: unknown[] = [];
+      const conn2 = { sendRequest: () => { next.push(1); return Promise.resolve({ accepted: true }); }, sendNotification: () => {} };
+      (server as any).conn = conn2;
+      (server as any).hostCoalescing = { pushEvents: true, channelsIncoming: true, channelScopedPush: false };
+      (server as any).markReady(conn2);
+      await until(() => errors.some((e) => e.includes("doesn't take channel-scoped pushes")));
+      assert.deepEqual(next, []);
+    });
+
+    it('a "not yet" resend goes to the host connected since once it is ready, if the occurrence fits it', async () => {
+      for (const open of [false, true]) {
+        const { server, sent } = wire(() => ({ error: true }), { open });
+        (server as any).conn.sendRequest = (m: string, p: unknown) => { sent.push({ method: m, params: p }); return Promise.reject(rpcError(-32002, 'no policy yet')); };
+        (server as any).readyConn = null;
+        const delivered = deliver(server, SMALL_IMAGE);
+        await until(() => sent.length === 1);
+        await new Promise((r) => setTimeout(r, 10));
+        const next: Array<{ method: string; params: any }> = [];
+        const conn2 = { sendRequest: (m: string, p: unknown) => { next.push({ method: m, params: p }); return Promise.resolve(open ? { results: [{ messageId: 'm1', accepted: true }] } : { accepted: true }); }, sendNotification: () => {} };
+        (server as any).conn = conn2;
+        (server as any).markReady(conn2);
+        await delivered;
+        if (!open) {
+          assert.equal(next.length, 1, 'a push goes to the host connected since');
+          assert.equal(eventIdOf(next[0]), eventIdOf(sent[0]));
+        } else {
+          assert.deepEqual(next, [], 'a channels/incoming one does not');
+          assert.ok(errors.some((e) => e.endsWith('not sent again: it went through a channel a previous host opened, and channels/incoming goes only to the host that opened it')), errors.join('\n'));
+        }
+      }
+    });
+
+    it('at most maxWaitingForHost occurrences wait for a host at once', async () => {
+      const { server, sent } = wire(() => ({ results: [{ messageId: 'm1', accepted: false }] }), { open: true });
+      (server as any).maxWaitingForHost = 0;
+      delays(server, 5);
+      const delivered = deliver(server, SMALL_IMAGE);
+      await until(() => errors.some((e) => e.includes('sending the same occurrence again')));
+      (server as any).conn = null;
+      await delivered;
+      assert.equal(sent.length, 1);
+      assert.ok(errors.some((e) => e.endsWith('not sent again: as many messages as may wait for a host (0) already are')), errors.join('\n'));
+    });
+
+    it('a push resend goes to the host connected since, once its start-up has settled, still the same occurrence', async () => {
+      const { server, sent } = wire((_m, _p, n) => n === 1
+        ? { accepted: false, reason: 'host is stopping' }
+        : { accepted: true });
+      delays(server, 20);
+      const delivered = deliver(server, SMALL_IMAGE);
+      await until(() => errors.some((e) => e.includes('sending the same occurrence again')));
+      // The host goes; another connects, and isn't ready yet.
+      const next: Array<{ method: string; params: any }> = [];
+      const conn2 = {
+        sendRequest: (m: string, p: unknown) => { next.push({ method: m, params: p }); return Promise.resolve({ accepted: true }); },
+        sendNotification: () => {},
+      };
+      (server as any).conn = conn2;
+      (server as any).readyConn = null;
+      await new Promise((r) => setTimeout(r, 60));
+      assert.deepEqual(next, [], 'nothing before its start-up settles');
+      (server as any).markReady(conn2);
+      await delivered;
+      assert.equal(sent.length, 1, 'nothing more on the old connection');
+      // (deepEqual above narrowed `next` to an empty array's type.)
+      const [resent] = next as Array<{ method: string; params: any }>;
+      assert.equal(next.length, 1);
+      assert.equal(resent.method, 'push/event');
+      assert.equal(eventIdOf(resent), eventIdOf(sent[0]));
+      assert.deepEqual(contentOf(resent), contentOf(sent[0]));
+      assert.ok(errors.includes('[discord-mcpl] sent message m1 in discord:g1:chan1 again (same event id, to the host connected since): accepted'), errors.join('\n'));
+    });
+
+    it('no resend to a host connected since that advertises no event coalescing', async () => {
+      const { server, sent } = wire(() => ({ results: [{ messageId: 'm1', accepted: false }] }), { open: true });
+      delays(server, 20);
+      const delivered = deliver(server, SMALL_IMAGE);
+      await until(() => errors.some((e) => e.includes('sending the same occurrence again')));
+      const next: unknown[] = [];
+      const conn2 = { sendRequest: (m: string) => { next.push(m); return Promise.resolve({}); }, sendNotification: () => {} };
+      (server as any).conn = conn2;
+      (server as any).hostCoalescing = undefined;
+      (server as any).markReady(conn2);
+      await delivered;
+      assert.equal(sent.length, 1);
+      assert.deepEqual(next, []);
+      assert.ok(errors.some((e) => e.endsWith("not sent again: the host now connected doesn't coalesce events, so the same occurrence sent again could be a duplicate")), errors.join('\n'));
+    });
+
+    it("no resend when no host connection is ready before the retry window's deadline", async () => {
+      const { server, sent } = wire(() => ({ results: [{ messageId: 'm1', accepted: false }] }), { open: true });
+      // A 300 ms deadline: the 10 ms wait fits even on a slow machine.
+      (server as any).hostRetryWindowMs = 600;
+      delays(server, 10);
+      const delivered = deliver(server, SMALL_IMAGE);
+      await until(() => errors.some((e) => e.includes('sending the same occurrence again')));
+      (server as any).conn = null;
+      await delivered;
+      assert.equal(sent.length, 1);
+      assert.ok(errors.some((e) => e.endsWith('not sent again: no host connection was ready in time')), errors.join('\n'));
+      assert.ok(errors.includes("[discord-mcpl] host didn't take message m1 in discord:g1:chan1: unspecified"), errors.join('\n'));
+    });
+  });
+
+  describe('edits and deletes', () => {
+    it("an edit the host fails with an error of its own reaches stderr after its resends; no answer stays quiet", async () => {
+      const failing = wire(() => { throw rpcError(-32050, 'storage down'); });
+      failing.edit()('chan1', 'm9', 'fixed', false, info);
+      await until(() => errors.some((e) => e.startsWith('[discord-mcpl] host failed edit of message m9')));
+      assert.equal(failing.sent.length, 6, 'the first send and five resends');
+      errors.length = 0;
+      const host = scriptedHost(() => 'no answer');
+      const silent = wire(() => undefined, { host });
+      (silent.server as any).retryDelaysMs = [2];
+      silent.edit()('chan1', 'm8', 'fixed', false, info);
+      await until(() => host.sent.length === 2);
+      await new Promise((r) => setTimeout(r, 80));
+      assert.equal(errors.some((e) => e.startsWith('[discord-mcpl] host failed')), false, errors.join('\n'));
+    });
+
+    it('an edit with no verdict is sent again with the same eventId', async () => {
+      const { sent, edit } = wire((_m, _p, n) => { if (n === 1) throw rpcError(-32000, 'host could not persist the acceptance; retry'); return { accepted: true }; });
+      edit()('chan1', 'm9', 'fixed', false, info);
+      await until(() => errors.some((e) => e.startsWith('[discord-mcpl] sent edit')));
       assert.equal(sent.length, 2);
       assert.equal(sent[1].params.eventId, sent[0].params.eventId);
-      assert.deepEqual(sent[1].params.coalesce, sent[0].params.coalesce);
-      assert.ok(errors.includes(`[discord-mcpl] host couldn't keep delete of message m9 in discord:g1:chan1 (${words}); retrying once with the same event id in 5ms`), errors.join('\n'));
+      assert.ok(errors.includes('[discord-mcpl] sent edit of message m9 in discord:g1:chan1 again (same event id): accepted'), errors.join('\n'));
     });
-  }
 
-  it('channels/incoming: the "durable; retry" words as an item reason are retried too', async () => {
-    const { server, sent } = wire((_m, _p, n) => n === 1
-      ? { results: [{ messageId: 'm1', accepted: false, reason: DURABLE }] }
-      : { results: [{ messageId: 'm1', accepted: true }] }, { open: true });
-    fast(server);
-    await deliver(server, SMALL_IMAGE);
-    assert.equal(sent.length, 2);
-    assert.equal(eventIdOf(sent[1]), 'discord_msg_m1');
-    assert.ok(errors.includes('[discord-mcpl] retried message m1 in discord:g1:chan1 with the same event id: accepted'), errors.join('\n'));
+    for (const words of ['host could not persist the acceptance; retry', 'host could not make the acceptance durable; retry']) {
+      it(`a delete with no verdict ("${words}", -32000) is sent again with the same eventId and coalesce member`, async () => {
+        const host = scriptedHost((_m, _p, n) => n === 1 ? { error: { code: -32000, message: words } } : { result: { accepted: true } });
+        const { sent, del } = wire(() => undefined, { host });
+        del()('chan1', 'm9', false, info);
+        await until(() => errors.some((e) => e.startsWith('[discord-mcpl] sent delete')));
+        assert.equal(sent.length, 2);
+        assert.equal(sent[1].params.eventId, sent[0].params.eventId);
+        assert.deepEqual(sent[1].params.coalesce, sent[0].params.coalesce);
+      });
+    }
+
+    for (const later of ['edit', 'delete'] as const) {
+      it(`an edit is not sent again once a later ${later} of the message has gone out`, async () => {
+        let answerFirst!: (v: unknown) => void;
+        const firstAnswer = new Promise((r) => { answerFirst = r; });
+        const { sent, edit, del } = wire((_m, _p, n) => n === 1 ? firstAnswer : { accepted: true });
+        edit()('chan1', 'm9', 'first', false, info);
+        await until(() => sent.length === 1);
+        if (later === 'edit') edit()('chan1', 'm9', 'second', false, info);
+        else del()('chan1', 'm9', false, info);
+        await until(() => sent.length === 2);
+        answerFirst({ accepted: false, reason: 'storage busy' });
+        await until(() => errors.some((e) => e.includes('not sent again')));
+        await new Promise((r) => setTimeout(r, 20));
+        assert.equal(sent.length, 2, 'the earlier edit is not sent again after the later one');
+        assert.ok(errors.includes('[discord-mcpl] edit of message m9 in discord:g1:chan1: host rejected it: storage busy; not sent again: a later edit or delete of the message has been sent since'), errors.join('\n'));
+      });
+    }
+
+    it('an edit that arrives while an earlier one waits to be sent again goes at once, and supersedes it', async () => {
+      const { server, sent, edit } = wire((_m, _p, n) => n === 1 ? { accepted: false, reason: 'storage busy' } : { accepted: true });
+      delays(server, 60);
+      edit()('chan1', 'm9', 'first', false, info);
+      await until(() => errors.some((e) => e.includes('sending the same occurrence again')));
+      edit()('chan1', 'm9', 'second', false, info);
+      await until(() => sent.length === 2);
+      assert.match(JSON.stringify(sent[1].params.payload), /second/, "the later edit doesn't wait");
+      await until(() => errors.some((e) => e.includes('not sent again')));
+      await new Promise((r) => setTimeout(r, 20));
+      assert.equal(sent.length, 2, 'the earlier edit is never sent again');
+    });
+
+    it('an edit refused for permission before start-up settled is "not yet": sent once more when it has', async () => {
+      const { server, sent, edit } = wire((_m, _p, n) => { if (n === 1) throw rpcError(-32002, 'no policy yet'); return { accepted: true }; });
+      (server as any).readyConn = null;
+      edit()('chan1', 'm9', 'fixed', false, info);
+      await until(() => sent.length === 1);
+      await new Promise((r) => setTimeout(r, 20));
+      (server as any).markReady((server as any).conn);
+      await until(() => sent.length === 2);
+      assert.equal(sent[1].params.eventId, sent[0].params.eventId);
+    });
+
+    it('…but not once a later edit has gone out while it waited', async () => {
+      const { server, sent, edit } = wire((_m, _p, n) => { if (n === 1) throw rpcError(-32002, 'no policy yet'); return { accepted: true }; });
+      (server as any).readyConn = null;
+      edit()('chan1', 'm9', 'first', false, info);
+      await until(() => sent.length === 1);
+      await new Promise((r) => setTimeout(r, 10));
+      edit()('chan1', 'm9', 'second', false, info); // same connection: goes at once
+      await until(() => sent.length === 2);
+      (server as any).markReady((server as any).conn);
+      await until(() => errors.some((e) => e.includes('not sent again: a later edit or delete')));
+      await new Promise((r) => setTimeout(r, 20));
+      assert.equal(sent.length, 2, 'the first edit is not sent after the second');
+    });
+
+    it("an edit's record lasts while it is unanswered: edits of 600 other messages can't make it look like the latest again", async () => {
+      let answerFirst!: (v: unknown) => void;
+      const firstAnswer = new Promise((r) => { answerFirst = r; });
+      const { server, sent, edit } = wire((_m, _p, n) => n === 1 ? firstAnswer : { accepted: true });
+      edit()('chan1', 'm9', 'first', false, info);
+      await until(() => sent.length === 1);
+      for (let i = 0; i < 600; i++) edit()('chan1', `other${i}`, 'x', false, info);
+      await until(() => sent.length === 601);
+      edit()('chan1', 'm9', 'second', false, info);
+      await until(() => sent.length === 602);
+      answerFirst({ accepted: false, reason: 'storage busy' });
+      await until(() => errors.some((e) => e.includes('not sent again')));
+      await new Promise((r) => setTimeout(r, 20));
+      assert.equal(sent.length, 602, 'the first edit is not sent again after the second');
+      assert.equal((server as any).mutationsInFlight.size, 0, 'every edit has settled, and no record is left');
+    });
+
+    it('an edit queued behind a create is held for a host connected since until its start-up has settled', async () => {
+      let answerCreate!: (v: unknown) => void;
+      const createAnswer = new Promise((r) => { answerCreate = r; });
+      const { server, sent, edit } = wire((m) => m === 'channels/incoming' ? createAnswer : { accepted: true }, { open: true });
+      const delivered = deliver(server, SMALL_IMAGE);
+      await until(() => sent.length === 1);
+      edit()('chan1', 'm1', 'look at this one', false, info); // waits for the create
+      // The host goes, and another connects: not ready yet.
+      const next: Array<{ method: string; params: any }> = [];
+      const conn2 = {
+        sendRequest: (m: string, p: unknown) => { next.push({ method: m, params: p }); return Promise.resolve({ accepted: true }); },
+        sendNotification: () => {},
+      };
+      (server as any).conn = conn2;
+      (server as any).readyConn = null;
+      answerCreate({ results: [{ messageId: 'm1', accepted: true }] });
+      await delivered;
+      await new Promise((r) => setTimeout(r, 20));
+      assert.deepEqual(next, [], 'not to a connection whose start-up has not settled');
+      assert.equal(sent.length, 1);
+      (server as any).markReady(conn2);
+      await until(() => next.length === 1);
+      // (deepEqual above narrowed `next` to an empty array's type.)
+      assert.match(JSON.stringify((next as any[])[0].params.payload), /look at this one/, 'held, then sent once it has');
+    });
+
+    it('a held edit is dropped when no host is ready in time, or when as many as may wait already are', async () => {
+      for (const [waitMs, max] of [[30, 64], [60_000, 0]] as const) {
+        let answerCreate!: (v: unknown) => void;
+        const createAnswer = new Promise((r) => { answerCreate = r; });
+        const { server, sent, edit } = wire((m) => m === 'channels/incoming' ? createAnswer : { accepted: true }, { open: true });
+        (server as any).reconnectWaitMs = waitMs;
+        (server as any).maxWaitingForHost = max;
+        const delivered = deliver(server, SMALL_IMAGE);
+        await until(() => sent.length === 1);
+        edit()('chan1', 'm1', 'look at this one', false, info);
+        (server as any).conn = null; // the host goes, and none comes back
+        answerCreate({ results: [{ messageId: 'm1', accepted: true }] });
+        await delivered;
+        await new Promise((r) => setTimeout(r, 60));
+        assert.equal(sent.length, 1, 'the held edit is never sent');
+        assert.equal((server as any).waitingForHost, 0, 'nothing is left waiting');
+      }
+    });
+
+    it('…and to the host connected since when it is ready', async () => {
+      let answerCreate!: (v: unknown) => void;
+      const createAnswer = new Promise((r) => { answerCreate = r; });
+      const { server, sent, edit } = wire((m) => m === 'channels/incoming' ? createAnswer : { accepted: true }, { open: true });
+      const delivered = deliver(server, SMALL_IMAGE);
+      await until(() => sent.length === 1);
+      edit()('chan1', 'm1', 'look at this one', false, info);
+      const next: Array<{ method: string; params: any }> = [];
+      const conn2 = {
+        sendRequest: (m: string, p: unknown) => { next.push({ method: m, params: p }); return Promise.resolve({ accepted: true }); },
+        sendNotification: () => {},
+      };
+      (server as any).conn = conn2;
+      (server as any).markReady(conn2);
+      answerCreate({ results: [{ messageId: 'm1', accepted: true }] });
+      await delivered;
+      await until(() => next.length === 1);
+      assert.equal(next[0].method, 'push/event');
+      assert.match(JSON.stringify(next[0].params.payload), /look at this one/);
+    });
   });
 
-  it('the media-omitted resend gets its own one retry, as the same resend', async () => {
-    const { server, sent } = wire((_m, _p, n) => n === 1
-      ? { results: [{ messageId: 'm1', accepted: false, reason: 'coalesce_invalid' }] }
-      : n === 2
-        ? { results: [{ messageId: 'm1', accepted: false, reason: PERSIST }] }
-        : { results: [{ messageId: 'm1', accepted: true }] }, { open: true });
-    fast(server);
-    await deliver(server, BIG_IMAGE);
-    assert.equal(sent.length, 3, 'the create, the resend, its retry');
-    assert.equal(eventIdOf(sent[1]), 'discord_msg_m1_media_omitted');
-    assert.equal(eventIdOf(sent[2]), 'discord_msg_m1_media_omitted');
-    assert.deepEqual(coalesceOf(sent[2]), { key: 'message:m1', initial: true });
-    assert.deepEqual(contentOf(sent[2]), contentOf(sent[1]));
-    assert.equal(contentOf(sent[2]).some((b: any) => b.type === 'image'), false);
-    assert.ok(errors.includes(`[discord-mcpl] host couldn't keep message m1 in discord:g1:chan1 (resent without inline media) (${PERSIST}); retrying once with the same event id in 5ms`), errors.join('\n'));
-    assert.ok(errors.includes('[discord-mcpl] retried message m1 in discord:g1:chan1 (resent without inline media) with the same event id: accepted'), errors.join('\n'));
-    assert.ok(errors.some((e) => e.startsWith('[discord-mcpl] resent message m1 in discord:g1:chan1 with 1 inline attachment(s) replaced by a note: accepted')), errors.join('\n'));
-  });
-
-  it('an edit is not retried once a delete of the message has gone out', async () => {
-    let answerFirst!: (v: unknown) => void;
-    const firstAnswer = new Promise((r) => { answerFirst = r; });
-    const { server, sent, edit, del } = wire((_m, _p, n) => n === 1 ? firstAnswer : { accepted: true });
-    fast(server);
-    const info = { guildId: 'g1', authorId: 'u1', authorName: 'someone' };
-    edit()('chan1', 'm9', 'first', false, info);
-    await until(() => sent.length === 1);
-    del()('chan1', 'm9', false, info);
-    await until(() => sent.length === 2);
-    answerFirst({ accepted: false, reason: DURABLE });
-    await until(() => errors.some((e) => e.includes('not retried')));
-    await new Promise((r) => setTimeout(r, 20));
-    assert.equal(sent.length, 2, 'the edit is not resent after the delete');
-    assert.ok(errors.includes(`[discord-mcpl] host couldn't keep edit of message m9 in discord:g1:chan1 (${DURABLE}); not retried: a later edit or delete of the message has been sent since`), errors.join('\n'));
-  });
-
-  it("an edit's record lasts while it is unanswered: edits of 600 other messages can't make it look like the latest again", async () => {
-    let answerFirst!: (v: unknown) => void;
-    const firstAnswer = new Promise((r) => { answerFirst = r; });
-    const { server, sent, edit } = wire((_m, _p, n) => n === 1 ? firstAnswer : { accepted: true });
-    fast(server);
-    const info = { guildId: 'g1', authorId: 'u1', authorName: 'someone' };
-    edit()('chan1', 'm9', 'first', false, info);
-    await until(() => sent.length === 1);
-    for (let i = 0; i < 600; i++) edit()('chan1', `other${i}`, 'x', false, info);
-    await until(() => sent.length === 601);
-    edit()('chan1', 'm9', 'second', false, info);
-    await until(() => sent.length === 602);
-    answerFirst({ accepted: false, reason: PERSIST });
-    await until(() => errors.some((e) => e.includes('not retried')));
-    await new Promise((r) => setTimeout(r, 20));
-    assert.equal(sent.length, 602, 'the first edit is not resent after the second');
-    // Every edit has settled, so no record is left.
-    assert.equal((server as any).mutationsInFlight.size, 0);
-  });
-
-  it('a later edit waits for the retry to be sent, not for its answer', async () => {
-    let answerRetry!: (v: unknown) => void;
-    const retryAnswer = new Promise((r) => { answerRetry = r; });
-    const { server, sent, edit } = wire((_m, _p, n) => n === 1
-      ? { accepted: false, reason: PERSIST }
-      : n === 2 ? retryAnswer : { accepted: true });
-    fast(server, 40);
-    const info = { guildId: 'g1', authorId: 'u1', authorName: 'someone' };
-    edit()('chan1', 'm9', 'first', false, info);
-    await until(() => errors.some((e) => e.includes('retrying once')));
-    edit()('chan1', 'm9', 'second', false, info);
-    // The retry's answer hasn't come, and the second edit goes out after it anyway.
-    await until(() => sent.length === 3);
-    assert.equal(sent[1].params.eventId, sent[0].params.eventId);
-    assert.match(JSON.stringify(sent[2].params.payload), /second/);
-    answerRetry({ accepted: true });
-    await until(() => errors.some((e) => e.startsWith('[discord-mcpl] retried edit')));
-  });
-
-  it("a retry isn't sent once the host's connection has ended, and what waited for it doesn't go to the next host", async () => {
-    const { server, sent, edit } = wire((_m, _p, n) => n === 1 ? { accepted: false, reason: PERSIST } : { accepted: true });
-    fast(server, 40);
-    const info = { guildId: 'g1', authorId: 'u1', authorName: 'someone' };
-    edit()('chan1', 'm9', 'first', false, info);
-    await until(() => errors.some((e) => e.includes('retrying once')));
-    edit()('chan1', 'm9', 'second', false, info); // waits for the retry
-    // The host goes, and another connects (not yet initialized).
-    const next: Array<{ method: string; params: any }> = [];
-    (server as any).conn = {
-      sendRequest: (m: string, p: unknown) => { next.push({ method: m, params: p }); return Promise.resolve({ accepted: true }); },
-      sendNotification: () => {},
-    };
-    await until(() => errors.some((e) => e.includes("not retried: the host's connection has ended")));
-    await new Promise((r) => setTimeout(r, 20));
-    assert.equal(sent.length, 1, 'no retry on the ended connection');
-    assert.deepEqual(next, [], "nothing the last host admitted goes to the next one");
-    assert.ok(errors.includes(`[discord-mcpl] host couldn't keep edit of message m9 in discord:g1:chan1 (${PERSIST}); not retried: the host's connection has ended`), errors.join('\n'));
-  });
-
-  it("a create's retry is dropped, as a failed send, when the host's connection ends during the wait", async () => {
-    const { server, sent } = wire(() => ({ results: [{ messageId: 'm1', accepted: false, reason: PERSIST }] }), { open: true });
-    fast(server, 40);
-    const delivered = deliver(server, SMALL_IMAGE);
-    await until(() => errors.some((e) => e.includes('retrying once')));
-    (server as any).conn = null;
-    await delivered;
-    assert.equal(sent.length, 1);
-    assert.ok(errors.includes(`[discord-mcpl] host couldn't keep message m1 in discord:g1:chan1 (${PERSIST}); not retried: the host's connection has ended`), errors.join('\n'));
-    assert.ok(errors.some((e) => e.startsWith('[discord-mcpl] channels/incoming failed:') && e.includes("(not retried: the host's connection has ended)")), errors.join('\n'));
-  });
-
-  it('the wait is capped at half the retry window the host advertises', () => {
-    const { server } = wire(() => undefined);
-    (server as any).persistRetryDelayMs = 1000;
-    (server as any).hostRetryWindowMs = 10;
-    assert.equal((server as any).persistRetryDelay(), 5);
-    (server as any).hostRetryWindowMs = 3_600_000;
-    assert.equal((server as any).persistRetryDelay(), 1000);
-  });
-
-  it('helpers: only the host\'s exact words, with -32000 on an error, count', () => {
-    assert.equal(isUnpersistedAnswer(PERSIST), true);
-    assert.equal(isUnpersistedAnswer(DURABLE), true);
-    assert.equal(isUnpersistedAnswer('host is stopping'), false);
-    assert.equal(isUnpersistedAnswer('coalesce_invalid'), false);
-    assert.equal(isUnpersistedAnswer(undefined), false);
-    // mcpl-core 0.2.1 prefixes the host's words.
-    assert.equal(unpersistedError(rpcError(-32000, PERSIST)), PERSIST);
-    assert.equal(unpersistedError({ code: -32000, message: DURABLE }), DURABLE);
-    // mcpl-core's own timeout is -32000 too, in other words.
-    assert.equal(unpersistedError(rpcError(-32000, 'Request timed out after 50ms: push/event')), undefined);
-    assert.equal(unpersistedError(rpcError(-32000, 'host is stopping')), undefined);
-    assert.equal(unpersistedError({ code: -32602, message: PERSIST }), undefined);
-    assert.equal(unpersistedError(new ConnectionClosedError()), undefined);
+  it('answerClass reads only what the spec defines', () => {
+    assert.equal(answerClass({ kind: 'accepted' }), 'done');
+    assert.equal(answerClass({ kind: 'no-result' }), 'done');
+    assert.equal(answerClass({ kind: 'failed' }), 'uncertain');
+    assert.equal(answerClass({ kind: 'rejected', reason: 'coalesce_invalid' }), 'final');
+    assert.equal(answerClass({ kind: 'rejected', reason: 'anything', code: -32602 }), 'final');
+    for (const code of [-32001, -32002, -32003, -32017, -32600, -32601, -32700]) {
+      assert.equal(answerClass({ kind: 'rejected', reason: 'x', code }), 'final', String(code));
+    }
+    assert.equal(answerClass({ kind: 'rejected', reason: 'x', code: -32023 }), 'unknown-channel');
+    // Words decide nothing: the same sentence is `refused` as a reason.
+    assert.equal(answerClass({ kind: 'rejected', reason: 'host could not persist the acceptance; retry' }), 'refused');
+    assert.equal(answerClass({ kind: 'rejected', reason: 'unspecified' }), 'refused');
+    assert.equal(answerClass({ kind: 'rejected', reason: 'x', code: 4001 }), 'refused');
     assert.equal(advertisedRetryWindowMs({ pushEvents: true, retryWindowMs: 3_600_000 }), 3_600_000);
     assert.equal(advertisedRetryWindowMs(true), undefined);
     assert.equal(advertisedRetryWindowMs({ retryWindowMs: -1 }), undefined);
