@@ -14,11 +14,13 @@ in the git log and PR descriptions.
   `chat:mention`, `chat:reply`, `chat:dm` and `chat:private`, `chat:addressed`
   or `chat:ambient`, and `chat:from-bot` or `chat:from-human`, read from the
   message as edited by the same rule as a create: an edit that adds a
-  mention is addressed, and one that takes the mention away is ambient. An
-  edit whose message discord.js holds only in part, so its mentions can't be
-  read, carries no address tags, as before. A host whose wake rules match
-  these tags now meets edits there too, where they used to fall past those
-  rules.
+  mention is addressed, and one whose message no longer mentions or replies
+  to the bot, outside a DM, is ambient. An edit whose addressing isn't known
+  carries no address tags, as before: one whose message discord.js holds
+  only in part, or an edit of a reply whose target Discord didn't send. A
+  host whose wake rules match these tags now meets edits there too, where
+  they used to fall past those rules: an immediate wake on
+  `chat:addressed`, say, now wakes on a typo fix of an addressed message.
 
 - **What is sent again after a host's answer rests on the MCPL spec alone,
   not on one host's words.** discord-mcpl serves more than one kind of

@@ -1561,6 +1561,29 @@ describe('DiscordMcplServer', () => {
     assert.deepEqual((threadEdit.params as PushEventParams).tags, ['chat:edited', 'chat:mention', 'chat:addressed', 'chat:from-human', 'chat:thread']);
   });
 
+  it('tags a create by the same rule, with its address tags first and in order', async (t) => {
+    const { client, discord, nextRequest } = await threadServer(t);
+    await client.sendRequest(method.CHANNELS_OPEN, { type: 'discord', address: { guildId: 'g1', channelId: 'c1' } });
+    const create = (id: string, over: Partial<DiscordMessageData>): DiscordMessageData => ({
+      id, content: 'hello', cleanContent: 'hello', authorId: 'u1', authorName: 'Bob', isBot: false,
+      channelId: 'c1', channelName: 'general', guildId: 'g1', guildName: 'Test Server',
+      mentions: [], attachments: [], timestamp: new Date(), ...over,
+    } as DiscordMessageData);
+    const rows: Array<[string, Partial<DiscordMessageData>, string[]]> = [
+      ['a mention', { mentions: ['bot_123'] }, ['chat:mention', 'chat:addressed', 'chat:from-human']],
+      ['a reply to the bot', { replyToUserId: 'bot_123' }, ['chat:reply', 'chat:addressed', 'chat:from-human']],
+      ["another bot's chatter", { isBot: true }, ['chat:ambient', 'chat:from-bot']],
+    ];
+    let n = 0;
+    for (const [name, over, tags] of rows) {
+      n += 1;
+      discord.simulateMessage(create(`c${n}`, over));
+      const incoming = await nextRequest('channels/incoming');
+      client.sendResponse(incoming.id, { results: [{ messageId: `c${n}`, accepted: true }] });
+      assert.deepEqual((incoming.params as ChannelsIncomingParams).messages[0].tags, tags, name);
+    }
+  });
+
   it("tags a DM's edit as addressed and private, as a DM's create is", async (t) => {
     const { client, discord } = await threadServer(t);
     discord.simulateEdit('dm7', 'd1', 'fixed', true, { guildId: null, authorId: 'u7', authorName: 'Ra', editedAt: '2026-10-02T00:00:02.000Z', address: { mentions: [], mentionsBotRole: false, replyToUserId: null, isBot: false } });

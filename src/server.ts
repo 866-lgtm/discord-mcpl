@@ -5115,9 +5115,9 @@ export class DiscordMcplServer {
       timestamp,
       origin: this.messageEventOrigin(channelId, messageId, info, registeredId),
       // The edited message's own addressing, read as its create's was: an
-      // edit can add a mention or take one away. With none known (a partial
-      // message), the edit carries no address tags, and the host keeps its
-      // turn for it rather than reading it as ambient.
+      // edit can add a mention or take one away. With none known (see
+      // handleMessageUpdate), the edit carries no address tags, and the host
+      // keeps its turn for it rather than reading it as ambient.
       tags: [
         'chat:edited',
         ...(info?.address ? addressTags(addressFlags(info.address, this.discord.botUserId), isDM, info.address.isBot) : []),

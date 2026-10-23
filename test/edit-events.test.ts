@@ -456,10 +456,10 @@ describe("an edit's address facts, from discord.js's own MESSAGE_UPDATE", () => 
     const sent: Array<MessageEventInfo | undefined> = [];
     adapter.onMessageEdit((_c, _m, _t, _isDM, info) => sent.push(info));
     let n = 0;
-    const update = async (extra: Record<string, unknown>) => {
+    const update = async (extra: Record<string, unknown>, id?: string) => {
       n += 1;
       handler(client, { d: {
-        id: `91000000000000000${n}`, channel_id: CH, guild_id: GUILD, content: 'edited text', type: 0, tts: false,
+        id: id ?? `9100000000000000${String(n).padStart(2, '0')}`, channel_id: CH, guild_id: GUILD, content: 'edited text', type: 0, tts: false,
         author: { id: HUMAN, username: 'someone', discriminator: '0' },
         timestamp: new Date(EDITED_AT - 60_000).toISOString(), edited_timestamp: new Date(EDITED_AT).toISOString(),
         mention_everyone: false, mentions: [], mention_roles: [], attachments: [], embeds: [], pinned: false,
@@ -467,9 +467,10 @@ describe("an edit's address facts, from discord.js's own MESSAGE_UPDATE", () => 
         ...extra,
       } });
       await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(sent.length, n, `edit ${n} reached the edit handler`);
       return sent.at(-1)?.address;
     };
-    return { client, update, sent };
+    return { client, update, sent, guild };
   }
 
   it('reads a mention, a role mention, a reply and none, for messages the client never cached', async (t) => {
@@ -484,6 +485,25 @@ describe("an edit's address facts, from discord.js's own MESSAGE_UPDATE", () => 
     }), { ...none, replyToUserId: BOT });
     assert.deepEqual(await f.update({}), none);
     assert.deepEqual(await f.update({ author: { id: HUMAN, username: 'someone', discriminator: '0', bot: true } }), { ...none, isBot: true });
+  });
+
+  it("reads the edit's own mentions for a message the client has cached, an added mention and a removed one", async (t) => {
+    const f = fixture();
+    t.after(() => f.client.destroy());
+    const ID = '930000000000000001';
+    const channel = f.client.channels.cache.get(CH) as any;
+    channel.messages._add({ id: ID, channel_id: CH, guild_id: GUILD, content: 'first', type: 0, author: { id: HUMAN, username: 'someone', discriminator: '0' }, timestamp: new Date(EDITED_AT - 60_000).toISOString(), edited_timestamp: null, mentions: [], mention_roles: [], attachments: [], embeds: [] });
+    const none = { mentions: [], mentionsBotRole: false, replyToUserId: null, isBot: false };
+    assert.deepEqual(await f.update({ content: 'now for the bot', mentions: [{ id: BOT, username: 'bot', bot: true, discriminator: '0' }] }, ID), { ...none, mentions: [BOT] }, 'an edit that adds the mention');
+    assert.deepEqual(await f.update({ content: 'for nobody again', mentions: [] }, ID), none, 'an edit that takes it away');
+  });
+
+  it("gives no address facts for a reply whose target Discord didn't send, not fetched or deleted", async (t) => {
+    const f = fixture();
+    t.after(() => f.client.destroy());
+    const reply = { type: 19, message_reference: { message_id: '919999999999999998', channel_id: CH, guild_id: GUILD } };
+    assert.equal(await f.update(reply), undefined, 'referenced_message absent: not fetched, so unknown');
+    assert.equal(await f.update({ ...reply, referenced_message: null }), undefined, 'referenced_message null: deleted, so unknown');
   });
 
   it("gives no address facts for a partial message, whose addressing isn't known", async (t) => {
