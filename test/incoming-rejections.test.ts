@@ -1346,6 +1346,77 @@ describe('owed messages', () => {
     assert.equal(saved().owed, undefined);
   });
 
+  it("owed messages go through the ingestion gate: an ambient one from a channel no longer subscribed is given up, a mention isn't", async () => {
+    const { server, sent } = wire(() => ({ accepted: true }));
+    onDiscord(server, [history('m1', 'ambient'), history('m2', 'hey bot', { mentionsBot: true })]);
+    (server as any).owe('chan1', 'm1', { uncertain: false });
+    (server as any).owe('chan1', 'm2', { uncertain: false });
+    ((server as any).subscribedChannels as Set<string>).delete('chan1');
+    await (server as any).deliverOwed((server as any).conn);
+    const block = blockOf(owedPushes(sent)[0]);
+    assert.match(block, /count="1"/);
+    assert.match(block, /id=m2\]/);
+    assert.equal(block.includes('id=m1'), false);
+    assert.ok(errors.some((e) => e.startsWith("[discord-mcpl] Gave up 1 owed message(s) in channel chan1: their channel doesn't take them now")), errors.join('\n'));
+    assert.equal((server as any).owed.size, 0);
+  });
+
+  it('a block refused as an unknown channel (-32023) is given up at once', async () => {
+    const { server } = wire(() => { throw rpcError(-32023, 'Unknown channel'); });
+    onDiscord(server, [history('m1', 'first')]);
+    (server as any).owe('chan1', 'm1', { uncertain: false });
+    await (server as any).deliverOwed((server as any).conn);
+    assert.equal((server as any).owed.size, 0);
+  });
+
+  it('a message owed again while its delivery is on its way stays owed after that delivery', async () => {
+    let answer!: (v: unknown) => void;
+    const answered = new Promise((r) => { answer = r; });
+    const { server, sent } = wire(() => answered);
+    onDiscord(server, [history('m1', 'first')]);
+    (server as any).owe('chan1', 'm1', { uncertain: false });
+    const delivering = (server as any).deliverOwed((server as any).conn);
+    await until(() => owedPushes(sent).length === 1);
+    (server as any).owe('chan1', 'm1', { uncertain: true, edit: true }); // an edit of it not taken meanwhile
+    answer({ accepted: true });
+    await delivering;
+    assert.deepEqual((server as any).owed.get('chan1').map((o: { id: string }) => o.id), ['m1']);
+  });
+
+  it("once nothing is owed in a channel, its try record goes: a later owing starts without the old cool-down", async () => {
+    const { server } = wire(() => ({ accepted: false, reason: 'busy' }));
+    onDiscord(server, [history('m1', 'first')]);
+    (server as any).owe('chan1', 'm1', { uncertain: false });
+    await (server as any).deliverOwed((server as any).conn);
+    assert.equal((server as any).owedTried.has('chan1'), true);
+    (server as any).isChannelMuted = (id: string) => id === 'chan1';
+    await (server as any).deliverOwed((server as any).conn);
+    assert.equal((server as any).owed.size, 0);
+    assert.equal((server as any).owedTried.has('chan1'), false);
+  });
+
+  it('loading the file keeps one entry per message and the newest 50', () => {
+    const list = [
+      { id: 'dup', uncertain: true, tries: 1 },
+      ...Array.from({ length: 55 }, (_, i) => ({ id: `m${i}` })),
+      { id: 'dup', edit: true, tries: 2 },
+    ];
+    writeFileSync(file, JSON.stringify({ watermarks: {}, dmChannels: [], missed: {}, owed: { chan1: list } }));
+    const { server } = wire(() => ({ accepted: true }));
+    (server as any).ensureWatermarkLoaded();
+    const owed = (server as any).owed.get('chan1');
+    assert.equal(owed.length, 50);
+    assert.equal(new Set(owed.map((o: { id: string }) => o.id)).size, 50);
+    assert.equal(owed[owed.length - 1].id, 'm54');
+  });
+
+  it('a later delete the host takes leaves nothing owed for the message either', async () => {
+    const { server, del } = wire(() => ({ accepted: true }));
+    (server as any).owe('chan1', 'm9', { uncertain: true });
+    del()('chan1', 'm9', false, { guildId: 'g1', authorId: 'u1', authorName: 'someone' });
+    await until(() => (server as any).owed.size === 0);
+  });
+
   it(`at most ${50} messages are owed per channel; the oldest go first`, () => {
     const { server } = wire(() => ({ accepted: true }));
     for (let i = 0; i < 52; i++) (server as any).owe('chan1', `m${i}`, { uncertain: false });

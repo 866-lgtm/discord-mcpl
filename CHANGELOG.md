@@ -74,14 +74,17 @@ in the git log and PR descriptions.
   (alongside the catch-up, not ahead of it), and when the host takes a
   message in that channel again (not within five minutes of a failed try on
   the same connection). One read of up to 100 messages from Discord answers
-  for every owed message inside it. A message Discord no longer has, one the
-  filters refuse now, and those of a muted, deleted or unknown channel are
-  given up. A block not delivered (not taken, a failed read, a channel whose
+  for every owed message inside it. They go through the same ingestion gate
+  as live messages: one that doesn't address the agent goes only while its
+  channel is open or subscribed. A message Discord no longer has, one the
+  filters or the gate refuse now, and those of a muted, deleted or unknown
+  channel are given up. A block not delivered (not taken, a failed read, a channel whose
   identity can't be resolved, or a filter refusal resting on facts that
   aren't current, which the catch-up holds back too) counts a try, at most
   one per connection, and three tries give it up; a refusal with a code the
-  spec gives a meaning gives it up at once. A later edit or delete of the
-  message that the host takes clears what was owed for it. At most 50
+  spec gives a meaning, or an unknown channel, gives it up at once. A later
+  edit or delete of the message that the host takes clears what was owed for
+  it; a message owed again while a delivery of it is on its way stays owed. At most 50
   messages are owed per channel. They are kept with the watermarks (`DISCORD_WATERMARK_FILE`,
   under `owed`, written only while something is owed), so a restart
   delivers them. Logged: `[discord-mcpl] Message <id> in channel <id> is

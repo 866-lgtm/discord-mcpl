@@ -3228,7 +3228,21 @@ export class DiscordMcplServer {
     const { value: saved } = readJsonFile(path, 'watermarks', usableWatermarks, {});
     for (const [chan, id] of Object.entries(saved.watermarks ?? {})) this.forwardedWatermark.set(chan, id);
     for (const id of saved.dmChannels ?? []) this.dmChannelIds.add(id);
-    for (const [chan, list] of Object.entries(saved.owed ?? {})) this.owed.set(chan, list);
+    for (const [chan, list] of Object.entries(saved.owed ?? {})) {
+      // As owe() keeps it: one entry per message (certain if either was, an
+      // edit only if both were, the most tries), the newest 50.
+      const byId = new Map<string, OwedMessage>();
+      for (const item of list) {
+        const known = byId.get(item.id);
+        if (!known) { byId.set(item.id, { ...item }); continue; }
+        if (!item.uncertain) delete known.uncertain;
+        if (!item.edit) delete known.edit;
+        const tries = Math.max(known.tries ?? 0, item.tries ?? 0);
+        if (tries > 0) known.tries = tries;
+      }
+      const kept = [...byId.values()].slice(-OWED_PER_CHANNEL_MAX);
+      if (kept.length > 0) this.owed.set(chan, kept);
+    }
     for (const [chan, tally] of Object.entries(saved.missed ?? {})) {
       this.missedTally.set(chan, {
         anchorId: tally.anchorId,
@@ -3450,6 +3464,7 @@ export class DiscordMcplServer {
     const list = this.owed.get(channelId) ?? [];
     const known = list.find((o) => o.id === messageId);
     if (known) {
+      this.owedRevs.set(known, (this.owedRevs.get(known) ?? 0) + 1);
       // Owed already. Only a certain answer about the create itself says it
       // didn't arrive; a refused edit says nothing about the create. With
       // the create owed, the edit mark is moot: the message goes as it is now.
@@ -3474,10 +3489,18 @@ export class DiscordMcplServer {
     if (!list) return;
     const left = list.filter((o) => !ids.includes(o.id));
     if (left.length === list.length) return;
-    if (left.length > 0) this.owed.set(channelId, left);
-    else this.owed.delete(channelId);
+    if (left.length > 0) {
+      this.owed.set(channelId, left);
+    } else {
+      this.owed.delete(channelId);
+      this.owedTried.delete(channelId);
+    }
     this.saveWatermark();
   }
+
+  /** Each owed entry's revision, bumped when it is owed again (owe): a
+   *  delivery forgets only the entries it delivered as they were. */
+  private readonly owedRevs = new WeakMap<OwedMessage, number>();
 
   /** Channels whose owed messages are being delivered (deliverOwedIn). */
   private readonly owedDelivering = new Set<string>();
@@ -3604,8 +3627,9 @@ export class DiscordMcplServer {
       // The live ingress decision, evaluated now, as the sweep evaluates it.
       // A channel filter's refusal that rests on facts that aren't current
       // may be wrong, so the channel is held back, as the sweep holds it.
-      const refused = found.filter(({ m }) => this.discord.historyIngressReason(channelId, guildId, m.authorId) !== null);
-      if (refused.some(({ m }) => this.discord.historyIngressReason(channelId, guildId, m.authorId) === 'channel-not-allowed')) {
+      const reasons = new Map(found.map(({ m }) => [m.id, this.discord.historyIngressReason(channelId, guildId, m.authorId)]));
+      const refused = found.filter(({ m }) => reasons.get(m.id) !== null);
+      if (refused.some(({ m }) => reasons.get(m.id) === 'channel-not-allowed')) {
         const notCurrent = this.discord.ingressFactsNotCurrent(channelId);
         if (notCurrent) {
           notThisTime(found.map(({ owed }) => owed),
@@ -3615,6 +3639,12 @@ export class DiscordMcplServer {
       }
       giveUp(refused.map(({ owed }) => owed), 'the filters refuse them now');
       found = found.filter((f) => !refused.includes(f));
+      // And the single ingestion gate (shouldEnterContext), as the live path
+      // admits an event now: a message that doesn't address the agent goes
+      // only while its channel is open or subscribed.
+      const shut = found.filter(({ m }) => !this.shouldEnterContext(channelId, { isDM, guildId, isMention: m.mentionsBot }));
+      giveUp(shut.map(({ owed }) => owed), "their channel doesn't take them now (closed or unsubscribed since, and they don't address the agent)");
+      found = found.filter((f) => !shut.includes(f));
       if (found.length === 0) return;
       found.sort((a, b) => a.m.timestamp.getTime() - b.m.timestamp.getTime());
 
@@ -3643,6 +3673,7 @@ export class DiscordMcplServer {
         .update(JSON.stringify(found.map(({ m, owed }) => [m.id, owed.edit === true, owed.uncertain === true, m.cleanContent])))
         .digest('hex')
         .slice(0, 16);
+      const revs = new Map(found.map(({ owed }) => [owed, this.owedRevs.get(owed) ?? 0]));
       let outcome: SendOutcome;
       try {
         outcome = pushOutcome(await conn.sendRequest(method.PUSH_EVENT, {
@@ -3668,12 +3699,17 @@ export class DiscordMcplServer {
       }
       if (outcome.kind === 'accepted' || outcome.kind === 'no-result') {
         this.owedTried.delete(channelId);
-        this.forgetOwed(channelId, found.map(({ owed }) => owed.id));
+        // Owed again while this was on its way (a later edit not taken, say):
+        // that owing stays, for the next delivery.
+        this.forgetOwed(channelId, found.filter(({ owed }) => (this.owedRevs.get(owed) ?? 0) === revs.get(owed)).map(({ owed }) => owed.id));
         console.error(`[discord-mcpl] Delivered ${found.length} owed message(s) in channel ${channelId}.`);
         dbg('owed:delivered', { channelId, ids: found.map(({ owed }) => owed.id), result: outcome.kind });
         return;
       }
-      notThisTime(found.map(({ owed }) => owed), describeOutcome(outcome, 'push/event'), answerClass(outcome) === 'final');
+      // A refusal the spec gives a meaning, unknown channel included (the
+      // channel was registered just now), won't change with another try.
+      const answer = answerClass(outcome);
+      notThisTime(found.map(({ owed }) => owed), describeOutcome(outcome, 'push/event'), answer === 'final' || answer === 'unknown-channel');
     } finally {
       this.owedDelivering.delete(channelId);
     }
@@ -4428,6 +4464,7 @@ export class DiscordMcplServer {
       if (this.forwardedWatermark.delete(id)) pruned = true;
       if (this.missedTally.delete(id)) pruned = true;
       if (this.owed.delete(id)) pruned = true;
+      this.owedTried.delete(id);
     }
     if (pruned) this.saveWatermark();
     this.forgetChannels(ids.map((id) => mcplChannelId(guildId, id)));
