@@ -68,12 +68,19 @@ in the git log and PR descriptions.
   give a meaning (malformed, not permitted, unknown channel) isn't owed: it's
   the host's decision or this server's bug. What is owed is delivered as
   Discord has it then, in one `<missed … reason="undelivered">` block per
-  channel, like the catch-up's, when a host connection becomes ready, and
-  when the host takes a message in that channel again. A message Discord no
-  longer has, one the filters would now refuse, and those of a muted channel
-  or of one Discord doesn't know are given up; a block the host doesn't take
-  is tried again, three times in all. At most 50 messages are owed per
-  channel. They are kept with the watermarks (`DISCORD_WATERMARK_FILE`,
+  channel, like the catch-up's, when a host connection becomes ready
+  (alongside the catch-up, not ahead of it), and when the host takes a
+  message in that channel again (not within five minutes of a failed try on
+  the same connection). One read of up to 100 messages from Discord answers
+  for every owed message inside it. A message Discord no longer has, one the
+  filters refuse now, and those of a muted, deleted or unknown channel are
+  given up. A block not delivered (not taken, a failed read, a channel whose
+  identity can't be resolved, or a filter refusal resting on facts that
+  aren't current, which the catch-up holds back too) counts a try, at most
+  one per connection, and three tries give it up; a refusal with a code the
+  spec gives a meaning gives it up at once. A later edit or delete of the
+  message that the host takes clears what was owed for it. At most 50
+  messages are owed per channel. They are kept with the watermarks (`DISCORD_WATERMARK_FILE`,
   under `owed`, written only while something is owed), so a restart
   delivers them. Logged: `[discord-mcpl] Message <id> in channel <id> is
   owed: …`, `[discord-mcpl] Delivered <n> owed message(s) in channel <id>.`,

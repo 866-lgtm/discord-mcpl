@@ -8,6 +8,7 @@
  */
 
 import type * as net from 'node:net';
+import { createHash } from 'node:crypto';
 import {
   McplConnection,
   textContent,
@@ -271,9 +272,12 @@ interface OwedMessage {
 }
 /** How many messages are owed per channel at most; the oldest go first. */
 const OWED_PER_CHANNEL_MAX = 50;
-/** How many times delivering an owed message is tried, one per connection
- *  that becomes ready, before it is given up. */
+/** How many delivery tries an owed message gets, at most one counted per
+ *  connection, before it is given up. */
 const OWED_DELIVERY_TRIES = 3;
+/** How long the live trigger waits after a failed delivery try on the same
+ *  connection before trying again (the try isn't counted again). */
+const OWED_RETRY_COOLDOWN_MS = 5 * 60_000;
 
 /** What the watermark store can use of its file. saveWatermark writes an
  *  object with up to four keys, any of which a file from an earlier version
@@ -1811,12 +1815,11 @@ export class DiscordMcplServer {
           }
         }
         this.markReady(conn);
-        // What the last host didn't take (owe), now that this one is ready.
-        try {
-          await this.deliverOwed(conn);
-        } catch (err) {
+        // What the last host didn't take (owe), now that this one is ready,
+        // alongside the sweep rather than ahead of it.
+        void this.deliverOwed(conn).catch((err) => {
           console.error('[discord-mcpl] Delivering owed messages failed:', errorText(err));
-        }
+        });
         // Deliver anything that arrived while the bot was offline (mentions +
         // DMs everywhere, full missed backscroll for subscribed channels).
         // Best-effort and one-shot; failures must not block serving.
@@ -3394,14 +3397,6 @@ export class DiscordMcplServer {
     return ` [reactions: ${parts.join(', ')}]`;
   }
 
-  /** On (re)connect, deliver what arrived while the bot was offline:
-   *  mentions + DMs from any known channel, plus the full missed backscroll
-   *  for subscribed channels (which already receive ambient delivery). Each
-   *  channel is scanned from its persisted watermark, bounded by catchupLimit.
-   *
-   *  No-op unless a watermark file is configured (without a persisted anchor
-   *  there's no "since when" to scan from) and messaging is enabled. Runs at
-   *  most once per process. */
   /** The place attributes of a `<missed>` block's header: channel, thread,
    *  channelId, and guild or dm. Each name is an attribute's value, so it is
    *  always quoted, with quotedValue's escaping, which the live location
@@ -3455,9 +3450,10 @@ export class DiscordMcplServer {
     const list = this.owed.get(channelId) ?? [];
     const known = list.find((o) => o.id === messageId);
     if (known) {
-      // Owed already: it is certainly owed if either time was certain, and an
-      // edit only while the create itself wasn't owed.
-      if (!how.uncertain) delete known.uncertain;
+      // Owed already. Only a certain answer about the create itself says it
+      // didn't arrive; a refused edit says nothing about the create. With
+      // the create owed, the edit mark is moot: the message goes as it is now.
+      if (!how.uncertain && !how.edit) delete known.uncertain;
       if (!how.edit) delete known.edit;
     } else {
       list.push({ id: messageId, ...(how.uncertain ? { uncertain: true as const } : {}), ...(how.edit ? { edit: true as const } : {}) });
@@ -3485,6 +3481,10 @@ export class DiscordMcplServer {
 
   /** Channels whose owed messages are being delivered (deliverOwedIn). */
   private readonly owedDelivering = new Set<string>();
+  /** Per channel, the connection its last delivery try counted on, and when
+   *  that try failed: a try counts once per connection, and a live trigger
+   *  waits OWED_RETRY_COOLDOWN_MS after a failure before trying again. */
+  private readonly owedTried = new Map<string, { conn: McplConnection; failedAt: number }>();
 
   /** Deliver everything owed to `conn`, whose start-up has settled
    *  (serve()), a channel at a time. */
@@ -3492,78 +3492,132 @@ export class DiscordMcplServer {
     this.ensureWatermarkLoaded();
     for (const channelId of [...this.owed.keys()]) {
       if (this.conn !== conn || conn.isClosed) return;
-      await this.deliverOwedIn(conn, channelId);
+      await this.deliverOwedIn(conn, channelId, 'ready');
     }
   }
 
   /**
    * Deliver a channel's owed messages (owe), as Discord has them now, in one
    * `<missed reason="undelivered">` block, pushed as the catch-up sweep pushes
-   * its blocks: when a connection becomes ready, and when the host takes a
-   * message in that channel again. A message Discord no longer has is
-   * forgotten, as are all of a channel Discord doesn't know or one that is
-   * now muted. Each line says when it may have arrived already, and when what
-   * wasn't taken was an edit. Delivered, they are forgotten; a final refusal
-   * (answerClass) gives them up; any other answer leaves them for the next
-   * try, OWED_DELIVERY_TRIES in all.
+   * its blocks: when a connection becomes ready (`ready`), and when the host
+   * takes a message in that channel again (`live`; not within
+   * OWED_RETRY_COOLDOWN_MS of a failed try on the same connection).
+   *
+   * Given up: a message Discord no longer has, one the live filters refuse
+   * now, everything owed in a muted channel or one Discord doesn't know, and
+   * a block refused with a code the spec gives a meaning. Not delivered this
+   * time (a read that failed, a channel whose identity can't be resolved, a
+   * filter answer that rests on facts that aren't current, as the sweep holds
+   * such a channel back; a block not taken): a try is counted, once per
+   * connection, and after OWED_DELIVERY_TRIES they are given up.
    */
-  private async deliverOwedIn(conn: McplConnection, channelId: string): Promise<void> {
+  private async deliverOwedIn(conn: McplConnection, channelId: string, trigger: 'ready' | 'live'): Promise<void> {
     if (this.owedDelivering.has(channelId)) return;
+    const tried = this.owedTried.get(channelId);
+    if (trigger === 'live' && tried?.conn === conn && Date.now() - tried.failedAt < OWED_RETRY_COOLDOWN_MS) return;
     this.owedDelivering.add(channelId);
     try {
       const list = [...(this.owed.get(channelId) ?? [])];
       if (list.length === 0) return;
       if (!this.mcplEnabled || !isEnabled('discord.messaging', this.enabledFeatureSets)) return;
+      const giveUp = (entries: readonly OwedMessage[], why: string): void => {
+        if (entries.length === 0) return;
+        console.error(`[discord-mcpl] Gave up ${entries.length} owed message(s) in channel ${channelId}: ${why}.`);
+        dbg('owed:given-up', { channelId, ids: entries.map((o) => o.id), why });
+        this.forgetOwed(channelId, entries.map((o) => o.id));
+      };
+      const notThisTime = (entries: readonly OwedMessage[], why: string, final = false): void => {
+        const counts = this.owedTried.get(channelId)?.conn !== conn;
+        this.owedTried.set(channelId, { conn, failedAt: Date.now() });
+        const givenUp: OwedMessage[] = [];
+        for (const owed of entries) {
+          if (counts) owed.tries = (owed.tries ?? 0) + 1;
+          if (final || (owed.tries ?? 0) >= OWED_DELIVERY_TRIES) givenUp.push(owed);
+        }
+        this.saveWatermark();
+        if (givenUp.length > 0) this.forgetOwed(channelId, givenUp.map((o) => o.id));
+        console.error(
+          `[discord-mcpl] Couldn't deliver ${entries.length} owed message(s) in channel ${channelId}: ${why}` +
+            (givenUp.length === entries.length ? '; given up.' : givenUp.length > 0
+              ? `; ${givenUp.length} given up, the rest tried again later.` : '; tried again later.'),
+        );
+        dbg('owed:not-delivered', { channelId, ids: entries.map((o) => o.id), why, givenUp: givenUp.map((o) => o.id) });
+      };
       if (this.isChannelMuted(channelId)) {
-        console.error(`[discord-mcpl] Gave up ${list.length} owed message(s) in channel ${channelId}: the channel is muted.`);
-        this.forgetOwed(channelId, list.map((o) => o.id));
+        giveUp(list, 'the channel is muted');
         return;
       }
+
+      // Read from Discord, a window of up to 100 messages at a time: one read
+      // around an owed message also answers for the owed messages inside its
+      // window, present or deleted since.
+      const have = new Map<string, HistoryMessage>();
+      const windows: Array<[bigint, bigint]> = [];
+      const covered = (id: string): boolean => {
+        const n = snowflake(id);
+        return n !== null && windows.some(([lo, hi]) => n >= lo && n <= hi);
+      };
+      for (const owed of [...list].sort((a, b) => compareSnowflakes(a.id, b.id))) {
+        if (have.has(owed.id) || covered(owed.id)) continue;
+        let page: HistoryMessage[];
+        try {
+          page = await this.discord.fetchAround(channelId, owed.id, 100);
+        } catch (err) {
+          if ((err as { code?: unknown } | null)?.code === UNKNOWN_CHANNEL) {
+            giveUp(list, "Discord doesn't know the channel");
+          } else {
+            notThisTime(list, `couldn't read them from Discord (${errorText(err)})`);
+          }
+          return;
+        }
+        for (const m of page) have.set(m.id, m);
+        const ns = page.map((m) => snowflake(m.id)).filter((n): n is bigint => n !== null);
+        if (ns.length > 0) windows.push([ns.reduce((a, b) => (b < a ? b : a)), ns.reduce((a, b) => (b > a ? b : a))]);
+      }
+      const gone = list.filter((o) => !have.has(o.id));
+      if (gone.length > 0) {
+        dbg('owed:gone', { channelId, gone: gone.map((o) => o.id) });
+        this.forgetOwed(channelId, gone.map((o) => o.id));
+      }
+      let found = list.filter((o) => have.has(o.id)).map((owed) => ({ owed, m: have.get(owed.id)! }));
+      if (found.length === 0) return;
+
+      // The channel as the sweep resolves it: the cache, looked up when it
+      // doesn't hold the channel whole and current.
       let meta = this.discord.getCachedChannelMeta(channelId);
-      if (!meta) meta = await this.discord.getChannelMeta(channelId).catch(() => null);
+      let lookupFailure: string | null = null;
+      if (!meta || (meta.threadId && meta.threadParentName === null) || this.discord.isStale(channelId)) {
+        const cached = meta;
+        meta = (await this.discord.getChannelMeta(channelId).catch((err) => {
+          lookupFailure = errorText(err);
+          return null;
+        })) ?? cached;
+      }
       const isDM = this.dmChannelIds.has(channelId) || meta?.isDM === true;
       const guildId = isDM ? null : (meta?.guildId ?? null);
       if (!isDM && !guildId) {
-        // Tried again at the next delivery, as the sweep holds such a channel back.
-        dbg('owed:identity-unresolved', { channelId });
+        notThisTime(found.map(({ owed }) => owed),
+          `neither its guild nor DM identity could be resolved${lookupFailure ? ` (its lookup failed: ${lookupFailure})` : ''}`);
         return;
       }
       if (guildId) await this.discord.lookUpStaleParent(channelId);
-      const found: Array<{ m: HistoryMessage; owed: OwedMessage }> = [];
-      const gone: string[] = [];
-      for (const owed of list) {
-        try {
-          const around = await this.discord.fetchAround(channelId, owed.id, 1);
-          const m = around.find((h) => h.id === owed.id);
-          if (m) found.push({ m, owed });
-          else gone.push(owed.id);
-        } catch (err) {
-          if ((err as { code?: unknown } | null)?.code === UNKNOWN_CHANNEL) {
-            console.error(`[discord-mcpl] Gave up ${list.length} owed message(s) in channel ${channelId}: Discord doesn't know the channel.`);
-            this.forgetOwed(channelId, list.map((o) => o.id));
-            return;
-          }
-          // Read again at the next try.
-          dbg('owed:fetch-failed', { channelId, messageId: owed.id, error: errorText(err) });
+      // The live ingress decision, evaluated now, as the sweep evaluates it.
+      // A channel filter's refusal that rests on facts that aren't current
+      // may be wrong, so the channel is held back, as the sweep holds it.
+      const refused = found.filter(({ m }) => this.discord.historyIngressReason(channelId, guildId, m.authorId) !== null);
+      if (refused.some(({ m }) => this.discord.historyIngressReason(channelId, guildId, m.authorId) === 'channel-not-allowed')) {
+        const notCurrent = this.discord.ingressFactsNotCurrent(channelId);
+        if (notCurrent) {
+          notThisTime(found.map(({ owed }) => owed),
+            `the channel filters would withhold them, but that answer rests on facts that aren't current (${notCurrent})`);
           return;
         }
       }
-      // The live ingress decision, evaluated now, as the sweep evaluates it:
-      // a message the filters would refuse today isn't delivered.
-      for (let i = found.length - 1; i >= 0; i--) {
-        const reason = this.discord.historyIngressReason(channelId, guildId, found[i].m.authorId);
-        if (reason !== null) {
-          dbg('owed:withheld', { channelId, messageId: found[i].m.id, reason });
-          gone.push(found[i].m.id);
-          found.splice(i, 1);
-        }
-      }
-      if (gone.length > 0) {
-        dbg('owed:gone', { channelId, gone });
-        this.forgetOwed(channelId, gone);
-      }
+      giveUp(refused.map(({ owed }) => owed), 'the filters refuse them now');
+      found = found.filter((f) => !refused.includes(f));
       if (found.length === 0) return;
       found.sort((a, b) => a.m.timestamp.getTime() - b.m.timestamp.getTime());
+
       // Registered before it's named, as the sweep and the live path do.
       const guildDelivery = !isDM && guildId ? this.registerGuildDelivery(guildId, channelId) : undefined;
       const mcplId = isDM
@@ -3582,14 +3636,18 @@ export class DiscordMcplServer {
         ...lines,
         '</missed>',
       ].join('\n');
-      const ids = found.map(({ m }) => m.id);
+      // The occurrence is this block: the same messages, marks and text give
+      // the same id (a block sent again is the same occurrence), and anything
+      // else a new one.
+      const digest = createHash('sha256')
+        .update(JSON.stringify(found.map(({ m, owed }) => [m.id, owed.edit === true, owed.uncertain === true, m.cleanContent])))
+        .digest('hex')
+        .slice(0, 16);
       let outcome: SendOutcome;
       try {
         outcome = pushOutcome(await conn.sendRequest(method.PUSH_EVENT, {
           featureSet: 'discord.messaging',
-          // One occurrence per set of messages: the same set sent again is
-          // the same occurrence.
-          eventId: `discord_owed_${channelId}_${ids[0]}_${ids[ids.length - 1]}_${ids.length}`,
+          eventId: `discord_owed_${channelId}_${digest}`,
           timestamp: new Date().toISOString(),
           origin: {
             source: 'discord',
@@ -3609,30 +3667,26 @@ export class DiscordMcplServer {
         outcome = sendErrorOutcome(err);
       }
       if (outcome.kind === 'accepted' || outcome.kind === 'no-result') {
-        this.forgetOwed(channelId, ids);
-        console.error(`[discord-mcpl] Delivered ${ids.length} owed message(s) in channel ${channelId}.`);
-        dbg('owed:delivered', { channelId, ids, result: outcome.kind });
+        this.owedTried.delete(channelId);
+        this.forgetOwed(channelId, found.map(({ owed }) => owed.id));
+        console.error(`[discord-mcpl] Delivered ${found.length} owed message(s) in channel ${channelId}.`);
+        dbg('owed:delivered', { channelId, ids: found.map(({ owed }) => owed.id), result: outcome.kind });
         return;
       }
-      const final = answerClass(outcome) === 'final';
-      const givenUp: string[] = [];
-      for (const { owed } of found) {
-        owed.tries = (owed.tries ?? 0) + 1;
-        if (final || owed.tries >= OWED_DELIVERY_TRIES) givenUp.push(owed.id);
-      }
-      this.saveWatermark();
-      if (givenUp.length > 0) this.forgetOwed(channelId, givenUp);
-      console.error(
-        `[discord-mcpl] Couldn't deliver ${ids.length} owed message(s) in channel ${channelId}: ${describeOutcome(outcome, 'push/event')}` +
-          (givenUp.length === ids.length ? '; given up.' : givenUp.length > 0
-            ? `; ${givenUp.length} given up, the rest tried again later.` : '; tried again later.'),
-      );
-      dbg('owed:not-delivered', { channelId, ids, result: outcome.kind, givenUp });
+      notThisTime(found.map(({ owed }) => owed), describeOutcome(outcome, 'push/event'), answerClass(outcome) === 'final');
     } finally {
       this.owedDelivering.delete(channelId);
     }
   }
 
+  /** On (re)connect, deliver what arrived while the bot was offline:
+   *  mentions + DMs from any known channel, plus the full missed backscroll
+   *  for subscribed channels (which already receive ambient delivery). Each
+   *  channel is scanned from its persisted watermark, bounded by catchupLimit.
+   *
+   *  No-op unless a watermark file is configured (without a persisted anchor
+   *  there's no "since when" to scan from) and messaging is enabled. Runs at
+   *  most once per process. */
   private async runReconnectSweep(): Promise<void> {
     if (this.sweepDone) return;
     this.sweepDone = true;
@@ -4373,6 +4427,7 @@ export class DiscordMcplServer {
     for (const id of ids) {
       if (this.forwardedWatermark.delete(id)) pruned = true;
       if (this.missedTally.delete(id)) pruned = true;
+      if (this.owed.delete(id)) pruned = true;
     }
     if (pruned) this.saveWatermark();
     this.forgetChannels(ids.map((id) => mcplChannelId(guildId, id)));
@@ -6039,7 +6094,7 @@ export class DiscordMcplServer {
       dbg('handleDiscordMessage:sent', { method: lane, channelMcplId, result: first.kind });
       // The host takes messages here again: what it didn't take before follows.
       if (this.owed.has(discordChannelId)) {
-        void this.deliverOwedIn(conn, discordChannelId).catch((err) => {
+        void this.deliverOwedIn(conn, discordChannelId, 'live').catch((err) => {
           console.error('[discord-mcpl] Delivering owed messages failed:', errorText(err));
         });
       }
@@ -6345,7 +6400,11 @@ export class DiscordMcplServer {
             }
           },
         });
-        if (outcome.kind === 'rejected') {
+        if (outcome.kind === 'accepted' || outcome.kind === 'no-result') {
+          // The host has the message as it is now (or its deletion): what was
+          // owed for it is no longer.
+          if (this.owed.get(discordChannelId)?.some((o) => o.id === messageId)) this.forgetOwed(discordChannelId, [messageId]);
+        } else if (outcome.kind === 'rejected') {
           console.error(`[discord-mcpl] host rejected ${kind} of message ${messageId} in ${channel}: ${outcome.reason}`);
           dbg('handleMessageMutation:rejected', { kind, messageId, channel, reason: outcome.reason, ...(outcome.code !== undefined ? { code: outcome.code } : {}) });
           // An edit not taken leaves the agent an older version: the message
@@ -6387,6 +6446,19 @@ function describeOutcome(outcome: SendOutcome | { kind: 'superseded' }, lane: 'c
 function sendErrorOutcome(err: unknown): SendOutcome {
   const rejection = errorRejection(err);
   return rejection ? { kind: 'rejected', ...rejection } : { kind: 'failed', error: errorText(err) };
+}
+
+/** A Discord id as a number, or null when it isn't one. */
+function snowflake(id: string): bigint | null {
+  return /^\d+$/.test(id) ? BigInt(id) : null;
+}
+
+/** Order Discord ids oldest first (others by their text). */
+function compareSnowflakes(a: string, b: string): number {
+  const x = snowflake(a);
+  const y = snowflake(b);
+  if (x !== null && y !== null) return x < y ? -1 : x > y ? 1 : 0;
+  return a.localeCompare(b);
 }
 
 function sleep(ms: number): Promise<void> {
