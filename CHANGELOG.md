@@ -25,9 +25,9 @@ in the git log and PR descriptions.
   - **A refusal the spec gives no meaning** (`accepted: false` with a
     free-text reason, or none): sent once more as the same occurrence.
   - **No verdict** (no answer, a closed connection, -32603, or another
-    -32000 to -32099 error the spec doesn't define, mcpl-core's own timeout
-    included): sent again as the same occurrence after 1 s, 5 s and 30 s
-    while answers stay that way.
+    code JSON-RPC reserves (-32768 to -32000) that neither it nor the spec
+    defines, mcpl-core's own timeout included): sent again as the same
+    occurrence after 1 s, 5 s and 30 s while answers stay that way.
 
   The last two only for an occurrence that carries `coalesce`, to a host that
   advertises event coalescing for its lane: RFC-006 §3.1 obliges that host to
@@ -47,9 +47,10 @@ in the git log and PR descriptions.
   channels registered), as RFC-006 §3.1 allows ("survives reconnects and
   host restarts"); never to a host that advertises no coalescing. 0.4.0
   dropped it instead. At most 64 occurrences wait for a host at once (each
-  holds its content while it waits). Only an occurrence that fits that host goes: one for
-  an open channel only if the channel is open with it, and one scoped to a
-  channel only if it takes channel-scoped pushes. (A stdio server exits with
+  holds its content while it waits). Only an occurrence that fits that host
+  goes: never one sent through an open channel (`channels/incoming`, for the
+  host that opened it), and one scoped to a channel only if it takes
+  channel-scoped pushes. (A stdio server exits with
   its host, so there is no next host to send it to.) An edit or delete that waited for its message's
   create is held for the host connected since until its start-up has
   settled, too (a minute at most), and a create still being sent is never pushed out of the

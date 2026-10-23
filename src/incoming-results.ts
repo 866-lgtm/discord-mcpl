@@ -62,18 +62,24 @@ export function pushOutcome(response: unknown): ForwardOutcome {
  *  (SPEC Appendix A). Any other code in that range is implementation-defined. */
 const SPEC_SERVER_RANGE_CODES = new Set([-32001, -32002, -32003, -32005, -32017, -32023, -32024]);
 
+/** The codes JSON-RPC and SPEC Appendix A define in JSON-RPC's reserved
+ *  range (-32768 to -32000). */
+const DEFINED_RESERVED_CODES = new Set([-32700, -32600, -32601, -32602, -32603, ...SPEC_SERVER_RANGE_CODES]);
+
 /**
  * The host's refusal in the error a request was rejected with, or undefined
  * when the error isn't a verdict on this message:
  * - no code: a closed connection, or any error that isn't JSON-RPC's;
  * - -32603: JSON-RPC's internal error;
- * - -32000 to -32099 outside the codes SPEC Appendix A defines: an
- *   implementation-defined server error, which mcpl-core's own timeout is too
- *   (-32000, "Request timed out after <n>ms: <method>" in 0.2.1).
+ * - any other code in JSON-RPC's reserved range (-32768 to -32000) that
+ *   neither JSON-RPC nor SPEC Appendix A defines: an implementation-defined
+ *   server error (-32000 to -32099), which mcpl-core's own timeout is too
+ *   (-32000, "Request timed out after <n>ms: <method>" in 0.2.1), or a code
+ *   JSON-RPC reserves and gives no meaning.
  *
  * Every other code is the host refusing this request: -32602 (malformed),
  * the spec's feature-set, capability and channel codes, JSON-RPC's -32600,
- * -32601 and -32700, and any code outside the server-error range.
+ * -32601 and -32700, and any code outside the reserved range.
  *
  * channels/incoming answers each message as a result without a code, so a
  * host's own failure there comes back as a refusal it gives no reason code
@@ -83,7 +89,7 @@ export function errorRejection(err: unknown): HostRejection | undefined {
   const e = err as { code?: unknown; message?: unknown } | null | undefined;
   if (!e || typeof e.code !== 'number') return undefined;
   if (e.code === -32603) return undefined;
-  if (e.code <= -32000 && e.code >= -32099 && !SPEC_SERVER_RANGE_CODES.has(e.code)) return undefined;
+  if (e.code <= -32000 && e.code >= -32768 && !DEFINED_RESERVED_CODES.has(e.code)) return undefined;
   const message = typeof e.message === 'string' ? e.message : '';
   // mcpl-core 0.2.1 puts "RPC error <code>: " in front of the host's message,
   // and later versions don't. The reason is the host's own words.
@@ -124,11 +130,12 @@ export function isContentRejection(rejection: HostRejection): boolean {
  * - `unknown-channel`: -32023, the host has no such channel registered: the
  *   sender can register it and send the same occurrence again.
  * - `refused`: a refusal the spec gives no meaning: `accepted: false` with a
- *   free-text reason or none, or an error code outside the server-error
+ *   free-text reason or none, or an error code outside JSON-RPC's reserved
  *   range. The host didn't admit it, so the same occurrence sent again can't
  *   be a duplicate, and as its cause is unknown, it may pass.
  * - `uncertain`: no verdict: no answer (a timeout, a closed connection),
- *   -32603, or an implementation-defined server error. It may have been
+ *   -32603, or another code in JSON-RPC's reserved range that neither it
+ *   nor the spec defines (an implementation-defined server error, say). It may have been
  *   admitted, so only the same occurrence may be sent again, which RFC-006
  *   §3.1's retry window makes safe on a coalescing host.
  */

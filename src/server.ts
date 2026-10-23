@@ -945,8 +945,10 @@ export class DiscordMcplServer {
   private hostRetryWindowMs: number | undefined;
   /**
    * The connection whose start-up has settled: it initialized, its policy was
-   * answered (or the grace for hosts that send none ran out), and the
-   * channels were registered with it. A resend, or an edit or delete that
+   * answered (or the grace for hosts that send none ran out), and channel
+   * registration with it was tried (best-effort, as the rest of start-up is:
+   * a failure is logged, and a push for a channel the host doesn't know
+   * gets its -32023 answer, which announces the channel again). A resend, or an edit or delete that
    * waited, goes to a connection other than the one it was first meant for
    * only once that one is ready (readyConnection).
    */
@@ -3234,13 +3236,13 @@ export class DiscordMcplServer {
     for (const [chan, id] of Object.entries(saved.watermarks ?? {})) this.forwardedWatermark.set(chan, id);
     for (const id of saved.dmChannels ?? []) this.dmChannelIds.add(id);
     for (const [chan, list] of Object.entries(saved.owed ?? {})) {
-      // As owe() keeps it: one entry per message (certain if either was, an
-      // edit only if both were, the most tries), the newest 50.
+      // As owe() keeps it: one entry per message (may have arrived if either
+      // copy says so, an edit only if both were, the most tries), the newest 50.
       const byId = new Map<string, OwedMessage>();
       for (const item of list) {
         const known = byId.get(item.id);
         if (!known) { byId.set(item.id, { ...item }); continue; }
-        if (!item.uncertain && !item.edit) delete known.uncertain;
+        if (item.uncertain) known.uncertain = true;
         if (!item.edit) delete known.edit;
         const tries = Math.max(known.tries ?? 0, item.tries ?? 0);
         if (tries > 0) known.tries = tries;
@@ -3470,10 +3472,11 @@ export class DiscordMcplServer {
     const known = list.find((o) => o.id === messageId);
     if (known) {
       this.owedRevs.set(known, (this.owedRevs.get(known) ?? 0) + 1);
-      // Owed already. Only a certain answer about the create itself says it
-      // didn't arrive; a refused edit says nothing about the create. With
-      // the create owed, the edit mark is moot: the message goes as it is now.
-      if (!how.uncertain && !how.edit) delete known.uncertain;
+      // Owed already. Each owing is about a different send, so the message
+      // may have arrived once any of them may have (a later certain refusal
+      // says nothing about an earlier send). With the create owed, the edit
+      // mark is moot: the message goes as it is now.
+      if (how.uncertain) known.uncertain = true;
       if (!how.edit) delete known.edit;
     } else {
       list.push({ id: messageId, ...(how.uncertain ? { uncertain: true as const } : {}), ...(how.edit ? { edit: true as const } : {}) });
@@ -3484,7 +3487,7 @@ export class DiscordMcplServer {
     }
     this.owed.set(channelId, list);
     this.saveWatermark();
-    console.error(`[discord-mcpl] ${how.edit ? 'The edit of message' : 'Message'} ${messageId} in channel ${channelId} is owed: it is delivered when the host takes messages there again.`);
+    console.error(`[discord-mcpl] ${how.edit ? 'The edit of message' : 'Message'} ${messageId} in channel ${channelId} is owed: it is delivered when a host connection is ready or the host takes messages there again, unless it is given up.`);
     dbg('owed:added', { channelId, messageId, ...how, owed: list.length });
   }
 
@@ -6007,9 +6010,10 @@ export class DiscordMcplServer {
         // Registered, as an open channel is.
         channel: channelMcplId,
         discordChannelId: msg.channelId,
-        // channels/incoming is for an open channel: the host connected since
-        // takes it only if it has the channel open too.
-        fits: () => (this.channelManager.isOpen(channelMcplId) ? undefined : "its channel isn't open with the host connected now"),
+        // channels/incoming is for a channel a host opened, and which host
+        // opened it isn't recorded (open state is the process's), so the
+        // occurrence doesn't go to another host at all.
+        fits: () => 'it went through a channel a previous host opened, and channels/incoming goes only to the host that opened it',
         messageId: msg.id,
         channelMcplId,
         content: message.content,
