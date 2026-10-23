@@ -893,8 +893,10 @@ export class DiscordMcplServer {
   private hostRetryWindowMs: number | undefined;
   /**
    * The connection whose start-up has settled: it initialized, its policy was
-   * answered (or the grace for hosts that send none ran out), and the
-   * channels were registered with it. A resend, or an edit or delete that
+   * answered (or the grace for hosts that send none ran out), and channel
+   * registration with it was tried (best-effort, as the rest of start-up is:
+   * a failure is logged, and a push for a channel the host doesn't know
+   * gets its -32023 answer, which announces the channel again). A resend, or an edit or delete that
    * waited, goes to a connection other than the one it was first meant for
    * only once that one is ready (readyConnection).
    */
@@ -5612,9 +5614,10 @@ export class DiscordMcplServer {
         coalesced: (message as { coalesce?: unknown }).coalesce !== undefined,
         // Registered, as an open channel is.
         channel: channelMcplId,
-        // channels/incoming is for an open channel: the host connected since
-        // takes it only if it has the channel open too.
-        fits: () => (this.channelManager.isOpen(channelMcplId) ? undefined : "its channel isn't open with the host connected now"),
+        // channels/incoming is for a channel a host opened, and which host
+        // opened it isn't recorded (open state is the process's), so the
+        // occurrence doesn't go to another host at all.
+        fits: () => 'it went through a channel a previous host opened, and channels/incoming goes only to the host that opened it',
         messageId: msg.id,
         channelMcplId,
         content: message.content,
