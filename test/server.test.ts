@@ -2995,6 +2995,54 @@ describe('a host that connects after another', () => {
   });
 });
 
+describe("a replaced connection's start-up", () => {
+  it('stops: it registers no channels with the host that replaced it', async () => {
+    const first = await createTestPair();
+    const server = new DiscordMcplServer(first.discord as unknown as DiscordAdapter);
+    (server as unknown as { policyGraceMs: number }).policyGraceMs = 100;
+    const firstServed = server.serve(first.serverConn);
+    // Initialized, but gone before its policy.
+    await first.client.sendRequest('initialize', {
+      protocolVersion: '2024-11-05',
+      capabilities: { experimental: { mcpl: { version: '0.4', pushEvents: true, channels: true, rollback: true } } },
+      clientInfo: { name: 'test-client', version: '0.1.0' },
+    });
+    first.client.close();
+    await firstServed;
+
+    const second = await createTestPair();
+    const secondServed = server.serve(second.serverConn);
+    const seen: string[] = [];
+    void (async () => {
+      try {
+        for (;;) {
+          const m = await second.client.nextMessage();
+          if (m.type === 'request') {
+            seen.push(m.request.method);
+            second.client.sendResponse(m.request.id, {});
+          } else {
+            seen.push(m.notification.method);
+          }
+        }
+      } catch { /* the client closed */ }
+    })();
+    (server as unknown as { policyGraceMs: number }).policyGraceMs = 60_000;
+    await second.client.sendRequest('initialize', {
+      protocolVersion: '2024-11-05',
+      capabilities: { experimental: { mcpl: { version: '0.4', pushEvents: true, channels: true, rollback: true } } },
+      clientInfo: { name: 'test-client', version: '0.1.0' },
+    });
+    try {
+      // The first connection's grace (100 ms) runs out meanwhile.
+      await new Promise((r) => setTimeout(r, 300));
+      assert.equal(seen.includes('channels/register'), false, `before the second host's policy: ${seen.join(', ')}`);
+    } finally {
+      second.client.close();
+      await secondServed;
+    }
+  });
+});
+
 describe('RFC-006 coalescing', () => {
   type Coalesce = { key: string; channelId?: string; retract?: boolean; initial?: boolean };
   type Push = PushEventParams & { coalesce?: Coalesce };

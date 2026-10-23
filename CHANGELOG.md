@@ -14,8 +14,11 @@ in the git log and PR descriptions.
   delete is now read by what the spec defines:
   - **Accepted**, or answered without a verdict: done.
   - **A refusal the spec gives a meaning** (-32602 / `coalesce_invalid`,
-    -32001, -32002, -32003, -32017, JSON-RPC's -32600, -32601, -32700):
-    final, logged, never sent again as it is.
+    every other code SPEC Appendix A defines but -32023, JSON-RPC's -32600,
+    -32601, -32700): final, logged, never sent again as it is. A permission
+    refusal (-32001, -32002, -32017) answered before the connection's
+    start-up had settled is "not yet": a host denies with them until its
+    policy is in place, so the occurrence is sent once more when it is.
   - **-32023, an unknown channel**: the channel is announced to the host
     again (`channels/changed`) and the same occurrence sent once more, on
     any host: it wasn't admitted, so it can't be a duplicate.
@@ -23,26 +26,31 @@ in the git log and PR descriptions.
     free-text reason, or none): sent once more as the same occurrence.
   - **No verdict** (no answer, a closed connection, -32603, or another
     -32000 to -32099 error the spec doesn't define, mcpl-core's own timeout
-    included): sent again as the same occurrence after 1 s, 5 s, 30 s, 2 min
-    and 10 min while answers stay that way.
+    included): sent again as the same occurrence after 1 s, 5 s and 30 s
+    while answers stay that way.
 
   The last two only for an occurrence that carries `coalesce`, to a host that
   advertises event coalescing for its lane: RFC-006 §3.1 obliges that host to
   recognize a repeated `eventId` for its retry window (`retryWindowMs`, an
   hour by default) and return the first result without repeating its
   effects. Resends stop at half that window after the first send. A host
-  that advertises no coalescing gets each occurrence once, as before. Every
+  that advertises no coalescing gets each occurrence once, as before. A
+  resend reaches the host after messages that came after it, each with its
+  own timestamp, which is why the waits are short. Every
   resend is logged (`[discord-mcpl] <what>: <answer>; sending the same
   occurrence again (same event id) in <n>ms`, then `[discord-mcpl] sent
   <what> again (same event id): <answer>`), and so is each one skipped
   (`…; not sent again: <why>`).
-- **A resend waits for the host to come back.** After a reconnect it goes to
-  the host connected since, once that host's start-up has settled
-  (initialized, its policy answered, the channels registered), as RFC-006
-  §3.1 allows ("survives reconnects and host restarts"); never to a host
-  that advertises no coalescing. 0.4.0 dropped it instead. An edit or delete
-  that waited for its message's create goes to the host connected since
-  only once its start-up has settled, too.
+- **A resend waits up to a minute for the host to come back.** On the TCP
+  transport, after a reconnect it goes to the host connected since, once
+  that host's start-up has settled (initialized, its policy answered, the
+  channels registered), as RFC-006 §3.1 allows ("survives reconnects and
+  host restarts"); never to a host that advertises no coalescing. 0.4.0
+  dropped it instead. (A stdio server exits with its host, so there is no
+  next host to send it to.) An edit or delete that waited for its message's
+  create goes to the host connected since only once its start-up has
+  settled, too, and a create still being sent is never pushed out of the
+  memory an edit waits on.
 - **A later edit or delete no longer waits for an earlier one being sent
   again.** It goes at once, and the earlier one isn't sent again: the later
   occurrence replaces or withdraws the message.

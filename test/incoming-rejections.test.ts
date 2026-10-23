@@ -600,7 +600,7 @@ describe('sending the same occurrence again, by what the spec defines', () => {
       assert.ok(errors.some((e) => e.startsWith('[discord-mcpl] resent message m1 in discord:g1:chan1 with 1 inline attachment(s) replaced by a note: accepted')), errors.join('\n'));
     });
 
-    for (const [code, message] of [[-32001, 'Feature set not enabled: discord.messaging'], [-32017, 'Channel not permitted'], [-32601, 'Method not found']] as const) {
+    for (const [code, message] of [[-32001, 'Feature set not enabled: discord.messaging'], [-32017, 'Channel not permitted'], [-32024, 'Channel open failed'], [-32601, 'Method not found']] as const) {
       it(`a refusal the spec defines (${code}) is final: logged, never sent again`, async () => {
         const host = scriptedHost(() => ({ error: { code, message } }));
         const { server, sent } = wire(() => undefined, { host });
@@ -668,6 +668,68 @@ describe('sending the same occurrence again, by what the spec defines', () => {
       assert.ok(errors.some((e) => e.endsWith("not sent again: the host's retry window is closing")), errors.join('\n'));
     });
 
+    it("a permission refusal before the connection's start-up settled is \"not yet\": sent once more when it has", async () => {
+      const host = scriptedHost((_m, _p, n) => n === 1
+        ? { error: { code: -32002, message: 'Capability denied: no policy yet' } }
+        : { result: { accepted: true } });
+      const { server, sent } = wire(() => undefined, { host });
+      (server as any).readyConn = null;
+      const delivered = deliver(server, SMALL_IMAGE);
+      await until(() => sent.length === 1);
+      await new Promise((r) => setTimeout(r, 20));
+      assert.equal(sent.length, 1, 'not before the start-up settles');
+      (server as any).markReady(host.conn);
+      await delivered;
+      assert.equal(sent.length, 2);
+      assert.equal(eventIdOf(sent[1]), eventIdOf(sent[0]));
+      assert.ok(errors.includes("[discord-mcpl] message m1 in discord:g1:chan1: host rejected it: Capability denied: no policy yet, before the host's start-up had settled; sending the same occurrence again now that it has"), errors.join('\n'));
+      assert.ok(errors.includes('[discord-mcpl] sent message m1 in discord:g1:chan1 again (same event id): accepted'), errors.join('\n'));
+    });
+
+    it('…and final once it has', async () => {
+      const host = scriptedHost(() => ({ error: { code: -32002, message: 'Capability denied' } }));
+      const { server, sent } = wire(() => undefined, { host });
+      await deliver(server, SMALL_IMAGE);
+      assert.equal(sent.length, 1);
+    });
+
+    it("no resend to a ready host that doesn't take Discord messages", async () => {
+      const { server, sent } = wire(() => ({ results: [{ messageId: 'm1', accepted: false }] }), { open: true });
+      delays(server, 20);
+      const delivered = deliver(server, SMALL_IMAGE);
+      await until(() => errors.some((e) => e.includes('sending the same occurrence again')));
+      ((server as any).enabledFeatureSets as Set<string>).delete('discord.messaging');
+      await delivered;
+      assert.equal(sent.length, 1);
+      assert.ok(errors.some((e) => e.endsWith("not sent again: the host connected now doesn't take Discord messages")), errors.join('\n'));
+    });
+
+    it('a resend waits at most reconnectWaitMs for a host, however long the retry window', async () => {
+      const { server, sent } = wire(() => ({ results: [{ messageId: 'm1', accepted: false }] }), { open: true });
+      (server as any).reconnectWaitMs = 50;
+      delays(server, 5);
+      const started = Date.now();
+      const delivered = deliver(server, SMALL_IMAGE);
+      await until(() => errors.some((e) => e.includes('sending the same occurrence again')));
+      (server as any).conn = null;
+      await delivered;
+      assert.ok(Date.now() - started < 1000);
+      assert.equal(sent.length, 1);
+      assert.ok(errors.some((e) => e.endsWith('not sent again: no host connection was ready in time')), errors.join('\n'));
+    });
+
+    it('a create still being sent is never pushed out of the memory its edits wait on', () => {
+      const { server } = wire(() => ({ accepted: true }));
+      const pending = (server as any).rememberCreate('pending');
+      for (let i = 0; i < 600; i++) (server as any).rememberCreate(`m${i}`).resolve();
+      const memory = (server as any).recentCreates as Map<string, unknown>;
+      assert.equal(memory.get('pending'), pending);
+      assert.equal(memory.size, 512);
+      pending.resolve();
+      (server as any).rememberCreate('one-more').resolve();
+      assert.equal(memory.has('pending'), false, 'once settled, it goes as the oldest');
+    });
+
     it('a resend goes to the host connected since, once its start-up has settled, still the same occurrence', async () => {
       const { server, sent } = wire((_m, _p, n) => n === 1
         ? { results: [{ messageId: 'm1', accepted: false, reason: 'host is stopping' }] }
@@ -720,7 +782,7 @@ describe('sending the same occurrence again, by what the spec defines', () => {
       (server as any).conn = null;
       await delivered;
       assert.equal(sent.length, 1);
-      assert.ok(errors.some((e) => e.endsWith("not sent again: no host connection was ready before the host's retry window closed")), errors.join('\n'));
+      assert.ok(errors.some((e) => e.endsWith('not sent again: no host connection was ready in time')), errors.join('\n'));
       assert.ok(errors.includes("[discord-mcpl] host didn't take message m1 in discord:g1:chan1: unspecified"), errors.join('\n'));
     });
   });
@@ -761,7 +823,7 @@ describe('sending the same occurrence again, by what the spec defines', () => {
         await until(() => errors.some((e) => e.includes('not sent again')));
         await new Promise((r) => setTimeout(r, 20));
         assert.equal(sent.length, 2, 'the earlier edit is not sent again after the later one');
-        assert.ok(errors.includes("[discord-mcpl] edit of message m9 in discord:g1:chan1: host didn't take it: storage busy; not sent again: a later edit or delete of the message has been sent since"), errors.join('\n'));
+        assert.ok(errors.includes('[discord-mcpl] edit of message m9 in discord:g1:chan1: host rejected it: storage busy; not sent again: a later edit or delete of the message has been sent since'), errors.join('\n'));
       });
     }
 
