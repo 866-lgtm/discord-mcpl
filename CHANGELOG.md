@@ -17,10 +17,14 @@ in the git log and PR descriptions.
   mention is addressed, and one whose message no longer mentions or replies
   to the bot, outside a DM, is ambient. An edit whose addressing isn't known
   carries no address tags, as before: one whose message discord.js holds
-  only in part, or an edit of a reply whose target Discord didn't send. A
-  host whose wake rules match these tags now meets edits there too, where
-  they used to fall past those rules: an immediate wake on
-  `chat:addressed`, say, now wakes on a typo fix of an addressed message.
+  only in part, or an edit of a reply whose target Discord didn't send.
+  What that changes is a host's gate's to say. agent-framework ships no
+  default gate, and without one every edit woke the agent before and still
+  does, tagged or not. Under a gate with rules on these tags, such as
+  connectome-host's documented example, edits used to fall past those
+  rules. Now an edit of an addressed message, a typo fix included, meets an
+  immediate rule on `chat:addressed` and wakes the agent at once, and an
+  edit to chatter meets a rule on `chat:ambient`.
 
 - **What is sent again after a host's answer rests on the MCPL spec alone,
   not on one host's words.** discord-mcpl serves more than one kind of
