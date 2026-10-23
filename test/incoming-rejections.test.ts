@@ -654,15 +654,16 @@ describe('sending the same occurrence again, by what the spec defines', () => {
       assert.equal(eventIdOf(sent[1]), eventIdOf(sent[0]));
     });
 
-    it("the waits stop at half the host's retry window, counted from the first send", async () => {
+    it("no resend whose wait would end after half the host's retry window, counted from the first send", async () => {
       const host = scriptedHost(() => ({ error: { code: -32000, message: 'busy' } }));
       const { server, sent } = wire(() => undefined, { host });
-      (server as any).hostRetryWindowMs = 200;
-      delays(server, 60, 5);
+      (server as any).hostRetryWindowMs = 400;
+      (server as any).retryDelaysMs = [50, 300, 5, 5, 5];
       const started = Date.now();
       await deliver(server, SMALL_IMAGE);
-      // 100 ms of waits fit before the deadline: the first 60, then the 40 left.
-      assert.ok(sent.length >= 2 && sent.length <= 3, `sent ${sent.length}`);
+      // The deadline is 200 ms after the first send: the 50 ms wait fits, the
+      // 300 ms one doesn't, and nothing is sent in a burst before it.
+      assert.equal(sent.length, 2);
       assert.ok(Date.now() - started < 1000);
       assert.ok(errors.some((e) => e.endsWith("not sent again: the host's retry window is closing")), errors.join('\n'));
     });
@@ -711,7 +712,8 @@ describe('sending the same occurrence again, by what the spec defines', () => {
 
     it("no resend when no host connection is ready before the retry window's deadline", async () => {
       const { server, sent } = wire(() => ({ results: [{ messageId: 'm1', accepted: false }] }), { open: true });
-      (server as any).hostRetryWindowMs = 200;
+      // A 300 ms deadline: the 10 ms wait fits even on a slow machine.
+      (server as any).hostRetryWindowMs = 600;
       delays(server, 10);
       const delivered = deliver(server, SMALL_IMAGE);
       await until(() => errors.some((e) => e.includes('sending the same occurrence again')));
