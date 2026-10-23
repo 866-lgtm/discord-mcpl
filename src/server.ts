@@ -875,9 +875,9 @@ export class DiscordMcplServer {
   /**
    * The waits before each resend of an occurrence whose answer leaves it
    * worth sending again (answerClass: `uncertain`, or `refused` once), as
-   * the same occurrence. Each is cut to what is left of the retry deadline,
-   * half the host's retry window after the first send. A field so tests can
-   * shorten it.
+   * the same occurrence. A resend whose wait wouldn't end by the retry
+   * deadline, half the host's retry window after the first send, isn't sent.
+   * A field so tests can shorten it.
    */
   private retryDelaysMs: readonly number[] = [1_000, 5_000, 30_000, 120_000, 600_000];
   /** The host's advertised `eventCoalescing.retryWindowMs`, if any. */
@@ -5932,9 +5932,11 @@ export class DiscordMcplServer {
         notResent(`sent ${resends + 1} times`);
         return { outcome, conn };
       }
+      // A resend whose wait wouldn't end before the deadline isn't sent:
+      // cutting the wait short would send a burst of resends at the end.
       const deadline = firstSentAt + windowMs / 2;
-      const wait = Math.min(this.retryDelaysMs[resends], deadline - Date.now());
-      if (wait < 0) {
+      const wait = this.retryDelaysMs[resends];
+      if (Date.now() + wait > deadline) {
         notResent("the host's retry window is closing");
         return { outcome, conn };
       }
