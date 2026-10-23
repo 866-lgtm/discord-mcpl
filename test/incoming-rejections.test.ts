@@ -1218,22 +1218,77 @@ describe('owed messages', () => {
     assert.equal((server as any).owed.size, 0);
   });
 
-  it(`a block the host doesn't take is tried again, one counted try per connection, ${3} in all, then given up`, async () => {
+  it(`a block the host doesn't take is tried again, ${3} tries in all, then given up — on one long-lived connection too`, async () => {
     const { server, sent } = wire(() => ({ accepted: false, reason: 'busy' }));
     onDiscord(server, [history('m1', 'first')]);
     (server as any).owe('chan1', 'm1', { uncertain: false });
     await (server as any).deliverOwed((server as any).conn);
-    // The same connection again: tried, but not counted again.
-    await (server as any).deliverOwed((server as any).conn);
-    assert.equal(owedPushes(sent).length, 2);
     assert.equal((server as any).owed.get('chan1')[0].tries, 1);
-    for (let i = 2; i <= 3; i++) {
-      const conn = reconnect(server, sent, () => ({ accepted: false, reason: 'busy' }));
-      await (server as any).deliverOwed(conn);
-    }
+    await (server as any).deliverOwed((server as any).conn);
+    assert.equal((server as any).owed.get('chan1')[0].tries, 2);
+    await (server as any).deliverOwed((server as any).conn);
+    assert.equal(owedPushes(sent).length, 3);
     assert.equal((server as any).owed.size, 0);
     assert.ok(errors.some((e) => e.startsWith("[discord-mcpl] Couldn't deliver 1 owed message(s) in channel chan1: host rejected it: busy; tried again later.")), errors.join('\n'));
     assert.ok(errors.some((e) => e.endsWith('; given up.')), errors.join('\n'));
+  });
+
+  it('a try cut short by its connection ending does not count', async () => {
+    const { server, sent } = wire(() => undefined);
+    onDiscord(server, [history('m1', 'first')]);
+    (server as any).owe('chan1', 'm1', { uncertain: false });
+    const conn = (server as any).conn;
+    conn.sendRequest = (m: string, p: unknown) => {
+      sent.push({ method: m, params: p });
+      (server as any).conn = null; // the host goes while the block is on its way
+      return Promise.reject(new ConnectionClosedError());
+    };
+    await (server as any).deliverOwed(conn);
+    assert.equal(owedPushes(sent).length, 1);
+    assert.deepEqual((server as any).owed.get('chan1'), [{ id: 'm1' }], 'no try counted');
+    assert.equal((server as any).owedTried.has('chan1'), false);
+  });
+
+  it("an owed message Discord no longer has is given up, and says so", async () => {
+    const { server } = wire(() => ({ accepted: true }));
+    onDiscord(server, []);
+    (server as any).owe('chan1', 'm1', { uncertain: false });
+    await (server as any).deliverOwed((server as any).conn);
+    assert.ok(errors.includes('[discord-mcpl] Gave up 1 owed message(s) in channel chan1: Discord no longer has them.'), errors.join('\n'));
+  });
+
+  it("Discord not knowing a channel whose guild is known deletes it, as the sweep does: nothing owed or tried is left", async () => {
+    const { server } = wire(() => ({ accepted: true }));
+    onDiscord(server, []);
+    (server as any).discord.fetchAround = async () => { throw Object.assign(new Error('Unknown Channel'), { code: 10003 }); };
+    (server as any).guildOfChannel = () => 'g1';
+    let deleted: unknown[] | undefined;
+    const channelDeleted = (server as any).channelDeleted.bind(server);
+    (server as any).channelDeleted = (...args: unknown[]) => { deleted = args; return channelDeleted(...args); };
+    (server as any).owe('chan1', 'm1', { uncertain: false });
+    await (server as any).deliverOwed((server as any).conn);
+    assert.deepEqual(deleted, ['g1', 'chan1']);
+    assert.equal((server as any).owed.size, 0);
+    assert.equal((server as any).owedTried.has('chan1'), false);
+    assert.equal(saved().owed, undefined);
+  });
+
+  it('a put-off delivery for a connection replaced again meanwhile is dropped, not pushed to it', async () => {
+    let answer!: (v: unknown) => void;
+    const answered = new Promise((r) => { answer = r; });
+    const { server, sent } = wire(() => answered);
+    onDiscord(server, [history('m1', 'first')]);
+    (server as any).owe('chan1', 'm1', { uncertain: false });
+    const first = (server as any).deliverOwed((server as any).conn);
+    await until(() => owedPushes(sent).length === 1);
+    const conn2 = reconnect(server, sent, () => ({ accepted: true }));
+    await (server as any).deliverOwedIn(conn2, 'chan1', 'ready'); // put off
+    (server as any).conn = null; // and conn2 goes too
+    answer({ accepted: false, reason: 'busy' });
+    await first;
+    await new Promise((r) => setTimeout(r, 20));
+    assert.equal(owedPushes(sent).length, 1, 'nothing pushed to the replaced connection');
+    assert.equal((server as any).owedRerun.size, 0);
   });
 
   it('a block refused with a code the spec defines is given up at once', async () => {

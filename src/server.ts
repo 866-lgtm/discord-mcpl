@@ -272,8 +272,8 @@ interface OwedMessage {
 }
 /** How many messages are owed per channel at most; the oldest go first. */
 const OWED_PER_CHANNEL_MAX = 50;
-/** How many delivery tries an owed message gets, at most one counted per
- *  connection, before it is given up. */
+/** How many delivery tries an owed message gets before it is given up. A
+ *  try cut short by its connection ending doesn't count. */
 const OWED_DELIVERY_TRIES = 3;
 /** How long the live trigger waits after a failed delivery try on the same
  *  connection before trying again (the try isn't counted again). */
@@ -3523,9 +3523,9 @@ export class DiscordMcplServer {
   /** A connection that became ready while its channel's delivery was still
    *  running (on the connection before it): it delivers once that ends. */
   private readonly owedRerun = new Map<string, McplConnection>();
-  /** Per channel, the connection its last delivery try counted on, and when
-   *  that try failed: a try counts once per connection, and a live trigger
-   *  waits OWED_RETRY_COOLDOWN_MS after a failure before trying again. */
+  /** Per channel, the connection its last failed delivery try was on, and
+   *  when: a live trigger waits OWED_RETRY_COOLDOWN_MS after a failure on
+   *  the same connection before trying again. */
   private readonly owedTried = new Map<string, { conn: McplConnection; failedAt: number }>();
 
   /** Deliver everything owed to `conn`, whose start-up has settled
@@ -3575,8 +3575,14 @@ export class DiscordMcplServer {
         this.forgetOwed(channelId, entries.map((o) => o.id));
       };
       const notThisTime = (entries: readonly OwedMessage[], why: string, final = false): void => {
-        const counts = this.owedTried.get(channelId)?.conn !== conn;
-        this.owedTried.set(channelId, { conn, failedAt: Date.now() });
+        // Every try counts, so a block never taken is given up after
+        // OWED_DELIVERY_TRIES whatever the connection (live tries on one
+        // connection are OWED_RETRY_COOLDOWN_MS apart, a ready one is one per
+        // connection) — but not one cut short by its connection ending: the
+        // next connection to become ready tries again.
+        const ended = this.conn !== conn || conn.isClosed;
+        const counts = !ended;
+        if (!ended) this.owedTried.set(channelId, { conn, failedAt: Date.now() });
         const givenUp: OwedMessage[] = [];
         for (const owed of entries) {
           if (counts) owed.tries = (owed.tries ?? 0) + 1;
@@ -3633,8 +3639,7 @@ export class DiscordMcplServer {
       }
       const gone = list.filter((o) => !have.has(o.id));
       if (gone.length > 0) {
-        dbg('owed:gone', { channelId, gone: gone.map((o) => o.id) });
-        this.forgetOwed(channelId, gone.map((o) => o.id));
+        giveUp(gone, 'Discord no longer has them');
       }
       let found = list.filter((o) => have.has(o.id)).map((owed) => ({ owed, m: have.get(owed.id)! }));
       if (found.length === 0) return;

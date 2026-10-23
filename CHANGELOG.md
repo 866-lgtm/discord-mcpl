@@ -91,8 +91,8 @@ in the git log and PR descriptions.
   channel are given up (Discord not knowing the channel is read as the
   catch-up reads it: the channel is gone). A block not delivered (not taken, a failed read, a channel whose
   identity can't be resolved, or a filter refusal resting on facts that
-  aren't current, which the catch-up holds back too) counts a try, at most
-  one per connection, and three tries give it up; a refusal with a code the
+  aren't current, which the catch-up holds back too) counts a try (not one
+  cut short by its connection ending), and three tries give it up; a refusal with a code the
   spec gives a meaning, or an unknown channel, gives it up at once. A later
   edit or delete of the message that the host takes clears what was owed for
   it; a message owed again while a delivery of it is on its way stays owed. At most 50
