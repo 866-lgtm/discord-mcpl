@@ -3568,11 +3568,17 @@ export class DiscordMcplServer {
       const list = [...(this.owed.get(channelId) ?? [])];
       if (list.length === 0) return;
       if (!this.mcplEnabled || !isEnabled('discord.messaging', this.enabledFeatureSets)) return;
+      // What this delivery read, as it was: an entry owed again meanwhile (a
+      // new revision, or a new entry) isn't given up with it.
+      const startRevs = new Map(list.map((o) => [o, this.owedRevs.get(o) ?? 0]));
+      const forgetAsRead = (entries: readonly OwedMessage[]): void => {
+        this.forgetOwedEntries(channelId, entries.filter((o) => (this.owedRevs.get(o) ?? 0) === startRevs.get(o)));
+      };
       const giveUp = (entries: readonly OwedMessage[], why: string): void => {
         if (entries.length === 0) return;
         console.error(`[discord-mcpl] Gave up ${entries.length} owed message(s) in channel ${channelId}: ${why}.`);
         dbg('owed:given-up', { channelId, ids: entries.map((o) => o.id), why });
-        this.forgetOwed(channelId, entries.map((o) => o.id));
+        forgetAsRead(entries);
       };
       const notThisTime = (entries: readonly OwedMessage[], why: string, final = false): void => {
         // Every try counts, so a block never taken is given up after
@@ -3589,7 +3595,7 @@ export class DiscordMcplServer {
           if (final || (owed.tries ?? 0) >= OWED_DELIVERY_TRIES) givenUp.push(owed);
         }
         this.saveWatermark();
-        if (givenUp.length > 0) this.forgetOwed(channelId, givenUp.map((o) => o.id));
+        if (givenUp.length > 0) forgetAsRead(givenUp);
         console.error(
           `[discord-mcpl] Couldn't deliver ${entries.length} owed message(s) in channel ${channelId}: ${why}` +
             (givenUp.length === entries.length ? '; given up.' : givenUp.length > 0
@@ -3663,6 +3669,12 @@ export class DiscordMcplServer {
         return;
       }
       if (guildId) await this.discord.lookUpStaleParent(channelId);
+      if (lookupFailure) {
+        console.error(
+          `[discord-mcpl] Couldn't look up channel ${channelId} for its owed messages (${lookupFailure}). They are placed and ` +
+            'filtered by what the cache knew of it, and may go out without its names.',
+        );
+      }
       // The live ingress decision, evaluated now, as the sweep evaluates it.
       // A channel filter's refusal that rests on facts that aren't current
       // may be wrong, so the channel is held back, as the sweep holds it.
@@ -3674,6 +3686,12 @@ export class DiscordMcplServer {
           notThisTime(found.map(({ owed }) => owed),
             `the channel filters would withhold them, but that answer rests on facts that aren't current (${notCurrent})`);
           return;
+        }
+      }
+      // A DM the allowlist refuses now gets the notice the sweep gives one.
+      for (const { m } of refused) {
+        if (reasons.get(m.id) === 'dm-user-not-allowed') {
+          this.handleDmRefusal({ messageId: m.id, channelId, authorId: m.authorId, origin: 'sweep' });
         }
       }
       giveUp(refused.map(({ owed }) => owed), 'the filters refuse them now');
