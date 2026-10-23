@@ -953,6 +953,11 @@ export class DiscordMcplServer {
   private readyConn: McplConnection | null = null;
   /** Woken when a connection becomes ready. */
   private readonly readyWaiters = new Set<() => void>();
+  /** Occurrences waiting for a host to become ready (waitForHost), and the
+   *  most allowed at once: each holds its content, inline media included,
+   *  while it waits. A field so tests can lower it. */
+  private waitingForHost = 0;
+  private maxWaitingForHost = 64;
   /** Numbers every edit and delete sent, process-wide, so no two share one. */
   private mutationSeq = 0;
   /**
@@ -4969,10 +4974,23 @@ export class DiscordMcplServer {
     return this.readyNow();
   }
 
+  /** An edit or delete that waited for its create while its host went:
+   *  held until a host is ready, for reconnectWaitMs at most, as a resend
+   *  waits (waitForHost), then sent there; dropped when none is. */
+  private holdForHost(kind: 'edit' | 'delete', channelId: string, messageId: string, send: (conn: McplConnection) => void): void {
+    void this.waitForHost(Date.now() + this.reconnectWaitMs).then((ready) => {
+      if (typeof ready === 'string') {
+        dbg(kind === 'edit' ? 'handleMessageEdit:drop' : 'handleMessageDelete:drop', { channelId, messageId, reason: 'no-ready-connection', why: ready });
+        return;
+      }
+      send(ready);
+    });
+  }
+
   private sendMessageEdit(admitted: McplConnection, channelId: string, messageId: string, newContent: string, isDM: boolean, info?: MessageEventInfo): void {
     const conn = this.mutationConn(admitted);
     if (!conn) {
-      dbg('handleMessageEdit:drop', { channelId, messageId, reason: 'no-ready-connection' });
+      this.holdForHost('edit', channelId, messageId, (ready) => this.sendMessageEdit(ready, channelId, messageId, newContent, isDM, info));
       return;
     }
     const registeredId = this.registerEventChannel(channelId, isDM, info);
@@ -5024,7 +5042,7 @@ export class DiscordMcplServer {
   private sendMessageDelete(admitted: McplConnection, channelId: string, messageId: string, isDM: boolean, info?: MessageEventInfo): void {
     const conn = this.mutationConn(admitted);
     if (!conn) {
-      dbg('handleMessageDelete:drop', { channelId, messageId, reason: 'no-ready-connection' });
+      this.holdForHost('delete', channelId, messageId, (ready) => this.sendMessageDelete(ready, channelId, messageId, isDM, info));
       return;
     }
     const registeredId = this.registerEventChannel(channelId, isDM, info);
@@ -6241,6 +6259,23 @@ export class DiscordMcplServer {
     }
   }
 
+  /** readyConnection for an occurrence that holds its content while it
+   *  waits: at once when a connection is ready, else waiting only while
+   *  fewer than maxWaitingForHost others do. */
+  private async waitForHost(deadline: number): Promise<McplConnection | string> {
+    const now = this.readyNow();
+    if (now) return now;
+    if (this.waitingForHost >= this.maxWaitingForHost) {
+      return `as many messages as may wait for a host (${this.maxWaitingForHost}) already are`;
+    }
+    this.waitingForHost++;
+    try {
+      return await this.readyConnection(deadline);
+    } finally {
+      this.waitingForHost--;
+    }
+  }
+
   /** Announce a registered channel to the host again (channels/changed
    *  `added`), when it is registered here. */
   private reannounceChannel(conn: McplConnection, id: string): boolean {
@@ -6338,7 +6373,7 @@ export class DiscordMcplServer {
       if (answer === 'final') {
         if (!sentBeforeReady || notYetResent || !isAuthorityRefusal(outcome)) return { outcome, conn };
         notYetResent = true;
-        const ready = await this.readyConnection(Date.now() + this.reconnectWaitMs);
+        const ready = await this.waitForHost(Date.now() + this.reconnectWaitMs);
         if (typeof ready === 'string') {
           notResent(ready);
           return { outcome, conn };
@@ -6391,7 +6426,7 @@ export class DiscordMcplServer {
         notResent('a later edit or delete of the message has been sent since');
         return { outcome: { kind: 'superseded' }, conn };
       }
-      const next = await this.readyConnection(Math.min(deadline, Date.now() + this.reconnectWaitMs));
+      const next = await this.waitForHost(Math.min(deadline, Date.now() + this.reconnectWaitMs));
       if (typeof next === 'string') {
         notResent(next);
         return { outcome, conn };
@@ -6476,6 +6511,9 @@ export class DiscordMcplServer {
           // left on Discord to deliver.
           if (kind === 'edit' && answerClass(outcome) === 'refused') this.owe(discordChannelId, messageId, { uncertain: false, edit: true });
         } else if (outcome.kind === 'failed') {
+          // The host's own error reaches the operator, as its refusals do; no
+          // answer (a timeout, a closed connection) stays quiet, as before.
+          if (outcome.hostError) console.error(`[discord-mcpl] host failed ${kind} of message ${messageId} in ${channel}: ${outcome.error}`);
           dbg('handleMessageMutation:send-failed', { kind, messageId, channel, error: outcome.error });
           if (kind === 'edit') this.owe(discordChannelId, messageId, { uncertain: true, edit: true });
         }
@@ -6490,7 +6528,7 @@ export class DiscordMcplServer {
 
 /** A forwarded occurrence's outcome: the host's answer, or no answer
  *  (`failed`: a timeout, a closed connection, the host's own failure). */
-type SendOutcome = ForwardOutcome | { kind: 'failed'; error: string };
+type SendOutcome = ForwardOutcome | { kind: 'failed'; error: string; hostError?: true };
 
 /** An outcome as the log lines put it. A refusal without a code reads as
  *  "didn't take" on channels/incoming, where a host's own failure comes back
@@ -6523,7 +6561,19 @@ function pushFits(
  *  (errorRejection), or a failed send. */
 function sendErrorOutcome(err: unknown): SendOutcome {
   const rejection = errorRejection(err);
-  return rejection ? { kind: 'rejected', ...rejection } : { kind: 'failed', error: errorText(err) };
+  if (rejection) return { kind: 'rejected', ...rejection };
+  return { kind: 'failed', error: errorText(err), ...(hostAnsweredWithError(err) ? { hostError: true as const } : {}) };
+}
+
+/** Whether an error is the host's answer (a JSON-RPC error it sent), not
+ *  mcpl-core's own timeout (an RpcError with -32000 in 0.2.1, "Request
+ *  timed out after <n>ms: <method>"; ConnectionTimeoutError later) or a
+ *  closed connection. */
+function hostAnsweredWithError(err: unknown): boolean {
+  const e = err as { code?: unknown; message?: unknown; name?: unknown } | null | undefined;
+  if (!e || typeof e.code !== 'number') return false;
+  if (e.name === 'ConnectionTimeoutError') return false;
+  return !(typeof e.message === 'string' && /Request timed out after \d+ms/.test(e.message));
 }
 
 /** A Discord id as a number, or null when it isn't one. */

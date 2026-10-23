@@ -135,13 +135,21 @@ export function isContentRejection(rejection: HostRejection): boolean {
 export type AnswerClass = 'done' | 'final' | 'unknown-channel' | 'refused' | 'uncertain';
 
 /** The refusal codes after which the same occurrence is never sent again. */
-const FINAL_CODES = new Set([-32602, -32001, -32002, -32003, -32005, -32017, -32024, -32600, -32601, -32700]);
+const FINAL_CODES = new Set([
+  // JSON-RPC's: invalid request, method not found, invalid params, parse error.
+  -32600, -32601, -32602, -32700,
+  // Every code SPEC Appendix A defines, but an unknown channel's.
+  ...[...SPEC_SERVER_RANGE_CODES].filter((code) => code !== -32023),
+]);
+
+/** Of those, the permission refusals (isAuthorityRefusal). */
+const AUTHORITY_CODES = new Set([-32001, -32002, -32017].filter((code) => SPEC_SERVER_RANGE_CODES.has(code)));
 
 /** The spec's permission refusals: feature set not enabled (-32001),
  *  capability denied (-32002), channel not permitted (-32017). A host denies
  *  with them until its §5.3 policy is settled, too. */
 export function isAuthorityRefusal(outcome: ForwardOutcome | { kind: 'failed' }): boolean {
-  return outcome.kind === 'rejected' && (outcome.code === -32001 || outcome.code === -32002 || outcome.code === -32017);
+  return outcome.kind === 'rejected' && outcome.code !== undefined && AUTHORITY_CODES.has(outcome.code);
 }
 
 export function answerClass(outcome: ForwardOutcome | { kind: 'failed' }): AnswerClass {
