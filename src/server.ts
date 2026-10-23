@@ -5594,6 +5594,9 @@ export class DiscordMcplServer {
         coalesced: (message as { coalesce?: unknown }).coalesce !== undefined,
         // Registered, as an open channel is.
         channel: channelMcplId,
+        // channels/incoming is for an open channel: the host connected since
+        // takes it only if it has the channel open too.
+        fits: () => (this.channelManager.isOpen(channelMcplId) ? undefined : "its channel isn't open with the host connected now"),
         messageId: msg.id,
         channelMcplId,
         content: message.content,
@@ -5688,6 +5691,7 @@ export class DiscordMcplServer {
         conn,
         coalesced: pushParams.coalesce !== undefined,
         channel: registeredId,
+        fits: () => pushFits(pushParams, this.hostCoalescing),
         messageId: msg.id,
         channelMcplId,
         content: pushParams.payload.content,
@@ -5745,6 +5749,8 @@ export class DiscordMcplServer {
     coalesced: boolean;
     /** The registered MCPL channel the occurrence names, if any. */
     channel: string | undefined;
+    /** Why the occurrence doesn't fit the host connected now (sendWithRetries). */
+    fits: () => string | undefined;
     messageId: string;
     channelMcplId: string;
     content: ContentBlock[];
@@ -5753,9 +5759,9 @@ export class DiscordMcplServer {
     mem: CreateMemory;
     send: (conn: McplConnection, content: ContentBlock[], resend: boolean) => Promise<SendOutcome>;
   }): Promise<void> {
-    const { lane, coalesced, channel, messageId, channelMcplId, content, attachmentBlocks, mem, send } = args;
+    const { lane, coalesced, channel, fits, messageId, channelMcplId, content, attachmentBlocks, mem, send } = args;
     const { outcome: first, conn } = await this.sendWithRetries({
-      lane, coalesced, channel, conn: args.conn,
+      lane, coalesced, channel, fits, conn: args.conn,
       what: `message ${messageId} in ${channelMcplId}`,
       dbgPrefix: 'handleDiscordMessage',
       attempt: (c) => send(c, content, false),
@@ -5792,7 +5798,7 @@ export class DiscordMcplServer {
     // only as a placeholder.
     if (mem.render) mem.render.attachments = rememberedAttachments(withoutInlineMedia(attachmentBlocks).content);
     const { outcome: second } = await this.sendWithRetries({
-      lane, coalesced, channel, conn,
+      lane, coalesced, channel, fits, conn,
       what: `message ${messageId} in ${channelMcplId} (resent without inline media)`,
       dbgPrefix: 'handleDiscordMessage',
       attempt: (c) => send(c, stripped.content, true),
@@ -5910,8 +5916,10 @@ export class DiscordMcplServer {
    * reconnect, the host connected since (§3.1's guarantee survives
    * reconnects and host restarts; only the TCP transport reconnects, as a
    * stdio server exits with its host). Never to a host that doesn't
-   * advertise coalescing for the lane. `superseded`, when given, is asked
-   * before each resend, and a superseded occurrence isn't sent again.
+   * advertise coalescing for the lane, and never when the occurrence,
+   * built for the first host, doesn't fit the one connected now (`fits`).
+   * `superseded`, when given, is asked before each resend, and a superseded
+   * occurrence isn't sent again.
    *
    * A resend reaches the host after messages that came after it, each with
    * its own timestamp; the waits are kept short for that reason (1 s, 5 s,
@@ -5928,8 +5936,12 @@ export class DiscordMcplServer {
     channel: string | undefined;
     attempt: (conn: McplConnection) => Promise<SendOutcome>;
     superseded?: () => boolean;
+    /** Why the occurrence, built for the host it was first sent to, doesn't
+     *  fit the host connected now, or undefined when it does. Asked before
+     *  it goes to a connection other than the last one. */
+    fits?: () => string | undefined;
   }): Promise<{ outcome: SendOutcome | { kind: 'superseded' }; conn: McplConnection }> {
-    const { lane, what, dbgPrefix, coalesced, channel, attempt, superseded } = args;
+    const { lane, what, dbgPrefix, coalesced, channel, attempt, superseded, fits } = args;
     let conn = args.conn;
     const firstSentAt = Date.now();
     let windowMs = this.retryWindowFor(lane);
@@ -5958,6 +5970,15 @@ export class DiscordMcplServer {
         const ready = await this.readyConnection(Date.now() + this.reconnectWaitMs);
         if (typeof ready === 'string') {
           notResent(ready);
+          return { outcome, conn };
+        }
+        if (superseded?.()) {
+          notResent('a later edit or delete of the message has been sent since');
+          return { outcome: { kind: 'superseded' }, conn };
+        }
+        const misfit = ready !== conn ? fits?.() : undefined;
+        if (misfit) {
+          notResent(misfit);
           return { outcome, conn };
         }
         console.error(`[discord-mcpl] ${what}: ${said(outcome)}, before the host's start-up had settled; sending the same occurrence again now that it has`);
@@ -6015,6 +6036,11 @@ export class DiscordMcplServer {
         return { outcome: { kind: 'superseded' }, conn };
       }
       const moved = next !== conn;
+      const misfit = moved ? fits?.() : undefined;
+      if (misfit) {
+        notResent(misfit);
+        return { outcome, conn };
+      }
       conn = next;
       resends++;
       sentBeforeReady = false;
@@ -6057,6 +6083,7 @@ export class DiscordMcplServer {
           coalesced: params.coalesce !== undefined,
           channel: registeredId,
           superseded: () => inFlight.latest !== seq,
+          fits: () => pushFits(params, this.hostCoalescing),
           attempt: async (c) => {
             try {
               return pushOutcome(await c.sendRequest(method.PUSH_EVENT, params as unknown as Record<string, unknown>));
@@ -6095,6 +6122,20 @@ function describeOutcome(outcome: SendOutcome | { kind: 'superseded' }, lane: 'c
     case 'failed': return `send failed: ${outcome.error}`;
     case 'superseded': return 'superseded';
   }
+}
+
+/** Why a push built for one host doesn't fit the host connected now: one
+ *  scoped to a channel (`coalesce.channelId`) goes only to a host that
+ *  advertises channel-scoped pushes (RFC-006 §10; another refuses it as
+ *  malformed, §13). */
+function pushFits(
+  params: CoalescedPushEventParams,
+  coalescing: { channelScopedPush?: boolean } | null | undefined,
+): string | undefined {
+  const scoped = (params.coalesce as { channelId?: unknown } | undefined)?.channelId !== undefined;
+  return scoped && !coalescing?.channelScopedPush
+    ? "the host connected now doesn't take channel-scoped pushes, and this one is scoped to its channel"
+    : undefined;
 }
 
 /** A request's error, read as the host's verdict: its refusal

@@ -727,6 +727,54 @@ describe('sending the same occurrence again, by what the spec defines', () => {
       assert.equal(memory.has('pending'), false, 'once settled, it goes as the oldest');
     });
 
+    it('after a reconnect, the resends are counted against the shortest retry window advertised meanwhile', async () => {
+      const { server, sent } = wire(() => { throw rpcError(-32603, 'Internal error'); });
+      (server as any).retryDelaysMs = [20, 300, 5];
+      const delivered = deliver(server, SMALL_IMAGE);
+      await until(() => errors.some((e) => e.includes('sending the same occurrence again')));
+      const next: unknown[] = [];
+      const conn2 = { sendRequest: () => { next.push(1); return Promise.reject(rpcError(-32603, 'Internal error')); }, sendNotification: () => {} };
+      (server as any).conn = conn2;
+      (server as any).hostRetryWindowMs = 200; // this host's: a 100 ms deadline from the first send
+      (server as any).markReady(conn2);
+      await delivered;
+      assert.equal(sent.length, 1);
+      assert.equal(next.length, 1, 'one resend to the host connected since, then none: the 300 ms wait passes its deadline');
+      assert.ok(errors.some((e) => e.endsWith("not sent again: the host's retry window is closing")), errors.join('\n'));
+    });
+
+    it("a resend to the host connected since is skipped when the message's channel isn't open with it", async () => {
+      const { server, sent } = wire(() => ({ results: [{ messageId: 'm1', accepted: false }] }), { open: true });
+      delays(server, 20);
+      const delivered = deliver(server, SMALL_IMAGE);
+      await until(() => errors.some((e) => e.includes('sending the same occurrence again')));
+      const next: unknown[] = [];
+      const conn2 = { sendRequest: () => { next.push(1); return Promise.resolve({}); }, sendNotification: () => {} };
+      (server as any).conn = conn2;
+      ((server as any).channelManager as ChannelManager).close('discord:g1:chan1');
+      (server as any).markReady(conn2);
+      await delivered;
+      assert.equal(sent.length, 1);
+      assert.deepEqual(next, []);
+      assert.ok(errors.some((e) => e.endsWith("not sent again: its channel isn't open with the host connected now")), errors.join('\n'));
+    });
+
+    it("a channel-scoped push isn't sent again to a host connected since that doesn't take them", async () => {
+      const { server, sent, edit } = wire(() => ({ accepted: false, reason: 'busy' }));
+      (server as any).hostCoalescing = { pushEvents: true, channelsIncoming: true, channelScopedPush: true };
+      delays(server, 20);
+      edit()('chan1', 'm9', 'fixed', false, info);
+      await until(() => errors.some((e) => e.includes('sending the same occurrence again')));
+      assert.equal(sent[0].params.coalesce.channelId, 'discord:g1:chan1', 'scoped to its channel');
+      const next: unknown[] = [];
+      const conn2 = { sendRequest: () => { next.push(1); return Promise.resolve({ accepted: true }); }, sendNotification: () => {} };
+      (server as any).conn = conn2;
+      (server as any).hostCoalescing = { pushEvents: true, channelsIncoming: true, channelScopedPush: false };
+      (server as any).markReady(conn2);
+      await until(() => errors.some((e) => e.includes("doesn't take channel-scoped pushes")));
+      assert.deepEqual(next, []);
+    });
+
     it('a resend goes to the host connected since, once its start-up has settled, still the same occurrence', async () => {
       const { server, sent } = wire((_m, _p, n) => n === 1
         ? { results: [{ messageId: 'm1', accepted: false, reason: 'host is stopping' }] }
@@ -835,6 +883,31 @@ describe('sending the same occurrence again, by what the spec defines', () => {
       await until(() => errors.some((e) => e.includes('not sent again')));
       await new Promise((r) => setTimeout(r, 20));
       assert.equal(sent.length, 2, 'the earlier edit is never sent again');
+    });
+
+    it('an edit refused for permission before start-up settled is "not yet": sent once more when it has', async () => {
+      const { server, sent, edit } = wire((_m, _p, n) => { if (n === 1) throw rpcError(-32002, 'no policy yet'); return { accepted: true }; });
+      (server as any).readyConn = null;
+      edit()('chan1', 'm9', 'fixed', false, info);
+      await until(() => sent.length === 1);
+      await new Promise((r) => setTimeout(r, 20));
+      (server as any).markReady((server as any).conn);
+      await until(() => sent.length === 2);
+      assert.equal(sent[1].params.eventId, sent[0].params.eventId);
+    });
+
+    it('…but not once a later edit has gone out while it waited', async () => {
+      const { server, sent, edit } = wire((_m, _p, n) => { if (n === 1) throw rpcError(-32002, 'no policy yet'); return { accepted: true }; });
+      (server as any).readyConn = null;
+      edit()('chan1', 'm9', 'first', false, info);
+      await until(() => sent.length === 1);
+      await new Promise((r) => setTimeout(r, 10));
+      edit()('chan1', 'm9', 'second', false, info); // same connection: goes at once
+      await until(() => sent.length === 2);
+      (server as any).markReady((server as any).conn);
+      await until(() => errors.some((e) => e.includes('not sent again: a later edit or delete')));
+      await new Promise((r) => setTimeout(r, 20));
+      assert.equal(sent.length, 2, 'the first edit is not sent after the second');
     });
 
     it("an edit's record lasts while it is unanswered: edits of 600 other messages can't make it look like the latest again", async () => {

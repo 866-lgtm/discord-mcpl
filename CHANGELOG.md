@@ -46,8 +46,10 @@ in the git log and PR descriptions.
   that host's start-up has settled (initialized, its policy answered, the
   channels registered), as RFC-006 §3.1 allows ("survives reconnects and
   host restarts"); never to a host that advertises no coalescing. 0.4.0
-  dropped it instead. (A stdio server exits with its host, so there is no
-  next host to send it to.) An edit or delete that waited for its message's
+  dropped it instead. Only an occurrence that fits that host goes: one for
+  an open channel only if the channel is open with it, and one scoped to a
+  channel only if it takes channel-scoped pushes. (A stdio server exits with
+  its host, so there is no next host to send it to.) An edit or delete that waited for its message's
   create goes to the host connected since only once its start-up has
   settled, too, and a create still being sent is never pushed out of the
   memory an edit waits on.
