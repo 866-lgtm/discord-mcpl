@@ -46,13 +46,18 @@ in the git log and PR descriptions.
   that host's start-up has settled (initialized, its policy answered, the
   channels registered), as RFC-006 §3.1 allows ("survives reconnects and
   host restarts"); never to a host that advertises no coalescing. 0.4.0
-  dropped it instead. Only an occurrence that fits that host goes: one for
+  dropped it instead. At most 64 occurrences wait for a host at once (each
+  holds its content while it waits). Only an occurrence that fits that host goes: one for
   an open channel only if the channel is open with it, and one scoped to a
   channel only if it takes channel-scoped pushes. (A stdio server exits with
   its host, so there is no next host to send it to.) An edit or delete that waited for its message's
-  create goes to the host connected since only once its start-up has
-  settled, too, and a create still being sent is never pushed out of the
+  create is held for the host connected since until its start-up has
+  settled, too (a minute at most), and a create still being sent is never pushed out of the
   memory an edit waits on.
+- **An edit or delete the host fails with an error of its own** (a -32000
+  to -32099 code the spec doesn't define, -32603) is logged on stderr
+  (`[discord-mcpl] host failed <edit|delete> of message …`) after its
+  resends; no answer stays in the debug log, as before.
 - **A later edit or delete no longer waits for an earlier one being sent
   again.** It goes at once, and the earlier one isn't sent again: the later
   occurrence replaces or withdraws the message.
