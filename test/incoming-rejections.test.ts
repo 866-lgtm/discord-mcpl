@@ -1039,7 +1039,7 @@ describe('owed messages', () => {
       assert.equal(owedPushes(sent).length, i);
     }
     assert.equal((server as any).owed.size, 0);
-    assert.ok(errors.some((e) => e.startsWith("[discord-mcpl] Couldn't deliver 1 owed message(s) in channel chan1: host didn't take it: busy; tried again later.")), errors.join('\n'));
+    assert.ok(errors.some((e) => e.startsWith("[discord-mcpl] Couldn't deliver 1 owed message(s) in channel chan1: host rejected it: busy; tried again later.")), errors.join('\n'));
     assert.ok(errors.some((e) => e.endsWith('; given up.')), errors.join('\n'));
   });
 

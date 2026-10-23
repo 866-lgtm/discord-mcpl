@@ -3623,7 +3623,7 @@ export class DiscordMcplServer {
       this.saveWatermark();
       if (givenUp.length > 0) this.forgetOwed(channelId, givenUp);
       console.error(
-        `[discord-mcpl] Couldn't deliver ${ids.length} owed message(s) in channel ${channelId}: ${describeOutcome(outcome)}` +
+        `[discord-mcpl] Couldn't deliver ${ids.length} owed message(s) in channel ${channelId}: ${describeOutcome(outcome, 'push/event')}` +
           (givenUp.length === ids.length ? '; given up.' : givenUp.length > 0
             ? `; ${givenUp.length} given up, the rest tried again later.` : '; tried again later.'),
       );
