@@ -59,7 +59,7 @@ export const featureSets: NamedFeatureSetDeclaration[] = [
       coreTags: [
         'chat:addressed', 'chat:mention', 'chat:reply', 'chat:dm', 'chat:ambient',
         'chat:private', 'chat:from-human', 'chat:from-bot', 'chat:thread',
-        'chat:reaction', 'chat:reaction-remove',
+        'chat:edited', 'chat:deleted', 'chat:reaction', 'chat:reaction-remove',
         'chat:has-image', 'chat:has-audio', 'chat:has-file',
       ],
       // RFC-001 rev 2: `suggestedTreatment` (formerly `defaultTreatment`) — a

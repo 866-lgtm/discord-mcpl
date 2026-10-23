@@ -223,6 +223,39 @@ function threadFields(thread: ThreadPlace): { threadName?: string; threadParentN
   };
 }
 
+/** Whether a message addresses the bot, from its address facts. A create and
+ *  each edit of it are read by this one rule. Granular, so the host's wake
+ *  gate can compose intentional policies: notably, let a *bot* activate this
+ *  bot only by an explicit @mention, never by a mere reply. That breaks
+ *  auto-reply loops between two bots (a reply is structural; an @mention is
+ *  deliberate) while humans keep waking the bot via reply or mention. */
+function addressFlags(
+  facts: { mentions: string[]; mentionsBotRole?: boolean; replyToUserId?: string | null },
+  botId: string | null,
+): { isExplicitMention: boolean; isReplyToBot: boolean; isMention: boolean } {
+  const isExplicitMention = (botId !== null && facts.mentions.includes(botId)) || facts.mentionsBotRole === true;
+  // Discord's "ping replied user" toggle controls only whether the bot
+  // appears in mentions; the reply itself is addressed to the bot either way.
+  const isReplyToBot = botId !== null && facts.replyToUserId === botId;
+  // `isMention` (explicit OR reply) is retained for subscription-bypass /
+  // backward compatibility only: the wake decision uses the granular flags
+  // via the gate.
+  return { isExplicitMention, isReplyToBot, isMention: isExplicitMention || isReplyToBot };
+}
+
+/** MCPL RFC-001 address tags, reserved chat:* core with umbrellas included so
+ *  no host-side implication expansion is needed. The host's wake gate routes
+ *  on these, for a create and for each edit. */
+function addressTags(flags: { isExplicitMention: boolean; isReplyToBot: boolean; isMention: boolean }, isDM: boolean, isBot: boolean): string[] {
+  const tags: string[] = [];
+  if (flags.isExplicitMention) tags.push('chat:mention');
+  if (flags.isReplyToBot) tags.push('chat:reply');
+  if (isDM) tags.push('chat:dm', 'chat:private');
+  tags.push(flags.isMention || isDM ? 'chat:addressed' : 'chat:ambient');
+  tags.push(isBot ? 'chat:from-bot' : 'chat:from-human');
+  return tags;
+}
+
 /** The place tag every lane gives a message posted in a thread: `chat:thread`
  *  (the host documents it as "Occurred in a thread"). */
 function threadTags(thread: ThreadPlace): string[] {
@@ -5081,7 +5114,15 @@ export class DiscordMcplServer {
       eventId: `discord_edit_${messageId}_${timestamp}_${mem ? ++mem.edits : ++this.editSeq}`,
       timestamp,
       origin: this.messageEventOrigin(channelId, messageId, info, registeredId),
-      tags: ['chat:edited', ...threadTags(info ?? {})],
+      // The edited message's own addressing, read as its create's was: an
+      // edit can add a mention or take one away. With none known (see
+      // handleMessageUpdate), the edit carries no address tags, and the host
+      // keeps its turn for it rather than reading it as ambient.
+      tags: [
+        'chat:edited',
+        ...(info?.address ? addressTags(addressFlags(info.address, this.discord.botUserId), isDM, info.address.isBot) : []),
+        ...threadTags(info ?? {}),
+      ],
       payload: { content },
       // RFC-006: replace the unread original; append once it was read.
       ...(this.hostCoalescing?.pushEvents
@@ -5759,23 +5800,11 @@ export class DiscordMcplServer {
     // `behavior: skip` (context yes, wake no).
     const botId = this.discord.botUserId;
     const isDM = msg.guildId === null;
-    // Granular address signals. We expose these separately in the event
-    // metadata so the host's wake gate can compose intentional policies —
-    // notably: let a *bot* activate this bot only by an explicit @mention,
-    // never by a mere reply. That breaks auto-reply loops between two bots
-    // (a reply is structural; an @mention is deliberate) while humans keep
-    // waking the bot via reply or mention as before.
-    const isExplicitMention =
-      (botId !== null && msg.mentions.includes(botId)) || msg.mentionsBotRole === true;
-    // Discord's "ping replied user" toggle controls only whether the bot
-    // appears in msg.mentions; the reply itself is addressed to the bot
-    // either way.
-    const isReplyToBot = botId !== null && msg.replyToUserId === botId;
+    // Granular address signals (addressFlags), exposed separately in the
+    // event metadata and tags for the host's wake gate.
+    const flags = addressFlags(msg, botId);
+    const { isExplicitMention, isReplyToBot, isMention } = flags;
     const isBot = msg.isBot;
-    // `isMention` (explicit OR reply) is retained for subscription-bypass /
-    // backward compatibility only — the wake decision uses the granular
-    // flags above via the gate.
-    const isMention = isExplicitMention || isReplyToBot;
     if (!this.shouldEnterContext(msg.channelId, { isMention, isDM, guildId: msg.guildId })) {
       // If we're tracking this channel's missed-ambient (i.e. it was
       // unsubscribed), tally what we're dropping so the agent can ask later.
@@ -5963,12 +5992,7 @@ export class DiscordMcplServer {
     // so no host-side implication expansion is needed) derived from the address
     // flags computed above. The host's wake gate routes on these.
     const eventTags: string[] = (() => {
-      const t = new Set<string>();
-      if (isExplicitMention) t.add('chat:mention');
-      if (isReplyToBot) t.add('chat:reply');
-      if (isDM) { t.add('chat:dm'); t.add('chat:private'); }
-      t.add(isMention || isDM ? 'chat:addressed' : 'chat:ambient');
-      t.add(isBot ? 'chat:from-bot' : 'chat:from-human');
+      const t = new Set<string>(addressTags(flags, isDM, isBot));
       for (const tag of threadTags(msg)) t.add(tag);
       for (const a of msg.attachments) {
         const ct = (a.contentType || '').toLowerCase();
