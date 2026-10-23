@@ -23,7 +23,9 @@ in the git log and PR descriptions.
     again (`channels/changed`) and the same occurrence sent once more, on
     any host: it wasn't admitted, so it can't be a duplicate.
   - **A refusal the spec gives no meaning** (`accepted: false` with a
-    free-text reason, or none): sent once more as the same occurrence.
+    free-text reason or none, or a JSON-RPC error whose code is outside
+    JSON-RPC's reserved range, such as an application's own): sent once
+    more as the same occurrence.
   - **No verdict** (no answer, a closed connection, -32603, or another
     code JSON-RPC reserves (-32768 to -32000) that neither it nor the spec
     defines, mcpl-core's own timeout included): sent again as the same
