@@ -53,6 +53,10 @@ const HISTORY_PROVENANCE =
   'place has channelId null and a header id of discord:?:<channel>. The canonical id is ' +
   'authoritative when a label differs.';
 
+const ATTACHMENT_LINKS =
+  " An attachment's url is signed by Discord and stops working at its expiresAt, when it has one; " +
+  'fetching the message again returns a fresh one.';
+
 const TARGET_RULE =
   'Give exactly one of messageId or latestFrom; the other may be omitted or null. ';
 
@@ -72,7 +76,7 @@ export const toolDefinitions: ToolDefinition[] = [
       type: 'object',
       properties: {
         channelId: { type: 'string', description: CHANNEL_ID_DESC },
-        content: { type: 'string', description: 'Message content (optional if files are attached)' },
+        content: { type: 'string', description: 'The message text. Required unless files are attached — a call with only channelId is rejected as empty.' },
         files: FILES_PROP,
       },
       required: ['channelId'],
@@ -87,7 +91,7 @@ export const toolDefinitions: ToolDefinition[] = [
         channelId: { type: 'string', description: CHANNEL_ID_DESC },
         messageId: { type: ['string', 'null'], description: TARGET_RULE + 'Message to reply to. ' + MESSAGE_ID_KIND },
         latestFrom: { type: ['string', 'null'], description: TARGET_RULE + LATEST_FROM_DESC },
-        content: { type: 'string', description: 'Reply content (optional if files are attached)' },
+        content: { type: 'string', description: "The reply's text. Required unless files are attached — a call with only channelId and its target (messageId or latestFrom) is rejected as empty." },
         files: FILES_PROP,
       },
       required: ['channelId'],
@@ -95,12 +99,12 @@ export const toolDefinitions: ToolDefinition[] = [
   },
   {
     name: 'send_dm',
-    description: "Send a direct message to a Discord user, identified by @username / display name (of someone in a shared server or who has DMed the bot) or by numeric user ID. To reply to a DM you received, pass the sender's name or id. Optionally include file attachments." + RECEIPT_PROVENANCE,
+    description: "Send a direct message to a Discord user, identified by @username / display name (of someone in a shared server or who has DMed the bot) or by numeric user ID. To reply to a DM you received, pass the sender's name or id as `userId` and your reply as `content`. Optionally include file attachments." + RECEIPT_PROVENANCE,
     inputSchema: {
       type: 'object',
       properties: {
         userId: { type: 'string', description: 'Discord @username / display name (of a member in a shared server or someone who has DMed the bot), or a numeric user ID (snowflake)' },
-        content: { type: 'string', description: 'Message content (optional if files are attached)' },
+        content: { type: 'string', description: 'The message text. Required unless files are attached — a call with only userId is rejected as empty.' },
         files: FILES_PROP,
       },
       required: ['userId'],
@@ -308,7 +312,7 @@ export const toolDefinitions: ToolDefinition[] = [
   },
   {
     name: 'fetch_history',
-    description: "Read past messages from a Discord channel, including message IDs. Use before/after message IDs and limit to select history; configured backscroll limits may reduce the amount. Use list_channel_members for people rather than messages." + HISTORY_PROVENANCE,
+    description: "Read past messages from a Discord channel, including message IDs. Use before/after message IDs and limit to select history; configured backscroll limits may reduce the amount. Use list_channel_members for people rather than messages." + ATTACHMENT_LINKS + HISTORY_PROVENANCE,
     inputSchema: {
       type: 'object',
       properties: {
@@ -335,7 +339,7 @@ export const toolDefinitions: ToolDefinition[] = [
     description:
       'Scroll to a specific message and fetch the surrounding context. Returns a ' +
       'window of messages centred on `messageId` (the message itself plus roughly ' +
-      'half the window on either side). Single request, so `limit` is capped at 100.' + HISTORY_PROVENANCE,
+      'half the window on either side). Single request, so `limit` is capped at 100.' + ATTACHMENT_LINKS + HISTORY_PROVENANCE,
     inputSchema: {
       type: 'object',
       properties: {

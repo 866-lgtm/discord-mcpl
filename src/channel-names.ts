@@ -59,7 +59,7 @@ export interface ChannelCandidate {
   /** Needed for tie-breaking: a stock Discord server ships a VOICE channel
    *  named "General" beside text #general, and matching is case-insensitive,
    *  so a name collision across types is the DEFAULT state, not an edge case. */
-  type: 'text' | 'announcement' | 'voice' | 'forum' | 'unknown';
+  type: 'text' | 'announcement' | 'voice' | 'stage' | 'forum' | 'unknown';
 }
 
 /**
@@ -77,6 +77,31 @@ export interface ChannelCandidate {
  */
 export function formatChannelLabel(name: string, guildName: string): string {
   return `#${name} (${guildName})`;
+}
+
+/**
+ * A thread's label: `#parent › thread (GuildName)`. Display only, and
+ * deliberately NOT the `#name (GuildName)` address form: this resolver
+ * excludes threads (they are addressed by id), and a thread labelled like a
+ * channel would paste as a same-named channel, the silent wrong-room failure
+ * this module exists to prevent. Without a known parent: `› thread (GuildName)`.
+ *
+ * Pasted back, it must fail loudly, and its shape alone doesn't ensure that:
+ * a voice or stage channel's name may hold spaces and `›`, so a voice room
+ * named `general › design-chat` would match the label as a name. So the
+ * resolver (DiscordAdapter.resolveChannelRef) refuses a name in this shape
+ * before anything else about it (threadLabelRefusal), and such a voice room
+ * is labelled by its id instead (channelLabelFor in channels.ts), since its
+ * `#name (Guild)` would be refused too.
+ */
+export function formatThreadLabel(parentName: string | null | undefined, threadName: string, guildName: string): string {
+  return `${parentName ? `#${parentName} ` : ''}› ${threadName} (${guildName})`;
+}
+
+/** Whether a name has a thread label's shape: `parent › thread`, or
+ *  `› thread` when the parent isn't known (formatThreadLabel). */
+export function isThreadLabelShape(name: string): boolean {
+  return /(?:^|\s)›\s/.test(name);
 }
 
 /** `#name (GuildName)` for a resolver candidate. */
@@ -157,7 +182,25 @@ export type ResolveResult =
    *  than a union with a `matched?: undefined` member, which said the same
    *  thing less legibly. */
   | { ok: true; id: string; matched?: ChannelCandidate }
-  | { ok: false; reason: 'not-found' | 'ambiguous'; message: string };
+  /** `thread-label`: the name had a thread label's shape, which is refused
+   *  before anything else about it (formatThreadLabel says why). */
+  | { ok: false; reason: 'not-found' | 'ambiguous' | 'thread-label'; message: string };
+
+/** The refusal of a reference whose name has a thread label's shape
+ *  (isThreadLabelShape), quoting the reference as it was given. A label's
+ *  shape says nothing about any server, so the refusal is the same whatever
+ *  is known of them. */
+export function threadLabelRefusal(given: string): ResolveResult {
+  return {
+    ok: false,
+    reason: 'thread-label',
+    message:
+      `Nothing was done: "${given}" has a thread label's shape (#parent › thread), and thread labels are ` +
+      'display-only, never matched as names. Address the thread by its id instead, discord:<server id>:<thread id> ' +
+      'or its numeric id, which is shown with the label wherever the label is. A channel whose name has this shape ' +
+      'is addressed by id too.',
+  };
+}
 
 /**
  * Resolve a parsed name against live candidates.
@@ -165,7 +208,9 @@ export type ResolveResult =
  * The caller MUST have already applied the channel allowlist — disallowed
  * channels must not reach here, both so a name cannot address a channel the
  * allowlist excludes, and so a forbidden `#general` cannot manufacture a
- * spurious collision with a permitted one.
+ * spurious collision with a permitted one. It MUST also have refused a name
+ * with a thread label's shape (threadLabelRefusal), which as a name could
+ * reach a voice or stage room whose name has the same shape.
  */
 export function resolveChannelName(
   ref: { name: string; guild?: string },
@@ -195,6 +240,17 @@ export function resolveChannelName(
   if (matches.length === 1) return { ok: true, id: matches[0].id, matched: matches[0] };
 
   if (matches.length === 0) {
+    // Candidates are only the SENDABLE kinds, so a channel of another kind,
+    // such as a category or a forum, may well have this name. The text says
+    // what a #name reaches, named from SENDABLE so it follows the rule, and
+    // how any other channel is given.
+    const kinds = [...SENDABLE];
+    const reached = `${kinds.slice(0, -1).join(', ')} or ${kinds[kinds.length - 1]} channel`;
+    const none = (where: string) =>
+      `No ${reached} that the configured channel filters allow is named #${ref.name}${where}, ` +
+      'and a #name reaches only those.';
+    const byId = "list_channels shows a server's channels with their ids, and a channel of any other kind, such as a " +
+      'category or a forum, is given by its id instead.';
     const near = candidates.filter((c) => c.name.toLowerCase() === wantName);
     if (wantGuild && near.length) {
       // The name exists, but not in the guild asked for. Say so precisely —
@@ -204,17 +260,14 @@ export function resolveChannelName(
         ok: false,
         reason: 'not-found',
         message:
-          `No channel #${ref.name} in a guild named "${ref.guild}". ` +
-          `That name exists elsewhere: ${near.map(channelLabel).join(', ')}`,
+          `${none(` in a guild named "${ref.guild}"`)} ` +
+          `That name exists elsewhere: ${near.map(channelLabel).join(', ')}. ${byId}`,
       };
     }
     return {
       ok: false,
       reason: 'not-found',
-      message:
-        `No visible channel named #${ref.name}` +
-        (ref.guild ? ` in "${ref.guild}"` : '') +
-        `. Use list_channels to see what is addressable.`,
+      message: `${none(ref.guild ? ` in "${ref.guild}"` : '')} ${byId}`,
     };
   }
 
@@ -283,14 +336,16 @@ const TEXTLIKE: ReadonlySet<string> = new Set(['text', 'announcement']);
  *
  *  This is an ALLOWLIST OF NAMED KINDS, deliberately not "everything except the
  *  few we exclude". It used to admit `'unknown'`, which was wrong in one
- *  direction (stage/media are not sendable); excluding `'unknown'` wholesale was
- *  then wrong in the other, because GuildAnnouncement (5) also landed in that
- *  bucket and `#announcements` is about as common a channel name as exists. An
- *  overloaded catch-all cannot be right either way — so kinds are named, and a
- *  new Discord channel type defaults to id-only addressing until someone
- *  deliberately classifies it. Failing closed here costs a bounce; failing open
- *  costs a send to something that cannot receive it. */
-const SENDABLE: ReadonlySet<string> = new Set([...TEXTLIKE, 'voice']);
+ *  direction (a media channel holds its posts as threads, like a forum);
+ *  excluding `'unknown'` wholesale was then wrong in the other, because
+ *  GuildAnnouncement (5) also landed in that bucket and `#announcements` is
+ *  about as common a channel name as exists. An overloaded catch-all cannot be
+ *  right either way — so kinds are named, and a new Discord channel type
+ *  defaults to id-only addressing until someone deliberately classifies it.
+ *  Failing closed here costs a bounce; failing open costs a send to something
+ *  that cannot receive it. A stage channel has a text chat, as a voice channel
+ *  does, and is named like one. */
+const SENDABLE: ReadonlySet<string> = new Set([...TEXTLIKE, 'voice', 'stage']);
 
 /** Whether a channel kind can be addressed by NAME. Exported so the mapping
  *  from Discord's type numbers to addressability is testable end to end —

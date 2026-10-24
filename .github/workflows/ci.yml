@@ -11,55 +11,42 @@ permissions:
 
 jobs:
   build-and-test:
-    name: Build & Test (${{ matrix.os }})
+    name: Build & Test (${{ matrix.os }}, Node ${{ matrix.node }})
     runs-on: ${{ matrix.os }}
+    # Bounds a hung test run, which GitHub would otherwise cancel only after
+    # 360 minutes. Node's test runner can loop forever reading a test file's
+    # output when what it has buffered starts with V8's serializer header but
+    # holds only part of a frame (nodejs/node#62704). The fix shipped in
+    # 24.18.0 and 26.2.0, and no 22.x release has it as of 22.23.3, so the
+    # ubuntu floor leg can hit it. Green legs here take under two minutes.
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       # Both platforms: a package-lock.json regenerated over an existing
       # node_modules tree records only that machine's native binaries, so a
       # lock made on macOS breaks Linux installs and vice versa. Each runner
       # catches the lock the other's platform produced. Tests run on ubuntu.
+      #
+      # Node at both ends of the range package.json's engines admits: its
+      # floor, pinned exactly (keep the two in step), so a change that needs
+      # a newer Node fails here rather than for someone running the floor;
+      # and the newest release. On ubuntu also each maintained Node line
+      # between those two majors (24 today), since each line ships its own
+      # built-in fetch.
       matrix:
         os: [ubuntu-latest, macos-latest]
-
-    # @animalabs/voice-kit is a `file:../voice-kit` link (package-lock records
-    # it as a link, not a version): the shape fleet boxes deploy with — pull +
-    # tsc, packages symlinked as siblings — and it is not on npm. So this job
-    # lays the workspace out the same way: this repo and voice-kit side by
-    # side, voice-kit built first, then `npm ci` here resolves the link.
-    defaults:
-      run:
-        working-directory: discord-mcpl
+        node: ['22.12.0', 'latest']
+        include:
+          - os: ubuntu-latest
+            node: '24'
 
     steps:
       - uses: actions/checkout@v4
-        with:
-          path: discord-mcpl
-
-      # voice-kit is a private repo, so the job-scoped GITHUB_TOKEN cannot
-      # read it. VOICE_KIT_READ_TOKEN is a fine-grained PAT with read-only
-      # Contents on anima-research/voice-kit. If the repo is ever made
-      # public the fallback to github.token makes the secret unnecessary.
-      # (Pull requests from forks never receive secrets, so on those the
-      # step below fails at checkout — expected, and the message says why.)
-      - name: "Check out voice-kit (the file: link sibling)"
-        uses: actions/checkout@v4
-        with:
-          repository: anima-research/voice-kit
-          ref: main
-          path: voice-kit
-          token: ${{ secrets.VOICE_KIT_READ_TOKEN || github.token }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 24
-
-      - name: Build voice-kit (what the link resolves to)
-        working-directory: voice-kit
-        run: |
-          npm ci
-          npm run build
+          node-version: ${{ matrix.node }}
 
       # npm ci installs the lock verbatim: npm >= 11 'npm install' silently
       # re-resolves platform packages missing from the lock, so only npm ci

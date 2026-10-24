@@ -10,11 +10,12 @@ import { DiscordAdapter, type HistoryMessage } from '../src/discord-adapter.js';
 import { DiscordMcplServer } from '../src/server.js';
 import { toolDefinitions } from '../src/tools.js';
 
-// Every assert.ok here carries a message. Without one, a failing assert.ok on
-// Node 20 quotes the failed expression by re-reading this file at the call's
-// position, which under tsx is the compiled code's (line 1, a large column);
-// that search retries without progress, so a regression hangs the run
-// instead of failing it.
+// Every assert.ok here carries a message. On Node 20, a failing assert.ok
+// without one quoted the failed expression by re-reading this file at the
+// call's position, which under tsx is the compiled code's (line 1, a large
+// column); that search retried without progress, so a regression hung the
+// run instead of failing it. Later Node versions weren't checked, and a
+// message costs nothing, so the rule stays.
 
 const at = (s: number) => new Date(Date.UTC(2026, 9, 7, 8, 0, s));
 const msg = (id: string, authorId: string, authorName: string, text: string, s: number, isBot = false): HistoryMessage => ({
@@ -301,7 +302,7 @@ describe('resolveLatestFrom', () => {
     assert.ok(!r.ok && /2 member\(s\) here couldn't be resolved to names/.test(r.message), JSON.stringify(r));
   });
 
-  it('sends a latestFrom reply with fail_if_not_exists whatever the default for other replies', async (t) => {
+  it('sends a plain reply with fail_if_not_exists false and a latestFrom reply with it true, whatever the client default', async (t) => {
     const adapter = new DiscordAdapter({ token: 'unused' });
     const client = (adapter as unknown as { client: Client }).client;
     t.after(() => client.destroy());
@@ -321,18 +322,18 @@ describe('resolveLatestFrom', () => {
       };
     });
     const reference = (i: number) => bodies[i].message_reference as Record<string, unknown>;
-    // Today discord.js's default (failIfNotExists: true) covers every reply.
+    // A reply by id states fail_if_not_exists: false, so it posts unthreaded
+    // when its target is gone, whatever discord.js's client default (true);
+    // a latestFrom reply, whose target the server chose, still fails.
     await adapter.sendMessage('dm1', 'by id', { replyTo: '1200000000000000001' });
     await adapter.sendMessage('dm1', 'by latestFrom', { replyTo: '1200000000000000002', requireReplyTarget: true });
-    assert.equal(reference(0).fail_if_not_exists, true, "a reply by id carries discord.js's default");
+    assert.equal(reference(0).fail_if_not_exists, false, 'a reply by id posts unthreaded when its target is gone');
     assert.equal(reference(1).fail_if_not_exists, true);
-    // With the default for other replies false, as #58 makes it, a reply by
-    // id posts unthreaded when its target is gone, and a latestFrom reply,
-    // whose target the server chose, still fails.
+    // And the same with the client default turned off.
     (client.options as { failIfNotExists: boolean }).failIfNotExists = false;
     await adapter.sendMessage('dm1', 'by id', { replyTo: '1200000000000000003' });
     await adapter.sendMessage('dm1', 'by latestFrom', { replyTo: '1200000000000000004', requireReplyTarget: true });
-    assert.equal(reference(2).fail_if_not_exists, false, 'a plain reply follows the default');
+    assert.equal(reference(2).fail_if_not_exists, false, 'a plain reply still posts unthreaded');
     assert.equal(reference(3).fail_if_not_exists, true, 'a latestFrom reply keeps failing');
     assert.deepEqual(bodies.map((b) => (b.message_reference as { message_id: string }).message_id),
       ['1200000000000000001', '1200000000000000002', '1200000000000000003', '1200000000000000004']);

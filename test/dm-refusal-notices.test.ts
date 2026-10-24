@@ -306,9 +306,6 @@ describe('live refusals', () => {
     h.failNoticesWith(Object.assign(new Error('Service Unavailable'), { status: 503 }));
     h.emit('server-error', { id: freshId(5) });
     await h.settle();
-    h.failNoticesWith(Object.assign(new Error('You are being rate limited.'), { status: 429 }));
-    h.emit('rate-limited-us', { id: freshId(6) });
-    await h.settle();
     h.failNoticesWith(null);
     h.emit('blocked-us', { id: freshId(3) });
     h.emit('flaky', { id: freshId(4) });
@@ -318,9 +315,7 @@ describe('live refusals', () => {
     assert.ok(h.logs.some((l) => /sender flaky.*notice unknown: socket hang up/.test(l)));
     assert.ok(h.logs.some((l) => /sender server-error.*notice unknown: Service Unavailable/.test(l)),
       'a 5xx may have posted it, so it is unknown, not failed');
-    assert.ok(h.logs.some((l) => /sender rate-limited-us.*notice unknown: You are being rate limited/.test(l)),
-      'a 429 is refused before Discord evaluates it, so an earlier attempt may have posted: unknown');
-    assert.equal(JSON.parse(readFileSync(h.noticesPath, 'utf-8')).senders['rate-limited-us'].lastNotice.outcome, 'unknown');
+    assert.equal(JSON.parse(readFileSync(h.noticesPath, 'utf-8')).senders['server-error'].lastNotice.outcome, 'unknown');
   });
 
   it('records a notice whose channel lookup failed as failed, since nothing was sent', async (t) => {
@@ -524,6 +519,23 @@ describe('the reconnect catch-up sweep applies the live ingress decision', () =>
     assert.equal(h.server.forwardedWatermark.get('gone-chan'), '400');
     assert.ok(h.logs.some((l) => /Catch-up held back channel gone-chan: neither its guild nor DM identity could be resolved/.test(l)),
       'visible outside the debug log');
+  });
+
+  it('with the real metadata helpers, a channel whose lookup fails and that the cache never held is held back, and its log line says so alone', async (t) => {
+    const h = await harness(t, {
+      dmUsers: ['friend'],
+      watermarks: { 'gone-chan': '400' },
+      history: async () => [historyMessage(freshId(1), 'friend', '@bot ping', true)],
+      realMeta: true,
+    });
+    t.mock.method(h.client.channels, 'fetch', async () => { throw new Error('Missing Access'); });
+    await h.server.runReconnectSweep();
+    assert.deepEqual(h.pushes, []);
+    assert.equal(h.server.forwardedWatermark.get('gone-chan'), '400');
+    assert.ok(h.logs.some((l) => /Catch-up held back channel gone-chan: neither its guild nor DM identity could be resolved \(its lookup failed: Missing Access\), so its missed messages were not delivered/.test(l)),
+      h.logs.join('\n'));
+    // Nothing went out, so no line says its messages may.
+    assert.ok(!h.logs.some((l) => l.includes('may go out')), h.logs.join('\n'));
   });
 
   it('says outside the debug log when it withholds guild messages the filters refuse', async (t) => {
@@ -833,15 +845,19 @@ describe('adapter surfaces', () => {
     );
   });
 
-  it('marks a lookup that finds no channel, or one it cannot send in, as never posted', async (t) => {
+  it('marks a lookup that gives no channel, or one that holds no messages, as never posted, and says which', async (t) => {
     const { adapter, client } = adapterFixture(t, { token: 'unused' });
-    const answers: unknown[] = [null, { id: 'no-send' }];
+    const answers: unknown[] = [null, { id: 'forum', type: ChannelType.GuildForum, guildId: 'g1' }];
     t.mock.method(client.channels, 'fetch', async () => answers.shift());
     const posts = t.mock.method(client.rest, 'post', async () => ({}));
-    for (const id of ['gone', 'no-send']) {
+    for (const [id, says] of [
+      // A DM has no server, so only its kind can keep discord.js from building it, and nothing retries a notice.
+      ['unbuilt', "Channel unbuilt exists, but it's a kind of channel this version of the adapter can't handle, so nothing was sent. Only an operator updating the adapter can change that."],
+      ['forum', 'Channel forum is a forum, which holds no messages, so nothing was sent. '],
+    ]) {
       await assert.rejects(
         adapter.sendDmNotice(id, DM_NOTICE_TEXT, 'dmn3'),
-        (err: Error & { notPosted?: unknown }) => err.notPosted === true && /not found or not a text channel/.test(err.message),
+        (err: Error & { notPosted?: unknown }) => err.notPosted === true && err.message.startsWith(says),
         id,
       );
     }

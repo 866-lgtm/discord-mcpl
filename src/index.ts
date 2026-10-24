@@ -56,7 +56,7 @@
 import * as net from 'node:net';
 import { McplConnection } from '@animalabs/mcpl-core';
 import { DiscordAdapter } from './discord-adapter.js';
-import { DiscordMcplServer, serveStdio } from './server.js';
+import { DiscordMcplServer, serveStdio, serveTcp } from './server.js';
 import {
   resolveStartupFilters,
   loadFiltersFile,
@@ -148,8 +148,8 @@ async function main(): Promise<void> {
 
   // Hot-reload: poll the filters file and apply changes live. Covers edits
   // from any source (human, ops tooling, the filters_update tool — which
-  // also applies its change directly; the poller is then an idempotent
-  // no-op re-apply). Parse failures keep the previous filters (fail-safe)
+  // also applies its change directly, so the poller's re-apply finds
+  // nothing new). Parse failures keep the previous filters (fail-safe)
   // and mark the whole plane's desired state invalid. A file missing for
   // two consecutive polls (one poll of grace for non-atomic editors) marks
   // the plane 'missing' — a deleted desired config must never keep
@@ -179,16 +179,11 @@ async function main(): Promise<void> {
         }
         return;
       }
-      const diff = discord.updateFilters(next);
-      server.filtersState.applyParsed(next);
+      const diff = server.applyReloadedFilters(next);
       console.error(
         `[discord-mcpl] filters hot-reloaded from ${filtersFile} ` +
           `(guilds +${diff.addedGuilds.length}/-${diff.removedGuilds.length})`,
       );
-      if (diff.addedGuilds.length) {
-        // Newly-allowed guilds: make their channels known to the host.
-        server.applyFilterChange();
-      }
     }, 3000);
     poll.unref();
   }
@@ -215,15 +210,13 @@ async function main(): Promise<void> {
     const tcpServer = net.createServer();
     tcpServer.listen(tcpPort, '127.0.0.1');
 
+    // A failure to listen (the port taken) emits 'error' with no listener
+    // yet, which ends the process, as it should. serveTcp's own listener
+    // goes on only once it's listening.
     await new Promise<void>((resolve) => tcpServer.once('listening', resolve));
 
-    // Accept and serve one connection at a time
-    while (true) {
-      const conn = await McplConnection.acceptTcp(tcpServer);
-      console.error('[discord-mcpl] Client connected');
-      await server.serve(conn);
-      console.error('[discord-mcpl] Client disconnected, waiting for next...');
-    }
+    // One client at a time, for as long as the process runs.
+    serveTcp(tcpServer, (conn) => server.serve(conn));
   }
 }
 
